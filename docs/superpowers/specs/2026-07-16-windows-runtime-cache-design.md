@@ -28,7 +28,9 @@ start:
 3. Source files are opened with the existing held-handle policy before keying
    or copying. Their key descriptors bind the handle-final path, filesystem
    identity, byte size, and SHA-256 digest. Copying reads those same held
-   streams.
+   streams. Before limits or copying, publication repeats `fstat()` and SHA-256
+   over each held stream, restores its position, and requires the final path,
+   device, inode, size, and digest to match the descriptor.
 4. A published object is visible only after its complete tree and manifest have
    been converted to the immutable ACL and atomically renamed into place.
 5. A cache hit is accepted only after its directory is held against
@@ -118,8 +120,21 @@ key input never retains caller-owned containers, so later caller mutation
 cannot change the meaning of an already returned key.
 
 Dependency object keys are copied, required to be strings, and sorted before
-keying. Generated-entry policy identifiers are required to be nonempty stable
-strings before either their inputs or renderer can participate in a key.
+keying. Each is exactly 64 lowercase hexadecimal characters, and duplicates
+are rejected rather than silently deduplicated. Generated-entry policy
+identifiers are required to be nonempty stable strings before either their
+inputs or renderer can participate in a key.
+
+At the key boundary, every held-source final path must be Windows-absolute:
+drive-rooted or UNC, never relative, root-relative, or drive-relative. Device,
+inode, and size are exact non-Boolean nonnegative integers, and SHA-256 is
+exactly 64 lowercase hexadecimal characters. These structural checks happen
+before a descriptor enters canonical JSON; Task 3 then verifies that the held
+stream still matches every descriptor field.
+
+JSON strings and mapping keys are recursively scanned for Unicode surrogate
+code points. Lone high or low surrogates are rejected with a located
+`RuntimeError` before `ensure_ascii=False` output is encoded as UTF-8.
 
 Destination spelling is excluded from the key input. It is retained only in
 separate manifest file records so the published layout preserves the first
@@ -159,8 +174,10 @@ CTest graph files, and launcher-owned `qt.conf` without circular content keys.
 Publication follows this sequence:
 
 1. Validate the strict layout name and every ordered destination pair, snapshot
-   JSON inputs, hold and hash all sources, validate limits, and compute the
-   object key before creating or changing cache filesystem state.
+   JSON inputs, hold and hash all sources, revalidate every stream's final
+   path/filesystem identity/size/SHA-256 against its descriptor, validate
+   limits, and compute the object key before creating or changing cache
+   filesystem state.
 2. If `objects/<key>` exists, hold and fully validate it.
 3. Otherwise create a unique `staging/<uuid>` tree, apply the build ACL, create
    directories, copy held sources, render generated entries for the final

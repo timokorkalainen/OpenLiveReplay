@@ -8,7 +8,7 @@ import math
 import ntpath
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import BinaryIO, Callable, List, Mapping, Sequence, Tuple, Union
 
 
@@ -96,7 +96,7 @@ def _json_snapshot(
     if isinstance(value, int):
         return int(value)
     if isinstance(value, str):
-        return str(value)
+        return _json_string(value, location=location)
     if isinstance(value, float):
         if math.isfinite(value):
             return float(value)
@@ -116,9 +116,10 @@ def _json_snapshot(
                     raise RuntimeError(
                         f"invalid JSON value at {location}: mapping key is not a string"
                     )
-                result[key] = _json_snapshot(
+                normalized_key = _json_string(key, location=f"{location}.<key>")
+                result[normalized_key] = _json_snapshot(
                     nested,
-                    location=f"{location}.{key}",
+                    location=f"{location}.{normalized_key}",
                     active_containers=active_containers,
                 )
             return result
@@ -145,6 +146,15 @@ def _json_snapshot(
     )
 
 
+def _json_string(value: str, *, location: str) -> str:
+    normalized = str(value)
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in normalized):
+        raise RuntimeError(
+            f"invalid JSON value at {location}: Unicode surrogate code point"
+        )
+    return normalized
+
+
 def _json_mapping_snapshot(value: object, *, location: str) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise RuntimeError(f"invalid JSON value at {location}: expected mapping")
@@ -158,6 +168,7 @@ _RESERVED_DOS_BASENAME = re.compile(
     r"^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|"
     r"COM[1-9¹²³]|LPT[1-9¹²³])$"
 )
+_LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _validate_win32_component(component: object, *, label: str) -> str:
@@ -195,9 +206,28 @@ def _normalized_destination(destination: Path) -> str:
 
 def _entry_key_input(entry: LayoutEntry) -> dict[str, object]:
     if isinstance(entry, HeldSource):
+        if not isinstance(entry.final_path, Path):
+            raise RuntimeError("invalid held source final_path: expected Path")
+        final_path = PureWindowsPath(entry.final_path)
+        if not final_path.is_absolute():
+            raise RuntimeError(
+                "invalid held source final_path: expected drive-rooted or UNC path"
+            )
+        for field_name in ("device", "inode", "size"):
+            value = getattr(entry, field_name)
+            if type(value) is not int or value < 0:
+                raise RuntimeError(
+                    f"invalid held source {field_name}: expected nonnegative integer"
+                )
+        if not isinstance(entry.sha256, str) or not _LOWER_SHA256.fullmatch(
+            entry.sha256
+        ):
+            raise RuntimeError(
+                "invalid held source sha256: expected lowercase 64-character hex"
+            )
         return {
             "kind": "held-source",
-            "final_path": entry.final_path.as_posix(),
+            "final_path": final_path.as_posix(),
             "device": entry.device,
             "inode": entry.inode,
             "size": entry.size,
@@ -231,10 +261,19 @@ def layout_key(
     normalized_name = _validate_win32_component(name, label="layout name")
     context_snapshot = _json_mapping_snapshot(context, location="context")
     normalized_dependency_keys: list[str] = []
+    seen_dependency_keys: set[str] = set()
     for dependency_key in dependency_keys:
-        if not isinstance(dependency_key, str):
-            raise RuntimeError("invalid dependency key: expected string")
-        normalized_dependency_keys.append(str(dependency_key))
+        if not isinstance(dependency_key, str) or not _LOWER_SHA256.fullmatch(
+            dependency_key
+        ):
+            raise RuntimeError(
+                "invalid dependency key: expected lowercase 64-character hex"
+            )
+        normalized_dependency_key = str(dependency_key)
+        if normalized_dependency_key in seen_dependency_keys:
+            raise RuntimeError(f"duplicate dependency key: {normalized_dependency_key}")
+        seen_dependency_keys.add(normalized_dependency_key)
+        normalized_dependency_keys.append(normalized_dependency_key)
     normalized_dependency_keys.sort()
     normalized_entries: list[tuple[str, Path, LayoutEntry]] = []
     seen_destinations: set[str] = set()

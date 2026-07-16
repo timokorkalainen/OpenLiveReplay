@@ -284,6 +284,10 @@ class CacheKeyTests(unittest.TestCase):
             {"value": float("nan")},
             {"value": float("inf")},
             {"value": float("-inf")},
+            {"value": "\ud800"},
+            {"value": "\udfff"},
+            {"\ud800": "surrogate key"},
+            {"\udfff": "surrogate key"},
         )
         for value in invalid_values:
             with self.subTest(value=value):
@@ -310,6 +314,56 @@ class CacheKeyTests(unittest.TestCase):
         self.assertEqual(key_input["dependency_keys"], ["a" * 64, "b" * 64])
         with self.assertRaisesRegex(RuntimeError, "invalid dependency key"):
             layout_key("tool", ((Path("value"), b"x"),), {}, (7,))
+        malformed = (
+            "",
+            "a" * 63,
+            "a" * 65,
+            "A" * 64,
+            "g" * 64,
+        )
+        for dependency in malformed:
+            with self.subTest(dependency=dependency):
+                with self.assertRaisesRegex(RuntimeError, "invalid dependency key"):
+                    layout_key(
+                        "tool", ((Path("value"), b"x"),), {}, (dependency,)
+                    )
+        with self.assertRaisesRegex(RuntimeError, "duplicate dependency key"):
+            layout_key(
+                "tool",
+                ((Path("value"), b"x"),),
+                {},
+                ("a" * 64, "a" * 64),
+            )
+
+    def test_layout_key_rejects_malformed_held_source_descriptors(self) -> None:
+        source = held("tool.exe", b"tool")
+        malformed = (
+            replace(source, final_path=Path("relative/tool.exe")),
+            replace(source, final_path=Path("C:relative\\tool.exe")),
+            replace(source, final_path=Path("/rooted/tool.exe")),
+            replace(source, device=True),
+            replace(source, device=-1),
+            replace(source, inode=False),
+            replace(source, inode=-1),
+            replace(source, size=True),
+            replace(source, size=-1),
+            replace(source, sha256="a" * 63),
+            replace(source, sha256="a" * 65),
+            replace(source, sha256="A" * 64),
+            replace(source, sha256="g" * 64),
+        )
+        for descriptor in malformed:
+            with self.subTest(descriptor=descriptor):
+                with self.assertRaisesRegex(RuntimeError, "invalid held source"):
+                    layout_key(
+                        "tool", ((Path("tool.exe"), descriptor),), {}, ()
+                    )
+
+        unc = replace(source, final_path=Path("//server/share/tool.exe"))
+        key, _key_input = layout_key(
+            "tool", ((Path("tool.exe"), unc),), {}, ()
+        )
+        self.assertEqual(len(key), 64)
 
     def test_layout_key_rejects_invalid_generated_policy(self) -> None:
         for policy in ("", 7, object()):
