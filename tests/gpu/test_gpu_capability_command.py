@@ -1194,8 +1194,11 @@ class CommandRewriteTests(unittest.TestCase):
             ("-add-plugin", "hidden-plugin", "action"),
             ("-load", "hidden-plugin.dll", "action"),
             ("-code-completion-at", "file.cpp:1:1", "action"),
+            ("-module-file-info", "hidden.pcm", "action"),
         )
         flag_controls = (
+            ("-ObjC", "source-selection"),
+            ("-ObjC++", "source-selection"),
             ("-dump-tokens", "action"),
             ("-dump-raw-tokens", "action"),
             ("-Eonly", "action"),
@@ -1220,9 +1223,16 @@ class CommandRewriteTests(unittest.TestCase):
             ("-code-completion-at=file.cpp:1:1", "action"),
             ("-verify=expected", "action"),
             ("-ast-dump-filter=GpuSurface", "action"),
+            ("-module-file-info=hidden.pcm", "action"),
             ("-fmodule-output=hidden.pcm", "output"),
+            ("-gen-reproducer=always", "output"),
             ("-unknown-future-action=hidden", "action"),
             ("-unknown-future-cc1-control", "ambiguous"),
+            ("-target-future-control=hidden", "ambiguous"),
+            ("-fmodule-future-control=hidden", "ambiguous"),
+            ("-fmodules-future-control=hidden", "ambiguous"),
+            ("-fms-future-control", "ambiguous"),
+            ("-fobjc-future-control", "ambiguous"),
         )
 
         for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
@@ -1257,11 +1267,21 @@ class CommandRewriteTests(unittest.TestCase):
             ("-fmodule-map-file", "module.modulemap"),
             ("-fmodule-file", "Core=Core.pcm"),
             ("-fmodules-cache-path", "module-cache"),
+            ("-mrelocation-model", "pic"),
+            ("-mthread-model", "posix"),
+            ("-target-linker-version", "14.0"),
+            ("-fmodules-prune-interval", "604800"),
         )
         safe_flags = (
             "-DKEEP=1", "-UOLD", "-Iinclude", "-std=c++20",
             "-fmodules", "-fimplicit-module-maps", "-fcxx-exceptions",
-            "-Wno-unknown-warning-option",
+            "-Wno-unknown-warning-option", "-O2", "-gline-tables-only",
+            "-mrelax-all", "-mnoexecstack", "-masm-verbose",
+            "-mconstructor-aliases", "-mframe-pointer=all",
+            "-fmodule-file=Core=Core.pcm",
+            "-fmodules-cache-path=module-cache",
+            "-fms-extensions", "-fms-compatibility-version=19.0",
+            "-fobjc-arc", "-fobjc-runtime=macosx-10.12",
         )
         for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
             arguments: list[str] = []

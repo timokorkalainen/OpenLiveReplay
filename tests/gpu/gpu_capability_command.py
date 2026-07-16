@@ -1159,6 +1159,8 @@ _GNU_FORWARDED_VALUE_OPTIONS = frozenset({
     "-triple", "-target-cpu", "-target-feature", "-target-abi",
     "-fmodule-map-file", "-fmodule-file", "-fmodule-name", "-fmodule-format",
     "-fmodules-cache-path", "-fprebuilt-module-path",
+    "-mrelocation-model", "-mthread-model", "-target-linker-version",
+    "-fmodules-prune-interval",
 })
 
 _CLANG_FRONTEND_DEPENDENCY_OPTIONS = frozenset({
@@ -1180,7 +1182,7 @@ _CLANG_FRONTEND_ACTION_PREFIXES = (
     "-migrate", "-index-", "-extract-api",
 )
 _CLANG_FRONTEND_ACTION_OPTIONS = frozenset({
-    "-E", "-Eonly", "-syntax-only", "-fsyntax-only",
+    "-E", "-Eonly", "-syntax-only", "-fsyntax-only", "-module-file-info",
 })
 _CLANG_FRONTEND_SAFE_FLAGS = frozenset({
     "-undef", "-nostdinc", "-nostdinc++", "-nobuiltininc", "-pthread",
@@ -1189,12 +1191,22 @@ _CLANG_FRONTEND_SAFE_FLAGS = frozenset({
     "-fcxx-exceptions", "-fexceptions", "-fno-exceptions", "-frtti", "-fno-rtti",
     "-fdelayed-template-parsing", "-fblocks", "-fcoroutines", "-fchar8_t",
     "-fno-char8_t", "-pedantic", "-pedantic-errors",
+    "-O", "-O0", "-O1", "-O2", "-O3", "-O4", "-Og", "-Os", "-Oz",
+    "-Ofast", "-g", "-g0", "-g1", "-g2", "-g3", "-gline-tables-only",
+    "-gline-directives-only", "-mrelax-all", "-mnoexecstack",
+    "-masm-verbose", "-mconstructor-aliases", "-fms-extensions", "-fobjc-arc",
 })
 _CLANG_FRONTEND_SAFE_PREFIXES = (
-    "-D", "-U", "-I", "-F", "-W", "-R", "-O", "-g", "-m",
-    "-std=", "-stdlib=", "-target-", "-triple=", "-fmodule-", "-fmodules-",
-    "-fprebuilt-module-path=", "-fms-", "-fobjc-",
+    "-D", "-U", "-I", "-F", "-W", "-R",
 )
+_CLANG_FRONTEND_SAFE_EQUALS_OPTIONS = frozenset({
+    "-std", "-stdlib", "-triple", "-target-cpu", "-target-feature",
+    "-target-abi", "-target-linker-version", "-fmodule-map-file",
+    "-fmodule-file", "-fmodule-name", "-fmodule-format",
+    "-fmodules-cache-path", "-fmodules-prune-interval",
+    "-fprebuilt-module-path", "-mframe-pointer", "-mrelocation-model",
+    "-mthread-model", "-fms-compatibility-version", "-fobjc-runtime",
+})
 
 
 def _validate_rewrite_source(configuration: PreprocessConfiguration) -> None:
@@ -1219,7 +1231,7 @@ def _gnu_forwarded_control(payload: str) -> str | None:
         "-frewrite-includes"
     ):
         return "marker"
-    if candidate in {"-c", "-S", "-x"} or lowered.startswith(
+    if candidate in {"-c", "-S", "-x", "-ObjC", "-ObjC++"} or lowered.startswith(
         ("-fpreprocessed", "-fdirectives-only", "-main-file-name")
     ):
         return "source-selection"
@@ -1241,9 +1253,10 @@ def _gnu_forwarded_control(payload: str) -> str | None:
         "-fmodule-output", "-serialize-diagnostics", "--serialize-diagnostics",
         "-serialize-diagnostic-file", "-diagnostic-log-file", "-stats-file",
         "-fdiagnostics-file=", "-fdiagnostics-serialization-file=",
+        "-gen-reproducer",
     )):
         return "output"
-    if candidate in _CLANG_FRONTEND_ACTION_OPTIONS or option_name.startswith(
+    if option_name in _CLANG_FRONTEND_ACTION_OPTIONS or option_name.startswith(
         _CLANG_FRONTEND_ACTION_PREFIXES
     ):
         return "action"
@@ -1259,8 +1272,14 @@ def _gnu_forwarded_control(payload: str) -> str | None:
         return "action"
     if candidate.startswith("@"):
         return "response"
-    if candidate in _CLANG_FRONTEND_SAFE_FLAGS or candidate.startswith(
-        _CLANG_FRONTEND_SAFE_PREFIXES
+    if (
+        candidate in _CLANG_FRONTEND_SAFE_FLAGS
+        or candidate.startswith(_CLANG_FRONTEND_SAFE_PREFIXES)
+        or (
+            option_name in _CLANG_FRONTEND_SAFE_EQUALS_OPTIONS
+            and "=" in candidate
+            and bool(candidate.partition("=")[2])
+        )
     ):
         return None
     return "ambiguous"
