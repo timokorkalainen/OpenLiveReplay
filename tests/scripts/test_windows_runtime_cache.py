@@ -551,11 +551,12 @@ class WindowsFilesystemTests(unittest.TestCase):
             (nested / "late.dll").write_bytes(b"late")
 
     def test_atomic_move_never_replaces_an_existing_destination(self) -> None:
-        source = self.root / "source"
+        cache = self.make_cache(self.root / "atomic-no-replace")
+        source = cache.staging / "source"
         source.mkdir()
         (source / "payload").write_bytes(b"source")
         sealed = runtime_cache._seal_tree_acl(source, self.sid, "RX")
-        destination = self.root / "destination"
+        destination = cache.objects / ("8" * 64)
         destination.mkdir()
         (destination / "payload").write_bytes(b"destination")
         try:
@@ -711,6 +712,110 @@ class WindowsFilesystemTests(unittest.TestCase):
         self.assertEqual(mutate_target.read_bytes(), b"mutate-original")
         _assert_mutation_denied(rename_target, directory=False)
         _assert_mutation_denied(mutate_target, directory=False)
+
+    def test_rx_conversion_holds_descendants_before_transitional_root_freeze(self) -> None:
+        tree = self.root / "pre-freeze-descendants"
+        tree.mkdir()
+        _set_tree_acl(tree, self.sid, "BUILD")
+        payload = tree / "protected.dll"
+        payload.write_bytes(b"original")
+        runtime_cache._set_path_acl(payload, self.sid, "BUILD")
+        escaped = self.root / "escaped-before-freeze.dll"
+        real_set_handle_acl_sddl = runtime_cache._set_handle_acl_sddl
+        attempted = False
+
+        def attack_at_root_freeze(handle: int, sddl: str) -> None:
+            nonlocal attempted
+            final = runtime_cache._final_path_from_handle(
+                runtime_cache._kernel32(), handle
+            )
+            if final == tree and "0x1f01b9" in sddl:
+                attempted = True
+                with self.assertRaises(OSError):
+                    payload.rename(escaped)
+                with self.assertRaises(OSError):
+                    payload.write_bytes(b"mutated")
+            real_set_handle_acl_sddl(handle, sddl)
+
+        with mock.patch.object(
+            runtime_cache,
+            "_set_handle_acl_sddl",
+            side_effect=attack_at_root_freeze,
+        ):
+            _set_tree_acl(tree, self.sid, "RX")
+
+        self.assertTrue(attempted)
+        self.assertFalse(escaped.exists())
+        self.assertEqual(payload.read_bytes(), b"original")
+        _assert_mutation_denied(payload, directory=False)
+
+    def test_publication_uses_bound_write_through_move_and_revalidates_identity(self) -> None:
+        cache = self.make_cache(self.root / "write-through-publish")
+        source = cache.staging / "creator"
+        source.mkdir()
+        (source / "payload.dll").write_bytes(b"payload")
+        sealed = runtime_cache._seal_tree_acl(source, self.sid, "RX")
+        destination = cache.objects / ("f" * 64)
+        try:
+            real_move = runtime_cache._move_file_no_replace_write_through
+            with mock.patch.object(
+                runtime_cache,
+                "_move_file_no_replace_write_through",
+                wraps=real_move,
+            ) as move:
+                _atomic_move_no_replace(source, destination, sealed=sealed)
+
+            move.assert_called_once_with(source, destination)
+            self.assertEqual(
+                runtime_cache._final_path_from_handle(
+                    runtime_cache._kernel32(), sealed.handle
+                ),
+                destination,
+            )
+            self.assertEqual((destination / "payload.dll").read_bytes(), b"payload")
+            with self.assertRaises(OSError):
+                (destination / "payload.dll").write_bytes(b"changed")
+        finally:
+            sealed.close()
+
+    def test_publication_blocks_rename_and_replacement_at_move(self) -> None:
+        cache = self.make_cache(self.root / "move-substitution")
+        source = cache.staging / "creator"
+        source.mkdir()
+        (source / "payload.dll").write_bytes(b"immutable")
+        sealed = runtime_cache._seal_tree_acl(source, self.sid, "RX")
+        destination = cache.objects / ("9" * 64)
+        escaped = cache.staging / "escaped"
+        real_move = runtime_cache._move_file_no_replace_write_through
+        attack_ran = False
+
+        def attack_then_move(move_source: Path, move_destination: Path) -> None:
+            nonlocal attack_ran
+            attack_ran = True
+            with self.assertRaises(OSError):
+                move_source.rename(escaped)
+            with self.assertRaises(OSError):
+                (cache.staging / "replacement").mkdir()
+            real_move(move_source, move_destination)
+
+        try:
+            with mock.patch.object(
+                runtime_cache,
+                "_move_file_no_replace_write_through",
+                side_effect=attack_then_move,
+            ):
+                _atomic_move_no_replace(source, destination, sealed=sealed)
+
+            self.assertTrue(attack_ran)
+            self.assertTrue(destination.exists())
+            self.assertFalse(source.exists())
+            self.assertFalse(escaped.exists())
+            self.assertEqual((destination / "payload.dll").read_bytes(), b"immutable")
+            with self.assertRaises(OSError):
+                (destination / "payload.dll").write_bytes(b"changed")
+            (cache.staging / "after-publication").mkdir()
+        finally:
+            sealed.close()
 
     def test_existing_cache_root_swap_is_detected_during_handle_bound_acl_update(
         self,
