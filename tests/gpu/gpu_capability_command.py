@@ -1156,7 +1156,7 @@ _GNU_FORWARDED_SEPARATE_VALUE_OPTIONS = frozenset({
     "-include-pch",
     "-isysroot", "--sysroot", "--define-macro", "--undefine-macro",
     "--include", "--imacros",
-    "-F", "-iframework", "-ivfsoverlay", "-resource-dir", "-std", "-stdlib",
+    "-F", "-iframework", "-ivfsoverlay", "-resource-dir",
     "-triple", "-aux-triple", "-target-cpu", "-target-feature", "-target-abi",
     "-fmodules-user-build-path", "-fmodule-implementation-of", "-fmodule-feature",
     "-mrelocation-model", "-mthread-model", "-target-linker-version",

@@ -1275,6 +1275,7 @@ class CommandRewriteTests(unittest.TestCase):
         )
         safe_flags = (
             "-DKEEP=1", "-UOLD", "-Iinclude", "-std=c++20",
+            "-stdlib=libc++",
             "-fmodules", "-fimplicit-module-maps", "-fcxx-exceptions",
             "-Wno-unknown-warning-option", "-O2", "-gline-tables-only",
             "-mrelax-all", "-mnoexecstack", "-masm-verbose",
@@ -1337,7 +1338,8 @@ class CommandRewriteTests(unittest.TestCase):
 
     def test_clang_frontend_joined_only_controls_cannot_hide_actions_as_operands(self):
         joined_only = (
-            "-target-sdk-version", "-fmodule-map-file", "-fmodule-file",
+            "-std", "-stdlib", "-target-sdk-version",
+            "-fmodule-map-file", "-fmodule-file",
             "-fmodule-name", "-fmodule-format", "-fmodules-cache-path",
             "-fprebuilt-module-path", "-fmodules-prune-interval",
         )
@@ -1347,6 +1349,20 @@ class CommandRewriteTests(unittest.TestCase):
                     ("-Xclang", option, "-Xclang", "-emit-obj", "file.cpp")
                     if family is CompilerFamily.CLANG
                     else (f"/clang:{option}", "/clang:-emit-obj", "file.cpp")
+                )
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, "hidden ambiguous option"
+                ):
+                    self.rewrite(family, arguments)
+
+    def test_clang_frontend_joined_only_controls_reject_malformed_spellings(self):
+        malformed = ("-std", "-std=", "-stdlib", "-stdlib=")
+        for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
+            for option in malformed:
+                arguments = (
+                    ("-Xclang", option, "file.cpp")
+                    if family is CompilerFamily.CLANG
+                    else (f"/clang:{option}", "file.cpp")
                 )
                 with self.subTest(family=family, option=option), self.assertRaisesRegex(
                     AuditInfrastructureError, "hidden ambiguous option"
