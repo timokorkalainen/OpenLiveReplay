@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import locale
 import os
 import subprocess
 import sys
@@ -240,6 +241,12 @@ class CompilerIdentificationTests(unittest.TestCase):
                 AuditInfrastructureError, message
             ):
                 identify_compiler(Path(name), output)
+
+    def test_localized_msvc_version_uses_strict_host_native_encoding(self):
+        output = (
+            "Kääntäjä Microsoft (R) C/C++ Optimizing Compiler Version 19.44\n"
+        ).encode(locale.getpreferredencoding(False), errors="strict")
+        self.assertEqual(identify_compiler(Path("cl.exe"), output), CompilerFamily.MSVC)
 
 
 class ResponseFileTests(unittest.TestCase):
@@ -511,6 +518,22 @@ class ConfigurationTests(unittest.TestCase):
             )
         self.assertNotEqual(metadata_changed.digest, version_changed.digest)
 
+    def test_compiler_cannot_change_between_version_probe_and_fingerprint(self):
+        def replace_during_probe(*_args, **_kwargs):
+            self.compiler.write_bytes(b"replacement-compiler-content")
+            return b"g++.exe (GCC) 13.1.0\n"
+
+        with mock.patch(
+            "gpu_capability_command._probe_compiler_version",
+            side_effect=replace_during_probe,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "changed during compiler version probe"
+        ):
+            make_configuration(
+                self.entry(), self.database, 3, self.source_root, self.production,
+                self.environment, AuditLimits()
+            )
+
     def test_normalized_version_output_is_stable(self):
         with mock.patch(
             "gpu_capability_command._probe_compiler_version",
@@ -749,7 +772,16 @@ class ConfigurationTests(unittest.TestCase):
         fixture = self.root / "probe-tree"
         fixture.mkdir()
         pid_file = fixture / "child.pid"
+        startup_pid_file = fixture / "startup-child.pid"
         heartbeat = fixture / "heartbeat.txt"
+        (fixture / "sitecustomize.py").write_text(
+            "import os,pathlib,subprocess,sys\n"
+            "if os.environ.get('GPU_PROBE_SITE_GUARD') != '1':\n"
+            " os.environ['GPU_PROBE_SITE_GUARD']='1'\n"
+            " child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], env=os.environ.copy())\n"
+            " pathlib.Path(os.environ['GPU_PROBE_STARTUP_PID']).write_text(str(child.pid), encoding='ascii')\n",
+            encoding="utf-8",
+        )
         child_code = (
             "import os,pathlib,time\n"
             "target=pathlib.Path(os.environ['GPU_PROBE_HEARTBEAT'])\n"
@@ -769,25 +801,45 @@ class ConfigurationTests(unittest.TestCase):
         environment = dict(
             os.environ,
             GPU_PROBE_PID=str(pid_file),
+            GPU_PROBE_STARTUP_PID=str(startup_pid_file),
             GPU_PROBE_HEARTBEAT=str(heartbeat),
+            PYTHONPATH=str(fixture),
         )
-        from gpu_capability_command import _run_probe_command
-        output = _run_probe_command(
-            [sys.executable, str(parent)], Path(sys.executable), fixture, environment
-        )
+        from gpu_capability_command import _run_probe_command, _WindowsProbeJob
+        if os.name == "nt":
+            original_attach = _WindowsProbeJob.attach
+
+            def delayed_attach(job, process):
+                deadline = time.monotonic() + 0.5
+                while not startup_pid_file.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                return original_attach(job, process)
+
+            with mock.patch.object(_WindowsProbeJob, "attach", delayed_attach):
+                output = _run_probe_command(
+                    [sys.executable, str(parent)], Path(sys.executable), fixture, environment
+                )
+        else:
+            output = _run_probe_command(
+                [sys.executable, str(parent)], Path(sys.executable), fixture, environment
+            )
         self.assertIn(b"gcc (GCC)", output)
-        child_pid = int(pid_file.read_text(encoding="ascii"))
-        deadline = time.monotonic() + 2.0
-        while self._pid_is_alive(child_pid) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        survived = self._pid_is_alive(child_pid)
-        if survived:
-            subprocess.run(
-                ["taskkill", "/PID", str(child_pid), "/T", "/F"],
-                capture_output=True,
-                check=False,
-            ) if os.name == "nt" else os.kill(child_pid, 9)
-        self.assertFalse(survived, "probe descendant survived cleanup")
+        child_pids = (
+            int(pid_file.read_text(encoding="ascii")),
+            int(startup_pid_file.read_text(encoding="ascii")),
+        )
+        for child_pid in child_pids:
+            deadline = time.monotonic() + 2.0
+            while self._pid_is_alive(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            survived = self._pid_is_alive(child_pid)
+            if survived:
+                subprocess.run(
+                    ["taskkill", "/PID", str(child_pid), "/T", "/F"],
+                    capture_output=True,
+                    check=False,
+                ) if os.name == "nt" else os.kill(child_pid, 9)
+            self.assertFalse(survived, "probe descendant survived cleanup")
 
     @staticmethod
     def _pid_is_alive(pid: int) -> bool:

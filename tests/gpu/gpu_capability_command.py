@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import locale
 import os
 import re
 import shlex
@@ -397,7 +398,9 @@ def _normalize_version_output(version_output: bytes) -> bytes:
     if b"\0" in version_output:
         raise AuditInfrastructureError("compiler version probe output is invalid")
     try:
-        text = version_output.decode("utf-8", errors="strict")
+        text = version_output.decode(
+            locale.getpreferredencoding(False), errors="strict"
+        )
     except UnicodeDecodeError as error:
         raise AuditInfrastructureError("compiler version probe output is undecodable") from error
     lines = [line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
@@ -679,7 +682,7 @@ class _ProbeContainment:
             "sys.stdin.buffer.read(1);"
             "raise SystemExit(subprocess.call(sys.argv[1:]))"
         )
-        return [sys.executable, "-c", helper, *command]
+        return [sys.executable, "-I", "-S", "-c", helper, *command]
 
     def attach(self, process: subprocess.Popen[bytes]) -> None:
         pid = getattr(process, "pid", None)
@@ -854,33 +857,43 @@ def _environment_digest(environment: Mapping[str, str]) -> str:
     return hasher.hexdigest()
 
 
-def _compiler_fingerprint(compiler: Path, normalized_version: bytes) -> str:
+def _compiler_metadata_snapshot(compiler: Path) -> tuple[int, int, int, int, int]:
     try:
-        before = compiler.stat()
+        metadata = compiler.stat()
     except OSError as error:
         raise AuditInfrastructureError(f"compiler executable is unreadable: {compiler}") from error
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(getattr(metadata, "st_ctime_ns", 0)),
+    )
+
+
+def _compiler_fingerprint(
+    compiler: Path,
+    normalized_version: bytes,
+    expected_snapshot: tuple[int, int, int, int, int],
+) -> str:
+    before_snapshot = _compiler_metadata_snapshot(compiler)
+    if before_snapshot != expected_snapshot:
+        raise AuditInfrastructureError(
+            f"compiler executable changed during compiler version probe: {compiler}"
+        )
     hasher = hashlib.sha256()
     _hash_field(hasher, str(compiler).encode("utf-8", errors="surrogatepass"))
-    _hash_field(hasher, str(before.st_size).encode("ascii"))
-    _hash_field(hasher, str(before.st_mtime_ns).encode("ascii"))
-    _hash_field(hasher, str(getattr(before, "st_ctime_ns", 0)).encode("ascii"))
+    _hash_field(hasher, str(expected_snapshot[2]).encode("ascii"))
+    _hash_field(hasher, str(expected_snapshot[3]).encode("ascii"))
+    _hash_field(hasher, str(expected_snapshot[4]).encode("ascii"))
     content = hashlib.sha256()
     try:
         with compiler.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):
                 content.update(chunk)
-        after = compiler.stat()
     except OSError as error:
         raise AuditInfrastructureError(f"compiler executable is unreadable: {compiler}") from error
-    if (
-        before.st_size,
-        before.st_mtime_ns,
-        getattr(before, "st_ctime_ns", 0),
-    ) != (
-        after.st_size,
-        after.st_mtime_ns,
-        getattr(after, "st_ctime_ns", 0),
-    ):
+    if _compiler_metadata_snapshot(compiler) != expected_snapshot:
         raise AuditInfrastructureError(f"compiler executable changed while fingerprinting: {compiler}")
     _hash_field(hasher, content.digest())
     _hash_field(hasher, normalized_version)
@@ -1024,7 +1037,12 @@ def make_configuration(
     _reject_driver_dialect_overrides(compiler_arguments)
     family_hint = _family_from_name(compiler_argument)
     compiler = _resolve_compiler(compiler_argument, cwd, environment)
+    compiler_snapshot = _compiler_metadata_snapshot(compiler)
     version_output = _probe_compiler_version(compiler, family_hint, cwd, environment)
+    if _compiler_metadata_snapshot(compiler) != compiler_snapshot:
+        raise AuditInfrastructureError(
+            f"compiler executable changed during compiler version probe: {compiler}"
+        )
     family = identify_compiler(compiler, version_output)
     normalized_version = _normalize_version_output(version_output)
     if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
@@ -1071,7 +1089,9 @@ def make_configuration(
         raise AuditInfrastructureError("compile command source does not match database entry")
 
     environment_digest = _environment_digest(environment)
-    compiler_fingerprint = _compiler_fingerprint(compiler, normalized_version)
+    compiler_fingerprint = _compiler_fingerprint(
+        compiler, normalized_version, compiler_snapshot
+    )
     semantic = {
         "schema": 1,
         "family": family.value,
