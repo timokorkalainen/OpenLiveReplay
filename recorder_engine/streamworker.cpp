@@ -40,6 +40,13 @@ extern "C" {
 }
 
 namespace {
+uint64_t nextStreamWorkerInstanceIdentity() {
+    static std::atomic<uint64_t> nextIdentity{1};
+    const uint64_t identity = nextIdentity.fetch_add(1, std::memory_order_relaxed);
+    if (identity == 0) qFatal("StreamWorker instance identity exhausted");
+    return identity;
+}
+
 bool sameTimecodeIdentity(const TimecodeEvidence& a, const TimecodeEvidence& b) {
     return a.labelRate == b.labelRate && a.sourceGeneration == b.sourceGeneration &&
            a.timingGeneration == b.timingGeneration && a.provenance == b.provenance &&
@@ -77,7 +84,8 @@ QString ingestFailureKindForLog(IngestFailureKind failure) {
 StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
                            int targetWidth, int targetHeight, int targetFps, int targetFpsNum,
                            int targetFpsDen, VideoCodecChoice codec, QObject* parent)
-    : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer),
+    : QThread(parent), m_url(url), m_sourceIndex(sourceIndex),
+      m_workerInstanceIdentity(nextStreamWorkerInstanceIdentity()), m_viewTrack(-1), m_muxer(muxer),
       m_sharedClock(clock) {
     m_videoCodec = codec;
     qRegisterMetaType<IngestStats>("IngestStats");
@@ -460,7 +468,7 @@ bool StreamWorker::muxFrameEvidenceIsCurrent(uint64_t epoch) const {
 
 void StreamWorker::emitFrameTimecodeEvidence(const TimecodeEvidence& evidence,
                                              uint64_t carrierEpoch) {
-    emit frameTimecode(m_sourceIndex, carrierEpoch, evidence);
+    emit frameTimecode(m_sourceIndex, m_workerInstanceIdentity, carrierEpoch, evidence);
 }
 
 qint64 StreamWorker::frameQueueBackstopBytes() const {

@@ -628,13 +628,15 @@ void ReplayManager::resetSourceTimecode(int sourceIndex) {
     m_sourceTimecodeIdentity[sourceIndex] = SourceTimecodeIdentity{};
 }
 
-void ReplayManager::onFrameTimecode(int sourceIndex, uint64_t carrierEpoch,
-                                    TimecodeEvidence evidence) {
+void ReplayManager::onFrameTimecode(int sourceIndex, uint64_t workerInstanceIdentity,
+                                    uint64_t carrierEpoch, TimecodeEvidence evidence) {
     if (sourceIndex < 0 || sourceIndex >= TimecodeAlignerV2::kMaxSources) return;
     const bool hasWorker = sourceIndex < m_workers.size() && m_workers[sourceIndex];
     if (carrierEpoch == 0) {
-        if (hasWorker) return;
-    } else if (!hasWorker || m_workers[sourceIndex]->currentCarrierEpoch() != carrierEpoch) {
+        if (hasWorker || workerInstanceIdentity != 0) return;
+    } else if (!hasWorker || workerInstanceIdentity == 0 ||
+               m_workers[sourceIndex]->workerInstanceIdentity() != workerInstanceIdentity ||
+               m_workers[sourceIndex]->currentCarrierEpoch() != carrierEpoch) {
         return;
     }
     if (evidence.discontinuity) {

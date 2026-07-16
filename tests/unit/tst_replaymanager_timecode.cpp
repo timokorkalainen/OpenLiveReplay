@@ -188,6 +188,7 @@ private slots:
     void reentrantConnectionTransitionDoesNotDeadlock();
     void queuedTimecodeIsRejectedAfterCarrierRotation();
     void queuedTimecodeIsRejectedAfterWorkerRemoval();
+    void queuedTimecodeIsRejectedAfterWorkerReplacementWithSameEpoch();
     void muxSubmissionCapturesCarrierEpochAtomically();
     void concurrentOldCarrierCannotCreateCurrentEntry();
     void concurrentCarrierRotationNeverErasesNewEpochEntry();
@@ -261,6 +262,7 @@ private:
     static bool feedEvidence(ReplayManager& m, int src, const TimecodeEvidence& value) {
         return QMetaObject::invokeMethod(&m, "onFrameTimecode", Qt::DirectConnection,
                                          Q_ARG(int, src), Q_ARG(uint64_t, uint64_t(0)),
+                                         Q_ARG(uint64_t, uint64_t(0)),
                                          Q_ARG(TimecodeEvidence, value));
     }
 
@@ -337,7 +339,7 @@ void TestReplayManagerTimecode::streamWorkerCarriesSelectedEvidenceExactlyOnce()
     QThread* deliveryThread = nullptr;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&](int sourceIndex, uint64_t, TimecodeEvidence value) {
+        [&](int sourceIndex, uint64_t, uint64_t, TimecodeEvidence value) {
             QCOMPARE(sourceIndex, 0);
             ++deliveryCount;
             delivered = value;
@@ -471,7 +473,7 @@ void TestReplayManagerTimecode::delayedNativeOutputUsesEvidenceForPacketPts() {
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int sourceIndex, uint64_t, TimecodeEvidence value) {
+        [&delivered](int sourceIndex, uint64_t, uint64_t, TimecodeEvidence value) {
             QCOMPARE(sourceIndex, 0);
             delivered.append(value);
         },
@@ -532,7 +534,7 @@ void TestReplayManagerTimecode::delayedNativeOutputAcrossGenerationResetDropsOld
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int, uint64_t, TimecodeEvidence value) { delivered.append(value); },
+        [&delivered](int, uint64_t, uint64_t, TimecodeEvidence value) { delivered.append(value); },
         Qt::QueuedConnection));
 
     const TimecodeEvidence oldGeneration = evidence(tcFrames(1, 0, 0, 0), 20, 30, 1, 7, 11);
@@ -595,7 +597,7 @@ void TestReplayManagerTimecode::delayedSoftwareOutputUsesEvidenceForPacketPts() 
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int sourceIndex, uint64_t, TimecodeEvidence value) {
+        [&delivered](int sourceIndex, uint64_t, uint64_t, TimecodeEvidence value) {
             QCOMPARE(sourceIndex, 0);
             delivered.append(value);
         },
@@ -652,7 +654,7 @@ void TestReplayManagerTimecode::delayedSoftwareCompletionAfterResetDropsEvidence
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int, uint64_t, TimecodeEvidence value) { delivered.append(value); },
+        [&delivered](int, uint64_t, uint64_t, TimecodeEvidence value) { delivered.append(value); },
         Qt::QueuedConnection));
 
     const TimecodeEvidence first = evidence(tcFrames(1, 0, 0, 0), 50, 30, 1, 7, 11);
@@ -714,7 +716,7 @@ void TestReplayManagerTimecode::completionAfterGenerationResetDropsOldEvidence()
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int, uint64_t, TimecodeEvidence value) { delivered.append(value); },
+        [&delivered](int, uint64_t, uint64_t, TimecodeEvidence value) { delivered.append(value); },
         Qt::QueuedConnection));
 
     const TimecodeEvidence oldGeneration = evidence(tcFrames(1, 0, 0, 0), 30, 30, 1, 7, 11);
@@ -999,7 +1001,8 @@ void TestReplayManagerTimecode::queuedTimecodeIsRejectedAfterCarrierRotation() {
                              &ReplayManager::onFrameTimecode, Qt::QueuedConnection));
 
     const uint64_t postedEpoch = worker.currentCarrierEpoch();
-    worker.frameTimecode(0, postedEpoch, evidence(tcFrames(1, 0, 0, 0), 10));
+    worker.frameTimecode(0, worker.workerInstanceIdentity(), postedEpoch,
+                         evidence(tcFrames(1, 0, 0, 0), 10));
     worker.clearMuxFrameEvidence();
     QCoreApplication::processEvents();
 
@@ -1014,11 +1017,38 @@ void TestReplayManagerTimecode::queuedTimecodeIsRejectedAfterWorkerRemoval() {
     QVERIFY(QObject::connect(&worker, &StreamWorker::frameTimecode, &manager,
                              &ReplayManager::onFrameTimecode, Qt::QueuedConnection));
 
-    worker.frameTimecode(0, worker.currentCarrierEpoch(), evidence(tcFrames(1, 0, 0, 0), 10));
+    worker.frameTimecode(0, worker.workerInstanceIdentity(), worker.currentCarrierEpoch(),
+                         evidence(tcFrames(1, 0, 0, 0), 10));
     manager.m_workers.clear();
     QCoreApplication::processEvents();
 
     QVERIFY(!manager.m_tcAligner.hasTimecode(0));
+}
+
+void TestReplayManagerTimecode::queuedTimecodeIsRejectedAfterWorkerReplacementWithSameEpoch() {
+    ReplayManager manager;
+    StreamWorker oldWorker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    StreamWorker replacementWorker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    QCOMPARE(oldWorker.currentCarrierEpoch(), replacementWorker.currentCarrierEpoch());
+
+    manager.m_workers.append(&oldWorker);
+    QVERIFY(QObject::connect(&oldWorker, &StreamWorker::frameTimecode, &manager,
+                             &ReplayManager::onFrameTimecode, Qt::QueuedConnection));
+    oldWorker.frameTimecode(0, oldWorker.workerInstanceIdentity(), oldWorker.currentCarrierEpoch(),
+                            evidence(tcFrames(1, 0, 0, 0), 10));
+
+    manager.m_workers[0] = &replacementWorker;
+    QVERIFY(QObject::connect(&replacementWorker, &StreamWorker::frameTimecode, &manager,
+                             &ReplayManager::onFrameTimecode, Qt::QueuedConnection));
+    QCoreApplication::processEvents();
+    QVERIFY(!manager.m_tcAligner.hasTimecode(0));
+
+    replacementWorker.frameTimecode(0, replacementWorker.workerInstanceIdentity(),
+                                    replacementWorker.currentCarrierEpoch(),
+                                    evidence(tcFrames(1, 0, 0, 1), 11));
+    QCoreApplication::processEvents();
+    QVERIFY(manager.m_tcAligner.hasTimecode(0));
+    manager.m_workers.clear();
 }
 
 void TestReplayManagerTimecode::muxSubmissionCapturesCarrierEpochAtomically() {
@@ -1405,7 +1435,7 @@ void TestReplayManagerTimecode::nativeMultiPtsBatchConsumesEveryDistinctEvidence
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int, uint64_t, TimecodeEvidence value) { delivered.append(value); },
+        [&delivered](int, uint64_t, uint64_t, TimecodeEvidence value) { delivered.append(value); },
         Qt::QueuedConnection));
     worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100113"), 10, true);
     worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100114"), 11, true);
@@ -1442,7 +1472,9 @@ void TestReplayManagerTimecode::nativeDuplicatePtsBatchSharesOneEvidenceMapping(
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int, uint64_t, TimecodeEvidence observed) { delivered.append(observed); },
+        [&delivered](int, uint64_t, uint64_t, TimecodeEvidence observed) {
+            delivered.append(observed);
+        },
         Qt::QueuedConnection));
     worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100113"), 20, true);
     worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100114"), 20, false);

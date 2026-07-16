@@ -125,6 +125,7 @@ public:
     void stop();
 
     int sourceIndex() const { return m_sourceIndex; }
+    uint64_t workerInstanceIdentity() const { return m_workerInstanceIdentity; }
     uint64_t currentCarrierEpoch() const { return m_carrierEpoch.load(std::memory_order_acquire); }
 
 #ifdef OLR_UNIT_TEST
@@ -148,7 +149,8 @@ signals:
     // Emitted after the muxer confirms that the selected frame's packet was written.
     // The evidence is rebound to the session frame where it was muxed and consumed
     // one-shot, so held CFR frames cannot report the same observation twice.
-    void frameTimecode(int sourceIndex, uint64_t carrierEpoch, TimecodeEvidence evidence);
+    void frameTimecode(int sourceIndex, uint64_t workerInstanceIdentity, uint64_t carrierEpoch,
+                       TimecodeEvidence evidence);
 
 public slots:
     void onMasterPulse(int64_t frameIndex, int64_t streamTimeMs);
@@ -168,6 +170,7 @@ private:
 
     QString m_url;
     int m_sourceIndex;            // Fixed: identity of this source
+    const uint64_t m_workerInstanceIdentity;
     std::atomic<int> m_viewTrack; // Dynamic: muxer track to write to (-1 = none)
     Muxer* m_muxer;
 

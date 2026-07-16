@@ -522,7 +522,7 @@ void TestStreamWorkerGpuEncode::delayedGpuOutputUsesEvidenceForPacketPts() {
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int sourceIndex, uint64_t, TimecodeEvidence value) {
+        [&delivered](int sourceIndex, uint64_t, uint64_t, TimecodeEvidence value) {
             QCOMPARE(sourceIndex, 0);
             delivered.append(value);
         },
@@ -582,7 +582,7 @@ void TestStreamWorkerGpuEncode::delayedGpuOutputAfterFallbackDropsOldEvidence() 
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int, uint64_t, TimecodeEvidence value) { delivered.append(value); },
+        [&delivered](int, uint64_t, uint64_t, TimecodeEvidence value) { delivered.append(value); },
         Qt::QueuedConnection));
 
     const TimecodeEvidence first = gpuEvidence(200, 90);
