@@ -69,10 +69,9 @@ _MSVC_VALUE_OPTIONS = frozenset({
     "/sourceDependencies", "/scanDependencies", "/external:I", "/AI", "/FU",
     "/ifcOutput", "/reference", "/headerUnit",
 })
-# cl and clang-cl switches are case-sensitive. Keep this inventory explicit: a
-# case variant of an arity-bearing option must not turn its operand into a
-# second source, and a case variant of an output option must not survive the
-# rewrite. Exact spellings are accepted with either the '/' or '-' introducer.
+# cl and clang-cl switches are case-sensitive. This is the exact option grammar
+# the audit itself interprets; unknown switches remain compiler-authoritative.
+# Exact spellings are accepted with either the '/' or '-' introducer.
 _MSVC_CASE_SENSITIVE_EXACT_OPTIONS = _MSVC_VALUE_OPTIONS | frozenset({
     "/c", "/nologo", "/E", "/P", "/EP", "/showIncludes",
     "/PD", "/PH", "/Fx", "/doc", "/TP", "/TC", "/Tp", "/Tc",
@@ -87,6 +86,31 @@ _MSVC_CASE_SENSITIVE_PREFIX_OPTIONS = (
     "/Yu", "/Yc", "/AI", "/FU", "/D", "/U", "/I",
     "/OUT", "/link", "/LD", "/clr:netcore", "/Tp", "/Tc",
     "/doc",
+)
+# These documented switches deliberately differ only by case from a shorter
+# switch above. Recognize them before checking misspellings so, for example,
+# /u never acquires /U's operand and /interface never looks like attached /I.
+_MSVC_CASE_DISTINCT_EXACT_OPTIONS = frozenset({
+    "/C", "/u", "/utf-8", "/interface", "/internalPartition",
+    "/exportHeader", "/translateInclude", "/validate-charset",
+})
+_MSVC_CASE_DISTINCT_PREFIX_OPTIONS = (
+    "/arch:", "/diagnostics:", "/execution-charset:", "/favor:",
+    "/fp:", "/source-charset:", "/Zc:",
+)
+# Only spellings that could be mistaken for a source-selection, marker, output,
+# or dependency control are rejected case-insensitively. Broad prefix folding
+# is incorrect for MSVC: /u versus /U, /C versus /c, /fp versus /Fp, and
+# /interface versus /I all have distinct documented meanings.
+_MSVC_AMBIGUOUS_EXACT_OPTIONS = frozenset({
+    "/c", "/E", "/P", "/EP", "/showIncludes", "/PD", "/PH", "/Fx",
+    "/doc", "/TP", "/TC", "/Tp", "/Tc",
+})
+_MSVC_AMBIGUOUS_PREFIX_OPTIONS = (
+    "/sourceDependencies", "/scanDependencies", "/ifcOutput",
+    "/experimental:log", "/showIncludes:", "/Fo", "/Fe", "/Fd", "/Fi",
+    "/Ft", "/FA", "/Fa", "/Fm", "/FR", "/Fr", "/OUT", "/link",
+    "/LD", "/clr:netcore", "/Yc", "/Tp", "/Tc", "/doc",
 )
 _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
@@ -949,9 +973,14 @@ def _msvc_slash_spelling(value: str) -> str:
 def _reject_msvc_case_variant(value: str) -> None:
     slash_spelling = _msvc_slash_spelling(value)
     _reject_msvc_exact_case_variant(value)
-    if slash_spelling in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS or any(
-        slash_spelling.startswith(prefix)
-        for prefix in _MSVC_CASE_SENSITIVE_PREFIX_OPTIONS
+    if (
+        slash_spelling in _MSVC_CASE_DISTINCT_EXACT_OPTIONS
+        or slash_spelling.startswith(_MSVC_CASE_DISTINCT_PREFIX_OPTIONS)
+        or slash_spelling in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS
+        or any(
+            slash_spelling.startswith(prefix)
+            for prefix in _MSVC_CASE_SENSITIVE_PREFIX_OPTIONS
+        )
     ):
         return
     # A dash may introduce an unrelated GNU-compatible clang-cl option such as
@@ -962,10 +991,10 @@ def _reject_msvc_case_variant(value: str) -> None:
     folded = slash_spelling.casefold()
     if any(
         folded == option.casefold()
-        for option in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS
+        for option in _MSVC_AMBIGUOUS_EXACT_OPTIONS
     ) or any(
         folded.startswith(prefix.casefold())
-        for prefix in _MSVC_CASE_SENSITIVE_PREFIX_OPTIONS
+        for prefix in _MSVC_AMBIGUOUS_PREFIX_OPTIONS
     ):
         raise AuditInfrastructureError(
             f"case-sensitive compiler option has unsupported spelling: {value}"
@@ -974,10 +1003,24 @@ def _reject_msvc_case_variant(value: str) -> None:
 
 def _reject_msvc_exact_case_variant(value: str) -> None:
     slash_spelling = _msvc_slash_spelling(value)
-    if slash_spelling not in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS and any(
-        slash_spelling.casefold() == option.casefold()
-        for option in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS
+    if (
+        slash_spelling in _MSVC_CASE_DISTINCT_EXACT_OPTIONS
+        or slash_spelling.startswith(_MSVC_CASE_DISTINCT_PREFIX_OPTIONS)
     ):
+        return
+    if slash_spelling in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS:
+        return
+    folded = slash_spelling.casefold()
+    ambiguous = any(
+        folded == option.casefold()
+        for option in _MSVC_AMBIGUOUS_EXACT_OPTIONS
+    )
+    # Resolve a dash option before clang-cl's GNU compatibility grammar. In
+    # particular, -d takes a GNU operand but is not the documented MSVC /D.
+    gnu_arity_collision = value.startswith("-") and value in _GNU_VALUE_OPTIONS and any(
+        folded == option.casefold() for option in _MSVC_VALUE_OPTIONS
+    )
+    if ambiguous or gnu_arity_collision:
         raise AuditInfrastructureError(
             f"case-sensitive compiler option has unsupported spelling: {value}"
         )
@@ -1129,6 +1172,8 @@ def _validate_rewrite_source(configuration: PreprocessConfiguration) -> None:
 
 def _gnu_forwarded_control(payload: str) -> str | None:
     candidate = payload
+    if not candidate.startswith(("-", "@")):
+        return None
     lowered = candidate.casefold()
     if candidate in {"-P", "--no-line-commands"} or lowered.startswith(
         "-frewrite-includes"
@@ -1205,7 +1250,7 @@ def _span_startswith(span: _ForwardedSpan, value: str) -> bool:
 
 def _gnu_flattened_forwarded_arguments(
     payloads: Iterable[str],
-) -> Iterator[str]:
+) -> Iterator[_ForwardedSpan]:
     """Flatten forwarding grammar in linear time without copying suffixes."""
 
     source = iter(payloads)
@@ -1263,20 +1308,29 @@ def _gnu_flattened_forwarded_arguments(
                     _CommaSpanCursor(span.text, span.start + 4, span.stop)
                 )
                 break
-            yield span.text[span.start:span.stop]
+            yield span
             break
 
 
 def _gnu_forwarded_sequence_control(payloads: Iterable[str]) -> str | None:
     pending_value: str | None = None
-    for payload in _gnu_flattened_forwarded_arguments(payloads):
+    for span in _gnu_flattened_forwarded_arguments(payloads):
         if pending_value is not None:
             pending_value = None
             continue
-        if payload in _GNU_FORWARDED_VALUE_OPTIONS:
-            pending_value = payload
+        value_option = next(
+            (
+                candidate for candidate in _GNU_FORWARDED_VALUE_OPTIONS
+                if _span_equals(span, candidate)
+            ),
+            None,
+        )
+        if value_option is not None:
+            pending_value = value_option
             continue
-        category = _gnu_forwarded_control(payload)
+        if span.start == span.stop or span.text[span.start] not in "-@":
+            continue
+        category = _gnu_forwarded_control(span.text[span.start:span.stop])
         if category:
             return category
     if pending_value is not None:
@@ -1287,40 +1341,50 @@ def _gnu_forwarded_sequence_control(payloads: Iterable[str]) -> str | None:
 
 
 def _clang_cl_forwarded_arguments(arguments: tuple[str, ...]) -> Iterator[str]:
-    """Yield every clang-cl forwarding channel as one ordered argument stream."""
+    """Yield clang-cl forwarding in the order the driver constructs cc1 args.
 
-    index = 0
-    while index < len(arguments):
-        value = arguments[index]
-        option = _msvc_option(value)
-        if option.startswith("/clang:"):
-            payload = value[len(value.partition(":")[0]) + 1 :]
-            if not payload:
-                raise AuditInfrastructureError(
-                    f"compiler option requires a value: {value}"
-                )
-            yield payload
+    Clang's driver appends -Wp/-Xpreprocessor values while assembling
+    preprocessing options, then appends -Xclang values near the end of the cc1
+    command. /clang: is clang-cl's spelling of the latter. Preserve argv order
+    within each bucket, but never let an operand cross the real bucket order.
+    """
+
+    for xclang_bucket in (False, True):
+        index = 0
+        while index < len(arguments):
+            value = arguments[index]
+            option = _msvc_option(value)
+            if option.startswith("/clang:"):
+                payload = value[len(value.partition(":")[0]) + 1 :]
+                if not payload:
+                    raise AuditInfrastructureError(
+                        f"compiler option requires a value: {value}"
+                    )
+                if xclang_bucket:
+                    yield payload
+                index += 1
+                continue
+            if value.startswith("-Wp,"):
+                if not xclang_bucket:
+                    yield value
+                index += 1
+                continue
+            forwarder = next(
+                (
+                    candidate for candidate in _GNU_FORWARDERS
+                    if value == candidate or value.startswith(f"{candidate}=")
+                ),
+                None,
+            )
+            if forwarder is not None:
+                current = _gnu_forwarded_argument(arguments, index, forwarder)
+                assert current is not None
+                _, end = current
+                if (forwarder == "-Xclang") == xclang_bucket:
+                    yield from arguments[index:end]
+                index = end
+                continue
             index += 1
-            continue
-        if value.casefold().startswith("-wp,"):
-            yield value
-            index += 1
-            continue
-        forwarder = next(
-            (
-                candidate for candidate in _GNU_FORWARDERS
-                if value == candidate or value.startswith(f"{candidate}=")
-            ),
-            None,
-        )
-        if forwarder is not None:
-            current = _gnu_forwarded_argument(arguments, index, forwarder)
-            assert current is not None
-            _, end = current
-            yield from arguments[index:end]
-            index = end
-            continue
-        index += 1
 
 
 def _gnu_forwarded_argument(
@@ -1393,7 +1457,7 @@ def _rewrite_gnu(
             ) else "output"
             raise AuditInfrastructureError(f"unsupported {category} option: {value}")
         if value.startswith("-Wp,"):
-            category = _gnu_forwarded_sequence_control(tuple(value[4:].split(",")))
+            category = _gnu_forwarded_sequence_control((value,))
             if category:
                 raise AuditInfrastructureError(
                     f"hidden {category} option is unsupported: {value}"

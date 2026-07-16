@@ -656,27 +656,26 @@ class ConfigurationTests(unittest.TestCase):
                             ((self.build / "main.cpp").resolve(),),
                         )
 
-    def test_msvc_wrong_case_value_options_fail_closed_before_source_selection(self):
+    def test_msvc_case_distinct_options_do_not_acquire_other_option_arity(self):
         from gpu_capability_command import _source_inputs
 
-        wrong_case = (
-            "/d", "/u", "/i", "/fi", "/fO", "/fE", "/fD", "/fI",
-            "/fp", "/ft", "/yu", "/yc", "/sourcedependencies",
-            "/scandependencies", "/external:i", "/ai", "/fu",
-            "/ifcoutput", "/Reference", "/headerunit",
-            "/Experimental:log",
-        )
         for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
-            for option in wrong_case:
-                for spelling in (option, f"-{option[1:]}"):
-                    with self.subTest(family=family, option=spelling), self.assertRaisesRegex(
-                        AuditInfrastructureError, "case-sensitive.*option"
-                    ):
-                        _source_inputs(
-                            (spelling, "hidden.cpp", "main.cpp"),
-                            self.build,
-                            family,
-                        )
+            for option in ("/u", "/C", "/utf-8", "/fp:fast", "/favor:AMD64", "/interface"):
+                with self.subTest(family=family, option=option):
+                    self.assertEqual(
+                        _source_inputs((option, "main.cpp"), self.build, family),
+                        ((self.build / "main.cpp").resolve(),),
+                    )
+
+    def test_clang_cl_gnu_arity_does_not_hide_a_source_via_msvc_misspelling(self):
+        from gpu_capability_command import _source_inputs
+
+        with self.assertRaisesRegex(AuditInfrastructureError, "case-sensitive.*option"):
+            _source_inputs(
+                ("-d", "hidden.cpp", "main.cpp"),
+                self.build,
+                CompilerFamily.CLANG_CL,
+            )
 
     def test_entry_source_outside_production_and_unknown_wrapper_fail(self):
         outside = self.root / "outside.cpp"
@@ -1364,19 +1363,38 @@ class CommandRewriteTests(unittest.TestCase):
 
     def test_clang_cl_mixed_forwarding_channels_share_ordered_operand_state(self):
         controls = (
-            ("/clang:-Xpreprocessor", "/clang:-include",
-             "-Xpreprocessor", "-P", "file.cpp"),
-            ("/clang:-include", "-Xpreprocessor", "-P", "file.cpp"),
             ("-Xpreprocessor", "-include", "/clang:-P", "file.cpp"),
             ("-Xpreprocessor=-include", "/clang:-P", "file.cpp"),
             ("/clang:-Wp,-include", "/clang:-P", "file.cpp"),
             ("-Wp,-include", "/clang:-P", "file.cpp"),
-            ("/clang:-include", "-Wp,-P", "file.cpp"),
         )
         for arguments in controls:
             with self.subTest(arguments=arguments):
                 rewritten = self.rewrite(CompilerFamily.CLANG_CL, arguments)
                 self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
+
+    def test_clang_cl_forwarding_uses_effective_cc1_bucket_order(self):
+        safe_controls = ("-P", "-o", "-MF")
+        for control in safe_controls:
+            arguments = (
+                f"/clang:{control}",
+                "-Xpreprocessor", "-include",
+                "file.cpp",
+            )
+            with self.subTest(kind="safe", control=control):
+                rewritten = self.rewrite(CompilerFamily.CLANG_CL, arguments)
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
+
+        for control, category in (("-P", "marker"), ("-o", "output"), ("-MF", "dependency")):
+            arguments = (
+                "/clang:-include",
+                "-Xpreprocessor", control,
+                "file.cpp",
+            )
+            with self.subTest(kind="hidden", control=control), self.assertRaisesRegex(
+                AuditInfrastructureError, f"hidden.*{category}"
+            ):
+                self.rewrite(CompilerFamily.CLANG_CL, arguments)
 
     def test_clang_cl_mixed_forwarding_rejects_controls_left_after_operand(self):
         controls = (
@@ -1385,7 +1403,7 @@ class CommandRewriteTests(unittest.TestCase):
             (("/clang:-Wp,-include", "/clang:-P",
               "-Xpreprocessor", "-P", "file.cpp"), "marker"),
             (("/clang:-include", "-Wp,-P",
-              "/clang:-o", "/clang:hidden.i", "file.cpp"), "output"),
+              "/clang:-o", "/clang:hidden.i", "file.cpp"), "marker"),
             (("/clang:-P", "/clang:-Wp,-include", "file.cpp"), "marker"),
         )
         for arguments, category in controls:
@@ -1436,6 +1454,27 @@ class CommandRewriteTests(unittest.TestCase):
 
         self.assertLess(elapsed, 8.0, f"4 MiB forwarding took {elapsed:.3f}s")
         self.assertLess(peak, 16 * 1024 * 1024, f"4 MiB forwarding peaked at {peak} bytes")
+
+    def test_four_mib_top_level_wp_fields_have_bounded_time_and_memory(self):
+        field = "safe-forwarded-value-" + "x" * 44
+        count = (4 * 1024 * 1024 - 4) // (len(field) + 1)
+        payload = "-Wp," + f"{field}," * count
+        arguments = (payload, "file.cpp")
+        self.assertGreaterEqual(len(payload), 3 * 1024 * 1024)
+        self.assertLessEqual(len(payload), 4 * 1024 * 1024)
+
+        tracemalloc.start()
+        started = time.perf_counter()
+        try:
+            rewritten = self.rewrite(CompilerFamily.CLANG, arguments)
+            elapsed = time.perf_counter() - started
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertEqual(rewritten.arguments[1:3], arguments)
+        self.assertLess(elapsed, 6.0, f"4 MiB -Wp fields took {elapsed:.3f}s")
+        self.assertLess(peak, 10 * 1024 * 1024, f"4 MiB -Wp fields peaked at {peak} bytes")
 
     def test_msvc_strips_preprocessor_and_auxiliary_output_controls(self):
         shared = (
@@ -1505,14 +1544,14 @@ class CommandRewriteTests(unittest.TestCase):
                         self.assertNotIn(spelling, rewritten.arguments)
                         self.assertEqual(rewritten.arguments.count("file.cpp"), 1)
 
-    def test_msvc_wrong_case_switches_fail_closed_during_rewrite(self):
+    def test_msvc_ambiguous_output_misspellings_fail_closed_during_rewrite(self):
         wrong_case = (
-            "/d", "/fu", "/fOhidden.obj", "/fE:hidden.exe",
+            "/fOhidden.obj", "/fE:hidden.exe", "/fDstate.pdb", "/fIhidden.i",
             "/sourcedependencies:old.json", "/scandependencies:scan.json",
-            "/ifcoutput:module.ifc", "/showincludes", "/C", "/Nologo",
-            "/e", "/p", "/ep", "/pd", "/ph", "/fX", "/faoutput.asm",
-            "/fMmap.txt", "/frbrowse.sbr", "/out:hidden.exe", "/Link",
-            "/yCprefix.h", "/ld", "/CLR:netcore",
+            "/ifcoutput:module.ifc", "/showincludes",
+            "/e", "/p", "/ep", "/pd", "/ph", "/fX", "/fMmap.txt",
+            "/frbrowse.sbr", "/out:hidden.exe", "/Link", "/yCprefix.h",
+            "/ld", "/CLR:netcore",
         )
         for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
             for option in wrong_case:
@@ -1521,16 +1560,18 @@ class CommandRewriteTests(unittest.TestCase):
                 ):
                     self.rewrite(family, (option, "file.cpp"))
 
-    def test_msvc_wrong_case_split_dash_switches_fail_closed(self):
-        wrong_case = (
-            "-d", "-u", "-i", "-fi", "-fu", "-showincludes", "-e", "-p",
+    def test_msvc_documented_case_distinct_semantics_are_preserved(self):
+        options = (
+            "/u", "/C", "/utf-8", "/fp:fast", "/favor:AMD64", "/interface",
+            "/internalPartition", "/exportHeader", "/translateInclude",
+            "/source-charset:utf-8", "/execution-charset:utf-8",
+            "/validate-charset", "/Zc:preprocessor", "/arch:AVX2",
         )
         for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
-            for option in wrong_case:
-                with self.subTest(family=family, option=option), self.assertRaisesRegex(
-                    AuditInfrastructureError, "case-sensitive.*option"
-                ):
-                    self.rewrite(family, (option, "hidden.cpp", "file.cpp"))
+            arguments = (*options, "file.cpp")
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
 
     def test_clang_cl_gnu_dash_options_are_not_case_variant_false_positives(self):
         arguments = ("-fmodules", "file.cpp")
@@ -1539,7 +1580,10 @@ class CommandRewriteTests(unittest.TestCase):
 
     def test_msvc_documented_help_case_exception_is_not_misclassified(self):
         for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
-            for option in ("/HELP", "/help", "-HeLp"):
+            for option in (
+                "/HELP", "/help", "-HeLp", "/Nologo", "/Reference",
+                "/headerunit", "/fu",
+            ):
                 with self.subTest(family=family, option=option):
                     rewritten = self.rewrite(family, (option, "file.cpp"))
                     self.assertIn(option, rewritten.arguments)
