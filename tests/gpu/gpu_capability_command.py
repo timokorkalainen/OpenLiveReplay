@@ -1150,20 +1150,16 @@ _GNU_REWRITE_REJECT_PREFIXES = (
     "-frewrite-includes",
 )
 _GNU_FORWARDERS = frozenset({"-Xclang", "-Xpreprocessor"})
-_GNU_FORWARDED_VALUE_OPTIONS = frozenset({
+_GNU_FORWARDED_SEPARATE_VALUE_OPTIONS = frozenset({
     "-D", "-U", "-A", "-I", "-isystem", "-iquote", "-idirafter",
     "-iprefix", "-iwithprefix", "-iwithprefixbefore", "-include", "-imacros",
-    "-include-pch", "-include-pth",
+    "-include-pch",
     "-isysroot", "--sysroot", "--define-macro", "--undefine-macro",
     "--include", "--imacros",
     "-F", "-iframework", "-ivfsoverlay", "-resource-dir", "-std", "-stdlib",
     "-triple", "-aux-triple", "-target-cpu", "-target-feature", "-target-abi",
-    "-target-sdk-version",
-    "-fmodule-map-file", "-fmodule-file", "-fmodule-name", "-fmodule-format",
-    "-fmodules-cache-path", "-fprebuilt-module-path",
     "-fmodules-user-build-path", "-fmodule-implementation-of", "-fmodule-feature",
     "-mrelocation-model", "-mthread-model", "-target-linker-version",
-    "-fmodules-prune-interval",
 })
 
 _CLANG_FRONTEND_DEPENDENCY_OPTIONS = frozenset({
@@ -1208,12 +1204,13 @@ _CLANG_FRONTEND_SAFE_PREFIXES = (
 )
 _CLANG_FRONTEND_SAFE_EQUALS_OPTIONS = frozenset({
     "-std", "-stdlib", "-triple", "-target-cpu", "-target-feature",
-    "-target-abi", "-target-linker-version", "-fmodule-map-file",
+    "-target-abi", "-target-linker-version", "-target-sdk-version",
+    "-fmodule-map-file",
     "-fmodule-file", "-fmodule-name", "-fmodule-format",
     "-fmodules-cache-path", "-fmodules-prune-interval",
     "-fmodules-ignore-macro", "-fmodules-prune-after",
     "-fprebuilt-module-path", "-mframe-pointer", "-mrelocation-model",
-    "-mthread-model", "-mcode-model", "-fms-compatibility-version",
+    "-mthread-model", "-fms-compatibility-version",
     "-fobjc-runtime", "-debug-info-kind", "-dwarf-version", "-debugger-tuning",
 })
 
@@ -1402,7 +1399,7 @@ def _gnu_forwarded_sequence_control(payloads: Iterable[str]) -> str | None:
             continue
         value_option = next(
             (
-                candidate for candidate in _GNU_FORWARDED_VALUE_OPTIONS
+                candidate for candidate in _GNU_FORWARDED_SEPARATE_VALUE_OPTIONS
                 if _span_equals(span, candidate)
             ),
             None,
@@ -1492,7 +1489,7 @@ def _gnu_forwarded_span(
     if current is None:
         return None
     payload, end = current
-    if payload not in _GNU_FORWARDED_VALUE_OPTIONS:
+    if payload not in _GNU_FORWARDED_SEPARATE_VALUE_OPTIONS:
         return end, _gnu_forwarded_sequence_control((payload,))
     if end >= len(arguments):
         raise AuditInfrastructureError(

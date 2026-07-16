@@ -1261,23 +1261,17 @@ class CommandRewriteTests(unittest.TestCase):
         safe_pairs = (
             ("-include", "forced.h"),
             ("-include-pch", "prefix.pch"),
-            ("-include-pth", "prefix.pth"),
             ("-isystem", "SDK Path"),
             ("-triple", "x86_64-pc-windows-msvc"),
             ("-aux-triple", "x86_64-pc-windows-msvc"),
             ("-target-cpu", "x86-64"),
             ("-target-feature", "+sse2"),
-            ("-target-sdk-version", "15.0"),
-            ("-fmodule-map-file", "module.modulemap"),
-            ("-fmodule-file", "Core=Core.pcm"),
-            ("-fmodules-cache-path", "module-cache"),
             ("-fmodules-user-build-path", "module-user-build"),
             ("-fmodule-implementation-of", "Core"),
             ("-fmodule-feature", "cplusplus"),
             ("-mrelocation-model", "pic"),
             ("-mthread-model", "posix"),
             ("-target-linker-version", "14.0"),
-            ("-fmodules-prune-interval", "604800"),
         )
         safe_flags = (
             "-DKEEP=1", "-UOLD", "-Iinclude", "-std=c++20",
@@ -1285,8 +1279,13 @@ class CommandRewriteTests(unittest.TestCase):
             "-Wno-unknown-warning-option", "-O2", "-gline-tables-only",
             "-mrelax-all", "-mnoexecstack", "-masm-verbose",
             "-mconstructor-aliases", "-mframe-pointer=all",
+            "-target-sdk-version=15.0",
+            "-fmodule-map-file=module.modulemap",
             "-fmodule-file=Core=Core.pcm",
+            "-fmodule-name=Core", "-fmodule-format=raw",
             "-fmodules-cache-path=module-cache",
+            "-fprebuilt-module-path=prebuilt-modules",
+            "-fmodules-prune-interval=604800",
             "-fmodules-ignore-macro=IGNORED",
             "-fmodules-prune-after=2678400",
             "-fmodules-validate-once-per-build-session",
@@ -1298,7 +1297,6 @@ class CommandRewriteTests(unittest.TestCase):
             "-disable-llvm-passes",
             "-debug-info-kind=constructor", "-dwarf-version=5",
             "-debugger-tuning=lldb", "-msoft-float", "-mstackrealign",
-            "-mcode-model=small",
         )
         for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
             arguments: list[str] = []
@@ -1319,13 +1317,11 @@ class CommandRewriteTests(unittest.TestCase):
 
     def test_clang_frontend_semantic_value_controls_require_exact_forwarded_arity(self):
         safe_pairs = (
-            "-include", "-include-pch", "-include-pth", "-isystem",
+            "-include", "-include-pch", "-isystem",
             "-triple", "-aux-triple", "-target-cpu", "-target-feature",
-            "-target-sdk-version", "-fmodule-map-file", "-fmodule-file",
-            "-fmodules-cache-path", "-fmodules-user-build-path",
+            "-fmodules-user-build-path",
             "-fmodule-implementation-of", "-fmodule-feature",
             "-mrelocation-model", "-mthread-model", "-target-linker-version",
-            "-fmodules-prune-interval",
         )
         for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
             for option in safe_pairs:
@@ -1336,6 +1332,46 @@ class CommandRewriteTests(unittest.TestCase):
                 )
                 with self.subTest(family=family, option=option), self.assertRaisesRegex(
                     AuditInfrastructureError, "requires a forwarded value|requires a value"
+                ):
+                    self.rewrite(family, arguments)
+
+    def test_clang_frontend_joined_only_controls_cannot_hide_actions_as_operands(self):
+        joined_only = (
+            "-target-sdk-version", "-fmodule-map-file", "-fmodule-file",
+            "-fmodule-name", "-fmodule-format", "-fmodules-cache-path",
+            "-fprebuilt-module-path", "-fmodules-prune-interval",
+        )
+        for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
+            for option in joined_only:
+                arguments = (
+                    ("-Xclang", option, "-Xclang", "-emit-obj", "file.cpp")
+                    if family is CompilerFamily.CLANG
+                    else (f"/clang:{option}", "/clang:-emit-obj", "file.cpp")
+                )
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, "hidden ambiguous option"
+                ):
+                    self.rewrite(family, arguments)
+
+    def test_clang_frontend_controls_absent_from_llvm_options_fail_closed(self):
+        for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
+            controls = (
+                (
+                    ("-Xclang", "-include-pth", "-Xclang", "prefix.pth", "file.cpp")
+                    if family is CompilerFamily.CLANG
+                    else ("/clang:-include-pth", "/clang:prefix.pth", "file.cpp")
+                ),
+                (
+                    ("-Xclang", "-mcode-model=small", "file.cpp")
+                    if family is CompilerFamily.CLANG
+                    else ("/clang:-mcode-model=small", "file.cpp")
+                ),
+            )
+            for arguments in controls:
+                with self.subTest(
+                    family=family, arguments=arguments
+                ), self.assertRaisesRegex(
+                    AuditInfrastructureError, "hidden ambiguous option"
                 ):
                     self.rewrite(family, arguments)
 
