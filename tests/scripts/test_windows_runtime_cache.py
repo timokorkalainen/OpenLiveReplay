@@ -1,10 +1,15 @@
 import hashlib
 import io
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import get_args
+from unittest import mock
 
 from tools.windows_runtime_cache import (
     GeneratedLayoutEntry,
@@ -12,9 +17,15 @@ from tools.windows_runtime_cache import (
     JsonScalar,
     LayoutEntry,
     LayoutEntries,
+    WindowsRuntimeCache,
+    _assert_mutation_denied,
+    _atomic_move_no_replace,
+    _set_tree_acl,
     canonical_json,
     layout_key,
+    local_app_data_cache_root,
 )
+from tools.windows_runtime_guard import _current_user_sid
 
 
 def held(name: str, payload: bytes, *, inode: int = 1) -> HeldSource:
@@ -451,6 +462,110 @@ class CacheKeyTests(unittest.TestCase):
         self.assertIn(HeldSource, get_args(LayoutEntry))
         self.assertIn(GeneratedLayoutEntry, get_args(LayoutEntry))
         self.assertTrue(get_args(LayoutEntries))
+
+
+@unittest.skipUnless(os.name == "nt", "requires Windows known folders and ACLs")
+class WindowsFilesystemTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.sid = _current_user_sid()
+
+    def tearDown(self) -> None:
+        if self.root.exists():
+            _set_tree_acl(self.root, self.sid, "DELETE")
+            shutil.rmtree(self.root, ignore_errors=True)
+        self.temporary.cleanup()
+
+    def make_cache(self, root: Path) -> WindowsRuntimeCache:
+        return WindowsRuntimeCache(
+            root,
+            self.sid,
+            lambda path: held(path.name, path.read_bytes()),
+            lambda path: (object(), path),
+        )
+
+    def test_known_folder_root_ignores_environment_and_rejects_reparse_parent(
+        self,
+    ) -> None:
+        expected = local_app_data_cache_root()
+        with mock.patch.dict(
+            os.environ,
+            {"LOCALAPPDATA": str(self.root / "poison")},
+            clear=False,
+        ):
+            self.assertEqual(local_app_data_cache_root(), expected)
+
+        real = self.root / "real"
+        real.mkdir()
+        alias = self.root / "alias"
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias), str(real)],
+            check=True,
+            capture_output=True,
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "reparse"):
+                self.make_cache(alias / "cache")
+        finally:
+            if alias.exists():
+                os.rmdir(alias)
+
+    def test_rx_tree_denies_file_and_directory_mutation_access(self) -> None:
+        tree = self.root / "tree"
+        tree.mkdir()
+        payload = tree / "payload.dll"
+        payload.write_bytes(b"payload")
+
+        _set_tree_acl(tree, self.sid, "RX")
+
+        _assert_mutation_denied(tree, directory=True)
+        _assert_mutation_denied(payload, directory=False)
+
+    def test_build_acl_allows_nested_payload_and_manifest_then_recursive_rx_denies_writes(
+        self,
+    ) -> None:
+        tree = self.root / "staging"
+        tree.mkdir()
+        _set_tree_acl(tree, self.sid, "BUILD")
+        nested = tree / "layout" / "plugins" / "imageformats"
+        nested.mkdir(parents=True)
+        payload = nested / "qjpeg.dll"
+        manifest = tree / "manifest.json"
+        payload.write_bytes(b"plugin")
+        manifest.write_text('{"complete":true}\n', encoding="utf-8")
+
+        _set_tree_acl(tree, self.sid, "RX")
+
+        self.assertEqual(payload.read_bytes(), b"plugin")
+        self.assertEqual(
+            manifest.read_text(encoding="utf-8"), '{"complete":true}\n'
+        )
+        for target in (payload, manifest):
+            _assert_mutation_denied(target, directory=False)
+            with self.assertRaises(OSError):
+                target.write_bytes(b"changed")
+        _assert_mutation_denied(nested, directory=True)
+        with self.assertRaises(OSError):
+            (nested / "late.dll").write_bytes(b"late")
+
+    def test_atomic_move_never_replaces_an_existing_destination(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        (source / "payload").write_bytes(b"source")
+        destination = self.root / "destination"
+        destination.mkdir()
+        (destination / "payload").write_bytes(b"destination")
+
+        with self.assertRaises(FileExistsError):
+            _atomic_move_no_replace(source, destination)
+        self.assertEqual((source / "payload").read_bytes(), b"source")
+        self.assertEqual((destination / "payload").read_bytes(), b"destination")
+
+        shutil.rmtree(destination)
+        _atomic_move_no_replace(source, destination)
+        self.assertFalse(source.exists())
+        self.assertEqual((destination / "payload").read_bytes(), b"source")
 
 
 if __name__ == "__main__":
