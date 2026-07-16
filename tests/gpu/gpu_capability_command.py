@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Mapping
 
@@ -56,14 +57,24 @@ _GNU_VALUE_OPTIONS = frozenset({
     "-MT", "-MQ", "-MJ", "-F", "-iframework", "-include-pch", "-include-pth",
     "-Xclang", "-Xpreprocessor", "-Xassembler", "-Xlinker", "-B", "-specs",
     "-wrapper", "-fmodule-file", "-fmodule-map-file",
+    "-serialize-diagnostics", "--serialize-diagnostics", "-dependency-file",
+    "--dependency-file",
 })
 _MSVC_VALUE_OPTIONS = frozenset({
-    "/d", "/u", "/i", "/fi", "/fo", "/fe", "/fd", "/fp", "/yu", "/yc",
+    "/d", "/u", "/i", "/fi", "/fo", "/fe", "/fd", "/fa", "/fm", "/fr",
+    "/fp", "/yu", "/yc",
     "/sourcedependencies", "/external:i", "/ai", "/fu", "/ifcoutput",
     "/reference", "/headerunit", "/scanDependencies".casefold(),
 })
 _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class RewrittenCommand:
+    arguments: tuple[str, ...]
+    dependency_output: Path
+    dependency_format: str
 
 
 def _launcher_name(value: str) -> str:
@@ -982,6 +993,243 @@ def _source_inputs(
 
 def _same_path(first: Path, second: Path) -> bool:
     return os.path.normcase(str(first)) == os.path.normcase(str(second))
+
+
+_GNU_REWRITE_REMOVE_FLAGS = frozenset({
+    "-c", "-S", "-E", "-P", "-M", "-MM", "-MD", "-MMD", "-MG", "-MP",
+})
+_GNU_REWRITE_REMOVE_VALUES = frozenset({
+    "-o", "-MF", "-MT", "-MQ", "-MJ", "-serialize-diagnostics",
+    "--serialize-diagnostics", "-dependency-file", "--dependency-file",
+})
+_GNU_REWRITE_ATTACHED_VALUES = (
+    "-MF", "-MT", "-MQ", "-MJ", "-o",
+)
+_GNU_REWRITE_EQUALS_VALUES = (
+    "-fdiagnostics-file=", "-fdiagnostics-serialization-file=",
+    "-fmodule-output=",
+)
+_GNU_REWRITE_REJECT_PREFIXES = (
+    "-save-temps", "--save-temps", "-dumpbase", "-dumpdir",
+    "-fmodule-output", "-fpreprocessed", "-fdirectives-only",
+    "-frewrite-includes",
+)
+_GNU_FORWARDERS = frozenset({"-Xclang", "-Xpreprocessor"})
+
+
+def _validate_rewrite_source(configuration: PreprocessConfiguration) -> None:
+    sources = _source_inputs(
+        configuration.arguments,
+        configuration.working_directory,
+        configuration.family,
+    )
+    if len(sources) > 1:
+        raise AuditInfrastructureError("compile command has multiple source inputs")
+    if not sources or not _same_path(sources[0], configuration.source.canonical):
+        raise AuditInfrastructureError("compile command source does not match configuration")
+
+
+def _gnu_forwarded_control(payload: str) -> str | None:
+    lowered = payload.casefold()
+    if payload == "-P" or lowered.startswith(("-wp,-p", "-frewrite-includes")):
+        return "marker"
+    if payload in {"-c", "-S"} or lowered.startswith(
+        ("-fpreprocessed", "-fdirectives-only")
+    ):
+        return "source-selection"
+    if payload == "-x" or "cpp-output" in lowered:
+        return "source-selection"
+    if payload in {"-MD", "-MMD", "-M", "-MM", "-MG", "-MP", "-MF", "-MT", "-MQ", "-MJ"}:
+        return "dependency"
+    if payload == "-o" or any(
+        payload.startswith(prefix) and len(payload) > len(prefix)
+        for prefix in _GNU_REWRITE_ATTACHED_VALUES
+    ):
+        return "output"
+    if lowered.startswith((
+        "-save-temps", "--save-temps", "-dumpbase", "-dumpdir",
+        "-fmodule-output", "-serialize-diagnostics", "--serialize-diagnostics",
+        "-fdiagnostics-file=", "-fdiagnostics-serialization-file=",
+    )):
+        return "output"
+    if payload.startswith("@"):
+        return "response"
+    return None
+
+
+def _rewrite_gnu(
+    configuration: PreprocessConfiguration, dependency_output: Path
+) -> RewrittenCommand:
+    rewritten: list[str] = [str(configuration.compiler)]
+    arguments = configuration.arguments
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value == "--":
+            raise AuditInfrastructureError("unsupported source-selection option: --")
+        if value in _GNU_REWRITE_REMOVE_FLAGS:
+            index += 1
+            continue
+        if value in _GNU_REWRITE_REMOVE_VALUES:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            index += 2
+            continue
+        if any(
+            value.startswith(prefix) and len(value) > len(prefix)
+            for prefix in _GNU_REWRITE_ATTACHED_VALUES
+        ) or value.startswith(_GNU_REWRITE_EQUALS_VALUES):
+            index += 1
+            continue
+        if value.startswith(_GNU_REWRITE_REJECT_PREFIXES):
+            category = "source-selection" if value.startswith(
+                ("-fpreprocessed", "-fdirectives-only", "-frewrite-includes")
+            ) else "output"
+            raise AuditInfrastructureError(f"unsupported {category} option: {value}")
+        if value.startswith("-Wp,"):
+            controls = [
+                _gnu_forwarded_control(payload)
+                for payload in value[4:].split(",")
+            ]
+            category = next((control for control in controls if control), None)
+            if category:
+                raise AuditInfrastructureError(
+                    f"hidden {category} option is unsupported: {value}"
+                )
+        if value in _GNU_FORWARDERS:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            payload = arguments[index + 1]
+            category = _gnu_forwarded_control(payload)
+            if category:
+                raise AuditInfrastructureError(
+                    f"hidden {category} option is unsupported: {value} {payload}"
+                )
+            rewritten.extend((value, payload))
+            index += 2
+            continue
+        if value == "-x":
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError("compiler option requires a value: -x")
+            language = arguments[index + 1]
+            if "cpp-output" in language.casefold() or "preprocessed" in language.casefold():
+                raise AuditInfrastructureError(
+                    f"unsupported source-selection language: {language}"
+                )
+            rewritten.extend((value, language))
+            index += 2
+            continue
+        if value.startswith("-x") and len(value) > 2:
+            language = value[2:]
+            if "cpp-output" in language.casefold() or "preprocessed" in language.casefold():
+                raise AuditInfrastructureError(
+                    f"unsupported source-selection language: {language}"
+                )
+        rewritten.append(value)
+        index += 1
+    rewritten.extend(("-E", "-MD", "-MF", str(dependency_output)))
+    return RewrittenCommand(
+        arguments=tuple(rewritten),
+        dependency_output=dependency_output,
+        dependency_format="gcc-depfile",
+    )
+
+
+_MSVC_REWRITE_REMOVE_FLAGS = frozenset({
+    "/c", "/nologo", "/e", "/p", "/ep", "/showincludes",
+})
+_MSVC_REWRITE_REMOVE_VALUES = frozenset({
+    "/fo", "/fe", "/fd", "/fa", "/fm", "/fr", "/fi",
+    "/sourcedependencies", "/scandependencies", "/ifcoutput",
+})
+_MSVC_REWRITE_ATTACHED_VALUES = (
+    "/sourcedependencies", "/scandependencies", "/ifcoutput",
+    "/fo", "/fe", "/fd", "/fa", "/fm", "/fr", "/fi",
+)
+_MSVC_REWRITE_REJECT_PREFIXES = (
+    "/out", "/link", "/yc", "/ld", "/clr:netcore",
+)
+
+
+def _msvc_option(value: str) -> str:
+    lowered = value.casefold()
+    if lowered.startswith("-"):
+        return f"/{lowered[1:]}"
+    return lowered
+
+
+def _rewrite_msvc(
+    configuration: PreprocessConfiguration, dependency_output: Path
+) -> RewrittenCommand:
+    rewritten: list[str] = [str(configuration.compiler)]
+    arguments = configuration.arguments
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        option = _msvc_option(value)
+        # MSVC distinguishes the forced-include /FI spelling from the
+        # preprocessed-output /Fi spelling even though most switches are
+        # case-insensitive.
+        slash_spelling = f"/{value[1:]}" if value.startswith("-") else value
+        if slash_spelling.startswith("/FI"):
+            rewritten.append(value)
+            index += 1
+            continue
+        if option.startswith("/clang:"):
+            payload = value[len(value.partition(":")[0]) + 1 :]
+            category = _gnu_forwarded_control(payload)
+            if category:
+                raise AuditInfrastructureError(
+                    f"hidden {category} option is unsupported: {value}"
+                )
+            rewritten.append(value)
+            index += 1
+            continue
+        if option in _MSVC_REWRITE_REMOVE_FLAGS or option.startswith("/showincludes:"):
+            index += 1
+            continue
+        if option in _MSVC_REWRITE_REMOVE_VALUES:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            index += 2
+            continue
+        if any(
+            option.startswith(prefix) and len(option) > len(prefix)
+            for prefix in _MSVC_REWRITE_ATTACHED_VALUES
+        ):
+            index += 1
+            continue
+        if option.startswith(_MSVC_REWRITE_REJECT_PREFIXES):
+            category = "source-selection" if option.startswith(("/link", "/yc")) else "output"
+            raise AuditInfrastructureError(f"unsupported {category} option: {value}")
+        rewritten.append(value)
+        index += 1
+    rewritten.extend(("/nologo", "/E", "/sourceDependencies", str(dependency_output)))
+    return RewrittenCommand(
+        arguments=tuple(rewritten),
+        dependency_output=dependency_output,
+        dependency_format="msvc-json",
+    )
+
+
+def rewrite_preprocess_command(
+    configuration: PreprocessConfiguration, dependency_output: Path
+) -> RewrittenCommand:
+    """Rewrite one normalized compile command into a fail-closed preprocess command."""
+
+    if not isinstance(configuration, PreprocessConfiguration):
+        raise AuditInfrastructureError("preprocess configuration is invalid")
+    if not isinstance(dependency_output, Path) or not dependency_output.is_absolute():
+        raise AuditInfrastructureError("dependency output must be an absolute path")
+    _validate_arguments((str(configuration.compiler), *configuration.arguments))
+    _validate_rewrite_source(configuration)
+    if configuration.family in {CompilerFamily.GCC, CompilerFamily.CLANG}:
+        return _rewrite_gnu(configuration, dependency_output)
+    if configuration.family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
+        return _rewrite_msvc(configuration, dependency_output)
+    raise AuditInfrastructureError(
+        f"unsupported compiler family: {configuration.family}"
+    )
 
 
 def _reject_driver_dialect_overrides(arguments: tuple[str, ...]) -> None:

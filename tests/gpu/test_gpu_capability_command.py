@@ -15,10 +15,12 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gpu_capability_command import (  # noqa: E402
+    RewrittenCommand,
     decode_compile_entry,
     expand_response_files,
     identify_compiler,
     make_configuration,
+    rewrite_preprocess_command,
     strip_launchers,
 )
 from gpu_capability_model import (  # noqa: E402
@@ -26,6 +28,7 @@ from gpu_capability_model import (  # noqa: E402
     AuditLimits,
     CompilerFamily,
     FileIdentity,
+    PreprocessConfiguration,
 )
 
 
@@ -865,6 +868,260 @@ class ConfigurationTests(unittest.TestCase):
             return kernel32.WaitForSingleObject(process, 0) == 258
         finally:
             kernel32.CloseHandle(process)
+
+
+class CommandRewriteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "file.cpp"
+        self.source.write_text("int value;\n", encoding="utf-8")
+        self.dependency_output = self.root / "private dependencies" / "deps.out"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def configuration(
+        self,
+        family: CompilerFamily,
+        arguments: tuple[str, ...],
+    ) -> PreprocessConfiguration:
+        compiler_name = {
+            CompilerFamily.GCC: "g++.exe",
+            CompilerFamily.CLANG: "clang++.exe",
+            CompilerFamily.MSVC: "cl.exe",
+            CompilerFamily.CLANG_CL: "clang-cl.exe",
+        }[family]
+        identity = FileIdentity(
+            canonical=self.source.resolve(),
+            relative=PurePosixPath("playback/gpu/file.cpp"),
+            device=None,
+            inode=None,
+            line_count=1,
+            production=True,
+        )
+        return PreprocessConfiguration(
+            entry_id="compile_commands.json:0",
+            family=family,
+            compiler=(self.root / compiler_name).resolve(),
+            working_directory=self.root.resolve(),
+            source=identity,
+            arguments=arguments,
+            environment_digest="environment",
+            digest=f"cfg-{family.value}",
+        )
+
+    def rewrite(
+        self,
+        family: CompilerFamily,
+        arguments: tuple[str, ...],
+    ) -> RewrittenCommand:
+        return rewrite_preprocess_command(
+            self.configuration(family, arguments), self.dependency_output
+        )
+
+    def test_rewritten_command_is_exact_and_immutable(self):
+        rewritten = self.rewrite(CompilerFamily.GCC, ("file.cpp",))
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(RewrittenCommand)),
+            ("arguments", "dependency_output", "dependency_format"),
+        )
+        self.assertIsInstance(rewritten.arguments, tuple)
+        self.assertEqual(rewritten.dependency_output, self.dependency_output)
+        self.assertEqual(rewritten.dependency_format, "gcc-depfile")
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            rewritten.dependency_format = "msvc-json"
+
+    def test_gcc_rewrite_preserves_semantics_and_replaces_outputs(self):
+        arguments = (
+            "-std=gnu++17", "-DOLR_GPU=1", "-Iinc", "-include", "forced.h",
+            "--sysroot=C:/sdk", "-target", "x86_64-w64-windows-gnu",
+            "-arch", "x86_64", "-FFrameworks", "-include-pch", "prefix.pch",
+            "-fmodule-file=Core=Core.pcm", "-fmodule-map-file=module.modulemap",
+            "-c", "file.cpp", "-o", "file.obj", "-MMD", "-MFdep.d",
+            "-MT", "old target", "-MQquoted target", "-MJ", "record.json", "-P",
+        )
+        rewritten = self.rewrite(CompilerFamily.GCC, arguments)
+        self.assertEqual(
+            rewritten.arguments,
+            (
+                str(self.configuration(CompilerFamily.GCC, arguments).compiler),
+                "-std=gnu++17", "-DOLR_GPU=1", "-Iinc", "-include", "forced.h",
+                "--sysroot=C:/sdk", "-target", "x86_64-w64-windows-gnu",
+                "-arch", "x86_64", "-FFrameworks", "-include-pch", "prefix.pch",
+                "-fmodule-file=Core=Core.pcm", "-fmodule-map-file=module.modulemap",
+                "file.cpp", "-E", "-MD", "-MF", str(self.dependency_output),
+            ),
+        )
+        self.assertEqual(rewritten.arguments.count("file.cpp"), 1)
+        self.assertNotIn("-P", rewritten.arguments)
+        self.assertNotIn("file.obj", rewritten.arguments)
+
+    def test_gnu_rewrite_matrix_strips_attached_and_standalone_outputs(self):
+        arguments = (
+            "-DKEEP=two words", "-xc++", "-c", "-S", "-E", "-P",
+            "-oattached.obj", "-MD", "-MMD", "-M", "-MM", "-MG", "-MP",
+            "-MFattached.d", "-MTattached", "-MQattached", "-MJattached.json",
+            "file.cpp",
+        )
+        for family in (CompilerFamily.GCC, CompilerFamily.CLANG):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(
+                    rewritten.arguments,
+                    (
+                        str(self.configuration(family, arguments).compiler),
+                        "-DKEEP=two words", "-xc++", "file.cpp",
+                        "-E", "-MD", "-MF", str(self.dependency_output),
+                    ),
+                )
+                self.assertEqual(rewritten.dependency_format, "gcc-depfile")
+
+    def test_gnu_strips_paired_diagnostic_outputs_without_treating_values_as_sources(self):
+        arguments = (
+            "-serialize-diagnostics", "diagnostics.dia",
+            "--dependency-file", "driver-deps.d",
+            "-fdiagnostics-file=diagnostics.txt", "file.cpp",
+        )
+        for family in (CompilerFamily.GCC, CompilerFamily.CLANG):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(
+                    rewritten.arguments,
+                    (
+                        str(self.configuration(family, arguments).compiler),
+                        "file.cpp", "-E", "-MD", "-MF",
+                        str(self.dependency_output),
+                    ),
+                )
+
+    def test_gnu_preserves_position_sensitive_preprocessing_arguments_byte_for_byte(self):
+        arguments = (
+            "-x", "c++", "-isystem", "SDK Path", "-iquotequoted path",
+            "-iframework", "Framework Path", "-imacrosmacros.h",
+            "-include-pth", "prefix.pth", "-Xclang", "-fmodules",
+            "-Xpreprocessor", "-DTHROUGH_FORWARDER=1", "file.cpp",
+        )
+        for family in (CompilerFamily.GCC, CompilerFamily.CLANG):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
+
+    def test_gnu_rejects_output_source_and_marker_traps(self):
+        controls = (
+            (("file.cpp", "other.cpp"), "multiple source"),
+            (("other.cpp",), "does not match"),
+            (("-save-temps=obj", "file.cpp"), "output"),
+            (("-fpreprocessed", "file.cpp"), "source-selection"),
+            (("-x", "c++-cpp-output", "file.cpp"), "source-selection"),
+            (("-Wp,-P", "file.cpp"), "hidden.*marker"),
+            (("-Xpreprocessor", "-P", "file.cpp"), "hidden.*marker"),
+            (("-Xclang", "-o", "file.cpp"), "hidden.*output"),
+        )
+        for family in (CompilerFamily.GCC, CompilerFamily.CLANG):
+            for arguments, message in controls:
+                with self.subTest(family=family, arguments=arguments), self.assertRaisesRegex(
+                    AuditInfrastructureError, message
+                ):
+                    self.rewrite(family, arguments)
+
+    def test_msvc_rewrite_preserves_semantics_and_replaces_outputs(self):
+        arguments = (
+            "/std:c++17", "/DOLR_GPU=1", "/I", "SDK Path", "/external:IExternal",
+            "/FIforced.h", "/Yuprefix.h", "/Fpprefix.pch", "/reference", "Core=Core.ifc",
+            "/c", "file.cpp", "/Fo", "out.obj", "/Feprogram.exe", "/Fdstate.pdb",
+            "/showIncludes", "/sourceDependencies", "old.json", "/P", "/EP",
+            "/Fiold.i", "/ifcOutput", "old.ifc",
+        )
+        rewritten = self.rewrite(CompilerFamily.MSVC, arguments)
+        self.assertEqual(
+            rewritten.arguments,
+            (
+                str(self.configuration(CompilerFamily.MSVC, arguments).compiler),
+                "/std:c++17", "/DOLR_GPU=1", "/I", "SDK Path", "/external:IExternal",
+                "/FIforced.h", "/Yuprefix.h", "/Fpprefix.pch", "/reference", "Core=Core.ifc",
+                "file.cpp", "/nologo", "/E", "/sourceDependencies",
+                str(self.dependency_output),
+            ),
+        )
+        self.assertEqual(rewritten.dependency_format, "msvc-json")
+
+    def test_msvc_and_clang_cl_strip_paired_attached_and_dashed_output_forms(self):
+        arguments = (
+            "/DKEEP=1", "/c", "file.cpp", "/Foone.obj", "/Fe", "two.exe",
+            "-Fdthree.pdb", "/Faassembly.asm", "/Fmmap.txt", "/FRbrowse.sbr",
+            "/sourceDependencies:old.json", "/showIncludes:user", "/nologo", "/E",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(
+                    rewritten.arguments,
+                    (
+                        str(self.configuration(family, arguments).compiler),
+                        "/DKEEP=1", "file.cpp", "/nologo", "/E",
+                        "/sourceDependencies", str(self.dependency_output),
+                    ),
+                )
+                self.assertEqual(rewritten.dependency_format, "msvc-json")
+
+    def test_msvc_strips_every_paired_output_without_treating_values_as_sources(self):
+        arguments = (
+            "/DKEEP=1", "/Fo", "one.obj", "/Fe", "two.exe",
+            "/Fd", "three.pdb", "/Fa", "assembly.asm", "/Fm", "map.txt",
+            "/FR", "browse.sbr", "/Fi", "preprocessed.i", "file.cpp",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(
+                    rewritten.arguments,
+                    (
+                        str(self.configuration(family, arguments).compiler),
+                        "/DKEEP=1", "file.cpp", "/nologo", "/E",
+                        "/sourceDependencies", str(self.dependency_output),
+                    ),
+                )
+
+    def test_msvc_preserves_pch_module_external_include_and_forced_source_forms(self):
+        arguments = (
+            "/std:c++20", "/external:I", "External SDK", "/FI", "forced.h",
+            "/Yu", "prefix.h", "/Fp", "prefix.pch", "/reference", "Core=Core.ifc",
+            "/Tpfile.cpp",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
+
+    def test_clang_cl_rejects_hidden_gnu_output_marker_and_source_options(self):
+        controls = (
+            (("/clang:-o", "/clang:hidden.obj", "file.cpp"), "hidden.*output"),
+            (("/clang:-MF", "/clang:hidden.d", "file.cpp"), "hidden.*dependency"),
+            (("/clang:-P", "file.cpp"), "hidden.*marker"),
+            (("/clang:-c", "file.cpp"), "hidden.*source-selection"),
+            (("/clang:-x", "/clang:c++-cpp-output", "file.cpp"), "hidden.*source-selection"),
+            (("/clang:@hidden.rsp", "file.cpp"), "hidden.*response"),
+        )
+        for arguments, message in controls:
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(
+                AuditInfrastructureError, message
+            ):
+                self.rewrite(CompilerFamily.CLANG_CL, arguments)
+
+    def test_msvc_and_clang_cl_reject_multiple_sources_and_unknown_outputs(self):
+        controls = (
+            (("file.cpp", "other.cpp"), "multiple source"),
+            (("other.cpp",), "does not match"),
+            (("/OUT:hidden.exe", "file.cpp"), "unsupported output"),
+            (("/link", "/OUT:hidden.exe", "file.cpp"), "source-selection"),
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for arguments, message in controls:
+                with self.subTest(family=family, arguments=arguments), self.assertRaisesRegex(
+                    AuditInfrastructureError, message
+                ):
+                    self.rewrite(family, arguments)
 
 
 if __name__ == "__main__":
