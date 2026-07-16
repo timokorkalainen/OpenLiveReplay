@@ -89,8 +89,27 @@ Layout entries cross the cache boundary as an ordered sequence of
 `(Path, LayoutEntry)` pairs, never as a `Path`-keyed mapping. On Windows,
 `Path` hashing is already ASCII case-insensitive, so a mapping could discard
 one of `Bin/tool.exe` and `bin/TOOL.exe` before the cache's component-wise
-`casefold()` collision check sees both destinations. The cache validates every
-pair before constructing any destination lookup.
+Windows normalization collision check sees both destinations. This cache is
+Windows-local: each component is normalized with `ntpath.normcase()`, not
+Unicode `casefold()`, so ASCII case aliases collide without conflating distinct
+names such as `straße` and `STRASSE`. The cache validates every pair before
+constructing any destination lookup.
+
+Every destination component, and the single-component layout name, follows
+strict Win32 naming rules before a key is returned or cache state can be
+mutated. Empty, parent, absolute, anchored, multi-component layout names,
+trailing-dot/space names, ASCII controls 0–31, `<>:"/\\|?*`, alternate data
+stream syntax, and DOS device basenames `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+and `LPT1`–`LPT9` are rejected case-insensitively even when a device basename
+has an extension.
+
+Launcher context and every `GeneratedLayoutEntry.inputs` mapping are
+recursively validated and copied into a detached plain JSON tree before
+keying. Mapping implementations such as `MappingProxyType`, tuples, and lists
+are accepted; mappings must have string keys, tuples become JSON arrays, and
+unsupported objects, cycles, NaN, and infinities are rejected. The returned
+key input never retains caller-owned containers, so later caller mutation
+cannot change the meaning of an already returned key.
 
 Destination spelling is also retained in the manifest so the published layout
 preserves the requested case while still rejecting case-insensitive
@@ -125,8 +144,9 @@ CTest graph files, and launcher-owned `qt.conf` without circular content keys.
 
 Publication follows this sequence:
 
-1. Hold and hash all sources, normalize destinations, validate limits, and
-   compute the object key.
+1. Validate the strict layout name and every ordered destination pair, snapshot
+   JSON inputs, hold and hash all sources, validate limits, and compute the
+   object key before creating or changing cache filesystem state.
 2. If `objects/<key>` exists, hold and fully validate it.
 3. Otherwise create a unique `staging/<uuid>` tree, apply the build ACL, create
    directories, copy held sources, render generated entries for the final
