@@ -179,9 +179,27 @@ class ModelTests(unittest.TestCase):
         for column in sequence._packed_columns():
             with self.assertRaises(TypeError):
                 column[0] = 0
-            with self.assertRaises(AttributeError):
-                column.release()
+            column.release()
         self.assertEqual(sequence[0], token)
+
+        direct = sequence._spelling_ids
+        self.assertNotIsInstance(direct, (array, memoryview))
+        with self.assertRaises(TypeError):
+            direct[0] = 1
+        with self.assertRaises(TypeError):
+            del direct[0]
+        with self.assertRaises(TypeError):
+            memoryview(direct)
+
+        packed = sequence._packed_columns()
+        self.assertTrue(
+            all(not isinstance(column, (array, memoryview)) for column in packed)
+        )
+        self.assertTrue(all(column.readonly for column in packed))
+        packed[0].release()
+        self.assertEqual(sequence[0], token)
+        self.assertEqual(sequence._packed_columns()[0][0], 0)
+
         with self.assertRaises(AttributeError):
             sequence._spelling_ids = array("I", (0,))
         with self.assertRaises(AttributeError):
@@ -191,6 +209,87 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             del sequence._frozen
         self.assertEqual(sequence[0], token)
+
+    def test_compact_sequence_counts_intern_tables_at_exact_retained_boundary(self):
+        configuration = self.configuration()
+        spellings = (b"lease",)
+        identities = (configuration.source,)
+        table_bytes = (
+            sum(len(spelling) for spelling in spellings)
+            + (len(spellings) + len(identities))
+            * (sys.getsizeof((None,)) - sys.getsizeof(()))
+        )
+        fields = dict(
+            spellings=spellings,
+            identities=identities,
+            spelling_ids=array("I"),
+            identity_ids=array("I"),
+            inclusion_ids=array("I"),
+            original_lines=array("I"),
+        )
+        exact = dataclasses.replace(
+            AuditLimits(), retained_token_bytes=table_bytes, rss_bytes=1_000_000
+        )
+
+        sequence = CompactTokenSequence._from_packed(
+            configuration, **fields, limits=exact, rss_reader=lambda: 0
+        )
+        self.assertEqual(len(sequence), 0)
+
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "retained packed token limit"
+        ):
+            CompactTokenSequence._from_packed(
+                configuration,
+                **fields,
+                limits=dataclasses.replace(exact, retained_token_bytes=table_bytes - 1),
+                rss_reader=lambda: 0,
+            )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "retained packed token limit"
+        ):
+            CompactTokenSequence._from_packed(
+                configuration,
+                **fields,
+                limits=dataclasses.replace(exact, retained_token_bytes=0),
+                rss_reader=lambda: 0,
+            )
+
+    def test_compact_sequence_checks_rss_before_uniqueness_allocation(self):
+        configuration = self.configuration()
+        spellings = tuple(f"token-{index}".encode() for index in range(1000))
+        with mock.patch("builtins.set", side_effect=AssertionError("set allocated")) as make_set:
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "coordinator RSS limit"
+            ):
+                CompactTokenSequence._from_packed(
+                    configuration,
+                    spellings=spellings,
+                    identities=(),
+                    spelling_ids=array("I"),
+                    identity_ids=array("I"),
+                    inclusion_ids=array("I"),
+                    original_lines=array("I"),
+                    limits=dataclasses.replace(AuditLimits(), rss_bytes=1),
+                    rss_reader=lambda: 0,
+                )
+            make_set.assert_not_called()
+
+    def test_compact_sequence_samples_rss_during_construction(self):
+        configuration = self.configuration()
+        samples = iter((0, 0, 1_000_001))
+        with self.assertRaisesRegex(AuditInfrastructureError, "coordinator RSS limit"):
+            CompactTokenSequence._from_packed(
+                configuration,
+                spellings=(b"lease",),
+                identities=(),
+                spelling_ids=array("I"),
+                identity_ids=array("I"),
+                inclusion_ids=array("I"),
+                original_lines=array("I"),
+                limits=dataclasses.replace(AuditLimits(), rss_bytes=1_000_000),
+                rss_reader=lambda: next(samples),
+            )
 
     def test_compact_sequence_rejects_copy_before_crossing_memory_bounds(self):
         configuration = self.configuration()
@@ -203,16 +302,22 @@ class ModelTests(unittest.TestCase):
             original_lines=array("I", (19, 19)),
         )
         packed_bytes = 2 * 4 * 4
+        table_bytes = (
+            sum(len(spelling) for spelling in fields["spellings"])
+            + (len(fields["spellings"]) + len(fields["identities"]))
+            * (sys.getsizeof((None,)) - sys.getsizeof(()))
+        )
+        retained_bytes = packed_bytes + table_bytes
         exact_limits = dataclasses.replace(
             AuditLimits(),
-            retained_token_bytes=packed_bytes,
-            rss_bytes=1000,
+            retained_token_bytes=retained_bytes,
+            rss_bytes=1_000_000,
         )
         sequence = CompactTokenSequence._from_packed(
             configuration,
             **fields,
             limits=exact_limits,
-            rss_reader=lambda: 1000 - packed_bytes,
+            rss_reader=lambda: 0,
         )
         self.assertEqual(sequence.packed_bytes, packed_bytes)
 
@@ -225,13 +330,13 @@ class ModelTests(unittest.TestCase):
                 CompactTokenSequence._from_packed(
                     configuration,
                     **fields,
-                    limits=exact_limits,
-                    rss_reader=lambda: 1000 - packed_bytes + 1,
+                    limits=dataclasses.replace(exact_limits, rss_bytes=1),
+                    rss_reader=lambda: 0,
                 )
             copy_column.assert_not_called()
 
         retained_too_small = dataclasses.replace(
-            exact_limits, retained_token_bytes=packed_bytes - 1
+            exact_limits, retained_token_bytes=retained_bytes - 1
         )
         with self.assertRaisesRegex(
             AuditInfrastructureError, "retained packed token limit"

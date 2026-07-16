@@ -170,21 +170,84 @@ def _copy_packed_column(column: array) -> array:
     return array("I", column)
 
 
-class _ReadOnlyPackedColumn(Sequence[int]):
-    """Fresh non-buffer access to one private packed column."""
+_PACKED_COLUMN_SLOTS = (
+    "_spelling_ids",
+    "_identity_ids",
+    "_inclusion_ids",
+    "_original_lines",
+)
+_SET_ENTRY_RSS_RESERVE = 128
+_EMPTY_SET_RSS_BYTES = sys.getsizeof(set())
+_EMPTY_ARRAY_RSS_BYTES = sys.getsizeof(array("I"))
+_COLUMN_LIST_RSS_BYTES = sys.getsizeof([None, None, None, None])
+_ARRAY_ALLOCATION_RSS_SLACK = 4096
+_TUPLE_SLOT_BYTES = sys.getsizeof((None,)) - sys.getsizeof(())
 
-    __slots__ = ("_owner", "_slot")
+
+def _checked_rss(
+    rss_reader: Callable[[], int],
+    limit: int,
+    *,
+    reserve: int = 0,
+) -> int:
+    rss = rss_reader()
+    if not isinstance(rss, int) or isinstance(rss, bool) or rss < 0:
+        raise AuditInfrastructureError("coordinator RSS sample is invalid")
+    if rss > limit or reserve > limit - rss:
+        raise AuditInfrastructureError("coordinator RSS limit exceeded")
+    return rss
+
+
+def _validate_interned_table(
+    values: tuple[object, ...],
+    label: str,
+    *,
+    rss_reader: Callable[[], int],
+    rss_limit: int,
+) -> None:
+    if not values:
+        return
+    _checked_rss(
+        rss_reader,
+        rss_limit,
+        reserve=_EMPTY_SET_RSS_BYTES
+        + len(values) * _SET_ENTRY_RSS_RESERVE,
+    )
+    unique = set(values)
+    _checked_rss(rss_reader, rss_limit)
+    if len(unique) != len(values):
+        raise AuditInfrastructureError(f"token {label} table is not interned")
+
+
+def _retained_table_bytes(
+    spellings: tuple[bytes, ...],
+    identities: tuple[FileIdentity | None, ...],
+) -> int:
+    return (
+        sum(len(spelling) for spelling in spellings)
+        + (len(spellings) + len(identities)) * _TUPLE_SLOT_BYTES
+    )
+
+
+class _ReadOnlyPackedColumn(Sequence[int]):
+    """Non-aliasing proxy over one fresh read-only memoryview."""
+
+    __slots__ = ("_view",)
     itemsize = 4
     format = "I"
     readonly = True
 
-    def __init__(self, owner: "CompactTokenSequence", slot: str) -> None:
-        object.__setattr__(self, "_owner", owner)
-        object.__setattr__(self, "_slot", slot)
+    def __init__(self, column: array) -> None:
+        object.__setattr__(self, "_view", memoryview(column).toreadonly())
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "_view":
+            raise AttributeError("packed view internals are private")
+        return object.__getattribute__(self, name)
 
     def __len__(self) -> int:
-        column = object.__getattribute__(self._owner, self._slot)
-        return len(column)
+        view = object.__getattribute__(self, "_view")
+        return len(view)
 
     @overload
     def __getitem__(self, index: int) -> int:
@@ -195,10 +258,14 @@ class _ReadOnlyPackedColumn(Sequence[int]):
         ...
 
     def __getitem__(self, index: int | slice) -> int | tuple[int, ...]:
-        column = object.__getattribute__(self._owner, self._slot)
+        view = object.__getattribute__(self, "_view")
         if isinstance(index, slice):
-            return tuple(column[index])
-        return int(column[index])
+            return tuple(view[index])
+        return int(view[index])
+
+    def release(self) -> None:
+        view = object.__getattribute__(self, "_view")
+        view.release()
 
 
 class CompactTokenSequence(Sequence[PreprocessedToken]):
@@ -220,6 +287,12 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
     def __delattr__(self, name: str) -> None:
         raise AttributeError("CompactTokenSequence is immutable")
 
+    def __getattribute__(self, name: str) -> object:
+        if name in _PACKED_COLUMN_SLOTS:
+            column = object.__getattribute__(self, name)
+            return _ReadOnlyPackedColumn(column)
+        return object.__getattribute__(self, name)
+
     def __init__(
         self,
         configuration: PreprocessConfiguration,
@@ -233,6 +306,7 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         limits: AuditLimits = AuditLimits(),
         rss_reader: Callable[[], int] = _current_process_rss_bytes,
     ) -> None:
+        _checked_rss(rss_reader, limits.rss_bytes)
         supplied_columns = (
             spelling_ids,
             identity_ids,
@@ -255,10 +329,6 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
             raise AuditInfrastructureError("packed token columns have different lengths")
         if any(not isinstance(spelling, bytes) for spelling in spellings):
             raise AuditInfrastructureError("token spellings must be bytes")
-        if len(set(spellings)) != len(spellings):
-            raise AuditInfrastructureError("token spelling table is not interned")
-        if len(set(identities)) != len(identities):
-            raise AuditInfrastructureError("token identity table is not interned")
         if len(spellings) > UINT32_MAX + 1 or len(identities) > UINT32_MAX + 1:
             raise AuditInfrastructureError("token intern table exceeds unsigned 32-bit IDs")
         if any(spelling_id >= len(spellings) for spelling_id in supplied_columns[0]):
@@ -270,24 +340,41 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
                 "packed identity ID does not exist in the identity table"
             )
 
-        retained_bytes = sum(
+        column_bytes = sum(
             len(column) * column.itemsize for column in supplied_columns
+        )
+        retained_bytes = column_bytes + _retained_table_bytes(
+            spellings, identities
         )
         if retained_bytes > limits.retained_token_bytes:
             raise AuditInfrastructureError("retained packed token limit exceeded")
-        rss_before_copy = rss_reader()
-        if (
-            not isinstance(rss_before_copy, int)
-            or isinstance(rss_before_copy, bool)
-            or rss_before_copy < 0
-        ):
-            raise AuditInfrastructureError("coordinator RSS sample is invalid")
-        if rss_before_copy + retained_bytes > limits.rss_bytes:
-            raise AuditInfrastructureError(
-                "coordinator RSS limit exceeded before packed copy"
-            )
+        _validate_interned_table(
+            spellings,
+            "spelling",
+            rss_reader=rss_reader,
+            rss_limit=limits.rss_bytes,
+        )
+        _validate_interned_table(
+            identities,
+            "identity",
+            rss_reader=rss_reader,
+            rss_limit=limits.rss_bytes,
+        )
 
-        columns = tuple(_copy_packed_column(column) for column in supplied_columns)
+        _checked_rss(
+            rss_reader, limits.rss_bytes, reserve=_COLUMN_LIST_RSS_BYTES
+        )
+        columns: list[array] = []
+        for column in supplied_columns:
+            _checked_rss(
+                rss_reader,
+                limits.rss_bytes,
+                reserve=_EMPTY_ARRAY_RSS_BYTES
+                + len(column) * column.itemsize
+                + _ARRAY_ALLOCATION_RSS_SLACK,
+            )
+            columns.append(_copy_packed_column(column))
+            _checked_rss(rss_reader, limits.rss_bytes)
         object.__setattr__(self, "_configuration", configuration)
         object.__setattr__(self, "_spellings", spellings)
         object.__setattr__(self, "_identities", identities)
@@ -295,6 +382,7 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         object.__setattr__(self, "_identity_ids", columns[1])
         object.__setattr__(self, "_inclusion_ids", columns[2])
         object.__setattr__(self, "_original_lines", columns[3])
+        _checked_rss(rss_reader, limits.rss_bytes)
 
     @classmethod
     def empty(cls, configuration: PreprocessConfiguration) -> "CompactTokenSequence":
@@ -373,7 +461,7 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         )
 
     def __len__(self) -> int:
-        return len(self._spelling_ids)
+        return len(object.__getattribute__(self, "_spelling_ids"))
 
     def _normalize_index(self, index: int) -> int:
         if index < 0:
@@ -384,13 +472,17 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
 
     def _token_at(self, index: int) -> PreprocessedToken:
         index = self._normalize_index(index)
+        spelling_ids = object.__getattribute__(self, "_spelling_ids")
+        identity_ids = object.__getattribute__(self, "_identity_ids")
+        inclusion_ids = object.__getattribute__(self, "_inclusion_ids")
+        original_lines = object.__getattribute__(self, "_original_lines")
         location = SourceLocation(
-            identity=self._identities[self._identity_ids[index]],
-            inclusion_instance=self._inclusion_ids[index],
-            line=self._original_lines[index],
+            identity=self._identities[identity_ids[index]],
+            inclusion_instance=inclusion_ids[index],
+            line=original_lines[index],
             configuration_digest=self._configuration.digest,
         )
-        return PreprocessedToken(self._spellings[self._spelling_ids[index]], location)
+        return PreprocessedToken(self._spellings[spelling_ids[index]], location)
 
     @overload
     def __getitem__(self, index: int) -> PreprocessedToken:
@@ -425,7 +517,8 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         )
 
     def spelling_id_at(self, index: int) -> int:
-        return self._spelling_ids[self._normalize_index(index)]
+        column = object.__getattribute__(self, "_spelling_ids")
+        return int(column[self._normalize_index(index)])
 
     def spelling_for(self, spelling_id: int) -> bytes:
         if spelling_id < 0 or spelling_id >= len(self._spellings):
@@ -439,17 +532,20 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
 
     def iter_runs(self) -> Iterator[PackedTokenRun]:
         size = len(self)
+        identity_ids = object.__getattribute__(self, "_identity_ids")
+        inclusion_ids = object.__getattribute__(self, "_inclusion_ids")
+        original_lines = object.__getattribute__(self, "_original_lines")
         start = 0
         while start < size:
-            identity_id = self._identity_ids[start]
-            inclusion_instance = self._inclusion_ids[start]
-            original_line = self._original_lines[start]
+            identity_id = identity_ids[start]
+            inclusion_instance = inclusion_ids[start]
+            original_line = original_lines[start]
             stop = start + 1
             while (
                 stop < size
-                and self._identity_ids[stop] == identity_id
-                and self._inclusion_ids[stop] == inclusion_instance
-                and self._original_lines[stop] == original_line
+                and identity_ids[stop] == identity_id
+                and inclusion_ids[stop] == inclusion_instance
+                and original_lines[stop] == original_line
             ):
                 stop += 1
             yield PackedTokenRun(
@@ -470,13 +566,8 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         _ReadOnlyPackedColumn,
     ]:
         return tuple(
-            _ReadOnlyPackedColumn(self, slot)
-            for slot in (
-                "_spelling_ids",
-                "_identity_ids",
-                "_inclusion_ids",
-                "_original_lines",
-            )
+            _ReadOnlyPackedColumn(object.__getattribute__(self, slot))
+            for slot in _PACKED_COLUMN_SLOTS
         )
 
 
