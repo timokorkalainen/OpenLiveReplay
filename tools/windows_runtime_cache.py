@@ -90,6 +90,7 @@ class CacheStats:
 _AclMode = Literal["PRIVATE", "BUILD", "RX", "DELETE"]
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_READ_ATTRIBUTES = 0x00000080
@@ -104,6 +105,8 @@ _DELETE = 0x00010000
 _FILE_ADD_FILE = 0x00000002
 _FILE_ADD_SUBDIRECTORY = 0x00000004
 _FILE_DELETE_CHILD = 0x00000040
+_READ_CONTROL = 0x00020000
+_WRITE_DAC = 0x00040000
 
 _ERROR_ACCESS_DENIED = 5
 _ERROR_FILE_EXISTS = 80
@@ -112,6 +115,35 @@ _MOVEFILE_WRITE_THROUGH = 0x00000008
 
 _DACL_SECURITY_INFORMATION = 0x00000004
 _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_SE_FILE_OBJECT = 1
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = (
+        ("length", wintypes.DWORD),
+        ("security_descriptor", ctypes.c_void_p),
+        ("inherit_handle", wintypes.BOOL),
+    )
+
+
+class _OwnedHandle:
+    def __init__(self, api: object, value: int) -> None:
+        self._api = api
+        self.value = value
+
+    def close(self) -> None:
+        if self.value:
+            self._api.CloseHandle(self.value)
+            self.value = 0
+
+    def __enter__(self) -> "_OwnedHandle":
+        return self
+
+    def __exit__(self, *_unused: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 class _Guid(ctypes.Structure):
@@ -158,17 +190,40 @@ class WindowsRuntimeCache:
         self.directory_holder = directory_holder
         self.limits = limits
         self.clock = clock
+        self._management_handles: list[_OwnedHandle] = []
+        production_root = root is None
         self.root = _ensure_private_directory_tree(
             local_app_data_cache_root() if root is None else root,
             sid,
+            managed_components=3 if production_root else 1,
+            retained_handles=self._management_handles,
         )
-        self.objects = _ensure_private_directory_tree(self.root / "objects", sid)
-        self.staging = _ensure_private_directory_tree(self.root / "staging", sid)
+        self.objects = _ensure_private_directory_tree(
+            self.root / "objects",
+            sid,
+            retained_handles=self._management_handles,
+            leaf_sddl=_managed_namespace_sddl(sid),
+        )
+        self.staging = _ensure_private_directory_tree(
+            self.root / "staging",
+            sid,
+            retained_handles=self._management_handles,
+        )
         self.quarantine = _ensure_private_directory_tree(
-            self.root / "quarantine", sid
+            self.root / "quarantine",
+            sid,
+            retained_handles=self._management_handles,
         )
-        self.access = _ensure_private_directory_tree(self.root / "access", sid)
-        self.locks = _ensure_private_directory_tree(self.root / "locks", sid)
+        self.access = _ensure_private_directory_tree(
+            self.root / "access",
+            sid,
+            retained_handles=self._management_handles,
+        )
+        self.locks = _ensure_private_directory_tree(
+            self.root / "locks",
+            sid,
+            retained_handles=self._management_handles,
+        )
 
 
 def local_app_data_cache_root() -> Path:
@@ -241,6 +296,11 @@ def _kernel32() -> object:
         wintypes.DWORD,
     )
     kernel32.MoveFileExW.restype = wintypes.BOOL
+    kernel32.CreateDirectoryW.argtypes = (
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_SecurityAttributes),
+    )
+    kernel32.CreateDirectoryW.restype = wintypes.BOOL
     return kernel32
 
 
@@ -280,10 +340,23 @@ def _final_path_from_handle(kernel32: object, handle: int) -> Path:
     return Path(_strip_resolver_final_path_prefix(buffer.value))
 
 
-def _assert_canonical_non_reparse_tree(
-    path: Path, parent: Optional[Path]
-) -> Path:
-    """Hold one path without following aliases and require lexical identity."""
+def _assert_handle_still_names(handle: int, expected: Path) -> None:
+    final = _final_path_from_handle(_kernel32(), handle)
+    if _path_identity(final) != _path_identity(_absolute_lexical(expected)):
+        raise RuntimeError(
+            f"cache path moved during protected update: {expected} -> {final}"
+        )
+
+
+def _open_canonical_non_reparse(
+    path: Path,
+    parent: Optional[Path],
+    *,
+    desired_access: int = _FILE_READ_ATTRIBUTES,
+    share_mode: int = _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+    directory: Optional[bool] = None,
+) -> tuple[_OwnedHandle, Path]:
+    """Open one canonical path without delete sharing or alias following."""
     if os.name != "nt":
         raise OSError("canonical Windows path validation requires Windows")
     lexical = _absolute_lexical(path)
@@ -299,8 +372,8 @@ def _assert_canonical_non_reparse_tree(
     kernel32 = _kernel32()
     handle = kernel32.CreateFileW(
         str(lexical),
-        _FILE_READ_ATTRIBUTES,
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        desired_access,
+        share_mode,
         None,
         _OPEN_EXISTING,
         _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
@@ -308,6 +381,7 @@ def _assert_canonical_non_reparse_tree(
     )
     if handle == _INVALID_HANDLE_VALUE:
         raise ctypes.WinError(ctypes.get_last_error())
+    owner = _OwnedHandle(kernel32, int(handle))
     try:
         attributes = _FileAttributeTagInfo()
         if not kernel32.GetFileInformationByHandleEx(
@@ -319,42 +393,89 @@ def _assert_canonical_non_reparse_tree(
             raise ctypes.WinError(ctypes.get_last_error())
         if attributes.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
             raise RuntimeError(f"cache path contains a reparse point: {lexical}")
-        final = _final_path_from_handle(kernel32, int(handle))
-    finally:
-        kernel32.CloseHandle(handle)
-
-    if _path_identity(lexical) != _path_identity(final):
-        raise RuntimeError(
-            f"cache path lexical/final mismatch: {lexical} != {final}"
+        is_directory = bool(
+            attributes.file_attributes & _FILE_ATTRIBUTE_DIRECTORY
         )
+        if directory is not None and directory != is_directory:
+            expected = "directory" if directory else "file"
+            raise RuntimeError(f"cache path is not a {expected}: {lexical}")
+        final = _final_path_from_handle(kernel32, owner.value)
+
+        if _path_identity(lexical) != _path_identity(final):
+            raise RuntimeError(
+                f"cache path lexical/final mismatch: {lexical} != {final}"
+            )
+        return owner, final
+    except BaseException:
+        owner.close()
+        raise
+
+
+def _assert_canonical_non_reparse_tree(
+    path: Path, parent: Optional[Path]
+) -> Path:
+    """Validate one path through a held, non-delete-shared handle."""
+    owner, final = _open_canonical_non_reparse(path, parent)
+    owner.close()
     return final
 
 
-def _ensure_private_directory_tree(path: Path, sid: str) -> Path:
+def _ensure_private_directory_tree(
+    path: Path,
+    sid: str,
+    *,
+    managed_components: int = 1,
+    retained_handles: Optional[list[_OwnedHandle]] = None,
+    leaf_sddl: Optional[str] = None,
+) -> Path:
     lexical = _absolute_lexical(path)
     if not lexical.anchor:
         raise RuntimeError(f"cache root must be absolute: {path}")
+    components = lexical.parts[1:]
+    if managed_components < 1 or managed_components > len(components):
+        raise RuntimeError(f"invalid managed cache path depth: {path}")
+    managed_start = len(components) - managed_components
     current = Path(lexical.anchor)
     canonical_parent = _assert_canonical_non_reparse_tree(current, None)
-    for component in lexical.parts[1:]:
+    for index, component in enumerate(components):
         current /= component
-        if not os.path.lexists(current):
-            try:
-                os.mkdir(current)
-            except FileExistsError:
-                pass
-            else:
-                _set_path_acl(current, sid, "PRIVATE")
-        canonical_parent = _assert_canonical_non_reparse_tree(
-            current, canonical_parent
+        managed = index >= managed_start
+        sddl = (
+            leaf_sddl
+            if current == lexical and leaf_sddl is not None
+            else _acl_sddl(sid, "PRIVATE")
         )
-        if not current.is_dir():
-            raise RuntimeError(f"cache directory is not a directory: {current}")
-    _set_path_acl(lexical, sid, "PRIVATE")
+        if not os.path.lexists(current):
+            if not managed:
+                raise RuntimeError(
+                    f"unmanaged cache parent does not exist: {current}"
+                )
+            _create_directory_with_acl(current, sid, sddl)
+        owner, canonical = _open_canonical_non_reparse(
+            current,
+            canonical_parent,
+            desired_access=(
+                _FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC
+                if managed
+                else _FILE_READ_ATTRIBUTES
+            ),
+            directory=True,
+        )
+        canonical_parent = canonical
+        if managed:
+            if current == lexical and leaf_sddl is not None:
+                _set_handle_acl_sddl(owner.value, sddl)
+            else:
+                _set_handle_acl(owner.value, sid, "PRIVATE")
+            _assert_handle_still_names(owner.value, current)
+            if retained_handles is not None:
+                retained_handles.append(owner)
+                continue
+        owner.close()
     return lexical
 
 
-def _security_descriptor(sid: str, mode: _AclMode) -> tuple[object, object]:
+def _acl_sddl(sid: str, mode: _AclMode) -> str:
     acl_sddl = {
         "PRIVATE": f"D:P(A;OICI;FA;;;{sid})",
         "BUILD": f"D:P(A;OICI;FA;;;{sid})",
@@ -362,10 +483,19 @@ def _security_descriptor(sid: str, mode: _AclMode) -> tuple[object, object]:
         "DELETE": f"D:P(A;OICI;FA;;;{sid})",
     }
     try:
-        sddl = acl_sddl[mode]
+        return acl_sddl[mode]
     except KeyError as error:
         raise ValueError(f"unsupported cache ACL mode: {mode}") from error
 
+
+def _managed_namespace_sddl(sid: str) -> str:
+    # Full current-user management access except FILE_DELETE_CHILD. Published
+    # children deny DELETE themselves; maintenance explicitly converts a child
+    # to DELETE before removing or quarantining it.
+    return f"D:P(A;OICI;0x1f01bf;;;{sid})"
+
+
+def _security_descriptor_from_sddl(sddl: str) -> tuple[ctypes.c_void_p, object]:
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = _kernel32()
     advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
@@ -387,38 +517,144 @@ def _security_descriptor(sid: str, mode: _AclMode) -> tuple[object, object]:
     return descriptor, kernel32
 
 
+def _descriptor_dacl(descriptor: ctypes.c_void_p) -> ctypes.c_void_p:
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.GetSecurityDescriptorDacl.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    )
+    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    present = wintypes.BOOL()
+    defaulted = wintypes.BOOL()
+    dacl = ctypes.c_void_p()
+    if not advapi32.GetSecurityDescriptorDacl(
+        descriptor,
+        ctypes.byref(present),
+        ctypes.byref(dacl),
+        ctypes.byref(defaulted),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not present.value:
+        raise RuntimeError("cache security descriptor has no DACL")
+    return dacl
+
+
+def _free_security_descriptor(
+    descriptor: ctypes.c_void_p, kernel32: object
+) -> None:
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.LocalFree(descriptor)
+
+
+def _set_handle_acl_sddl(handle: int, sddl: str) -> None:
+    descriptor, kernel32 = _security_descriptor_from_sddl(sddl)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.SetSecurityInfo.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    advapi32.SetSecurityInfo.restype = wintypes.DWORD
+    try:
+        result = int(
+            advapi32.SetSecurityInfo(
+                handle,
+                _SE_FILE_OBJECT,
+                _DACL_SECURITY_INFORMATION
+                | _PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                _descriptor_dacl(descriptor),
+                None,
+            )
+        )
+        if result:
+            raise OSError(result, "SetSecurityInfo(cache handle) failed")
+    finally:
+        _free_security_descriptor(descriptor, kernel32)
+
+
+def _set_handle_acl(handle: int, sid: str, mode: _AclMode) -> None:
+    _set_handle_acl_sddl(handle, _acl_sddl(sid, mode))
+
+
+def _create_directory_with_acl(path: Path, sid: str, sddl: str) -> bool:
+    del sid  # The SID is already bound into the supplied protected descriptor.
+    descriptor, kernel32 = _security_descriptor_from_sddl(sddl)
+    attributes = _SecurityAttributes(
+        ctypes.sizeof(_SecurityAttributes), descriptor, False
+    )
+    try:
+        if kernel32.CreateDirectoryW(str(path), ctypes.byref(attributes)):
+            return True
+        error = ctypes.get_last_error()
+        if error in (_ERROR_FILE_EXISTS, _ERROR_ALREADY_EXISTS):
+            return False
+        raise ctypes.WinError(error)
+    finally:
+        _free_security_descriptor(descriptor, kernel32)
+
+
 def _set_path_acl(path: Path, sid: str, mode: _AclMode) -> None:
     if os.name != "nt":
         raise OSError("Windows ACL conversion requires Windows")
-    descriptor, kernel32 = _security_descriptor(sid, mode)
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    advapi32.SetFileSecurityW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.c_void_p,
+    owner, _canonical = _open_canonical_non_reparse(
+        path,
+        _absolute_lexical(path).parent,
+        desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC,
     )
-    advapi32.SetFileSecurityW.restype = wintypes.BOOL
     try:
-        if not advapi32.SetFileSecurityW(
-            str(path),
-            _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
-            descriptor,
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
+        _set_handle_acl(owner.value, sid, mode)
+        _assert_handle_still_names(owner.value, path)
     finally:
-        kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
-        kernel32.LocalFree.restype = ctypes.c_void_p
-        kernel32.LocalFree(descriptor)
+        owner.close()
 
 
-def _enumerate_non_reparse_tree(path: Path) -> tuple[list[Path], list[Path]]:
+def _set_tree_acl(path: Path, sid: str, mode: _AclMode) -> None:
+    """Apply a protected DACL, recursively for immutable/delete conversions."""
     root = _absolute_lexical(path)
-    _assert_canonical_non_reparse_tree(root, root.parent)
-    directories: list[Path] = []
-    files: list[Path] = []
+    if mode not in ("RX", "DELETE"):
+        _set_path_acl(root, sid, mode)
+        return
 
-    def visit(directory: Path) -> None:
-        with os.scandir(directory) as entries:
+    def convert_file(target: Path) -> None:
+        owner, _canonical = _open_canonical_non_reparse(
+            target,
+            target.parent,
+            desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC,
+            share_mode=_FILE_SHARE_READ,
+            directory=False,
+        )
+        try:
+            _set_handle_acl(owner.value, sid, mode)
+            _assert_handle_still_names(owner.value, target)
+        finally:
+            owner.close()
+
+    def convert_directory(directory: Path) -> None:
+        owner, _canonical = _open_canonical_non_reparse(
+            directory,
+            directory.parent,
+            desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC,
+            share_mode=_FILE_SHARE_READ,
+            directory=True,
+        )
+        try:
+            if mode == "RX":
+                # Close this namespace before observing its members. Once RX is
+                # applied, no late child can appear and existing children cannot
+                # be renamed while their handle-bound conversion proceeds.
+                _set_handle_acl(owner.value, sid, mode)
+                _assert_handle_still_names(owner.value, directory)
+            with os.scandir(directory) as scanned:
+                entries = sorted(scanned, key=lambda entry: entry.name.casefold())
             for entry in entries:
                 target = Path(entry.path)
                 stat_result = entry.stat(follow_symlinks=False)
@@ -429,41 +665,17 @@ def _enumerate_non_reparse_tree(path: Path) -> tuple[list[Path], list[Path]]:
                     raise RuntimeError(
                         f"cache ACL tree contains a reparse point: {target}"
                     )
-                _assert_canonical_non_reparse_tree(target, directory)
                 if entry.is_dir(follow_symlinks=False):
-                    directories.append(target)
-                    visit(target)
+                    convert_directory(target)
                 else:
-                    files.append(target)
+                    convert_file(target)
+            if mode == "DELETE":
+                _set_handle_acl(owner.value, sid, mode)
+            _assert_handle_still_names(owner.value, directory)
+        finally:
+            owner.close()
 
-    visit(root)
-    return directories, files
-
-
-def _set_tree_acl(path: Path, sid: str, mode: _AclMode) -> None:
-    """Apply a protected DACL, recursively for immutable/delete conversions."""
-    root = _absolute_lexical(path)
-    if mode not in ("RX", "DELETE"):
-        _assert_canonical_non_reparse_tree(root, root.parent)
-        _set_path_acl(root, sid, mode)
-        return
-
-    directories, files = _enumerate_non_reparse_tree(root)
-    if mode == "RX":
-        targets = [
-            *files,
-            *sorted(directories, key=lambda value: len(value.parts), reverse=True),
-            root,
-        ]
-    else:
-        targets = [
-            root,
-            *sorted(directories, key=lambda value: len(value.parts)),
-            *files,
-        ]
-    for target in targets:
-        _assert_canonical_non_reparse_tree(target, target.parent)
-        _set_path_acl(target, sid, mode)
+    convert_directory(root)
 
 
 def _assert_mutation_denied(path: Path, *, directory: bool) -> None:

@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import get_args
 from unittest import mock
 
+import tools.windows_runtime_cache as runtime_cache
 from tools.windows_runtime_cache import (
     GeneratedLayoutEntry,
     HeldSource,
@@ -566,6 +567,124 @@ class WindowsFilesystemTests(unittest.TestCase):
         _atomic_move_no_replace(source, destination)
         self.assertFalse(source.exists())
         self.assertEqual((destination / "payload").read_bytes(), b"source")
+
+    def test_rx_conversion_denies_late_insertion_before_descendant_walk(self) -> None:
+        tree = self.root / "race"
+        nested = tree / "nested"
+        nested.mkdir(parents=True)
+        (nested / "payload.dll").write_bytes(b"payload")
+        _set_tree_acl(tree, self.sid, "BUILD")
+        real_set_handle_acl = runtime_cache._set_handle_acl
+        attempted = False
+
+        def attempt_late_insert(handle: int, sid: str, mode: str) -> None:
+            nonlocal attempted
+            real_set_handle_acl(handle, sid, mode)
+            final = runtime_cache._final_path_from_handle(
+                runtime_cache._kernel32(), handle
+            )
+            if mode == "RX" and final == tree:
+                attempted = True
+                with self.assertRaises(OSError):
+                    (tree / "late").mkdir()
+
+        with mock.patch.object(
+            runtime_cache, "_set_handle_acl", side_effect=attempt_late_insert
+        ):
+            _set_tree_acl(tree, self.sid, "RX")
+
+        self.assertTrue(attempted)
+        self.assertFalse((tree / "late").exists())
+
+    def test_objects_parent_cannot_authorize_published_child_rename(self) -> None:
+        cache = self.make_cache(self.root / "cache")
+        published = cache.objects / ("a" * 64)
+        published.mkdir()
+        (published / "payload.dll").write_bytes(b"payload")
+        _set_tree_acl(published, self.sid, "RX")
+
+        _assert_mutation_denied(published, directory=True)
+        with self.assertRaises(OSError):
+            published.rename(cache.objects / ("b" * 64))
+        self.assertTrue(published.exists())
+
+        _set_tree_acl(published, self.sid, "DELETE")
+        quarantined = cache.quarantine / published.name
+        published.rename(quarantined)
+        self.assertTrue(quarantined.exists())
+
+    def test_immutable_staging_tree_can_publish_into_objects_namespace(self) -> None:
+        cache = self.make_cache(self.root / "publish")
+        source = cache.staging / "creator"
+        source.mkdir()
+        (source / "payload.dll").write_bytes(b"payload")
+        _set_tree_acl(source, self.sid, "RX")
+        destination = cache.objects / ("c" * 64)
+
+        _atomic_move_no_replace(source, destination)
+
+        self.assertFalse(source.exists())
+        self.assertEqual((destination / "payload.dll").read_bytes(), b"payload")
+        with self.assertRaises(OSError):
+            destination.rename(cache.objects / ("d" * 64))
+
+        loser = cache.staging / "loser"
+        loser.mkdir()
+        (loser / "payload.dll").write_bytes(b"loser")
+        _set_tree_acl(loser, self.sid, "RX")
+        with self.assertRaises(FileExistsError):
+            _atomic_move_no_replace(loser, destination)
+        self.assertTrue(loser.exists())
+
+    def test_existing_cache_root_swap_is_detected_during_handle_bound_acl_update(
+        self,
+    ) -> None:
+        cache_root = self.root / "existing"
+        cache_root.mkdir()
+        swapped = self.root / "swapped"
+        real_set_handle_acl = runtime_cache._set_handle_acl
+        attempted = False
+
+        def attempt_swap(handle: int, sid: str, mode: str) -> None:
+            nonlocal attempted
+            final = runtime_cache._final_path_from_handle(
+                runtime_cache._kernel32(), handle
+            )
+            if final == cache_root:
+                attempted = True
+                cache_root.rename(swapped)
+            real_set_handle_acl(handle, sid, mode)
+
+        with mock.patch.object(
+            runtime_cache, "_set_handle_acl", side_effect=attempt_swap
+        ):
+            with self.assertRaisesRegex(RuntimeError, "moved during protected update"):
+                self.make_cache(cache_root)
+
+        self.assertTrue(attempted)
+        self.assertFalse(cache_root.exists())
+        self.assertTrue(swapped.exists())
+
+    def test_missing_managed_directories_receive_acl_at_creation(self) -> None:
+        cache_root = self.root / "atomic"
+        real_create = runtime_cache._create_directory_with_acl
+        created: list[Path] = []
+
+        def record_create(path: Path, sid: str, sddl: str) -> bool:
+            created.append(path)
+            self.assertEqual(sid, self.sid)
+            self.assertTrue(sddl.startswith("D:P"))
+            return real_create(path, sid, sddl)
+
+        with mock.patch.object(
+            runtime_cache,
+            "_create_directory_with_acl",
+            side_effect=record_create,
+        ):
+            cache = self.make_cache(cache_root)
+
+        self.assertIn(cache_root, created)
+        self.assertIn(cache.objects, created)
 
 
 if __name__ == "__main__":
