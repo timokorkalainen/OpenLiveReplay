@@ -10,6 +10,7 @@
 
 ## Global Constraints
 
+- Execute every relative command from `D:/Development/OpenLiveReplay/.claude/worktrees/gpu-surface-lease`; build/cache/test paths belong to that worktree.
 - `GpuSurface::nativeHandle()` remains protected and `GpuReadLease` remains its only friend.
 - `retainUntilFenceRetired()` and `pendingFenceValue()` remain public monotonic watermark operations.
 - Native backing acquisition remains through `GpuSyncReadScope`; public synchronous `read()` remains narrowly audited and `withRead()` remains preferred.
@@ -20,13 +21,13 @@
 - Supported compiler families are GCC/MinGW, Clang/AppleClang, MSVC `cl`, and clang-cl. A family is incomplete until a live smoke test proves rewriting, dependencies, markers, one forbidden expansion, and one safe paste.
 - Response expansion limits are depth 8, 32 distinct files, and 4 MiB aggregate bytes; cycles and decoding ambiguity fail closed.
 - Source-only macro limits remain depth 96, 256 continuous source tokens, 2,048 generated tokens, and 1,024 paste operations; exhaustion fails closed.
-- Execution limits are 60 seconds and 128 MiB stdout per invocation, 1 MiB retained stderr, 240 seconds total cold execution, 512 MiB coordinator RSS, and `min(8, logical_cpu_count)` compiler processes.
+- Execution limits are 60 seconds and 128 MiB stdout per invocation, 1 MiB retained stderr, 384 MiB retained packed token storage, 240 seconds total cold execution, 512 MiB coordinator RSS, and `min(8, logical_cpu_count)` compiler processes.
 - Cache limits are 512 MiB, 256 complete entries, one-hour incomplete-entry cleanup, and 14-day complete-entry retention.
 - Acceptance limits are 180 seconds cold and 20 seconds unchanged warm on the supported Windows reference build, with at most 512 MiB coordinator RSS.
 - Compiler failure, timeout, output overflow, dependency failure, unsupported command syntax, missing active coverage, ambiguous identity, malformed markers, and incomplete output are infrastructure failures; partial output never passes.
 - Preserve the unrelated `tests/unit/tst_realcodecbenchmark.cpp` modification. Use targeted `git add <paths>`, never `git add -A`, and never stage `handoff-notes`.
 - Do not touch `expectedDecodeSurfaceBytesForTrack` or add a warning workaround. Use `-DOLR_WERROR=OFF` only for the documented local GCC build.
-- Do not run Windows test executables directly. Run CTest through `D:/Development/OpenLiveReplay/windows-runtime-stable/tools/run_ctest.py`.
+- Do not run Windows test executables directly. Run CTest through the stable wrapper at commit `812ac65b`: `D:/Development/OpenLiveReplay/.claude/worktrees/windows-runtime-stable/tools/run_ctest.py`.
 - End every implementation commit with `Co-Authored-By: Claude <noreply@anthropic.com>`.
 - After each task, request a fresh-context review of that task's diff and fix every Critical or Important finding before starting the next task.
 
@@ -34,7 +35,7 @@
 
 ## File Structure and Interfaces
 
-- Create `tests/gpu/gpu_capability_model.py`: shared immutable types, hard limits, compiler-family enum, file identities, configurations, provenance tokens, compact translation-unit views, coverage reports, and `AuditInfrastructureError`.
+- Create `tests/gpu/gpu_capability_model.py`: shared immutable types, hard limits, compiler-family enum, file identities, on-demand provenance token views, packed token runs/columns, compact translation-unit views, coverage reports, and `AuditInfrastructureError`.
 - Create `tests/gpu/gpu_capability_command.py`: compile-entry decoding, launcher removal, response-file expansion, compiler identification/fingerprinting, and family-specific preprocessing command rewriting.
 - Create `tests/gpu/gpu_capability_provenance.py`: canonical production/dependency identity, byte-stream marker parsing, inclusion-stack validation, dependency parsing, and compact full-TU token construction.
 - Create `tests/gpu/gpu_capability_runner.py`: bounded subprocess/process-group execution, concurrency, compiler orchestration, and configuration coverage.
@@ -70,6 +71,7 @@ class AuditLimits:
     total_seconds: float = 240.0
     stdout_bytes: int = 128 * 1024 * 1024
     stderr_bytes: int = 1024 * 1024
+    retained_token_bytes: int = 384 * 1024 * 1024
     rss_bytes: int = 512 * 1024 * 1024
     workers: int = min(8, os.cpu_count() or 1)
 
@@ -93,22 +95,30 @@ class PreprocessConfiguration:
     environment_digest: str
     digest: str
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SourceLocation:
     identity: FileIdentity | None
     inclusion_instance: int
     line: int
     configuration_digest: str
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PreprocessedToken:
     spelling: bytes
     location: SourceLocation
 
+@dataclass(frozen=True, slots=True)
+class PackedTokenRun:
+    start: int
+    stop: int
+    identity_id: int
+    inclusion_instance: int
+    original_line: int
+
 @dataclass(frozen=True)
 class PreprocessedTranslationUnitView:
     configuration: PreprocessConfiguration
-    tokens: tuple[PreprocessedToken, ...]
+    tokens: "CompactTokenSequence"
     dependencies: tuple[FileIdentity, ...]
 
 @dataclass(frozen=True)
@@ -120,6 +130,23 @@ class CoverageReport:
 class AuditInfrastructureError(RuntimeError):
     pass
 ```
+
+`CompactTokenSequence(Sequence[PreprocessedToken])` is backed by interned
+`tuple[bytes, ...]` spelling and `tuple[FileIdentity | None, ...]` identity tables
+plus four private `array('I')` columns named spelling IDs, identity IDs,
+inclusion IDs, and original lines. It rejects a host where `array('I').itemsize`
+is not four. It keeps a reference to the view's `PreprocessConfiguration`; the
+digest string exists only in that configuration and is read on token-view
+materialization. Its exact public interface
+is `empty(configuration: PreprocessConfiguration) -> CompactTokenSequence`, `__len__() -> int`,
+integer/slice `__getitem__`, `__iter__() -> Iterator[PreprocessedToken]`,
+`packed_bytes: int`, `spelling_id_at(index: int) -> int`,
+`spelling_for(spelling_id: int) -> bytes`,
+`identity_for(identity_id: int) -> FileIdentity | None`, and
+`iter_runs() -> Iterator[PackedTokenRun]`. Integer/slice access and iteration
+materialize token views on demand; the sequence never retains them.
+Spelling, identity, inclusion, and original-line values above `UINT32_MAX` fail
+before append rather than wrapping.
 
 ---
 
@@ -141,7 +168,15 @@ class ModelTests(unittest.TestCase):
         limits = AuditLimits()
         self.assertEqual((limits.response_depth, limits.response_files), (8, 32))
         self.assertEqual(limits.stdout_bytes, 128 * 1024 * 1024)
+        self.assertEqual(limits.retained_token_bytes, 384 * 1024 * 1024)
         self.assertEqual(limits.workers, min(8, os.cpu_count() or 1))
+
+    def test_compact_sequence_does_not_retain_token_views(self):
+        sequence = CompactTokenSequence.empty(self.configuration(digest="cfg-a"))
+        self.assertIsInstance(sequence, Sequence)
+        self.assertNotIsInstance(sequence, tuple)
+        self.assertEqual(len(sequence), 0)
+        self.assertEqual(sequence.packed_bytes, 0)
 
     def test_platform_classifier_is_path_based(self):
         families = frozenset({CompilerFamily.GCC})
@@ -163,13 +198,20 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'gpu_capability_model'
 
 - [ ] **Step 3: Implement the exact immutable types and canonical enumeration**
 
-Implement the signatures above. `enumerate_production_identities()` must reject a resolved path outside the root, a symlink/reparse crossing, duplicate filesystem identity, case-fold collision, non-regular file, or unreadable UTF-8 production file by raising `AuditInfrastructureError` with the repository-relative path.
+Implement the signatures above, including `CompactTokenSequence` with intern tables,
+four private 32-bit `array('I')` columns, packed-byte accounting, on-demand token
+views, and packed runs. `enumerate_production_identities()` must reject a resolved
+path outside the root, a symlink/reparse crossing, duplicate filesystem identity,
+case-fold collision, non-regular file, or unreadable UTF-8 production file by
+raising `AuditInfrastructureError` with the repository-relative path.
 
 - [ ] **Step 4: Run the model tests**
 
 Run: `python -m unittest tests/gpu/test_gpu_capability_model.py -v`
 
-Expected: PASS for exact limits, frozen dataclasses, generic/Apple/Windows classification, alias rejection, case collision, and physical line counts.
+Expected: PASS for exact limits, frozen/slotted token views, non-tuple compact
+storage, four-byte packed columns, generic/Apple/Windows classification, alias
+rejection, case collision, and physical line counts.
 
 - [ ] **Step 5: Commit the model**
 
@@ -342,10 +384,10 @@ git commit -m "test(gpu): rewrite capability preprocess commands" -m "Co-Authore
 - Create: `tests/gpu/test_gpu_capability_provenance.py`
 
 **Interfaces:**
-- Consumes: `FileIdentity`, `PreprocessConfiguration`, `PreprocessedToken`, `PreprocessedTranslationUnitView`, and `AuditInfrastructureError`.
+- Consumes: `FileIdentity`, `PreprocessConfiguration`, `CompactTokenSequence`, `PackedTokenRun`, `PreprocessedToken`, `PreprocessedTranslationUnitView`, `AuditLimits`, and `AuditInfrastructureError`.
 - Produces: dependency parsers, spoof rejection, and the exact streaming interface below.
 
-`PreprocessedStreamBuilder(configuration: PreprocessConfiguration, production: Mapping[PurePosixPath, FileIdentity])` exposes `feed(chunk: bytes) -> None` and `finalize(dependencies: tuple[FileIdentity, ...]) -> PreprocessedTranslationUnitView`. The remaining exact functions are `parse_gcc_dependencies(path: Path) -> tuple[Path, ...]`, `parse_msvc_dependencies(path: Path) -> tuple[Path, ...]`, `validate_dependency_identities(paths: tuple[Path, ...], source_root: Path, production: Mapping[PurePosixPath, FileIdentity]) -> tuple[FileIdentity, ...]`, and `reject_source_line_spoofs(path: Path, production: Mapping[PurePosixPath, FileIdentity]) -> None`.
+`PreprocessedStreamBuilder(configuration: PreprocessConfiguration, production: Mapping[PurePosixPath, FileIdentity], limits: AuditLimits, rss_reader: Callable[[], int])` exposes `feed(chunk: bytes) -> None`, `finalize(dependencies: tuple[FileIdentity, ...]) -> PreprocessedTranslationUnitView`, `retained_bytes: int`, and `peak_rss_bytes: int`. The remaining exact functions are `parse_gcc_dependencies(path: Path) -> tuple[Path, ...]`, `parse_msvc_dependencies(path: Path) -> tuple[Path, ...]`, `validate_dependency_identities(paths: tuple[Path, ...], source_root: Path, production: Mapping[PurePosixPath, FileIdentity]) -> tuple[FileIdentity, ...]`, and `reject_source_line_spoofs(path: Path, production: Mapping[PurePosixPath, FileIdentity]) -> None`.
 
 - [ ] **Step 1: Write failing GCC include-stack and full-context tests**
 
@@ -375,9 +417,41 @@ Expected: FAIL because provenance parsing is absent.
 
 - [ ] **Step 3: Implement byte-stream GCC marker parsing and compact tokens**
 
-Parse marker syntax from bytes, C-unescape filenames, resolve relative markers against working directory then current real-file directory, and require exactly one dependency identity. Keep all code tokens but attach production or non-production location. Intern spellings; keep non-ASCII identifiers as opaque byte tokens. Reject line zero outside bootstrap, `<stdin>`, unknown pseudo-files, invalid bytes, out-of-range production lines, and stack inconsistencies.
+Parse marker syntax from bytes, C-unescape filenames, resolve relative markers against working directory then current real-file directory, and require exactly one dependency identity. Keep all code tokens in intern tables plus the four packed 32-bit columns; never append a `PreprocessedToken` object to retained storage. Keep non-ASCII identifiers as opaque byte spellings. Reserve columns in bounded blocks and check `retained_bytes` and sampled RSS before each block is committed. Reject line zero outside bootstrap, `<stdin>`, unknown pseudo-files, invalid bytes, out-of-range production lines, stack inconsistencies, retained storage above 384 MiB, and coordinator RSS above 512 MiB.
 
-- [ ] **Step 4: Add failing MSVC transition and path tests**
+- [ ] **Step 4: Add adversarial dense-token memory and early-failure tests**
+
+```python
+def test_one_million_dense_tokens_stay_packed(self):
+    baseline = current_process_rss_bytes()
+    limits = dataclasses.replace(AuditLimits(),
+                                 retained_token_bytes=20 * 1024 * 1024,
+                                 rss_bytes=baseline + 64 * 1024 * 1024)
+    builder = self.builder(limits=limits, rss_reader=current_process_rss_bytes)
+    builder.feed(self.main_marker())
+    for _ in range(2000):
+        builder.feed(b"x " * 500)
+    view = builder.finalize((self.main_identity,))
+    self.assertEqual(len(view.tokens), 1_000_000)
+    self.assertLessEqual(view.tokens.packed_bytes, 16_100_000)
+    self.assertLess(builder.peak_rss_bytes, limits.rss_bytes)
+    self.assertNotIsInstance(view.tokens, tuple)
+
+def test_builder_fails_before_packed_limit_is_crossed(self):
+    limits = dataclasses.replace(AuditLimits(),
+                                 retained_token_bytes=1024 * 1024)
+    builder = self.builder(limits=limits, rss_reader=lambda: 0)
+    with self.assertRaisesRegex(AuditInfrastructureError,
+                                "retained packed token limit"):
+        for _ in range(1000):
+            builder.feed(b"x " * 500)
+    self.assertLessEqual(builder.retained_bytes, limits.retained_token_bytes)
+```
+
+The test also asserts the builder has no raw-output or retained-token-view
+attribute and that deleting the view releases the packed arrays.
+
+- [ ] **Step 5: Add failing MSVC transition and path tests**
 
 ```python
 def test_msvc_repeated_header_gets_distinct_instances(self):
@@ -394,15 +468,15 @@ def test_msvc_repeated_header_gets_distinct_instances(self):
 
 Add Windows case/separator normalization, ancestor return, recursive/return ambiguity, malformed quote, embedded NUL, active-code-page decode failure, and absolute/relative collision tests.
 
-- [ ] **Step 5: Implement MSVC stack inference and dependency parsing**
+- [ ] **Step 6: Implement MSVC stack inference and dependency parsing**
 
 Treat a marker to the current identity as line advance, a new dependency as a child inclusion, and an unambiguous ancestor as return. Reject a target that can be interpreted both ways. Parse GCC escaped depfiles and MSVC dependency JSON with canonical deduplication, including system headers.
 
-- [ ] **Step 6: Add and implement raw `#line` spoof controls**
+- [ ] **Step 7: Add and implement raw `#line` spoof controls**
 
 Test production direct and spliced `#line`, and non-production dependency directives targeting absolute, relative, case-variant, and separator-variant production paths. `reject_source_line_spoofs()` must reject each target while allowing an unrelated generated-file target.
 
-- [ ] **Step 7: Run provenance tests and commit**
+- [ ] **Step 8: Run provenance tests and commit**
 
 Run: `python -m unittest tests/gpu/test_gpu_capability_provenance.py -v`
 
@@ -426,7 +500,7 @@ git commit -m "test(gpu): validate capability token provenance" -m "Co-Authored-
 
 - [ ] **Step 1: Create a deterministic fake preprocessor and failing success/failure tests**
 
-The fixture accepts `--fixture-mode success|fail|sleep|overflow|malformed|child-sleep`, emits a valid GCC or MSVC marker stream, writes the requested dependency format, and flushes output in 4 KiB chunks. Tests assert success returns bounded chunks and nonzero exit includes only the final 1 MiB stderr tail.
+The fixture accepts `--fixture-mode success|dense|fail|sleep|overflow|malformed|child-sleep`, emits a valid GCC or MSVC marker stream, writes the requested dependency format, and flushes output in 4 KiB chunks. Dense mode emits a requested count of `x` tokens without constructing the full stream. Tests assert success returns a compact view and nonzero exit includes only the final 1 MiB stderr tail.
 
 ```python
 def test_nonzero_exit_never_returns_partial_view(self):
@@ -453,7 +527,7 @@ Use `start_new_session=True` plus group termination on POSIX and a kill-on-close
 
 - [ ] **Step 4: Add exact output/RSS/dependency/decode failure tests**
 
-Cover stdout exactly at and one byte over the configured test limit, stderr truncation, malformed UTF/path bytes, missing depfile, malformed dependency JSON, dependency outside the manifest, 60-second/default and injected-short deadline selection, 240-second global deadline, and injected RSS overflow.
+Cover stdout exactly at and one byte over the configured test limit, stderr truncation, malformed UTF/path bytes, missing depfile, malformed dependency JSON, dependency outside the manifest, 60-second/default and injected-short deadline selection, 240-second global deadline, injected RSS overflow, and dense output that crosses the packed-token limit before the stdout limit. Assert `ExecutionResult` has no stdout payload, the runner has no raw-output cache, and the finalized dense view uses `CompactTokenSequence`.
 
 - [ ] **Step 5: Connect successful execution to dependency and provenance validation**
 
@@ -494,6 +568,16 @@ def test_hit_requires_every_dependency_content_hash(self):
 def test_partial_entry_is_never_a_hit(self):
     self.write_incomplete_manifest()
     self.assertIsNone(cache.load(self.configuration))
+
+def test_cache_serializes_packed_columns_without_token_views(self):
+    with mock.patch.object(CompactTokenSequence, "__iter__",
+                           side_effect=AssertionError("token iteration")), \
+         mock.patch.object(CompactTokenSequence, "__getitem__",
+                           side_effect=AssertionError("token materialization")):
+        cache.publish(self.dense_view)
+        restored = cache.load(self.configuration)
+    self.assertEqual(restored.tokens.packed_bytes,
+                     self.dense_view.tokens.packed_bytes)
 ```
 
 Add compiler fingerprint, arguments, working directory, environment digest, missing dependency, alias, permission error, malformed manifest, schema mismatch, payload hash, and concurrent winner tests.
@@ -506,7 +590,7 @@ Expected: FAIL because the cache is absent.
 
 - [ ] **Step 3: Implement content-keyed load and atomic publication**
 
-Use a schema-versioned base key from the configuration. Persist no environment values. Store canonical dependency paths and SHA-256 hashes, compact tokens/provenance, and payload digest. Write into a unique temporary directory, fsync files and manifest, then atomically rename. Validate all dependencies before deserializing a hit. Record access time in an atomic sidecar outside the immutable payload so LRU reads cannot corrupt an entry. Cache no failure or partial output.
+Use a schema-versioned base key from the configuration. Persist no environment values. Store canonical dependency paths and SHA-256 hashes, intern tables and packed `array` columns, and payload digest. Stream arrays directly to/from the payload in bounded blocks; never iterate/materialize `PreprocessedToken` objects and never construct one monolithic serialized byte string. Write into a unique temporary directory, fsync files and manifest, then atomically rename. Validate all dependencies before deserializing a hit. Record access time in an atomic sidecar outside the immutable payload so LRU reads cannot corrupt an entry. Cache no failure or partial output.
 
 - [ ] **Step 4: Add failing cleanup and bounded-size tests**
 
@@ -590,7 +674,7 @@ git commit -m "test(gpu): enforce compiler capability coverage" -m "Co-Authored-
 
 **Interfaces:**
 - Consumes: `PreprocessedTranslationUnitView`, `CoverageReport`, and existing `Finding` capability policy.
-- Produces: `AuditBuffer.from_preprocessed(view) -> AuditBuffer`; `AuditBuffer.location_at(offset: int) -> SourceLocation`; `audit_preprocessed_view(view: PreprocessedTranslationUnitView) -> list[Finding]`; `aggregate_findings(findings: Iterable[tuple[Finding, str]]) -> list[AggregatedFinding]`, where `AggregatedFinding` contains one `Finding` and sorted unique `configurations: tuple[str, ...]`.
+- Produces: `AuditBuffer.from_preprocessed(view: PreprocessedTranslationUnitView, limits: AuditLimits, rss_reader: Callable[[], int]) -> AuditBuffer`; `AuditBuffer.location_at(offset: int) -> SourceLocation`; `AuditBuffer.peak_rss_bytes: int`; `audit_preprocessed_view(view: PreprocessedTranslationUnitView, limits: AuditLimits, rss_reader: Callable[[], int]) -> list[Finding]`; `aggregate_findings(findings: Iterable[tuple[Finding, str]]) -> list[AggregatedFinding]`, where `AggregatedFinding` contains one `Finding` and sorted unique `configurations: tuple[str, ...]`.
 
 - [ ] **Step 1: Add failing full-context and production-origin tests**
 
@@ -602,13 +686,25 @@ def test_nonproduction_scope_context_is_kept_but_not_reported(self):
                         b"lease.nativeHandle();"),
         self.external(b"}"),
     ))
-    findings = audit_preprocessed_view(view)
+    findings = audit_preprocessed_view(
+        view, self.limits, current_process_rss_bytes)
     self.assertEqual([(item.path, item.line) for item in findings], [
         (PurePosixPath("playback/gpu/gpufence.h"), 41)])
 
 def test_external_guarded_spelling_cannot_report(self):
     self.assertEqual(audit_preprocessed_view(
-        self.view((self.external(b"surface.nativeHandle();"),))), [])
+        self.view((self.external(b"surface.nativeHandle();"),)),
+        self.limits, current_process_rss_bytes), [])
+
+def test_audit_buffer_consumes_packed_runs_without_token_views(self):
+    view = self.one_million_token_view()
+    with mock.patch.object(CompactTokenSequence, "__iter__",
+                           side_effect=AssertionError("token iteration")), \
+         mock.patch.object(CompactTokenSequence, "__getitem__",
+                           side_effect=AssertionError("token materialization")):
+        buffer = AuditBuffer.from_preprocessed(
+            view, self.limits, current_process_rss_bytes)
+    self.assertLess(buffer.peak_rss_bytes, self.limits.rss_bytes)
 ```
 
 Add repeated-header instance, scope spanning an include, callback body, `withRead`, `complete`, longjmp, typed sink/method, public member, and mixed-provenance rejection controls.
@@ -621,7 +717,17 @@ Expected: FAIL because compiler-view auditing is absent.
 
 - [ ] **Step 3: Implement `AuditBuffer` and provenance-aware candidate filtering**
 
-Build normalized audit text from compact tokens while preserving delimiters and token boundaries. Store run-length offset-to-`SourceLocation` mapping. Refactor finding construction to resolve the candidate token's path/line dynamically instead of using one path for the whole translation unit. Keep non-production tokens for grammar context but require reportable candidate tokens to have a production identity. Reject a capability expression whose required tokens have inconsistent production identity.
+Build normalized audit bytes from `CompactTokenSequence.iter_runs()`,
+`spelling_id_at()`, and table lookups while preserving delimiters and token
+boundaries. Never call token `__iter__`/`__getitem__` and never copy the four
+packed columns. Store run-length normalized-offset mappings back to packed run
+indices; materialize `SourceLocation` only for a reported candidate. Check RSS
+while appending normalized blocks and fail before 512 MiB. Refactor finding
+construction to resolve the candidate token's path/line dynamically instead of
+using one path for the whole translation unit. Keep non-production tokens for
+grammar context but require reportable candidate tokens to have a production
+identity. Reject a capability expression whose required tokens have inconsistent
+production identity.
 
 - [ ] **Step 4: Refactor every existing capability grammar to use candidate provenance**
 
@@ -796,7 +902,7 @@ Accept one or more `--compile-commands`, require `--cache-dir` for compiler mode
 
 - [ ] **Step 4: Update CMake test registration**
 
-Register Python unit discovery and live compiler tests. Pass `${CMAKE_BINARY_DIR}/gpu-capability-cache` and `${CMAKE_BINARY_DIR}/compile_commands.json` to the source audit. Map `CMAKE_CXX_COMPILER_ID` to the exact family spelling and invoke the live test with `--live-only --live-compiler FAMILY=${CMAKE_CXX_COMPILER} --require-live-family FAMILY`. Set only `gpu_capability_source_audit` to `TIMEOUT 300`; keep performance `RUN_SERIAL` and `TIMEOUT 180`. Label all four tests `gpu-capability;ci`.
+Register Python unit discovery and live compiler tests. Pass `${CMAKE_BINARY_DIR}/gpu-capability-cache` and `${CMAKE_BINARY_DIR}/compile_commands.json` to the source audit. Map `CMAKE_CXX_COMPILER_ID` to the exact family spelling and invoke the live test with `--live-only --live-compiler FAMILY=${CMAKE_CXX_COMPILER} --require-live-family FAMILY`. Set both `gpu_capability_source_audit` and `gpu_capability_source_audit_perf` to `TIMEOUT 300`; keep performance `RUN_SERIAL`. The performance process still enforces and reports the internal 180-second cold acceptance limit, leaving 120 seconds for CTest launch, teardown, and failure diagnostics. Label all four tests `gpu-capability;ci`.
 
 - [ ] **Step 5: Add live compiler-family CI evidence**
 
@@ -879,7 +985,7 @@ Expected: build succeeds with the source audit and Python tests registered.
 - [ ] **Step 3: Run focused CTest through the stable runtime launcher**
 
 ```powershell
-python D:/Development/OpenLiveReplay/windows-runtime-stable/tools/run_ctest.py --test-dir D:/Development/OpenLiveReplay/.claude/worktrees/gpu-surface-lease/build/gpu -R '^(gpu_capability_(preprocess_unit|live_compilers|source_audit|source_audit_perf)|gpu_(negcompile|compile_pass).*)$' --output-on-failure
+python D:/Development/OpenLiveReplay/.claude/worktrees/windows-runtime-stable/tools/run_ctest.py --test-dir D:/Development/OpenLiveReplay/.claude/worktrees/gpu-surface-lease/build/gpu -R '^(gpu_capability_(preprocess_unit|live_compilers|source_audit|source_audit_perf)|gpu_(negcompile|compile_pass).*)$' --output-on-failure
 ```
 
 Expected: all capability, live MinGW, negative-compile, compile-pass, and performance gates pass. No raw test executable is launched.
@@ -887,7 +993,7 @@ Expected: all capability, live MinGW, negative-compile, compile-pass, and perfor
 - [ ] **Step 4: Run the full unit suite through the stable runtime launcher**
 
 ```powershell
-python D:/Development/OpenLiveReplay/windows-runtime-stable/tools/run_ctest.py --test-dir D:/Development/OpenLiveReplay/.claude/worktrees/gpu-surface-lease/build/gpu -L unit --output-on-failure
+python D:/Development/OpenLiveReplay/.claude/worktrees/windows-runtime-stable/tools/run_ctest.py --test-dir D:/Development/OpenLiveReplay/.claude/worktrees/gpu-surface-lease/build/gpu -L unit --output-on-failure
 ```
 
 Expected: every unit test passes and the closing process audit reports zero surviving test/application processes.

@@ -226,6 +226,7 @@ The fixed limits are:
 - 240 seconds for all cold invocations in one audit process;
 - 128 MiB of stdout per invocation;
 - 1 MiB of retained stderr per invocation;
+- 384 MiB of retained packed token tables and columns per invocation;
 - 512 MiB peak coordinator resident memory; and
 - at most `min(8, logical_cpu_count)` compiler processes concurrently.
 
@@ -296,12 +297,32 @@ make provenance ambiguous and fail the configuration.
 
 ## Preprocessed translation-unit views
 
-Each configuration produces one `PreprocessedTranslationUnitView`. The stream
-parser interns token spelling and stores a compact token sequence; every token
-carries its canonical file identity or a non-production identity, inclusion-
-instance identifier, original line, and configuration digest. Preprocessor
-marker/directive records are consumed by the provenance parser and are never
-treated as C++ code. The raw subprocess text is not retained.
+Each configuration produces one `PreprocessedTranslationUnitView`. Its `tokens`
+member is a `CompactTokenSequence`, not a tuple of token dataclasses. The
+sequence interns spelling and file identity once, then stores four parallel
+32-bit `array` columns per token: spelling-table ID, identity-table ID,
+inclusion-instance ID, and original line. The digest string exists only in the
+view's `PreprocessConfiguration`; the sequence retains a reference to that same
+configuration and reads its digest only when materializing a token view.
+Implementations require four-byte `array('I')` items;
+a host with a different item size fails explicitly rather than changing the
+memory calculation. A spelling/identity/inclusion ID or original line above
+`UINT32_MAX` also fails before append; integer wrap is never accepted.
+
+`CompactTokenSequence` implements `collections.abc.Sequence`. `__getitem__` and
+`__iter__` materialize immutable `PreprocessedToken`/`SourceLocation` views only
+on demand. Its packed interface exposes `packed_bytes`, spelling/identity table
+lookups, indexed spelling IDs, and runs of equal identity/inclusion/line so the
+audit can consume packed storage without allocating one Python object per token.
+Preprocessor marker/directive records are consumed by the provenance parser and
+are never treated as C++ code. The raw subprocess text and per-token dataclass
+objects are not retained.
+
+The streaming builder reserves and appends packed columns in bounded blocks,
+tracks column/table bytes and sampled process RSS after each block, and raises an
+infrastructure failure before either the 384 MiB retained-token bound or the
+512 MiB coordinator-RSS bound is crossed. A partial sequence is never finalized
+or cached.
 
 The view keeps tokens from non-production dependencies because their balanced
 scopes and declarations can provide syntactic context around a production
@@ -319,10 +340,15 @@ wrong source location.
 
 The existing direct capability, synchronous-scope, callback, completion,
 non-local-control, typed sink/method, public-member, and binding grammars are
-refactored to consume this token/provenance interface. Their position API uses
-the compiler's original-line mapping rather than normalized output line numbers.
-Compiler-expanded tokens are therefore reported at the invocation/source
-location selected by the compiler.
+refactored to consume packed runs, spelling IDs, and identity lookups directly.
+`AuditBuffer` must not enumerate `PreprocessedToken` objects or copy the four
+packed columns. It constructs normalized audit bytes in bounded blocks from
+packed runs/table lookups, stores run-length offsets back to packed runs, and
+checks coordinator RSS before committing each block. Its position API
+materializes a location only for a reportable candidate and uses the compiler's
+original-line mapping rather than normalized output line numbers. Compiler-
+expanded tokens are therefore reported at the invocation/source location
+selected by the compiler.
 
 Findings are deduplicated by canonical path, original line, forbidden
 expression, and reason. The diagnostic also lists every configuration digest in
@@ -377,12 +403,22 @@ and shared across configurations. A changed, missing, aliased, or unreadable
 dependency invalidates the entry. Compiler failure and partial output are never
 cached.
 
+Cache serialization streams intern tables and packed columns in bounded blocks.
+It neither enumerates token views nor constructs a monolithic serialized copy;
+deserialization rebuilds arrays directly and applies the same packed-byte/RSS
+limits before publishing a hit.
+
 Entries publish by write-to-temporary plus atomic rename after the manifest and
 payload are complete. Cache corruption is a miss followed by rebuild; inability
 to rebuild is a gate failure. Cleanup removes incomplete entries older than one
 hour, then least-recently-used complete entries until the cache is at most
 512 MiB and 256 entries. Complete entries unused for 14 days are eligible for
 removal. Cleanup never follows links and never modifies the source tree.
+
+The performance suite streams one million high-density repeated tokens and
+proves that packed retained bytes and RSS remain below injected limits without
+retaining raw stdout or one dataclass per token. A second control injects a
+smaller packed-byte limit and proves the builder fails before crossing it.
 
 On the repository's supported Windows reference build, the acceptance limits are
 180 seconds for an empty-cache audit, 20 seconds for an unchanged warm-cache
