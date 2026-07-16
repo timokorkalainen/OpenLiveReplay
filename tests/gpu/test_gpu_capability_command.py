@@ -633,6 +633,51 @@ class ConfigurationTests(unittest.TestCase):
                         ((self.build / "main.cpp").resolve(),),
                     )
 
+    def test_msvc_exact_case_value_options_preserve_source_arity(self):
+        from gpu_capability_command import _source_inputs
+
+        options = (
+            "/D", "/U", "/I", "/FI", "/Fo", "/Fe", "/Fd", "/Fi",
+            "/Fp", "/Ft", "/Yu", "/Yc", "/sourceDependencies",
+            "/scanDependencies", "/external:I", "/AI", "/FU",
+            "/ifcOutput", "/reference", "/headerUnit",
+            "/experimental:log",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in options:
+                for spelling in (option, f"-{option[1:]}"):
+                    with self.subTest(family=family, option=spelling):
+                        self.assertEqual(
+                            _source_inputs(
+                                (spelling, "operand.file", "main.cpp"),
+                                self.build,
+                                family,
+                            ),
+                            ((self.build / "main.cpp").resolve(),),
+                        )
+
+    def test_msvc_wrong_case_value_options_fail_closed_before_source_selection(self):
+        from gpu_capability_command import _source_inputs
+
+        wrong_case = (
+            "/d", "/u", "/i", "/fi", "/fO", "/fE", "/fD", "/fI",
+            "/fp", "/ft", "/yu", "/yc", "/sourcedependencies",
+            "/scandependencies", "/external:i", "/ai", "/fu",
+            "/ifcoutput", "/Reference", "/headerunit",
+            "/Experimental:log",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in wrong_case:
+                for spelling in (option, f"-{option[1:]}"):
+                    with self.subTest(family=family, option=spelling), self.assertRaisesRegex(
+                        AuditInfrastructureError, "case-sensitive.*option"
+                    ):
+                        _source_inputs(
+                            (spelling, "hidden.cpp", "main.cpp"),
+                            self.build,
+                            family,
+                        )
+
     def test_entry_source_outside_production_and_unknown_wrapper_fail(self):
         outside = self.root / "outside.cpp"
         outside.write_text("int x;\n", encoding="utf-8")
@@ -1430,6 +1475,74 @@ class CommandRewriteTests(unittest.TestCase):
                     AuditInfrastructureError, "requires a value"
                 ):
                     self.rewrite(family, ("file.cpp", option))
+
+    def test_msvc_output_controls_with_empty_attached_paths_fail_closed(self):
+        options = (
+            "/Fo:", "/Fe:", "/Fd:", "/Fi:", "/Ft:",
+            "/sourceDependencies:", "/scanDependencies:", "/ifcOutput:",
+            "/experimental:log:",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in options:
+                for spelling in (option, f"-{option[1:]}"):
+                    with self.subTest(family=family, option=spelling), self.assertRaisesRegex(
+                        AuditInfrastructureError, "requires a value"
+                    ):
+                        self.rewrite(family, ("file.cpp", spelling))
+
+    def test_msvc_output_controls_accept_nonempty_colon_attached_paths(self):
+        options = (
+            "/Fo:object.obj", "/Fe:program.exe", "/Fd:state.pdb",
+            "/Fi:preprocessed.i", "/Ft:import-headers",
+            "/sourceDependencies:old.json", "/scanDependencies:scan.json",
+            "/ifcOutput:module.ifc", "/experimental:log:audit.sarif",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in options:
+                for spelling in (option, f"-{option[1:]}"):
+                    with self.subTest(family=family, option=spelling):
+                        rewritten = self.rewrite(family, (spelling, "file.cpp"))
+                        self.assertNotIn(spelling, rewritten.arguments)
+                        self.assertEqual(rewritten.arguments.count("file.cpp"), 1)
+
+    def test_msvc_wrong_case_switches_fail_closed_during_rewrite(self):
+        wrong_case = (
+            "/d", "/fu", "/fOhidden.obj", "/fE:hidden.exe",
+            "/sourcedependencies:old.json", "/scandependencies:scan.json",
+            "/ifcoutput:module.ifc", "/showincludes", "/C", "/Nologo",
+            "/e", "/p", "/ep", "/pd", "/ph", "/fX", "/faoutput.asm",
+            "/fMmap.txt", "/frbrowse.sbr", "/out:hidden.exe", "/Link",
+            "/yCprefix.h", "/ld", "/CLR:netcore",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in wrong_case:
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, "case-sensitive.*option"
+                ):
+                    self.rewrite(family, (option, "file.cpp"))
+
+    def test_msvc_wrong_case_split_dash_switches_fail_closed(self):
+        wrong_case = (
+            "-d", "-u", "-i", "-fi", "-fu", "-showincludes", "-e", "-p",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in wrong_case:
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, "case-sensitive.*option"
+                ):
+                    self.rewrite(family, (option, "hidden.cpp", "file.cpp"))
+
+    def test_clang_cl_gnu_dash_options_are_not_case_variant_false_positives(self):
+        arguments = ("-fmodules", "file.cpp")
+        rewritten = self.rewrite(CompilerFamily.CLANG_CL, arguments)
+        self.assertEqual(rewritten.arguments[1:3], arguments)
+
+    def test_msvc_documented_help_case_exception_is_not_misclassified(self):
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in ("/HELP", "/help", "-HeLp"):
+                with self.subTest(family=family, option=option):
+                    rewritten = self.rewrite(family, (option, "file.cpp"))
+                    self.assertIn(option, rewritten.arguments)
 
     def test_msvc_and_clang_cl_strip_directives_mode_dependency_output(self):
         arguments = (

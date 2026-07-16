@@ -64,11 +64,30 @@ _GNU_VALUE_OPTIONS = frozenset({
     "--dependency-file",
 })
 _MSVC_VALUE_OPTIONS = frozenset({
-    "/d", "/u", "/i", "/fi", "/fo", "/fe", "/fd",
-    "/fp", "/ft", "/yu", "/yc", "/experimental:log",
-    "/sourcedependencies", "/external:i", "/ai", "/fu", "/ifcoutput",
-    "/reference", "/headerunit", "/scanDependencies".casefold(),
+    "/D", "/U", "/I", "/FI", "/Fo", "/Fe", "/Fd", "/Fi",
+    "/Fp", "/Ft", "/Yu", "/Yc", "/experimental:log",
+    "/sourceDependencies", "/scanDependencies", "/external:I", "/AI", "/FU",
+    "/ifcOutput", "/reference", "/headerUnit",
 })
+# cl and clang-cl switches are case-sensitive. Keep this inventory explicit: a
+# case variant of an arity-bearing option must not turn its operand into a
+# second source, and a case variant of an output option must not survive the
+# rewrite. Exact spellings are accepted with either the '/' or '-' introducer.
+_MSVC_CASE_SENSITIVE_EXACT_OPTIONS = _MSVC_VALUE_OPTIONS | frozenset({
+    "/c", "/nologo", "/E", "/P", "/EP", "/showIncludes",
+    "/PD", "/PH", "/Fx", "/doc", "/TP", "/TC", "/Tp", "/Tc",
+    "/FA", "/Fa", "/Fm", "/FR", "/Fr", "/d1PP",
+})
+_MSVC_CASE_SENSITIVE_PREFIX_OPTIONS = (
+    "/sourceDependencies", "/scanDependencies", "/ifcOutput",
+    "/experimental:log", "/external:I", "/showIncludes:",
+    "/headerUnit", "/reference", "/clang:",
+    "/Fo", "/Fe", "/Fd", "/Fi", "/Ft", "/Fp", "/FI",
+    "/FA", "/Fa", "/Fm", "/FR", "/Fr",
+    "/Yu", "/Yc", "/AI", "/FU", "/D", "/U", "/I",
+    "/OUT", "/link", "/LD", "/clr:netcore", "/Tp", "/Tc",
+    "/doc",
+)
 _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
 
@@ -921,6 +940,49 @@ def _canonical_argument_path(value: str, cwd: Path) -> Path:
     return path.resolve(strict=False)
 
 
+def _msvc_slash_spelling(value: str) -> str:
+    if value.startswith(("-", "/")):
+        return f"/{value[1:]}"
+    return value
+
+
+def _reject_msvc_case_variant(value: str) -> None:
+    slash_spelling = _msvc_slash_spelling(value)
+    _reject_msvc_exact_case_variant(value)
+    if slash_spelling in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS or any(
+        slash_spelling.startswith(prefix)
+        for prefix in _MSVC_CASE_SENSITIVE_PREFIX_OPTIONS
+    ):
+        return
+    # A dash may introduce an unrelated GNU-compatible clang-cl option such as
+    # -fmodules. Exact cl options above still enforce case, but only slash
+    # spellings are unambiguously members of the attached cl-option grammar.
+    if value.startswith("-"):
+        return
+    folded = slash_spelling.casefold()
+    if any(
+        folded == option.casefold()
+        for option in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS
+    ) or any(
+        folded.startswith(prefix.casefold())
+        for prefix in _MSVC_CASE_SENSITIVE_PREFIX_OPTIONS
+    ):
+        raise AuditInfrastructureError(
+            f"case-sensitive compiler option has unsupported spelling: {value}"
+        )
+
+
+def _reject_msvc_exact_case_variant(value: str) -> None:
+    slash_spelling = _msvc_slash_spelling(value)
+    if slash_spelling not in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS and any(
+        slash_spelling.casefold() == option.casefold()
+        for option in _MSVC_CASE_SENSITIVE_EXACT_OPTIONS
+    ):
+        raise AuditInfrastructureError(
+            f"case-sensitive compiler option has unsupported spelling: {value}"
+        )
+
+
 def _source_inputs(
     arguments: tuple[str, ...], cwd: Path, family: CompilerFamily
 ) -> tuple[Path, ...]:
@@ -937,7 +999,15 @@ def _source_inputs(
             positional_only = True
             index += 1
             continue
-        lowered = value.casefold()
+        if (
+            not positional_only
+            and family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
+            and value.startswith(("-", "/"))
+        ):
+            # Resolve exact cl spellings before clang-cl's GNU compatibility
+            # options: for example, -d must not silently acquire GNU arity and
+            # hide a source when /D is the case-sensitive cl spelling.
+            _reject_msvc_exact_case_variant(value)
         if not positional_only and value in _GNU_VALUE_OPTIONS and family in {
             CompilerFamily.GCC, CompilerFamily.CLANG, CompilerFamily.CLANG_CL
         }:
@@ -945,28 +1015,23 @@ def _source_inputs(
                 raise AuditInfrastructureError(f"compiler option requires a value: {value}")
             index += 2
             continue
-        msvc_lowered = (
-            f"/{lowered[1:]}"
-            if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
-            and lowered.startswith("-")
-            and len(lowered) > 1
-            else lowered
-        )
+        msvc_spelling = _msvc_slash_spelling(value)
         if (
             not positional_only
-            and msvc_lowered == "/sourcedependencies:directives"
+            and family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
+            and value.startswith(("-", "/"))
+        ):
+            _reject_msvc_case_variant(value)
+        if (
+            not positional_only
+            and msvc_spelling == "/sourceDependencies:directives"
             and family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
         ):
             if index + 1 >= len(arguments):
                 raise AuditInfrastructureError(f"compiler option requires a value: {value}")
             index += 2
             continue
-        slash_spelling = (
-            f"/{value[1:]}"
-            if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
-            and value.startswith(("-", "/"))
-            else value
-        )
+        slash_spelling = msvc_spelling
         if not positional_only and slash_spelling in {"/TC", "/TP"} and family in {
             CompilerFamily.MSVC, CompilerFamily.CLANG_CL
         }:
@@ -994,7 +1059,7 @@ def _source_inputs(
             sources.append(_canonical_argument_path(candidate, cwd))
             index += 1
             continue
-        if not positional_only and msvc_lowered in _MSVC_VALUE_OPTIONS and family in {
+        if not positional_only and msvc_spelling in _MSVC_VALUE_OPTIONS and family in {
             CompilerFamily.MSVC, CompilerFamily.CLANG_CL
         }:
             if index + 1 >= len(arguments):
@@ -1381,34 +1446,44 @@ def _rewrite_gnu(
 
 
 _MSVC_REWRITE_REMOVE_FLAGS = frozenset({
-    "/c", "/nologo", "/e", "/p", "/ep", "/showincludes",
-    "/pd", "/ph", "/fx", "/doc",
+    "/c", "/nologo", "/E", "/P", "/EP", "/showIncludes",
+    "/PD", "/PH", "/Fx", "/doc",
 })
 _MSVC_REWRITE_REMOVE_VALUES = frozenset({
-    "/fo", "/fe", "/fd", "/fi",
-    "/ft", "/experimental:log",
-    "/sourcedependencies", "/scandependencies", "/ifcoutput",
+    "/Fo", "/Fe", "/Fd", "/Fi",
+    "/Ft", "/experimental:log",
+    "/sourceDependencies", "/scanDependencies", "/ifcOutput",
 })
 _MSVC_REWRITE_ATTACHED_VALUES = (
-    "/sourcedependencies", "/scandependencies", "/ifcoutput",
+    "/sourceDependencies", "/scanDependencies", "/ifcOutput",
     "/experimental:log", "/doc",
-    "/fo", "/fe", "/fd", "/fi", "/ft",
+    "/Fo", "/Fe", "/Fd", "/Fi", "/Ft",
 )
 _MSVC_REWRITE_OPTIONAL_OUTPUT_PREFIXES = ("/FA", "/Fa", "/Fm", "/FR", "/Fr")
 _MSVC_REWRITE_REJECT_PREFIXES = (
-    "/out", "/link", "/yc", "/ld", "/clr:netcore",
+    "/OUT", "/link", "/Yc", "/LD", "/clr:netcore",
 )
 _MSVC_REWRITE_PRESERVE_VALUES = frozenset({
-    "/d", "/u", "/i", "/fp", "/yu", "/external:i", "/ai", "/fu",
-    "/reference", "/headerunit",
+    "/D", "/U", "/I", "/Fp", "/Yu", "/external:I", "/AI", "/FU",
+    "/reference", "/headerUnit",
 })
 
 
 def _msvc_option(value: str) -> str:
-    lowered = value.casefold()
-    if lowered.startswith("-"):
-        return f"/{lowered[1:]}"
-    return lowered
+    return _msvc_slash_spelling(value)
+
+
+def _msvc_attached_required_output(option: str) -> bool:
+    for prefix in _MSVC_REWRITE_ATTACHED_VALUES:
+        if not option.startswith(prefix) or len(option) == len(prefix):
+            continue
+        payload = option[len(prefix):]
+        if payload == ":":
+            raise AuditInfrastructureError(
+                f"compiler option requires a value: {option}"
+            )
+        return True
+    return False
 
 
 def _rewrite_msvc(
@@ -1428,10 +1503,9 @@ def _rewrite_msvc(
     while index < len(arguments):
         value = arguments[index]
         option = _msvc_option(value)
-        # MSVC distinguishes the forced-include /FI spelling from the
-        # preprocessed-output /Fi spelling even though most switches are
-        # case-insensitive.
-        slash_spelling = f"/{value[1:]}" if value.startswith("-") else value
+        if value.startswith(("-", "/")):
+            _reject_msvc_case_variant(value)
+        slash_spelling = option
         if slash_spelling == "/FI":
             if index + 1 >= len(arguments):
                 raise AuditInfrastructureError(f"compiler option requires a value: {value}")
@@ -1469,7 +1543,7 @@ def _rewrite_msvc(
             rewritten.extend(arguments[index:end])
             index = end
             continue
-        if option == "/sourcedependencies:directives":
+        if option == "/sourceDependencies:directives":
             if index + 1 >= len(arguments):
                 raise AuditInfrastructureError(f"compiler option requires a value: {value}")
             index += 2
@@ -1478,7 +1552,7 @@ def _rewrite_msvc(
             rewritten.append(value)
             index += 1
             continue
-        if option in _MSVC_REWRITE_REMOVE_FLAGS or option.startswith("/showincludes:"):
+        if option in _MSVC_REWRITE_REMOVE_FLAGS or option.startswith("/showIncludes:"):
             index += 1
             continue
         if option in _MSVC_REWRITE_REMOVE_VALUES:
@@ -1486,10 +1560,7 @@ def _rewrite_msvc(
                 raise AuditInfrastructureError(f"compiler option requires a value: {value}")
             index += 2
             continue
-        if any(
-            option.startswith(prefix) and len(option) > len(prefix)
-            for prefix in _MSVC_REWRITE_ATTACHED_VALUES
-        ):
+        if _msvc_attached_required_output(option):
             index += 1
             continue
         if option in _MSVC_REWRITE_PRESERVE_VALUES:
