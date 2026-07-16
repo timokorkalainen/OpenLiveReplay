@@ -628,38 +628,21 @@ class ConfigurationTests(unittest.TestCase):
                 environment=dict(self.environment, CCACHE_CONFIGPATH=str(bad)),
             )
 
-    def test_msvc_cl_environment_arguments_are_merged_before_response_validation(self):
+    def test_msvc_cl_environment_arguments_fail_closed_before_double_application(self):
         compiler = self.compiler.with_name("cl.exe")
         compiler.write_bytes(self.compiler.read_bytes())
         response = self.build / "environment.rsp"
         response.write_text("/DTAIL=1", encoding="utf-8")
         entry = self.entry(arguments=[str(compiler), "../playback/gpu/file.cpp"])
-        environment = dict(
-            self.environment,
-            CL="/DHEAD=1",
-            _CL_=f"@{response}",
-        )
-        with mock.patch(
-            "gpu_capability_command._probe_compiler_version",
-            return_value=b"Microsoft (R) C/C++ Optimizing Compiler Version 19.44\n",
-        ):
-            configuration = make_configuration(
-                entry, self.database, 3, self.source_root, self.production,
-                environment, AuditLimits()
-            )
-        self.assertEqual(
-            configuration.arguments,
-            ("/DHEAD=1", "../playback/gpu/file.cpp", "/DTAIL=1"),
-        )
-
-        with mock.patch(
-            "gpu_capability_command._probe_compiler_version",
-            return_value=b"Microsoft (R) C/C++ Optimizing Compiler Version 19.44\n",
-        ), self.assertRaisesRegex(AuditInfrastructureError, "multiple source"):
-            make_configuration(
-                entry, self.database, 3, self.source_root, self.production,
-                dict(environment, _CL_="other.cpp"), AuditLimits()
-            )
+        for name, value in (("CL", "/DHEAD=1"), ("_CL_", f"@{response}")):
+            with self.subTest(name=name), mock.patch(
+                "gpu_capability_command._probe_compiler_version",
+                return_value=b"Microsoft (R) C/C++ Optimizing Compiler Version 19.44\n",
+            ), self.assertRaisesRegex(AuditInfrastructureError, rf"{name}.*unsupported"):
+                make_configuration(
+                    entry, self.database, 3, self.source_root, self.production,
+                    dict(self.environment, **{name: value}), AuditLimits()
+                )
 
     def test_clang_driver_and_response_dialect_overrides_fail_closed(self):
         clang = self.compiler.with_name("clang++.exe")

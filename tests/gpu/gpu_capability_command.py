@@ -984,31 +984,13 @@ def _reject_driver_dialect_overrides(arguments: tuple[str, ...]) -> None:
             raise AuditInfrastructureError(f"hidden compiler driver/response mode is unsupported: {value}")
 
 
-def _msvc_environment_arguments(
-    environment: Mapping[str, str],
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    values: dict[str, str] = {}
+def _reject_msvc_environment_arguments(environment: Mapping[str, str]) -> None:
     for name, value in environment.items():
         normalized = name.casefold()
-        if normalized in {"cl", "_cl_"}:
-            if normalized in values:
-                raise AuditInfrastructureError(f"ambiguous MSVC environment command line: {name}")
-            if len(value) > 32 * 1024 or "\0" in value:
-                raise AuditInfrastructureError(f"invalid MSVC environment command line: {name}")
-            values[normalized] = value
-
-    def decode(name: str) -> tuple[str, ...]:
-        value = values.get(name, "")
-        if not value.strip():
-            return ()
-        try:
-            return _windows_command_line_split(f"gpu-capability-environment {value}")[1:]
-        except AuditInfrastructureError as error:
+        if normalized in {"cl", "_cl_"} and value.strip():
             raise AuditInfrastructureError(
-                f"unsupported MSVC environment command quoting: {name}"
-            ) from error
-
-    return decode("cl"), decode("_cl_")
+                f"MSVC environment command line {name} is unsupported"
+            )
 
 
 def make_configuration(
@@ -1046,9 +1028,7 @@ def make_configuration(
     family = identify_compiler(compiler, version_output)
     normalized_version = _normalize_version_output(version_output)
     if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
-        prefix, suffix = _msvc_environment_arguments(environment)
-        compiler_arguments = (*prefix, *compiler_arguments, *suffix)
-        _reject_driver_dialect_overrides(compiler_arguments)
+        _reject_msvc_environment_arguments(environment)
     expanded_arguments = expand_response_files(
         compiler_arguments, family, cwd, limits
     )
