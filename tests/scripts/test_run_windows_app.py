@@ -14,6 +14,7 @@ import time
 import unittest
 from unittest import mock
 
+from tools import windows_runtime_cache
 from tests.scripts.test_run_ctest import _write_manifest_pe_fixture
 
 
@@ -80,6 +81,28 @@ class RunWindowsAppTests(unittest.TestCase):
             )
         )
         (self.build / "CMakeCache.txt").write_text(cache + "\n", encoding="utf-8")
+
+    def remove_test_runtime_cache(self, cache_root: Path) -> None:
+        if not cache_root.exists():
+            return
+        windows_runtime_cache._set_tree_acl(
+            cache_root,
+            self.launcher.runtime_guard._current_user_sid(),
+            "DELETE",
+        )
+        shutil.rmtree(cache_root)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows API bindings")
+    def test_runtime_guard_win32_api_binding_is_initialized_once(self) -> None:
+        binding = self.launcher.runtime_guard._runtime_kernel32
+        binding.cache_clear()
+
+        first = binding()
+        second = binding()
+
+        self.assertIs(first, second)
+        self.assertEqual(binding.cache_info().misses, 1)
+        self.assertEqual(binding.cache_info().hits, 1)
 
     def test_runtime_uses_active_cache_roots_not_workspace_or_ambient_path(self) -> None:
         ambient = self.workspace / "windows_build" / "dist" / "ffmpeg" / "bin"
@@ -175,7 +198,7 @@ class RunWindowsAppTests(unittest.TestCase):
             )
         finally:
             lease.close()
-        self.assertFalse(staged_qml.exists())
+        self.assertTrue(staged_qml.exists())
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_runtime_stages_windows_and_offscreen_platform_plugins(self) -> None:
@@ -216,6 +239,57 @@ class RunWindowsAppTests(unittest.TestCase):
             )
             with self.assertRaises(OSError):
                 staged_conf.write_text("Plugins=C:/late", encoding="utf-8")
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_app_runtime_immediate_warm_cache_writes_no_payload(self) -> None:
+        cache_root = Path(self.temporary.name) / "app-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        with self.launcher.runtime_guard.RuntimeAuditLease(cache_root) as cold:
+            cold_env = self.launcher.prepare_windows_app_runtime(
+                self.build, self.app, {}, audit_lease=cold
+            )
+            cold_executable = cold.launch_executable
+            self.assertGreater(cold.cache_miss_count, 0)
+            self.assertGreater(cold.payload_written_file_count, 0)
+        self.assertTrue(cold_executable.is_file())
+
+        with self.launcher.runtime_guard.RuntimeAuditLease(cache_root) as warm:
+            warm_env = self.launcher.prepare_windows_app_runtime(
+                self.build, self.app, {}, audit_lease=warm
+            )
+            self.assertEqual(warm_env, cold_env)
+            self.assertEqual(warm.launch_executable, cold_executable)
+            self.assertGreater(warm.cache_hit_count, 0)
+            self.assertEqual(
+                (
+                    warm.cache_miss_count,
+                    warm.payload_written_file_count,
+                    warm.payload_written_byte_count,
+                ),
+                (0, 0, 0),
+            )
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_app_source_change_forces_only_app_layout_miss(self) -> None:
+        cache_root = Path(self.temporary.name) / "app-change-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        with self.launcher.runtime_guard.RuntimeAuditLease(cache_root) as cold:
+            self.launcher.prepare_windows_app_runtime(
+                self.build, self.app, {}, audit_lease=cold
+            )
+            cold_executable = cold.launch_executable
+
+        changed = bytearray(self.app.read_bytes())
+        changed[-1] ^= 1
+        self.app.write_bytes(changed)
+
+        with self.launcher.runtime_guard.RuntimeAuditLease(cache_root) as changed_lease:
+            self.launcher.prepare_windows_app_runtime(
+                self.build, self.app, {}, audit_lease=changed_lease
+            )
+            self.assertNotEqual(changed_lease.launch_executable, cold_executable)
+            self.assertEqual(changed_lease.cache_miss_count, 1)
+            self.assertGreater(changed_lease.cache_hit_count, 0)
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_external_app_lease_closes_app_and_runtime_namespaces(self) -> None:

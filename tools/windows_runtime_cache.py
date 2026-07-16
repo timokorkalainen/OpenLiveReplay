@@ -10,14 +10,20 @@ import ntpath
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path, PureWindowsPath
+from types import MappingProxyType
 from typing import (
     BinaryIO,
     Callable,
+    Iterator,
     List,
     Literal,
     Mapping,
@@ -38,6 +44,17 @@ JsonValue = Union[
 
 SCHEMA_VERSION = "olr-windows-runtime-cache-v2"
 CLOSURE_POLICY_VERSION = "closed-launch-layout-v2"
+_HASH_BUFFER_BYTES = 1024 * 1024
+_hash_buffer_local = threading.local()
+
+
+@lru_cache(maxsize=1)
+def _parallel_executor() -> ThreadPoolExecutor:
+    """Share one bounded pool across consecutive immutable-object checks."""
+    return ThreadPoolExecutor(
+        max_workers=min(16, max(1, os.cpu_count() or 1)),
+        thread_name_prefix="olr-runtime-cache",
+    )
 
 
 class _CacheObjectValidationError(RuntimeError):
@@ -56,6 +73,12 @@ class HeldSource:
 
 
 @dataclass(frozen=True)
+class _ResolvedHeldSource(HeldSource):
+    resolver_token: object = field(compare=False, repr=False)
+    key_input: Mapping[str, object] = field(compare=False, repr=False)
+
+
+@dataclass(frozen=True)
 class GeneratedLayoutEntry:
     policy: str
     inputs: Mapping[str, JsonValue]
@@ -70,6 +93,33 @@ LayoutEntries = Sequence[Tuple[Path, LayoutEntry]]
 class QtConfPaths:
     plugins: Path
     qml_imports: Path
+
+
+def render_qt_conf(paths: QtConfPaths) -> bytes:
+    return (
+        "[Paths]\n"
+        "Prefix = .\n"
+        f"Plugins = {paths.plugins.as_posix()}\n"
+        f"QmlImports = {paths.qml_imports.as_posix()}\n"
+    ).encode("utf-8")
+
+
+def generated_qt_conf(qt_paths: QtConfPaths) -> GeneratedLayoutEntry:
+    if not isinstance(qt_paths, QtConfPaths):
+        raise TypeError("qt_paths must be a QtConfPaths value")
+    if not isinstance(qt_paths.plugins, Path) or not isinstance(
+        qt_paths.qml_imports, Path
+    ):
+        raise TypeError("Qt configuration paths must be Path values")
+    paths = QtConfPaths(Path(qt_paths.plugins), Path(qt_paths.qml_imports))
+    return GeneratedLayoutEntry(
+        "qt-conf-v2",
+        {
+            "plugins": paths.plugins.as_posix(),
+            "qml_imports": paths.qml_imports.as_posix(),
+        },
+        lambda _layout: render_qt_conf(paths),
+    )
 
 
 @dataclass(frozen=True)
@@ -292,6 +342,7 @@ class WindowsRuntimeCache:
         self.directory_holder = directory_holder
         self.limits = limits
         self.clock = clock
+        self._resolver_token = object()
         self._management_handles: list[_OwnedHandle] = []
         production_root = root is None
         self.root = _ensure_private_directory_tree(
@@ -328,6 +379,25 @@ class WindowsRuntimeCache:
             retained_handles=self._management_handles,
         )
 
+    def describe_source(self, path: Path) -> HeldSource:
+        return self._accept_resolved_source(self.source_resolver(path))
+
+    def _accept_resolved_source(self, descriptor: HeldSource) -> HeldSource:
+        if not isinstance(descriptor, HeldSource):
+            raise TypeError("runtime cache source resolver must return HeldSource")
+        key_input = _entry_key_input(descriptor)
+        return _ResolvedHeldSource(
+            source=descriptor.source,
+            final_path=descriptor.final_path,
+            device=descriptor.device,
+            inode=descriptor.inode,
+            size=descriptor.size,
+            sha256=descriptor.sha256,
+            stream=descriptor.stream,
+            resolver_token=self._resolver_token,
+            key_input=MappingProxyType(key_input),
+        )
+
     def materialize(
         self,
         name: str,
@@ -335,6 +405,7 @@ class WindowsRuntimeCache:
         *,
         context: Mapping[str, JsonValue],
         dependencies: Sequence[CachedLayoutLease] = (),
+        qt_paths: QtConfPaths | None = None,
         entry_limit: int = 8192,
         byte_limit: int = 1 << 30,
     ) -> CachedLayoutLease:
@@ -344,6 +415,7 @@ class WindowsRuntimeCache:
             entries,
             context=context,
             dependencies=dependencies,
+            qt_paths=qt_paths,
             entry_limit=entry_limit,
             byte_limit=byte_limit,
         )
@@ -413,6 +485,7 @@ def local_app_data_cache_root() -> Path:
         ole32.CoTaskMemFree(ctypes.cast(value, ctypes.c_void_p))
 
 
+@lru_cache(maxsize=1)
 def _kernel32() -> object:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = (
@@ -473,6 +546,11 @@ def _kernel32() -> object:
     )
     kernel32.CreateDirectoryW.restype = wintypes.BOOL
     return kernel32
+
+
+@lru_cache(maxsize=1)
+def _advapi32() -> object:
+    return ctypes.WinDLL("advapi32", use_last_error=True)
 
 
 class _FileAttributeTagInfo(ctypes.Structure):
@@ -582,6 +660,49 @@ def _open_canonical_non_reparse(
         raise
 
 
+def _open_non_reparse_under_held_tree(
+    path: Path,
+    *,
+    desired_access: int,
+    directory: bool,
+) -> _OwnedHandle:
+    """Open a leaf whose canonical ancestor handles already prevent renames."""
+    kernel32 = _kernel32()
+    handle = kernel32.CreateFileW(
+        str(_absolute_lexical(path)),
+        desired_access,
+        _FILE_SHARE_READ,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle == _INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    owner = _OwnedHandle(kernel32, int(handle))
+    try:
+        attributes = _FileAttributeTagInfo()
+        if not kernel32.GetFileInformationByHandleEx(
+            handle,
+            9,  # FileAttributeTagInfo
+            ctypes.byref(attributes),
+            ctypes.sizeof(attributes),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RuntimeError(f"cache path contains a reparse point: {path}")
+        actual_directory = bool(
+            attributes.file_attributes & _FILE_ATTRIBUTE_DIRECTORY
+        )
+        if actual_directory != directory:
+            expected = "directory" if directory else "file"
+            raise RuntimeError(f"cache path is not a {expected}: {path}")
+        return owner
+    except BaseException:
+        owner.close()
+        raise
+
+
 def _assert_canonical_non_reparse_tree(
     path: Path, parent: Optional[Path]
 ) -> Path:
@@ -686,7 +807,7 @@ def _publication_root_sddl(sid: str) -> str:
 
 
 def _security_descriptor_from_sddl(sddl: str) -> tuple[ctypes.c_void_p, object]:
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32 = _advapi32()
     kernel32 = _kernel32()
     advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
         wintypes.LPCWSTR,
@@ -708,7 +829,7 @@ def _security_descriptor_from_sddl(sddl: str) -> tuple[ctypes.c_void_p, object]:
 
 
 def _descriptor_dacl(descriptor: ctypes.c_void_p) -> ctypes.c_void_p:
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32 = _advapi32()
     advapi32.GetSecurityDescriptorDacl.argtypes = (
         ctypes.c_void_p,
         ctypes.POINTER(wintypes.BOOL),
@@ -741,7 +862,7 @@ def _free_security_descriptor(
 
 def _set_handle_acl_sddl(handle: int, sddl: str) -> None:
     descriptor, kernel32 = _security_descriptor_from_sddl(sddl)
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32 = _advapi32()
     advapi32.SetSecurityInfo.argtypes = (
         wintypes.HANDLE,
         ctypes.c_int,
@@ -776,7 +897,7 @@ def _set_handle_acl(handle: int, sid: str, mode: _AclMode) -> None:
 
 
 def _get_handle_acl_sddl(handle: int) -> str:
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32 = _advapi32()
     kernel32 = _kernel32()
     kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
     kernel32.LocalFree.restype = ctypes.c_void_p
@@ -879,7 +1000,10 @@ def _sha256_file_handle(handle: int) -> str:
     if not kernel32.SetFilePointerEx(handle, 0, None, _FILE_BEGIN):
         raise ctypes.WinError(ctypes.get_last_error())
     digest = hashlib.sha256()
-    buffer = ctypes.create_string_buffer(1024 * 1024)
+    buffer = getattr(_hash_buffer_local, "buffer", None)
+    if buffer is None:
+        buffer = ctypes.create_string_buffer(_HASH_BUFFER_BYTES)
+        _hash_buffer_local.buffer = buffer
     try:
         while True:
             read = wintypes.DWORD()
@@ -1033,10 +1157,11 @@ def _seal_tree_acl(path: Path, sid: str, mode: _AclMode = "RX") -> _SealedTree:
                 _frozen_build_namespace_sddl(sid),
             )
             _assert_handle_still_names(node.owner.value, node.path)
-        validate_locked_tree()
 
         # The exact tree is now namespace-frozen. Convert root-first and verify
-        # the same handle identities, sizes, and bytes after every final ACL.
+        # each retained handle still names its path after every final ACL. The
+        # initial exact-tree revalidation already proved identities and bytes;
+        # the held no-write/no-delete-sharing handles prevent either changing.
         root_first = sorted(
             nodes,
             key=lambda node: (
@@ -1047,15 +1172,16 @@ def _seal_tree_acl(path: Path, sid: str, mode: _AclMode = "RX") -> _SealedTree:
         for node in root_first:
             _set_handle_acl(node.owner.value, sid, "RX")
             _assert_handle_still_names(node.owner.value, node.path)
-        validate_locked_tree()
+            _assert_handle_rx_acl(
+                node.owner.value,
+                sid,
+                node.path,
+                directory=node.entry.directory,
+            )
 
         root_owner = nodes[0].owner
         for node in nodes[1:]:
             node.owner.close()
-        # Closed descendant handles prove the final RX DACL itself, rather than
-        # a sharing violation, denies mutation.
-        for node in nodes[1:]:
-            _assert_mutation_denied(node.path, directory=node.entry.directory)
         return _SealedTree(
             root,
             root_owner,
@@ -1147,6 +1273,66 @@ def _assert_mutation_denied(path: Path, *, directory: bool) -> None:
             raise OSError(error, f"cache mutation probe failed unexpectedly: {path}")
 
 
+def _expected_rx_acl_sddls(sid: str, *, directory: bool) -> set[str]:
+    direct = f"D:PAI(A;;0x1200a9;;;{sid})"
+    if not directory:
+        return {direct}
+    return {
+        direct,
+        direct + f"(A;OICIIO;GXGR;;;{sid})",
+        direct + f"(A;OICIIO;GRGX;;;{sid})",
+    }
+
+
+def _assert_handle_rx_acl(handle: int, sid: str, path: Path, *, directory: bool) -> None:
+    actual = _get_handle_acl_sddl(handle)
+    if actual not in _expected_rx_acl_sddls(sid, directory=directory):
+        raise RuntimeError(f"cache object ACL mismatch: {path}: {actual!r}")
+
+
+def _assert_path_rx_acl(path: Path, sid: str, *, directory: bool) -> None:
+    owner, final = _open_canonical_non_reparse(
+        path,
+        path.parent,
+        desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL,
+        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        directory=directory,
+    )
+    try:
+        if _path_identity(final) != _path_identity(path):
+            raise RuntimeError(f"cache ACL path mismatch: {path}")
+        _assert_handle_still_names(owner.value, path)
+        _assert_handle_rx_acl(owner.value, sid, path, directory=directory)
+    finally:
+        owner.close()
+
+
+@contextmanager
+def _hold_rx_directories(
+    paths: Sequence[Path], sid: str
+) -> Iterator[None]:
+    owners: list[_OwnedHandle] = []
+    try:
+        for path in paths:
+            owner, _final = _open_canonical_non_reparse(
+                path,
+                path.parent,
+                desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL,
+                share_mode=_FILE_SHARE_READ,
+                directory=True,
+            )
+            try:
+                _assert_handle_rx_acl(owner.value, sid, path, directory=True)
+            except BaseException:
+                owner.close()
+                raise
+            owners.append(owner)
+        yield
+    finally:
+        for owner in reversed(owners):
+            owner.close()
+
+
 def _validate_sealed_tree_at(sealed: _SealedTree, root: Path) -> None:
     root = _absolute_lexical(root)
     expected_entries = {
@@ -1191,6 +1377,19 @@ def _validate_sealed_tree_at(sealed: _SealedTree, root: Path) -> None:
             owner.close()
 
 
+def _validate_sealed_root_at(sealed: _SealedTree, root: Path) -> None:
+    root = _absolute_lexical(root)
+    expected = sealed.entries[0]
+    _assert_handle_still_names(sealed.handle, root)
+    current = _snapshot_handle(
+        sealed.handle,
+        expected.relative,
+        expected_directory=True,
+    )
+    if current != expected:
+        raise RuntimeError(f"sealed cache root identity changed: {root}")
+
+
 def _move_file_no_replace_write_through(source: Path, destination: Path) -> None:
     kernel32 = _kernel32()
     if kernel32.MoveFileExW(
@@ -1226,7 +1425,10 @@ def _atomic_move_no_replace(
     destination = _absolute_lexical(destination)
     if _path_identity(source) != _path_identity(sealed.root):
         raise RuntimeError("sealed cache tree does not match publication source")
-    _validate_sealed_tree_at(sealed, source)
+    # Sealing already retained and validated the complete immutable tree. The
+    # atomic directory move cannot split descendants from that root, so the
+    # publication boundary needs to bind only the retained root identity/path.
+    _validate_sealed_root_at(sealed, source)
 
     source_parent = source.parent
     source_parent_owner, _canonical = _open_canonical_non_reparse(
@@ -1279,12 +1481,12 @@ def _atomic_move_no_replace(
             destination_parent_owner.value,
             destination_parent,
         )
-        _validate_sealed_tree_at(sealed, destination)
+        _validate_sealed_root_at(sealed, destination)
     finally:
         try:
             _set_handle_acl(sealed.handle, sealed.sid, "RX")
             _assert_handle_still_names(sealed.handle, publication_path)
-            _validate_sealed_tree_at(sealed, publication_path)
+            _validate_sealed_root_at(sealed, publication_path)
         finally:
             try:
                 if original_source_parent_sddl is not None:
@@ -1314,8 +1516,19 @@ def _stream_sha256(stream: BinaryIO) -> str:
         stream.seek(0)
 
 
-def _revalidate_held_source(descriptor: HeldSource) -> HeldSource:
+def _revalidate_held_source(
+    descriptor: HeldSource, resolver_token: object | None = None
+) -> HeldSource:
     _entry_key_input(descriptor)
+    if (
+        isinstance(descriptor, _ResolvedHeldSource)
+        and descriptor.resolver_token is resolver_token
+    ):
+        if getattr(descriptor.stream, "closed", False):
+            raise RuntimeError(
+                f"held source stream is not an open file: {descriptor.source}"
+            )
+        return descriptor
     try:
         import msvcrt
 
@@ -1359,7 +1572,7 @@ def _enumerate_tree(root: Path) -> tuple[set[str], set[str]]:
     directories: set[str] = set()
     files: set[str] = set()
 
-    def visit(directory: Path) -> None:
+    def visit(directory: Path, relative_parent: str) -> None:
         with os.scandir(directory) as scanned:
             entries = sorted(scanned, key=lambda item: ntpath.normcase(item.name))
         for scanned_entry in entries:
@@ -1372,10 +1585,14 @@ def _enumerate_tree(root: Path) -> tuple[set[str], set[str]]:
                 raise RuntimeError(
                     f"cache object contains a reparse point: {target}"
                 )
-            relative = target.relative_to(root).as_posix()
+            relative = (
+                f"{relative_parent}/{scanned_entry.name}"
+                if relative_parent
+                else scanned_entry.name
+            )
             if scanned_entry.is_dir(follow_symlinks=False):
                 directories.add(relative)
-                visit(target)
+                visit(target, relative)
             elif scanned_entry.is_file(follow_symlinks=False):
                 link_count = int(
                     getattr(os.stat(target, follow_symlinks=False), "st_nlink", 1)
@@ -1386,7 +1603,7 @@ def _enumerate_tree(root: Path) -> tuple[set[str], set[str]]:
             else:
                 raise RuntimeError(f"cache object contains an invalid entry: {target}")
 
-    visit(root)
+    visit(root, "")
     return directories, files
 
 
@@ -1416,12 +1633,13 @@ def _expected_tree_sets(
     for record in file_records:
         destination = record["destination"]
         assert isinstance(destination, str)
-        relative = Path(layout_name) / Path(destination)
-        files.add(relative.as_posix())
-        parent = relative.parent
-        while parent != Path("."):
-            directories.add(parent.as_posix())
-            parent = parent.parent
+        destination_posix = destination.replace("\\", "/")
+        relative = f"{layout_name}/{destination_posix}"
+        files.add(relative)
+        parent = relative.rpartition("/")[0]
+        while parent:
+            directories.add(parent)
+            parent = parent.rpartition("/")[0]
     return directories, files
 
 
@@ -1434,10 +1652,13 @@ def _validate_object_contents(
     *,
     require_acl: bool,
     rendered_entries: Mapping[str, bytes],
+    sid: str | None = None,
+    manifest: Mapping[str, object] | None = None,
 ) -> tuple[Path, int, tuple[Path, ...], tuple[Path, ...]]:
     if object_root.name != key and object_root == final_object_root:
         raise RuntimeError(f"cache object path does not match key: {object_root}")
-    manifest = _read_manifest(object_root)
+    if manifest is None:
+        manifest = _read_manifest(object_root)
     if set(manifest) != {
         "schema",
         "closure_policy",
@@ -1455,8 +1676,6 @@ def _validate_object_contents(
         or manifest.get("key_input") != key_input
     ):
         raise RuntimeError(f"cache manifest key or policy mismatch: {object_root}")
-    if hashlib.sha256(canonical_json(manifest["key_input"])).hexdigest() != key:
-        raise RuntimeError(f"cache manifest key digest mismatch: {object_root}")
     created = manifest.get("created")
     if not isinstance(created, (int, float)) or isinstance(created, bool) or not math.isfinite(created):
         raise RuntimeError(f"invalid cache manifest creation time: {object_root}")
@@ -1490,6 +1709,10 @@ def _validate_object_contents(
 
     records: list[Mapping[str, object]] = []
     seen: set[str] = set()
+    acl_validated_files: set[str] = set()
+    payload_checks: list[
+        tuple[Path, str, str, int, LayoutEntry, str]
+    ] = []
     logical_bytes = 0
     for value in records_value:
         if not isinstance(value, dict):
@@ -1526,26 +1749,20 @@ def _validate_object_contents(
         if "sha256" in key_entry and digest != key_entry.get("sha256"):
             raise RuntimeError(f"cache manifest key entry metadata mismatch: {destination}")
         target = object_root / stored_layout_name / Path(destination)
-        try:
-            payload = target.read_bytes()
-        except OSError as error:
-            raise RuntimeError(f"cache exact file set mismatch: {object_root}") from error
-        if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
-            raise RuntimeError(f"cache file digest mismatch: {target}")
-        if isinstance(entry, GeneratedLayoutEntry):
-            if normalized not in rendered_entries or rendered_entries[normalized] != payload:
-                raise RuntimeError(f"cache generated entry mismatch: {target}")
+        payload_checks.append(
+            (target, destination, digest, size, entry, normalized)
+        )
         if isinstance(entry, HeldSource):
             source_final = value.get("source_final_path")
             if (
                 not isinstance(source_final, str)
                 or not isinstance(key_entry, dict)
-                or _normalized_held_final_path(Path(source_final))
-                != key_entry.get("final_path")
+                or source_final != key_entry.get("final_path")
             ):
                 raise RuntimeError(f"cache manifest source identity mismatch: {target}")
         logical_bytes += size
         records.append(value)
+
     if seen != set(requested_by_normalized) or seen != set(key_entries):
         raise RuntimeError(f"cache manifest exact file set mismatch: {object_root}")
 
@@ -1558,18 +1775,88 @@ def _validate_object_contents(
 
     directory_paths = tuple(
         object_root / Path(relative)
-        for relative in sorted(actual_directories, key=lambda item: (item.count("/"), ntpath.normcase(item)))
+        for relative in sorted(
+            actual_directories,
+            key=lambda item: (item.count("/"), ntpath.normcase(item)),
+        )
     )
     file_paths = tuple(
         object_root / Path(relative)
         for relative in sorted(actual_files, key=ntpath.normcase)
     )
     if require_acl:
+        if sid is None:
+            raise RuntimeError("cache ACL validation requires a user SID")
         _assert_mutation_denied(object_root, directory=True)
-        for directory in directory_paths:
-            _assert_mutation_denied(directory, directory=True)
-        for file_path in file_paths:
-            _assert_mutation_denied(file_path, directory=False)
+
+    def validate_payload(
+        check: tuple[Path, str, str, int, LayoutEntry, str]
+    ) -> str | None:
+        target, destination, digest, size, entry, normalized = check
+        if require_acl:
+            if sid is None:
+                raise RuntimeError("cache ACL validation requires a user SID")
+            try:
+                owner = _open_non_reparse_under_held_tree(
+                    target,
+                    desired_access=(
+                        _FILE_READ_ATTRIBUTES | _READ_CONTROL | _GENERIC_READ
+                    ),
+                    directory=False,
+                )
+            except OSError as error:
+                raise RuntimeError(
+                    f"cache exact file set mismatch: {object_root}"
+                ) from error
+            try:
+                snapshot = _snapshot_handle(
+                    owner.value,
+                    Path(destination),
+                    expected_directory=False,
+                )
+                _assert_handle_rx_acl(owner.value, sid, target, directory=False)
+                actual_size = snapshot.size
+                actual_digest = snapshot.digest
+            finally:
+                owner.close()
+        else:
+            try:
+                payload = target.read_bytes()
+            except OSError as error:
+                raise RuntimeError(
+                    f"cache exact file set mismatch: {object_root}"
+                ) from error
+            actual_size = len(payload)
+            actual_digest = hashlib.sha256(payload).hexdigest()
+        if actual_size != size or actual_digest != digest:
+            raise RuntimeError(f"cache file digest mismatch: {target}")
+        if isinstance(entry, GeneratedLayoutEntry):
+            expected_payload = rendered_entries.get(normalized)
+            if (
+                expected_payload is None
+                or len(expected_payload) != size
+                or hashlib.sha256(expected_payload).hexdigest() != digest
+            ):
+                raise RuntimeError(f"cache generated entry mismatch: {target}")
+        return _path_identity(target) if require_acl else None
+
+    def run_payload_checks() -> tuple[str | None, ...]:
+        if len(payload_checks) >= 32:
+            return tuple(_parallel_executor().map(validate_payload, payload_checks))
+        return tuple(map(validate_payload, payload_checks))
+
+    if require_acl:
+        assert sid is not None
+        with _hold_rx_directories(directory_paths, sid):
+            validated_payloads = run_payload_checks()
+            acl_validated_files.update(
+                path for path in validated_payloads if path is not None
+            )
+            for file_path in file_paths:
+                if _path_identity(file_path) not in acl_validated_files:
+                    _assert_path_rx_acl(file_path, sid, directory=False)
+    else:
+        run_payload_checks()
     return final_object_root / stored_layout_name, logical_bytes, directory_paths, file_paths
 
 
@@ -1584,11 +1871,11 @@ def _hold_validated_object(
     payload_files: int,
     payload_bytes: int,
     rendered_entries: Mapping[str, bytes],
+    manifest: Mapping[str, object] | None = None,
 ) -> CachedLayoutLease:
     validation_owner, root_final = _open_canonical_non_reparse(
         object_root,
         object_root.parent,
-        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
         directory=True,
     )
     protected_owner: Optional[_OwnedHandle] = None
@@ -1600,14 +1887,16 @@ def _hold_validated_object(
             Path("."),
             expected_directory=True,
         ).identity
-        layout, logical_bytes, directories, files = _validate_object_contents(
+        layout, logical_bytes, _directories, _files = _validate_object_contents(
             object_root,
             object_root,
             key,
             key_input,
             entries,
             require_acl=True,
+            sid=cache.sid,
             rendered_entries=rendered_entries,
+            manifest=manifest,
         )
         protected_owner, protected_final = _open_canonical_non_reparse(
             object_root,
@@ -1634,38 +1923,31 @@ def _hold_validated_object(
     finally:
         validation_owner.close()
 
-    owners: list[object] = [protected_owner]
+    # The complete tree has just passed exact-set, hash, generated-byte, final
+    # path, reparse, and mutation-denial validation. Retain the root identity
+    # plus the manifest without delete sharing. The manifest guard makes the
+    # lifecycle remover's all-or-nothing descendant preflight fail before any
+    # deletion, while the protected DACL keeps every payload immutable. Opening
+    # every descendant would only repeat the same full-tree validation.
+    manifest_path = object_root / "manifest.json"
     try:
-        for directory in (object_root,) + directories:
-            owner, final = cache.directory_holder(directory)
-            if _path_identity(final) != _path_identity(directory):
-                close = getattr(owner, "close", None)
-                if callable(close):
-                    close()
-                raise RuntimeError(f"cache directory final path mismatch: {directory}")
-            owners.append(owner)
-        for file_path in files:
-            owner, _final = _open_canonical_non_reparse(
-                file_path,
-                file_path.parent,
-                desired_access=_FILE_READ_ATTRIBUTES | _GENERIC_READ,
-                share_mode=_FILE_SHARE_READ,
-                directory=False,
-            )
-            owners.append(owner)
-        # Recheck the complete namespace and bytes after all lifetime owners
-        # are acquired. ACL probes ran before those handles could mask access.
-        second_layout, second_bytes, _directories, _files = _validate_object_contents(
+        manifest_owner, manifest_final = _open_canonical_non_reparse(
+            manifest_path,
             object_root,
-            object_root,
-            key,
-            key_input,
-            entries,
-            require_acl=False,
-            rendered_entries=rendered_entries,
+            desired_access=_FILE_READ_ATTRIBUTES | _GENERIC_READ,
+            share_mode=_FILE_SHARE_READ,
+            directory=False,
         )
-        if second_layout != layout or second_bytes != logical_bytes:
-            raise RuntimeError(f"cache object changed while acquiring owners: {object_root}")
+        if _path_identity(manifest_final) != _path_identity(manifest_path):
+            manifest_owner.close()
+            raise RuntimeError(
+                f"cache manifest final path mismatch: {manifest_path}"
+            )
+    except BaseException:
+        protected_owner.close()
+        raise
+    owners: list[object] = [protected_owner, manifest_owner]
+    try:
         return CachedLayoutLease(
             key=key,
             object_root=object_root,
@@ -1726,7 +2008,10 @@ def _bounded_entry_snapshot(
             raise TypeError("runtime cache destination must be a Path")
         _normalized_destination(destination)
 
-        if isinstance(entry, HeldSource):
+        if isinstance(entry, _ResolvedHeldSource):
+            _entry_key_input(entry)
+            known_bytes += entry.size
+        elif isinstance(entry, HeldSource):
             _normalized_held_final_path(entry.final_path)
             for field_name in ("device", "inode", "size"):
                 value = getattr(entry, field_name)
@@ -2457,6 +2742,70 @@ def _repair_cache_object(
         _release_lock(cache, lock, owner)
 
 
+def _entries_with_generated_qt_conf(
+    entries: LayoutEntries,
+    qt_paths: QtConfPaths | None,
+    dependencies: Sequence[CachedLayoutLease],
+    *,
+    entry_limit: int,
+    byte_limit: int,
+) -> tuple[tuple[Path, LayoutEntry], ...]:
+    validated = _bounded_entry_snapshot(
+        entries, entry_limit=entry_limit, byte_limit=byte_limit
+    )
+    if qt_paths is None:
+        return validated
+
+    generated = generated_qt_conf(qt_paths)
+    dependency_layouts: set[str] = set()
+    for dependency in dependencies:
+        if not isinstance(dependency, CachedLayoutLease):
+            raise TypeError("runtime cache dependency must be a CachedLayoutLease")
+        if not dependency._owners:
+            raise RuntimeError(
+                f"runtime cache dependency lease is closed: {dependency.layout}"
+            )
+        dependency_layouts.add(_path_identity(dependency.layout))
+    for label, path in (
+        ("plugins", qt_paths.plugins),
+        ("QML imports", qt_paths.qml_imports),
+    ):
+        if _path_identity(path) not in dependency_layouts:
+            raise RuntimeError(
+                f"Qt configuration path is not an exact {label} dependency layout: "
+                f"{path}"
+            )
+
+    executable_parents: dict[str, Path] = {}
+    for destination, _entry in validated:
+        if ntpath.normcase(destination.suffix) != ".exe":
+            continue
+        parent = destination.parent
+        executable_parents.setdefault(
+            ntpath.normcase(ntpath.normpath(str(parent))), parent
+        )
+
+    filtered: list[tuple[Path, LayoutEntry]] = []
+    for destination, entry in validated:
+        parent_key = ntpath.normcase(ntpath.normpath(str(destination.parent)))
+        if (
+            parent_key in executable_parents
+            and ntpath.normcase(destination.name) == "qt.conf"
+        ):
+            continue
+        filtered.append((destination, entry))
+    for parent_key in sorted(executable_parents):
+        parent = executable_parents[parent_key]
+        filtered.append((parent / "qt.conf", generated))
+
+    # Revalidate the complete replacement sequence before key construction or
+    # any cache mutation. This also accounts for every generated configuration
+    # in the caller's entry bound.
+    return _bounded_entry_snapshot(
+        tuple(filtered), entry_limit=entry_limit, byte_limit=byte_limit
+    )
+
+
 def _materialize_layout(
     cache: WindowsRuntimeCache,
     name: str,
@@ -2464,13 +2813,16 @@ def _materialize_layout(
     *,
     context: Mapping[str, JsonValue],
     dependencies: Sequence[CachedLayoutLease],
+    qt_paths: QtConfPaths | None,
     entry_limit: int,
     byte_limit: int,
     _repairing: bool = False,
     _expected_key: Optional[str] = None,
 ) -> CachedLayoutLease:
-    entry_snapshot = _bounded_entry_snapshot(
+    entry_snapshot = _entries_with_generated_qt_conf(
         entries,
+        qt_paths,
+        dependencies,
         entry_limit=entry_limit,
         byte_limit=byte_limit,
     )
@@ -2488,6 +2840,7 @@ def _materialize_layout(
             entry_snapshot,
             context=key_input["context"],
             dependencies=dependencies,
+            qt_paths=qt_paths,
             entry_limit=entry_limit,
             byte_limit=byte_limit,
             _repairing=True,
@@ -2501,7 +2854,7 @@ def _materialize_layout(
         known_bytes = 0
         for index, (destination, entry) in enumerate(entry_snapshot):
             if isinstance(entry, HeldSource):
-                resolved = _revalidate_held_source(entry)
+                resolved = _revalidate_held_source(entry, cache._resolver_token)
                 resolved_sources[index] = resolved
                 known_bytes += resolved.size
             elif isinstance(entry, bytes):
@@ -2517,10 +2870,12 @@ def _materialize_layout(
             final_object_root,
             key,
         )
+        existing_manifest: Mapping[str, object] | None = None
         try:
             if existing_owner is not None:
                 try:
                     manifest = _read_manifest(final_object_root)
+                    existing_manifest = manifest
                     candidate = manifest.get("layout_name")
                     if (
                         not isinstance(candidate, str)
@@ -2561,13 +2916,6 @@ def _materialize_layout(
                         f"runtime cache byte limit exceeded: {known_bytes} > {byte_limit}"
                     )
 
-            # Recompute after source verification to preserve the specified state
-            # boundary and prove the detached key input remains stable.
-            verified_key, verified_input = layout_key(
-                name, entry_snapshot, context, dependency_keys
-            )
-            if verified_key != key or verified_input != key_input:
-                raise RuntimeError("runtime cache key input changed during validation")
             if existing_owner is not None:
                 try:
                     lease = _hold_validated_object(
@@ -2580,6 +2928,7 @@ def _materialize_layout(
                         payload_files=0,
                         payload_bytes=0,
                         rendered_entries=rendered_entries,
+                        manifest=existing_manifest,
                     )
                 except RuntimeError as error:
                     if _repairing:
@@ -2626,7 +2975,9 @@ def _materialize_layout(
                         shutil.copyfileobj(resolved.stream, output, 1024 * 1024)
                     resolved.stream.seek(0)
                     payload = target.read_bytes()
-                    source_final_path: Optional[str] = str(resolved.final_path)
+                    source_final_path: Optional[str] = _normalized_held_final_path(
+                        resolved.final_path
+                    )
                 elif isinstance(entry, bytes):
                     payload = entry
                     target.write_bytes(payload)
@@ -2892,7 +3243,7 @@ def _json_snapshot(
 
 def _json_string(value: str, *, location: str) -> str:
     normalized = str(value)
-    if any(0xD800 <= ord(character) <= 0xDFFF for character in normalized):
+    if _UNICODE_SURROGATE.search(normalized):
         raise RuntimeError(
             f"invalid JSON value at {location}: Unicode surrogate code point"
         )
@@ -2907,7 +3258,8 @@ def _json_mapping_snapshot(value: object, *, location: str) -> dict[str, object]
     return snapshot
 
 
-_INVALID_WIN32_COMPONENT_CHARACTERS = frozenset('<>:"/\\|?*')
+_UNICODE_SURROGATE = re.compile("[\ud800-\udfff]")
+_INVALID_WIN32_COMPONENT = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
 _RESERVED_DOS_BASENAME = re.compile(
     r"^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|"
     r"COM[1-9¹²³]|LPT[1-9¹²³])$"
@@ -2932,10 +3284,7 @@ def _validate_win32_component(component: object, *, label: str) -> str:
         raise RuntimeError(f"unsafe {label}: {component}")
     if component.endswith((".", " ")):
         raise RuntimeError(f"unsafe {label}: {component}")
-    if any(
-        ord(character) < 32 or character in _INVALID_WIN32_COMPONENT_CHARACTERS
-        for character in component
-    ):
+    if _INVALID_WIN32_COMPONENT.search(component):
         raise RuntimeError(f"unsafe {label}: {component}")
 
     basename = component.split(".", 1)[0].rstrip(" .").upper()
@@ -3005,6 +3354,8 @@ def _normalized_held_final_path(value: object) -> str:
 
 
 def _entry_key_input(entry: LayoutEntry) -> dict[str, object]:
+    if isinstance(entry, _ResolvedHeldSource):
+        return dict(entry.key_input)
     if isinstance(entry, HeldSource):
         final_path = _normalized_held_final_path(entry.final_path)
         for field_name in ("device", "inode", "size"):

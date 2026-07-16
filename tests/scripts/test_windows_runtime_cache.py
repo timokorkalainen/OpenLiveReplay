@@ -24,6 +24,7 @@ from tools.windows_runtime_cache import (
     JsonScalar,
     LayoutEntry,
     LayoutEntries,
+    QtConfPaths,
     WindowsRuntimeCache,
     _assert_mutation_denied,
     _atomic_move_no_replace,
@@ -649,6 +650,21 @@ class WindowsFilesystemTests(unittest.TestCase):
             lambda path: (object(), path),
         )
 
+    def test_win32_api_bindings_are_initialized_once(self) -> None:
+        runtime_cache._kernel32.cache_clear()
+        runtime_cache._advapi32.cache_clear()
+        with mock.patch.object(
+            runtime_cache.ctypes,
+            "WinDLL",
+            wraps=runtime_cache.ctypes.WinDLL,
+        ) as load:
+            self.assertIs(runtime_cache._kernel32(), runtime_cache._kernel32())
+            self.assertIs(runtime_cache._advapi32(), runtime_cache._advapi32())
+        self.assertEqual(
+            [call.args[0] for call in load.call_args_list],
+            ["kernel32", "advapi32"],
+        )
+
     def test_close_releases_management_handles_without_removing_objects(self) -> None:
         cache = self.make_cache(self.root / "close-cache")
         published = cache.objects / "published"
@@ -774,6 +790,23 @@ class WindowsFilesystemTests(unittest.TestCase):
         _assert_mutation_denied(nested, directory=True)
         with self.assertRaises(OSError):
             (nested / "late.dll").write_bytes(b"late")
+
+    def test_rx_conversion_revalidates_held_bytes_once_before_acl_changes(self) -> None:
+        tree = self.root / "bounded-rx-validation"
+        tree.mkdir()
+        _set_tree_acl(tree, self.sid, "BUILD")
+        (tree / "payload.dll").write_bytes(b"payload")
+
+        with mock.patch.object(
+            runtime_cache,
+            "_snapshot_handle",
+            wraps=runtime_cache._snapshot_handle,
+        ) as snapshot:
+            _set_tree_acl(tree, self.sid, "RX")
+
+        # One snapshot while each node is acquired and one exact-tree
+        # revalidation after all no-write/no-delete-sharing handles are held.
+        self.assertEqual(snapshot.call_count, 4)
 
     def test_atomic_move_never_replaces_an_existing_destination(self) -> None:
         cache = self.make_cache(self.root / "atomic-no-replace")
@@ -983,14 +1016,22 @@ class WindowsFilesystemTests(unittest.TestCase):
         destination = cache.objects / ("f" * 64)
         try:
             real_move = runtime_cache._move_file_no_replace_write_through
-            with mock.patch.object(
-                runtime_cache,
-                "_move_file_no_replace_write_through",
-                wraps=real_move,
-            ) as move:
+            with (
+                mock.patch.object(
+                    runtime_cache,
+                    "_move_file_no_replace_write_through",
+                    wraps=real_move,
+                ) as move,
+                mock.patch.object(
+                    runtime_cache,
+                    "_validate_sealed_tree_at",
+                    wraps=runtime_cache._validate_sealed_tree_at,
+                ) as descendant_revalidation,
+            ):
                 _atomic_move_no_replace(source, destination, sealed=sealed)
 
             move.assert_called_once_with(source, destination)
+            descendant_revalidation.assert_not_called()
             self.assertEqual(
                 runtime_cache._final_path_from_handle(
                     runtime_cache._kernel32(), sealed.handle
@@ -1181,6 +1222,85 @@ class PublicationTests(unittest.TestCase):
         self.assert_warm_zero(second)
         self.assertEqual(second.object_root, first_root)
         self.assertEqual((second.logical_files, second.logical_bytes), (1, 4))
+
+    def test_warm_hit_validates_once_and_retains_the_immutable_root(self) -> None:
+        entries = ((Path("bin/tool.exe"), self.held_file("held.exe", b"tool")),)
+        cold = self.remember(
+            self.cache.materialize("held-root", entries, context={})
+        )
+        self.close(cold)
+
+        with mock.patch.object(
+            runtime_cache,
+            "_validate_object_contents",
+            wraps=runtime_cache._validate_object_contents,
+        ) as validate:
+            warm = self.remember(
+                self.cache.materialize("held-root", entries, context={})
+            )
+
+        self.assertTrue(warm.cache_hit)
+        self.assertEqual(validate.call_count, 1)
+        self.assertEqual(len(warm._owners), 2)
+        self.cache.cleanup(force=True)
+        self.assertTrue(warm.layout.is_dir())
+
+    def test_warm_hit_uses_one_semantic_acl_probe_per_object(self) -> None:
+        entries = tuple(
+            (Path(f"bin/tool-{index}.dll"), self.held_file(f"tool-{index}.dll", b"x"))
+            for index in range(8)
+        )
+        cold = self.remember(self.cache.materialize("acl-probe", entries, context={}))
+        self.close(cold)
+
+        with mock.patch.object(
+            runtime_cache,
+            "_assert_mutation_denied",
+            wraps=runtime_cache._assert_mutation_denied,
+        ) as mutation_probe:
+            warm = self.remember(
+                self.cache.materialize("acl-probe", entries, context={})
+            )
+
+        self.assertTrue(warm.cache_hit)
+        mutation_probe.assert_called_once_with(warm.object_root, directory=True)
+
+    def test_cache_resolved_held_source_is_not_hashed_twice(self) -> None:
+        path = self.sources / "resolved-once.dll"
+        path.write_bytes(b"resolved")
+        descriptor = self.cache.describe_source(path)
+        self.descriptors.append(descriptor)
+
+        with mock.patch.object(
+            runtime_cache,
+            "_final_path_from_handle",
+            wraps=runtime_cache._final_path_from_handle,
+        ) as final_path:
+            self.assertIs(
+                runtime_cache._revalidate_held_source(
+                    descriptor, self.cache._resolver_token
+                ),
+                descriptor,
+            )
+        final_path.assert_not_called()
+
+        with mock.patch.object(
+            runtime_cache,
+            "_stream_sha256",
+            wraps=runtime_cache._stream_sha256,
+        ) as stream_hash:
+            lease = self.remember(
+                self.cache.materialize(
+                    "resolved-once",
+                    ((Path("resolved-once.dll"), descriptor),),
+                    context={},
+                )
+            )
+
+        stream_hash.assert_not_called()
+        self.assertEqual(
+            (lease.layout / "resolved-once.dll").read_bytes(), b"resolved"
+        )
 
     def test_case_only_destination_and_layout_spelling_reuses_stored_spelling(self) -> None:
         source = self.held_file("tool.exe", b"tool")
@@ -1818,6 +1938,148 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(results[0]["layout"], results[1]["layout"])
         self.assertEqual([result["payload_files"] for result in results], [1, 1])
         self.assertTrue(all(result["payload_bytes"] > 0 for result in results))
+
+
+@unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+class QtConfTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.cache_root = self.root / "cache"
+        self.sources = self.root / "sources"
+        self.sources.mkdir()
+        self.sid = _current_user_sid()
+        self.leases: list[CachedLayoutLease] = []
+        self.descriptors: list[HeldSource] = []
+        self.cache = WindowsRuntimeCache(
+            self.cache_root,
+            self.sid,
+            _resolved_source,
+            lambda path: runtime_cache._open_canonical_non_reparse(
+                path, path.parent, directory=True
+            ),
+        )
+        self.plugin_dependency = self.remember(
+            self.cache.materialize(
+                "qt-plugins",
+                ((Path("platforms/.closed"), b"closed\n"),),
+                context={"family": "app"},
+            )
+        )
+        self.qml_dependency = self.remember(
+            self.cache.materialize(
+                "qt-qml",
+                ((Path(".closed"), b"closed\n"),),
+                context={"family": "app"},
+            )
+        )
+        self.qt_dependencies = (self.plugin_dependency, self.qml_dependency)
+        self.plugin_layout = self.plugin_dependency.layout
+        self.qml_layout = self.qml_dependency.layout
+
+    def tearDown(self) -> None:
+        for lease in reversed(self.leases):
+            lease.close()
+        for descriptor in reversed(self.descriptors):
+            descriptor.stream.close()
+        self.cache.close()
+        if self.root.exists():
+            _set_tree_acl(self.root, self.sid, "DELETE")
+            shutil.rmtree(self.root, ignore_errors=True)
+        self.temporary.cleanup()
+
+    def held_file(self, name: str, payload: bytes) -> HeldSource:
+        path = self.sources / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        descriptor = _resolved_source(path)
+        self.descriptors.append(descriptor)
+        return descriptor
+
+    def remember(self, lease: CachedLayoutLease) -> CachedLayoutLease:
+        self.leases.append(lease)
+        return lease
+
+    def test_generated_qt_conf_declares_v2_policy_and_normalized_inputs(self) -> None:
+        paths = QtConfPaths(self.plugin_layout, self.qml_layout)
+        generated = runtime_cache.generated_qt_conf(paths)
+        self.assertEqual(generated.policy, "qt-conf-v2")
+        self.assertEqual(
+            generated.inputs,
+            {
+                "plugins": self.plugin_layout.as_posix(),
+                "qml_imports": self.qml_layout.as_posix(),
+            },
+        )
+        self.assertEqual(
+            generated.render(self.root),
+            (
+                "[Paths]\n"
+                "Prefix = .\n"
+                f"Plugins = {self.plugin_layout.as_posix()}\n"
+                f"QmlImports = {self.qml_layout.as_posix()}\n"
+            ).encode("utf-8"),
+        )
+
+    def test_layout_replaces_qt_conf_beside_every_executable(self) -> None:
+        qt_paths = QtConfPaths(self.plugin_layout, self.qml_layout)
+        entries = (
+            (Path("app.exe"), self.held_file("app.exe", b"app")),
+            (Path("qt.conf"), b"Plugins=C:/mutable"),
+            (Path("tools/qmllint.exe"), self.held_file("qmllint.exe", b"qml")),
+            (Path("tools/QT.CoNf"), b"QmlImports=C:/mutable"),
+        )
+        lease = self.remember(
+            self.cache.materialize(
+                "mixed",
+                entries,
+                context={},
+                dependencies=self.qt_dependencies,
+                qt_paths=qt_paths,
+            )
+        )
+        configs = (lease.layout / "qt.conf", lease.layout / "tools/qt.conf")
+        for config in configs:
+            rendered = config.read_text(encoding="utf-8")
+            self.assertNotIn("mutable", rendered)
+            self.assertIn(self.plugin_layout.as_posix(), rendered)
+            self.assertIn(self.qml_layout.as_posix(), rendered)
+            with self.assertRaises(OSError):
+                config.write_text("late", encoding="utf-8")
+        lease.close()
+        self.leases.remove(lease)
+        for config in configs:
+            self.assertTrue(config.is_file())
+            with self.assertRaises(OSError):
+                config.write_text("late-after-close", encoding="utf-8")
+
+    def test_qt_conf_paths_must_exactly_match_dependency_layouts(self) -> None:
+        entries = ((Path("app.exe"), self.held_file("app.exe", b"app")),)
+        with self.assertRaisesRegex(RuntimeError, "Qt configuration path"):
+            self.cache.materialize(
+                "app",
+                entries,
+                context={},
+                dependencies=self.qt_dependencies,
+                qt_paths=QtConfPaths(
+                    self.plugin_layout / "platforms", self.qml_layout
+                ),
+            )
+
+    def test_qt_conf_injection_is_keyed_before_cache_mutation(self) -> None:
+        before = set(self.cache.objects.iterdir())
+        with self.assertRaisesRegex(RuntimeError, "unsafe destination"):
+            self.cache.materialize(
+                "app",
+                (
+                    (Path("app.exe"), self.held_file("app.exe", b"app")),
+                    (Path("bad./payload"), b"bad"),
+                ),
+                context={},
+                dependencies=self.qt_dependencies,
+                qt_paths=QtConfPaths(self.plugin_layout, self.qml_layout),
+            )
+        self.assertEqual(set(self.cache.objects.iterdir()), before)
 
 
 @unittest.skipUnless(os.name == "nt", "requires Windows lifecycle semantics")

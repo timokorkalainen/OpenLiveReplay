@@ -7,6 +7,7 @@ import ctypes
 from ctypes import wintypes
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
+from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
@@ -25,7 +26,33 @@ from tools.windows_runtime_cache import (
     JsonValue,
     QtConfPaths,
     WindowsRuntimeCache,
+    _parallel_executor,
 )
+
+
+@lru_cache(maxsize=1)
+def _runtime_kernel32() -> object:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.GetFinalPathNameByHandleW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    )
+    kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
+    return kernel32
 
 
 class RuntimeRoots(NamedTuple):
@@ -360,6 +387,22 @@ class RuntimeAuditLease:
             stream=stream,
         )
 
+    def _describe_held_sources(self, paths: Sequence[Path]) -> dict[Path, HeldSource]:
+        unique = tuple(dict.fromkeys(path.absolute() for path in paths))
+        for path in unique:
+            self.hold(path)
+        if len(unique) >= 32:
+            resolved = tuple(
+                _parallel_executor().map(self._describe_held_source, unique)
+            )
+        else:
+            resolved = tuple(self._describe_held_source(path) for path in unique)
+        cache = self._runtime_cache()
+        return {
+            path: cache._accept_resolved_source(descriptor)
+            for path, descriptor in zip(unique, resolved, strict=True)
+        }
+
     @staticmethod
     def _layout_path_key(path: Path) -> str:
         return os.path.normcase(os.path.abspath(path))
@@ -459,7 +502,7 @@ class RuntimeAuditLease:
                         "runtime cache byte limit exceeded: "
                         f"{total_size} > {byte_limit}"
                     )
-                descriptor = self._describe_held_source(entry)
+                descriptor = self._runtime_cache().describe_source(entry)
                 final = descriptor.final_path
                 if not _is_relative_to(final, source) or os.path.normcase(
                     str(entry)
@@ -529,25 +572,31 @@ class RuntimeAuditLease:
         pairs = tuple(entries.items()) if isinstance(entries, Mapping) else tuple(entries)
         described: list[tuple[Path, HeldSource | bytes | GeneratedLayoutEntry]] = []
         known_bytes = 0
-        for relative, source in pairs:
+        path_sources: list[Path] = []
+        for _relative, source in pairs:
             if isinstance(source, Path):
                 stream = self.hold(source)
                 known_bytes += int(os.fstat(stream.fileno()).st_size)
-                if known_bytes > byte_limit:
-                    raise RuntimeError(
-                        "runtime cache byte limit exceeded: "
-                        f"{known_bytes} > {byte_limit}"
-                    )
-                entry: HeldSource | bytes | GeneratedLayoutEntry = (
-                    self._describe_held_source(source)
-                )
+                path_sources.append(source)
             elif isinstance(source, bytes):
                 known_bytes += len(source)
-                if known_bytes > byte_limit:
-                    raise RuntimeError(
-                        "runtime cache byte limit exceeded: "
-                        f"{known_bytes} > {byte_limit}"
-                    )
+            elif not isinstance(source, GeneratedLayoutEntry) and not callable(source):
+                raise RuntimeError(
+                    "protected layout contains unsupported source: "
+                    f"{type(source).__name__}"
+                )
+            if known_bytes > byte_limit:
+                raise RuntimeError(
+                    "runtime cache byte limit exceeded: "
+                    f"{known_bytes} > {byte_limit}"
+                )
+        held_sources = self._describe_held_sources(path_sources)
+        for relative, source in pairs:
+            if isinstance(source, Path):
+                entry: HeldSource | bytes | GeneratedLayoutEntry = (
+                    held_sources[source.absolute()]
+                )
+            elif isinstance(source, bytes):
                 entry = source
             elif isinstance(source, GeneratedLayoutEntry):
                 entry = source
@@ -561,10 +610,7 @@ class RuntimeAuditLease:
                     source,
                 )
             else:
-                raise RuntimeError(
-                    "protected layout contains unsupported source: "
-                    f"{type(source).__name__}"
-                )
+                raise AssertionError("unsupported layout source escaped validation")
             described.append((Path(relative), entry))
 
         dependency_leases: list[CachedLayoutLease] = []
@@ -579,25 +625,12 @@ class RuntimeAuditLease:
                 )
             dependency_leases.append(dependency_lease)
 
-        effective_context: Mapping[str, JsonValue]
-        if qt_paths is None:
-            effective_context = {} if context is None else context
-        else:
-            if not isinstance(qt_paths, QtConfPaths):
-                raise TypeError("qt_paths must be a QtConfPaths value")
-            effective_context = {
-                "context": {} if context is None else context,
-                "qt_paths": {
-                    "plugins": qt_paths.plugins.as_posix(),
-                    "qml_imports": qt_paths.qml_imports.as_posix(),
-                },
-            }
-
         lease = self._runtime_cache().materialize(
             name,
             tuple(described),
-            context=effective_context,
+            context={} if context is None else context,
             dependencies=tuple(dependency_leases),
+            qt_paths=qt_paths,
             entry_limit=entry_limit,
             byte_limit=byte_limit,
         )
@@ -656,19 +689,7 @@ class RuntimeAuditLease:
 
         import msvcrt
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateFileW.argtypes = (
-            ctypes.c_wchar_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-        )
-        kernel32.CreateFileW.restype = ctypes.c_void_p
-        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32 = _runtime_kernel32()
         handle = kernel32.CreateFileW(
             str(path),
             0x80000000,  # GENERIC_READ
@@ -710,14 +731,7 @@ class RuntimeAuditLease:
 
     @classmethod
     def _final_path_from_handle(cls, handle: int) -> Path:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetFinalPathNameByHandleW.argtypes = (
-            ctypes.c_void_p,
-            ctypes.c_wchar_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-        )
-        kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
+        kernel32 = _runtime_kernel32()
         size = int(kernel32.GetFinalPathNameByHandleW(handle, None, 0, 0))
         if not size:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -731,19 +745,7 @@ class RuntimeAuditLease:
 
     @classmethod
     def _open_directory_locked(cls, path: Path) -> tuple[object, Path]:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateFileW.argtypes = (
-            ctypes.c_wchar_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-        )
-        kernel32.CreateFileW.restype = ctypes.c_void_p
-        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32 = _runtime_kernel32()
         handle = kernel32.CreateFileW(
             str(path),
             0x00000080,  # FILE_READ_ATTRIBUTES
@@ -1231,6 +1233,7 @@ def qt_plugin_closure(
 _QML_RUNTIME_SUFFIXES = frozenset(
     {".dll", ".qml", ".js", ".mjs", ".qmltypes"}
 )
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _QML_IMPORT = re.compile(
     r"(?m)^\s*import\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
 )
@@ -1287,13 +1290,30 @@ def qt_qml_closure(qt_qml: Path, source_roots: Iterable[Path]) -> tuple[Path, ..
         for candidate in candidates:
             pending.update(imports_from(candidate))
 
-    selected: set[Path] = set()
-    for root_file in qt_qml.iterdir():
-        if root_file.is_file() and (
-            root_file.suffix.casefold() in _QML_RUNTIME_SUFFIXES
-            or root_file.name.casefold() == "qmldir"
+    def scandir_entries(directory: Path) -> tuple[os.DirEntry[str], ...]:
+        with os.scandir(directory) as scanned:
+            return tuple(scanned)
+
+    def reject_reparse(entry: os.DirEntry[str]) -> None:
+        stat_result = entry.stat(follow_symlinks=False)
+        if (
+            getattr(stat_result, "st_file_attributes", 0)
+            & _FILE_ATTRIBUTE_REPARSE_POINT
         ):
-            selected.add(root_file.resolve())
+            raise RuntimeError(
+                f"Qt QML closure contains a reparse alias: {entry.path}"
+            )
+
+    selected: set[Path] = set()
+    for root_entry in scandir_entries(qt_qml):
+        reject_reparse(root_entry)
+        if root_entry.is_file(follow_symlinks=False):
+            root_file = Path(root_entry.path)
+            if (
+                root_file.suffix.casefold() in _QML_RUNTIME_SUFFIXES
+                or root_file.name.casefold() == "qmldir"
+            ):
+                selected.add(root_file)
 
     visited: set[str] = set()
     while pending:
@@ -1304,23 +1324,21 @@ def qt_qml_closure(qt_qml: Path, source_roots: Iterable[Path]) -> tuple[Path, ..
         module = qt_qml.joinpath(*uri.split("."))
         if not module.is_dir():
             continue
-        for child in module.rglob("*"):
-            is_junction = getattr(child, "is_junction", lambda: False)()
-            if child.is_symlink() or is_junction:
-                raise RuntimeError(
-                    f"Qt QML closure contains a reparse alias: {child}"
-                )
-            if not child.is_file():
-                continue
-            canonical = child.resolve()
-            if not canonical.is_relative_to(qt_qml) or os.path.normcase(
-                str(child)
-            ) != os.path.normcase(str(canonical)):
-                raise RuntimeError(
-                    f"Qt QML closure contains a reparse alias: {child} -> {canonical}"
-                )
-            selected.add(canonical)
-            pending.update(imports_from(canonical))
+        directories = [module]
+        while directories:
+            directory = directories.pop()
+            for child_entry in scandir_entries(directory):
+                reject_reparse(child_entry)
+                child = Path(child_entry.path)
+                if child_entry.is_dir(follow_symlinks=False):
+                    directories.append(child)
+                elif child_entry.is_file(follow_symlinks=False):
+                    selected.add(child)
+                    pending.update(imports_from(child))
+                else:
+                    raise RuntimeError(
+                        f"Qt QML closure contains an invalid entry: {child}"
+                    )
     return tuple(sorted(selected, key=lambda path: str(path).casefold()))
 
 

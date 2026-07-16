@@ -166,7 +166,13 @@ def prepare_windows_app_runtime(
                 Path("platforms") / ".closed", b"closed plugin namespace\n"
             )
             launch_plugins = lease.stage_readonly_layout(
-                "app-qt-plugins", plugin_entries, byte_limit=256 << 20
+                "app-qt-plugins",
+                plugin_entries,
+                context={
+                    "policy": "app-qt-plugins-v2",
+                    "platforms": ("qwindows.dll", "qoffscreen.dll"),
+                },
+                byte_limit=256 << 20,
             )
             launch_platform_plugins = (
                 launch_plugins / qt_platform_plugins.relative_to(qt_plugins)
@@ -177,7 +183,13 @@ def prepare_windows_app_runtime(
             }
             qml_entries.setdefault(Path(".closed"), b"closed QML namespace\n")
             launch_qml = lease.stage_readonly_layout(
-                "app-qt-qml", qml_entries, byte_limit=512 << 20
+                "app-qt-qml",
+                qml_entries,
+                context={
+                    "policy": "app-qt-qml-v2",
+                    "source_root": source_root.as_posix(),
+                },
+                byte_limit=512 << 20,
             )
 
             runtime_relative_dirs = (
@@ -211,7 +223,20 @@ def prepare_windows_app_runtime(
                     if child.is_file() and child in runtime_closure:
                         runtime_entries[relative_directory / child.name] = child
             runtime_layout = lease.stage_readonly_layout(
-                "app-runtime", runtime_entries, byte_limit=2 << 30
+                "app-runtime",
+                runtime_entries,
+                context={
+                    "policy": "app-runtime-v2",
+                    "runtime_roots": tuple(
+                        directory.as_posix() for directory in runtime_dirs
+                    ),
+                    "relative_directories": tuple(
+                        path.as_posix() for path in runtime_relative_dirs
+                    ),
+                },
+                dependencies=(launch_plugins, launch_qml),
+                qt_paths=runtime_guard.QtConfPaths(launch_plugins, launch_qml),
+                byte_limit=2 << 30,
             )
             loader_directory = runtime_layout / "loader"
             launch_runtime_dirs = tuple(
@@ -222,17 +247,19 @@ def prepare_windows_app_runtime(
 
             app_entries: dict[Path, Path | bytes] = {
                 Path(executable.name): executable,
-                Path("qt.conf"): (
-                    "[Paths]\n"
-                    "Prefix = .\n"
-                    f"Plugins = {launch_plugins.as_posix()}\n"
-                    f"QmlImports = {launch_qml.as_posix()}\n"
-                ).encode("utf-8"),
             }
             for adjacent in adjacent_app_dlls:
                 app_entries[Path(adjacent.name)] = adjacent
             app_layout = lease.stage_readonly_layout(
-                "app", app_entries, byte_limit=1 << 30
+                "app",
+                app_entries,
+                context={
+                    "policy": "app-layout-v2",
+                    "executable": executable.name,
+                },
+                dependencies=(runtime_layout, launch_plugins, launch_qml),
+                qt_paths=runtime_guard.QtConfPaths(launch_plugins, launch_qml),
+                byte_limit=1 << 30,
             )
             launch_executable = app_layout / executable.name
             lease.launch_executable = launch_executable
