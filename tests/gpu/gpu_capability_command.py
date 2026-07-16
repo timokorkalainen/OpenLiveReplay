@@ -53,6 +53,8 @@ _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*=(.*)\Z", re.DOTALL)
 _GNU_VALUE_OPTIONS = frozenset({
     "-o", "-D", "-U", "-A", "-I", "-isystem", "-iquote", "-idirafter",
     "-iprefix", "-iwithprefix", "-iwithprefixbefore", "-include", "-imacros",
+    "--output", "--dump", "-d", "--define-macro", "--undefine-macro",
+    "--include", "--imacros",
     "-isysroot", "--sysroot", "-x", "-target", "--target", "-arch", "-MF",
     "-MT", "-MQ", "-MJ", "-F", "-iframework", "-include-pch", "-include-pth",
     "-Xclang", "-Xpreprocessor", "-Xassembler", "-Xlinker", "-B", "-specs",
@@ -1006,17 +1008,21 @@ def _same_path(first: Path, second: Path) -> bool:
 
 _GNU_REWRITE_REMOVE_FLAGS = frozenset({
     "-c", "-S", "-E", "-P", "-M", "-MM", "-MD", "-MMD", "-MG", "-MP",
+    "--dependencies", "--user-dependencies", "--write-dependencies",
+    "--write-user-dependencies", "--print-missing-file-dependencies",
+    "--no-line-commands", "-dM", "-dD", "-dN", "-dI", "-dU",
 })
 _GNU_REWRITE_REMOVE_VALUES = frozenset({
     "-o", "-MF", "-MT", "-MQ", "-MJ", "-serialize-diagnostics",
     "--serialize-diagnostics", "-dependency-file", "--dependency-file",
+    "--output", "--dump", "-d",
 })
 _GNU_REWRITE_ATTACHED_VALUES = (
     "-MF", "-MT", "-MQ", "-MJ", "-o",
 )
 _GNU_REWRITE_EQUALS_VALUES = (
     "-fdiagnostics-file=", "-fdiagnostics-serialization-file=",
-    "-fmodule-output=",
+    "-fmodule-output=", "--output=", "--dump=",
 )
 _GNU_REWRITE_REJECT_PREFIXES = (
     "-save-temps", "--save-temps", "-dumpbase", "-dumpdir",
@@ -1024,6 +1030,12 @@ _GNU_REWRITE_REJECT_PREFIXES = (
     "-frewrite-includes",
 )
 _GNU_FORWARDERS = frozenset({"-Xclang", "-Xpreprocessor"})
+_GNU_FORWARDED_VALUE_OPTIONS = frozenset({
+    "-D", "-U", "-A", "-I", "-isystem", "-iquote", "-idirafter",
+    "-iprefix", "-iwithprefix", "-iwithprefixbefore", "-include", "-imacros",
+    "-isysroot", "--sysroot", "--define-macro", "--undefine-macro",
+    "--include", "--imacros",
+})
 
 
 def _validate_rewrite_source(configuration: PreprocessConfiguration) -> None:
@@ -1043,10 +1055,20 @@ def _gnu_forwarded_control(payload: str) -> str | None:
     while pending:
         candidate = pending.pop()
         lowered = candidate.casefold()
+        if candidate.startswith(("-Xclang=", "-Xpreprocessor=")):
+            nested = candidate.partition("=")[2]
+            if not nested:
+                raise AuditInfrastructureError(
+                    f"forwarded compiler option requires a value: {candidate}"
+                )
+            pending.append(nested)
+            continue
         if lowered.startswith("-wp,"):
             pending.extend(reversed(candidate[4:].split(",")))
             continue
-        if candidate == "-P" or lowered.startswith("-frewrite-includes"):
+        if candidate in {"-P", "--no-line-commands"} or lowered.startswith(
+            "-frewrite-includes"
+        ):
             return "marker"
         if candidate in {"-c", "-S"} or lowered.startswith(
             ("-fpreprocessed", "-fdirectives-only")
@@ -1057,12 +1079,18 @@ def _gnu_forwarded_control(payload: str) -> str | None:
         if candidate in {
             "-MD", "-MMD", "-M", "-MM", "-MG", "-MP", "-MF", "-MT", "-MQ",
             "-MJ", "-dependency-file", "--dependency-file",
+            "--dependencies", "--user-dependencies", "--write-dependencies",
+            "--write-user-dependencies", "--print-missing-file-dependencies",
         } or any(
             candidate.startswith(prefix) and len(candidate) > len(prefix)
             for prefix in ("-MF", "-MT", "-MQ", "-MJ")
         ) or lowered.startswith(("-dependency-file=", "--dependency-file=")):
             return "dependency"
         if candidate == "-o" or candidate.startswith("-o") and len(candidate) > 2:
+            return "output"
+        if candidate in {"--output", "-d", "-dM", "-dD", "-dN", "-dI", "-dU"}:
+            return "output"
+        if lowered.startswith(("--output=", "--dump=")) or candidate == "--dump":
             return "output"
         if lowered.startswith((
             "-save-temps", "--save-temps", "-dumpbase", "-dumpdir",
@@ -1073,6 +1101,62 @@ def _gnu_forwarded_control(payload: str) -> str | None:
         if candidate.startswith("@"):
             return "response"
     return None
+
+
+def _gnu_forwarded_sequence_control(payloads: tuple[str, ...]) -> str | None:
+    index = 0
+    while index < len(payloads):
+        payload = payloads[index]
+        if payload in _GNU_FORWARDED_VALUE_OPTIONS:
+            if index + 1 >= len(payloads):
+                raise AuditInfrastructureError(
+                    f"forwarded compiler option requires a value: {payload}"
+                )
+            index += 2
+            continue
+        category = _gnu_forwarded_control(payload)
+        if category:
+            return category
+        index += 1
+    return None
+
+
+def _gnu_forwarded_argument(
+    arguments: tuple[str, ...], index: int, forwarder: str
+) -> tuple[str, int] | None:
+    value = arguments[index]
+    if value == forwarder:
+        if index + 1 >= len(arguments):
+            raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+        return arguments[index + 1], index + 2
+    elif value.startswith(f"{forwarder}="):
+        payload = value.partition("=")[2]
+        if not payload:
+            raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+        return payload, index + 1
+    return None
+
+
+def _gnu_forwarded_span(
+    arguments: tuple[str, ...], index: int, forwarder: str
+) -> tuple[int, str | None] | None:
+    current = _gnu_forwarded_argument(arguments, index, forwarder)
+    if current is None:
+        return None
+    payload, end = current
+    if payload not in _GNU_FORWARDED_VALUE_OPTIONS:
+        return end, _gnu_forwarded_control(payload)
+    if end >= len(arguments):
+        raise AuditInfrastructureError(
+            f"forwarded compiler option requires a value: {payload}"
+        )
+    operand = _gnu_forwarded_argument(arguments, end, forwarder)
+    if operand is None:
+        raise AuditInfrastructureError(
+            f"forwarded compiler option requires a forwarded value: {payload}"
+        )
+    _, operand_end = operand
+    return operand_end, None
 
 
 def _rewrite_gnu(
@@ -1093,6 +1177,8 @@ def _rewrite_gnu(
                 raise AuditInfrastructureError(f"compiler option requires a value: {value}")
             index += 2
             continue
+        if value in {"--output=", "--dump="}:
+            raise AuditInfrastructureError(f"compiler option requires a value: {value}")
         if any(
             value.startswith(prefix) and len(value) > len(prefix)
             for prefix in _GNU_REWRITE_ATTACHED_VALUES
@@ -1105,26 +1191,24 @@ def _rewrite_gnu(
             ) else "output"
             raise AuditInfrastructureError(f"unsupported {category} option: {value}")
         if value.startswith("-Wp,"):
-            controls = [
-                _gnu_forwarded_control(payload)
-                for payload in value[4:].split(",")
-            ]
-            category = next((control for control in controls if control), None)
+            category = _gnu_forwarded_sequence_control(tuple(value[4:].split(",")))
             if category:
                 raise AuditInfrastructureError(
                     f"hidden {category} option is unsupported: {value}"
                 )
-        if value in _GNU_FORWARDERS:
-            if index + 1 >= len(arguments):
-                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
-            payload = arguments[index + 1]
-            category = _gnu_forwarded_control(payload)
+        forwarder = next(
+            (candidate for candidate in _GNU_FORWARDERS
+             if value == candidate or value.startswith(f"{candidate}=")),
+            None,
+        )
+        if forwarder is not None:
+            end, category = _gnu_forwarded_span(arguments, index, forwarder)
             if category:
                 raise AuditInfrastructureError(
-                    f"hidden {category} option is unsupported: {value} {payload}"
+                    f"hidden {category} option is unsupported: {value}"
                 )
-            rewritten.extend((value, payload))
-            index += 2
+            rewritten.extend(arguments[index:end])
+            index = end
             continue
         if value == "-x":
             if index + 1 >= len(arguments):
@@ -1143,6 +1227,12 @@ def _rewrite_gnu(
                 raise AuditInfrastructureError(
                     f"unsupported source-selection language: {language}"
                 )
+        if value in _GNU_VALUE_OPTIONS:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            rewritten.extend((value, arguments[index + 1]))
+            index += 2
+            continue
         rewritten.append(value)
         index += 1
     rewritten.extend(("-E", "-MD", "-MF", str(dependency_output)))
@@ -1167,6 +1257,10 @@ _MSVC_REWRITE_ATTACHED_VALUES = (
 _MSVC_REWRITE_REJECT_PREFIXES = (
     "/out", "/link", "/yc", "/ld", "/clr:netcore",
 )
+_MSVC_REWRITE_PRESERVE_VALUES = frozenset({
+    "/d", "/u", "/i", "/fp", "/yu", "/external:i", "/ai", "/fu",
+    "/reference", "/headerunit",
+})
 
 
 def _msvc_option(value: str) -> str:
@@ -1189,9 +1283,29 @@ def _rewrite_msvc(
         # preprocessed-output /Fi spelling even though most switches are
         # case-insensitive.
         slash_spelling = f"/{value[1:]}" if value.startswith("-") else value
+        if slash_spelling == "/FI":
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            rewritten.extend((value, arguments[index + 1]))
+            index += 2
+            continue
         if slash_spelling.startswith("/FI"):
             rewritten.append(value)
             index += 1
+            continue
+        forwarder = next(
+            (candidate for candidate in _GNU_FORWARDERS
+             if value == candidate or value.startswith(f"{candidate}=")),
+            None,
+        )
+        if forwarder is not None:
+            end, category = _gnu_forwarded_span(arguments, index, forwarder)
+            if category:
+                raise AuditInfrastructureError(
+                    f"hidden {category} option is unsupported: {value}"
+                )
+            rewritten.extend(arguments[index:end])
+            index = end
             continue
         if option == "/sourcedependencies:directives":
             if index + 1 >= len(arguments):
@@ -1200,6 +1314,22 @@ def _rewrite_msvc(
             continue
         if option.startswith("/clang:"):
             payload = value[len(value.partition(":")[0]) + 1 :]
+            if not payload:
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            if payload in _GNU_FORWARDED_VALUE_OPTIONS:
+                if index + 1 >= len(arguments) or not _msvc_option(
+                    arguments[index + 1]
+                ).startswith("/clang:"):
+                    raise AuditInfrastructureError(
+                        f"forwarded compiler option requires a forwarded value: {payload}"
+                    )
+                if not arguments[index + 1].partition(":")[2]:
+                    raise AuditInfrastructureError(
+                        f"forwarded compiler option requires a value: {payload}"
+                    )
+                rewritten.extend((value, arguments[index + 1]))
+                index += 2
+                continue
             category = _gnu_forwarded_control(payload)
             if category:
                 raise AuditInfrastructureError(
@@ -1221,6 +1351,12 @@ def _rewrite_msvc(
             for prefix in _MSVC_REWRITE_ATTACHED_VALUES
         ):
             index += 1
+            continue
+        if option in _MSVC_REWRITE_PRESERVE_VALUES:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            rewritten.extend((value, arguments[index + 1]))
+            index += 2
             continue
         if option.startswith(_MSVC_REWRITE_REJECT_PREFIXES):
             category = "source-selection" if option.startswith(("/link", "/yc")) else "output"

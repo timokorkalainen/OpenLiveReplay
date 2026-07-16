@@ -977,6 +977,34 @@ class CommandRewriteTests(unittest.TestCase):
                 )
                 self.assertEqual(rewritten.dependency_format, "gcc-depfile")
 
+    def test_gnu_strips_documented_long_output_dependency_and_dump_modes(self):
+        arguments = (
+            "--output", "first.i", "--output=second.i",
+            "--dependencies", "--user-dependencies",
+            "--write-dependencies", "--write-user-dependencies",
+            "--print-missing-file-dependencies", "--no-line-commands",
+            "-dM", "--dump=M", "--dump", "M", "file.cpp",
+        )
+        for family in (CompilerFamily.GCC, CompilerFamily.CLANG):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(
+                    rewritten.arguments,
+                    (
+                        str(self.configuration(family, arguments).compiler),
+                        "file.cpp", "-E", "-MD", "-MF",
+                        str(self.dependency_output),
+                    ),
+                )
+
+    def test_gnu_long_output_and_dump_options_require_values(self):
+        for family in (CompilerFamily.GCC, CompilerFamily.CLANG):
+            for option in ("--output", "--dump", "--output=", "--dump="):
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, "requires a value"
+                ):
+                    self.rewrite(family, ("file.cpp", option))
+
     def test_gnu_strips_paired_diagnostic_outputs_without_treating_values_as_sources(self):
         arguments = (
             "-serialize-diagnostics", "diagnostics.dia",
@@ -1007,6 +1035,19 @@ class CommandRewriteTests(unittest.TestCase):
                 rewritten = self.rewrite(family, arguments)
                 self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
 
+    def test_gnu_preserves_option_looking_operands_of_paired_semantic_options(self):
+        arguments = (
+            "-include", "-P", "-imacros", "-M", "-I", "-o",
+            "-D", "-dM", "-isystem", "--dependencies", "file.cpp",
+            "--include", "--no-line-commands", "--imacros", "--dependencies",
+            "--define-macro", "--output", "--undefine-macro", "--dump=M",
+        )
+        for family in (CompilerFamily.GCC, CompilerFamily.CLANG):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
+                self.assertEqual(rewritten.arguments.count("file.cpp"), 1)
+
     def test_gnu_rejects_output_source_and_marker_traps(self):
         controls = (
             (("file.cpp", "other.cpp"), "multiple source"),
@@ -1024,6 +1065,76 @@ class CommandRewriteTests(unittest.TestCase):
                     AuditInfrastructureError, message
                 ):
                     self.rewrite(family, arguments)
+
+    def test_gnu_and_clang_cl_reject_joined_xclang_hidden_controls(self):
+        controls = (
+            ("-Xclang=-P", "marker"),
+            ("-Xclang=-o", "output"),
+            ("-Xclang=-MFhidden.d", "dependency"),
+            ("-Xclang=-x", "source-selection"),
+            ("-Xclang=@hidden.rsp", "response"),
+        )
+        for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
+            for option, category in controls:
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, f"hidden.*{category}"
+                ):
+                    self.rewrite(family, (option, "file.cpp"))
+
+    def test_joined_forwarders_require_nonempty_payloads(self):
+        controls = (
+            (CompilerFamily.CLANG, ("-Xclang=", "file.cpp")),
+            (CompilerFamily.CLANG_CL, ("-Xclang=", "file.cpp")),
+            (CompilerFamily.CLANG_CL, ("/clang:", "file.cpp")),
+            (CompilerFamily.CLANG_CL,
+             ("/clang:-include", "/clang:", "file.cpp")),
+        )
+        for family, arguments in controls:
+            with self.subTest(family=family, arguments=arguments), self.assertRaisesRegex(
+                AuditInfrastructureError, "requires a value"
+            ):
+                self.rewrite(family, arguments)
+
+    def test_forwarded_long_and_dump_controls_fail_closed(self):
+        controls = (
+            ("--output=hidden.i", "output"),
+            ("--dependencies", "dependency"),
+            ("--user-dependencies", "dependency"),
+            ("--write-dependencies", "dependency"),
+            ("--write-user-dependencies", "dependency"),
+            ("--print-missing-file-dependencies", "dependency"),
+            ("--no-line-commands", "marker"),
+            ("-dM", "output"),
+            ("--dump=M", "output"),
+        )
+        for family in (CompilerFamily.GCC, CompilerFamily.CLANG):
+            for payload, category in controls:
+                with self.subTest(family=family, payload=payload), self.assertRaisesRegex(
+                    AuditInfrastructureError, f"hidden.*{category}"
+                ):
+                    self.rewrite(family, ("-Xpreprocessor", payload, "file.cpp"))
+
+    def test_forwarded_semantic_options_preserve_option_looking_operands(self):
+        controls = (
+            (CompilerFamily.GCC,
+             ("-Xpreprocessor", "-include", "-Xpreprocessor", "-P", "file.cpp")),
+            (CompilerFamily.CLANG,
+             ("-Xclang", "-include", "-Xclang", "-P", "file.cpp")),
+            (CompilerFamily.CLANG,
+             ("-Xclang=-include", "-Xclang=-P", "file.cpp")),
+            (CompilerFamily.CLANG,
+             ("-Xclang=-include", "-Xclang=-include", "file.cpp")),
+            (CompilerFamily.CLANG_CL,
+             ("-Xclang", "-include", "-Xclang", "-P", "file.cpp")),
+            (CompilerFamily.CLANG_CL,
+             ("/clang:-include", "/clang:-P", "file.cpp")),
+            (CompilerFamily.GCC, ("-Wp,-include,-P", "file.cpp")),
+            (CompilerFamily.CLANG, ("-Wp,-include,-P", "file.cpp")),
+        )
+        for family, arguments in controls:
+            with self.subTest(family=family, arguments=arguments):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
 
     def test_msvc_rewrite_preserves_semantics_and_replaces_outputs(self):
         arguments = (
@@ -1093,6 +1204,18 @@ class CommandRewriteTests(unittest.TestCase):
             with self.subTest(family=family):
                 rewritten = self.rewrite(family, arguments)
                 self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
+
+    def test_msvc_preserves_option_looking_operands_of_paired_semantic_options(self):
+        arguments = (
+            "/FI", "/P", "/I", "/Fo", "/D", "/showIncludes",
+            "/Fp", "/sourceDependencies", "/reference", "/OUT:library.ifc",
+            "file.cpp",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
+                self.assertEqual(rewritten.arguments.count("file.cpp"), 1)
 
     def test_clang_cl_rejects_hidden_gnu_output_marker_and_source_options(self):
         controls = (
