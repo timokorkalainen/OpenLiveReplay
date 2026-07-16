@@ -527,6 +527,12 @@ def guarded_macro_composition_findings(
     class ExpansionDepthExceeded(RuntimeError):
         pass
 
+    class ExpansionComplexityExceeded(RuntimeError):
+        pass
+
+    class ExpansionSyntaxFailure(RuntimeError):
+        pass
+
     @dataclass(frozen=True)
     class ExpansionToken:
         value: str
@@ -534,6 +540,23 @@ def guarded_macro_composition_findings(
 
     maximum_expansion_depth = 96
     maximum_continuous_macro_tokens = 256
+    maximum_generated_macro_tokens = 2048
+    maximum_macro_paste_operations = 1024
+
+    @dataclass
+    class ExpansionBudget:
+        remaining_tokens: int = maximum_generated_macro_tokens
+        remaining_pastes: int = maximum_macro_paste_operations
+
+        def reserve_tokens(self, count: int) -> None:
+            if count < 0 or count > self.remaining_tokens:
+                raise ExpansionComplexityExceeded
+            self.remaining_tokens -= count
+
+        def reserve_paste(self) -> None:
+            if self.remaining_pastes <= 0:
+                raise ExpansionComplexityExceeded
+            self.remaining_pastes -= 1
 
     def value_call_arguments(values: tuple[ExpansionToken, ...], opening: int) \
             -> tuple[list[tuple[ExpansionToken, ...]], int] | None:
@@ -569,10 +592,40 @@ def guarded_macro_composition_findings(
             joined.extend(argument)
         return tuple(joined)
 
+    def paste_tokens(values: list[ExpansionToken], budget: ExpansionBudget,
+                     inherited_hidden: frozenset[str]) -> tuple[ExpansionToken, ...]:
+        pasted: list[ExpansionToken] = []
+        cursor = 0
+        while cursor < len(values):
+            token = values[cursor]
+            if token.value == "##":
+                raise ExpansionSyntaxFailure
+            current = token
+            while cursor + 1 < len(values) and values[cursor + 1].value == "##":
+                budget.reserve_paste()
+                if cursor + 2 >= len(values) or values[cursor + 2].value == "##":
+                    raise ExpansionSyntaxFailure
+                right = values[cursor + 2]
+                if current.value == "__macro_placemarker__":
+                    combined_value = right.value
+                elif right.value == "__macro_placemarker__":
+                    combined_value = current.value
+                else:
+                    combined_value = current.value + right.value
+                current = ExpansionToken(
+                    combined_value,
+                    current.hidden | right.hidden | inherited_hidden)
+                cursor += 2
+            if current.value != "__macro_placemarker__":
+                pasted.append(current)
+            cursor += 1
+        return tuple(pasted)
+
     def expand_function(name: str, definition: MacroDefinition,
                         supplied: list[tuple[ExpansionToken, ...]], depth: int,
-                        inherited_hidden: frozenset[str]) \
-            -> tuple[ExpansionToken, ...] | None:
+                        inherited_hidden: frozenset[str], budget: ExpansionBudget,
+                        suffix_truncated: bool) \
+            -> tuple[ExpansionToken, ...]:
         if depth > maximum_expansion_depth:
             raise ExpansionDepthExceeded
         replacement_hidden = inherited_hidden | {name}
@@ -583,13 +636,14 @@ def guarded_macro_composition_findings(
             supplied = [tuple()]
         if ((variadic is None and len(supplied) != fixed_count)
                 or (variadic is not None and len(supplied) < fixed_count)):
-            return None
+            raise ExpansionSyntaxFailure
 
         fixed_parameters = definition.parameters[:fixed_count]
         raw_arguments = dict(zip(fixed_parameters, supplied[:fixed_count], strict=True))
         prescanned_arguments = {
             parameter: expand_sequence(
-                with_hidden(argument, argument_hidden), depth + 1)
+                with_hidden(argument, argument_hidden), depth + 1, budget,
+                suffix_truncated)
             for parameter, argument in raw_arguments.items()
         }
         if variadic is not None:
@@ -597,7 +651,8 @@ def guarded_macro_composition_findings(
             raw_arguments[variadic] = join_variadic(raw_variadic, argument_hidden)
             prescanned_arguments[variadic] = join_variadic([
                 expand_sequence(
-                    with_hidden(argument, argument_hidden), depth + 1)
+                    with_hidden(argument, argument_hidden), depth + 1, budget,
+                    suffix_truncated)
                 for argument in raw_variadic
             ], argument_hidden)
 
@@ -608,6 +663,7 @@ def guarded_macro_composition_findings(
             value = replacement[cursor]
             if (value == "#" and cursor + 1 < len(replacement)
                     and replacement[cursor + 1] in raw_arguments):
+                budget.reserve_tokens(1)
                 substituted.append(ExpansionToken(
                     "__macro_string_literal__", replacement_hidden))
                 cursor += 2
@@ -619,28 +675,27 @@ def guarded_macro_composition_findings(
                         and replacement[cursor + 1] == "##"))
                 selected = (raw_arguments[value] if adjacent_to_paste
                             else prescanned_arguments[value])
-                substituted.extend(with_hidden(selected, argument_hidden))
+                selected_with_hidden = with_hidden(selected, argument_hidden)
+                if adjacent_to_paste and not selected_with_hidden:
+                    selected_with_hidden = (
+                        ExpansionToken("__macro_placemarker__", replacement_hidden),)
+                budget.reserve_tokens(len(selected_with_hidden))
+                substituted.extend(selected_with_hidden)
             else:
+                budget.reserve_tokens(1)
                 substituted.append(ExpansionToken(value, replacement_hidden))
             cursor += 1
 
-        while any(token.value == "##" for token in substituted):
-            paste = next(index for index, token in enumerate(substituted)
-                         if token.value == "##")
-            if paste == 0 or paste + 1 >= len(substituted):
-                return None
-            left = substituted[paste - 1]
-            right = substituted[paste + 1]
-            substituted[paste - 1:paste + 2] = [
-                ExpansionToken(left.value + right.value,
-                               left.hidden | right.hidden | replacement_hidden)
-            ]
-        return expand_sequence(tuple(substituted), depth + 1)
+        return paste_tokens(substituted, budget, replacement_hidden)
 
-    def expand_sequence(values: tuple[ExpansionToken, ...], depth: int = 0) \
+    def expand_sequence(values: tuple[ExpansionToken, ...], depth: int = 0,
+                        budget: ExpansionBudget | None = None,
+                        suffix_truncated: bool = False) \
             -> tuple[ExpansionToken, ...]:
         if depth > maximum_expansion_depth:
             raise ExpansionDepthExceeded
+        if budget is None:
+            budget = ExpansionBudget()
         expanded: list[ExpansionToken] = []
         cursor = 0
         while cursor < len(values):
@@ -653,11 +708,15 @@ def guarded_macro_composition_findings(
                 continue
             if not definition.function_like:
                 replacement_hidden = token.hidden | {value}
-                replacement = tuple(
+                budget.reserve_tokens(len(definition.replacement))
+                replacement_values = [
                     ExpansionToken(item, replacement_hidden)
-                    for item in definition.replacement)
+                    for item in definition.replacement]
+                replacement = paste_tokens(
+                    replacement_values, budget, replacement_hidden)
                 rescanned = expand_sequence(
-                    replacement + values[cursor + 1:], depth + 1)
+                    replacement + values[cursor + 1:], depth + 1, budget,
+                    suffix_truncated)
                 return tuple(expanded) + rescanned
             if (cursor + 1 >= len(values)
                     or values[cursor + 1].value != "("):
@@ -666,20 +725,17 @@ def guarded_macro_composition_findings(
                 continue
             parsed = value_call_arguments(values, cursor + 1)
             if parsed is None:
-                expanded.append(value)
-                cursor += 1
-                continue
+                if suffix_truncated:
+                    raise ExpansionComplexityExceeded
+                raise ExpansionSyntaxFailure
             arguments, closing = parsed
             replacement = expand_function(
                 value, definition, arguments, depth + 1,
-                token.hidden)
-            if replacement is None:
-                expanded.extend(values[cursor:closing + 1])
-            else:
-                rescanned = expand_sequence(
-                    replacement + values[closing + 1:], depth + 1)
-                return tuple(expanded) + rescanned
-            cursor = closing + 1
+                token.hidden, budget, suffix_truncated)
+            rescanned = expand_sequence(
+                replacement + values[closing + 1:], depth + 1, budget,
+                suffix_truncated)
+            return tuple(expanded) + rescanned
         return tuple(expanded)
 
     paren_stack: list[int] = []
@@ -700,23 +756,30 @@ def guarded_macro_composition_findings(
             else:
                 macros[name] = definition
             event_index += 1
+        definition = macros.get(token.value)
         if (not re.fullmatch(r"[A-Za-z_]\w*", token.value)
-                or tokens[index + 1].value != "("
-                or token.value not in macros
+                or definition is None
                 or any(start <= token.start < end for start, end in directive_ranges)):
             continue
-        closing = paren_closings.get(index + 1)
-        if closing is None:
-            continue
-        too_complex = closing - index + 1 > maximum_continuous_macro_tokens
-        while closing + 1 < len(tokens) and tokens[closing + 1].value == "(":
-            postfix_closing = paren_closings.get(closing + 1)
-            if postfix_closing is None:
-                break
-            if postfix_closing - index + 1 > maximum_continuous_macro_tokens:
-                too_complex = True
-                break
-            closing = postfix_closing
+        too_complex = False
+        if definition.function_like:
+            if tokens[index + 1].value != "(":
+                continue
+            closing = paren_closings.get(index + 1)
+            if closing is None:
+                findings.append(Finding(
+                    path, translated.line_at(token.start), "macro expansion syntax",
+                    "macro expansion syntax is incomplete; rejected fail-closed"))
+                continue
+            too_complex = closing - index + 1 > maximum_continuous_macro_tokens
+            while closing + 1 < len(tokens) and tokens[closing + 1].value == "(":
+                postfix_closing = paren_closings.get(closing + 1)
+                if postfix_closing is None:
+                    break
+                if postfix_closing - index + 1 > maximum_continuous_macro_tokens:
+                    too_complex = True
+                    break
+                closing = postfix_closing
         if too_complex:
             line = translated.line_at(token.start)
             if line not in reported_postfix_complexity_lines:
@@ -726,17 +789,45 @@ def guarded_macro_composition_findings(
                     "macro postfix complexity exceeds the bounded audit limit; "
                     "rejected fail-closed"))
             continue
+
+        suffix_end = index
+        while (suffix_end < len(tokens)
+               and suffix_end - index < maximum_continuous_macro_tokens):
+            suffix_token = tokens[suffix_end]
+            if (suffix_end > index
+                    and any(start <= suffix_token.start < end
+                            for start, end in directive_ranges)):
+                break
+            suffix_end += 1
+            if suffix_token.value in {";", "{", "}"}:
+                break
+        suffix_truncated = (
+            suffix_end < len(tokens)
+            and tokens[suffix_end - 1].value not in {";", "{", "}"}
+            and not any(start <= tokens[suffix_end].start < end
+                        for start, end in directive_ranges))
         invocation = tuple(
-            ExpansionToken(item.value) for item in tokens[index:closing + 1])
+            ExpansionToken(item.value) for item in tokens[index:suffix_end])
         try:
-            expansion = expand_sequence(invocation)
+            expansion = expand_sequence(
+                invocation, suffix_truncated=suffix_truncated)
         except ExpansionDepthExceeded:
             findings.append(Finding(
                 path, translated.line_at(token.start), "macro expansion depth",
                 "macro expansion depth exceeded the bounded audit limit; rejected fail-closed"))
             continue
-        if (not expansion or expansion[0].value not in guarded
-                or (len(expansion) > 1 and expansion[1].value != "(")):
+        except ExpansionComplexityExceeded:
+            findings.append(Finding(
+                path, translated.line_at(token.start), "macro expansion complexity",
+                "macro expansion complexity exceeded the bounded audit limit; "
+                "rejected fail-closed"))
+            continue
+        except ExpansionSyntaxFailure:
+            findings.append(Finding(
+                path, translated.line_at(token.start), "macro expansion syntax",
+                "macro expansion syntax is incomplete; rejected fail-closed"))
+            continue
+        if not expansion or expansion[0].value not in guarded:
             continue
         findings.append(Finding(
             path, translated.line_at(token.start), "guarded identifier macro composition",
@@ -3646,6 +3737,66 @@ def mutation_self_tests() -> None:
                for finding in compiler_token_origin_alias):
         raise AssertionError("original postfix macro was hidden by replacement state")
 
+    compiler_object_tail_alias = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void bad(const GpuReadLease& lease) { "
+        "lease.OPEN native, Handle)(); }",
+        {
+            "OPEN": MacroDefinition(False, ("PASTE", "(")),
+            "PASTE": MacroDefinition(
+                True, ("PASTE_I", "(", "left", ",", "right", ")"),
+                ("left", "right")),
+            "PASTE_I": MacroDefinition(
+                True, ("left", "##", "right"), ("left", "right")),
+        })
+    if not any("guarded identifier macro composition" in finding.expression
+               for finding in compiler_object_tail_alias):
+        raise AssertionError("compiler object macro did not consume its original tail")
+
+    compiler_safe_object_tail = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void safe(const GpuReadLease& lease) { "
+        "lease.OPEN other, Handle)(); }",
+        {
+            "OPEN": MacroDefinition(False, ("PASTE", "(")),
+            "PASTE": MacroDefinition(
+                True, ("PASTE_I", "(", "left", ",", "right", ")"),
+                ("left", "right")),
+            "PASTE_I": MacroDefinition(
+                True, ("left", "##", "right"), ("left", "right")),
+        })
+    if compiler_safe_object_tail:
+        raise AssertionError("safe compiler object-tail macro was rejected:\n" +
+                             "\n".join(
+                                 finding.render() for finding in compiler_safe_object_tail))
+
+    compiler_malformed_replacement = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void malformed(const GpuReadLease& lease) { lease.OPEN(); }",
+        {
+            "OPEN": MacroDefinition(True, ("PASTE", "("), ()),
+            "PASTE": MacroDefinition(
+                True, ("left", "##", "right"), ("left", "right")),
+        })
+    if not any("macro expansion syntax" in finding.reason
+               for finding in compiler_malformed_replacement):
+        raise AssertionError("malformed compiler replacement did not fail closed structurally")
+
+    compiler_wide_replacement = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void bounded(const GpuReadLease& lease) { lease.WIDE(n)(); }",
+        {
+            "WIDE": MacroDefinition(
+                True, tuple(
+                    token
+                    for index in range(4096)
+                    for token in (("value", "##") if index < 4095 else ("value",))),
+                ("value",)),
+        })
+    if not any("macro expansion complexity" in finding.reason
+               for finding in compiler_wide_replacement):
+        raise AssertionError("wide compiler replacement did not fail closed deliberately")
+
     compiler_guarded_object_alias = audit_capability_uses(
         PurePosixPath("playback/gpu/gpufence.h"),
         "void bad(const GpuReadLease& lease) { lease.GUARD(); }",
@@ -4139,13 +4290,56 @@ def performance_self_tests() -> str:
                 for count in counts)
             + f", ratios={postfix_adjacent[0]:.3f}/"
             f"{postfix_adjacent[1]:.3f}/{postfix_aggregate:.3f}")
+
+    wide_source = translate_source(
+        "void bounded(const GpuReadLease& lease) { lease.WIDE(n)(); }")
+    wide_macros = {
+        count: {
+            "WIDE": MacroDefinition(
+                True, tuple(
+                    token
+                    for index in range(count)
+                    for token in (("value", "##") if index < count - 1 else ("value",))),
+                ("value",)),
+        }
+        for count in counts
+    }
+    wide_samples: dict[int, list[float]] = {count: [] for count in counts}
+    for order in (counts, tuple(reversed(counts)), (8192, 16384, 4096)):
+        for count in order:
+            started = time.perf_counter()
+            findings = guarded_macro_composition_findings(
+                path, wide_source, wide_macros[count])
+            wide_samples[count].append(time.perf_counter() - started)
+            if not any("macro expansion complexity" in finding.reason
+                       for finding in findings):
+                raise AssertionError(
+                    f"wide macro replacement did not fail closed at {count}")
+    wide_scores = {count: min(wide_samples[count]) for count in counts}
+    wide_adjacent = (
+        wide_scores[8192] / wide_scores[4096],
+        wide_scores[16384] / wide_scores[8192],
+    )
+    wide_aggregate = wide_scores[16384] / wide_scores[4096]
+    if max(wide_adjacent) > 3.25 or wide_aggregate > 5.75:
+        raise AssertionError(
+            "wide macro replacement audit is not near-linear: "
+            + ", ".join(
+                f"{count}={wide_scores[count]:.4f}s samples="
+                + "/".join(f"{sample:.4f}" for sample in wide_samples[count])
+                for count in counts)
+            + f", ratios={wide_adjacent[0]:.3f}/"
+            f"{wide_adjacent[1]:.3f}/{wide_aggregate:.3f}")
     return (
         ", ".join(f"{count}={scores[count]:.4f}s" for count in counts)
         + f", ratios={adjacent[0]:.3f}/{adjacent[1]:.3f}/{aggregate:.3f}; "
         + "postfix "
         + ", ".join(f"{count}={postfix_scores[count]:.4f}s" for count in counts)
         + f", ratios={postfix_adjacent[0]:.3f}/"
-        f"{postfix_adjacent[1]:.3f}/{postfix_aggregate:.3f}")
+        f"{postfix_adjacent[1]:.3f}/{postfix_aggregate:.3f}; wide "
+        + ", ".join(f"{count}={wide_scores[count]:.4f}s" for count in counts)
+        + f", ratios={wide_adjacent[0]:.3f}/"
+        f"{wide_adjacent[1]:.3f}/{wide_aggregate:.3f}")
 
 
 def load_production_sources(root: Path) -> dict[PurePosixPath, str]:
