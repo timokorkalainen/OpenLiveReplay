@@ -130,6 +130,10 @@ Import `replace` from `dataclasses`, `MappingProxyType` from `types`, and
 - `test_layout_key_uses_windows_case_normalization_not_unicode_casefold`
   accepts both `Bin/straße.exe` and `bin/STRASSE.exe` while the existing exact
   `Bin/tool.exe` / `bin/TOOL.exe` pair remains a collision.
+- `test_layout_key_excludes_case_only_destination_spelling_from_identity`
+  proves `Bin/Tool.exe` and `bin/tool.exe`, with identical entry metadata,
+  produce identical keys and key inputs containing only
+  `normalized_destination`.
 - `test_layout_key_rejects_unsafe_layout_names` rejects `../escape`, `x/y`,
   `x\\y`, `C:relative`, `AUX.txt`, `layout.`, and `layout `.
 - `test_layout_key_normalizes_layout_name_identity_for_windows` proves `tool`
@@ -238,6 +242,7 @@ nonempty string. Independently encode the normalized layout name and
 destination, held final path/device/inode/size/
 digest, literal size/digest, and generated policy/normalized inputs, and return
 `sha256(canonical_json(key_input)).hexdigest()` plus that detached key input.
+Requested destination spelling must not appear anywhere in `key_input`.
 Never construct a `Path`-keyed entry dictionary: Windows `Path` hashing can
 erase an ASCII case collision before validation.
 
@@ -397,7 +402,7 @@ git commit -m "feat: protect Windows runtime cache roots" -m "Co-Authored-By: Cl
 
 - [ ] **Step 1: Write publication, validation, and race tests**
 
-Create `PublicationTests(unittest.TestCase)`. Its methods cover one cold miss followed by a warm hit, manifest-last visibility, exact-set rejection, file/manifest/generated tampering, loosened ACL rejection, source identity/content change misses, interrupted staging, and two spawned Python processes racing on the same key. The generated test entry must render against `lease.layout`, and the warm test must assert `payload_files == payload_bytes == 0`.
+Create `PublicationTests(unittest.TestCase)`. Its methods cover one cold miss followed by a warm hit, a case-only destination-spelling warm hit, manifest-last visibility, exact-set rejection, file/manifest/generated tampering, loosened ACL rejection, source identity/content change misses, interrupted staging, and two spawned Python processes racing on the same key. The generated test entry must render against `lease.layout`, and every warm test must assert `payload_files == payload_bytes == 0`. The case-only test publishes `Bin/Tool.exe`, requests `bin/tool.exe` with identical metadata, and requires the second lease to reuse the first object key and stored manifest spelling.
 
 ```python
 @unittest.skipUnless(os.name == "nt", "requires Windows publication semantics")
@@ -462,7 +467,7 @@ strictly validate layout name and every ordered destination pair; snapshot JSON
 -> loser: DELETE-ACL and remove its staging -> hold and validate winner -> return hit
 ```
 
-`manifest.json` must contain schema/policy versions, key input with normalized layout identity, object key, requested layout-name spelling, creation time, and file records with canonical destination spelling, size, SHA-256, and entry kind. On a case-only spelling hit, strict validation and `ntpath.normcase()` of the manifest spelling must reproduce the requested normalized identity; return the layout path using the stored manifest spelling instead of treating that spelling difference as corruption. Validation must enumerate with `os.scandir`, reject symlinks/junctions/reparse tags, compare the exact directory/file set, recompute the directory key and every file digest, rerender generated entries for the final layout path, run mutation-denial probes, and retain directory owners plus read-locked file streams in `CachedLayoutLease._owners` until `close()`.
+`manifest.json` must contain schema/policy versions, the spelling-independent key input with normalized layout and destination identities, object key, requested layout-name spelling, creation time, and separate file records with requested destination spelling, size, SHA-256, and entry kind. Neither requested layout nor destination spelling may enter key recomputation. On a case-only spelling hit, strict validation and `ntpath.normcase()` of every stored manifest spelling must reproduce the requested normalized identities; enumerate and return paths using stored manifest spellings instead of treating spelling differences as corruption. Validation must enumerate with `os.scandir`, reject symlinks/junctions/reparse tags, compare the exact directory/file set, recompute the directory key and every file digest, rerender generated entries for the final layout path, run mutation-denial probes, and retain directory owners plus read-locked file streams in `CachedLayoutLease._owners` until `close()`.
 
 The strict layout-name/destination validation and JSON snapshot must finish
 before `materialize()` creates a staging directory, changes an ACL, acquires a

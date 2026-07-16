@@ -209,6 +209,24 @@ class CacheKeyTests(unittest.TestCase):
         self.assertEqual(len(key), 64)
         self.assertEqual(len(manifest["entries"]), 2)
 
+    def test_layout_key_excludes_case_only_destination_spelling_from_identity(
+        self,
+    ) -> None:
+        source = held("tool.exe", b"tool")
+        upper_key, upper_input = layout_key(
+            "tool", ((Path("Bin/Tool.exe"), source),), {}, ()
+        )
+        lower_key, lower_input = layout_key(
+            "tool", ((Path("bin/tool.exe"), source),), {}, ()
+        )
+        self.assertEqual(upper_key, lower_key)
+        self.assertEqual(upper_input, lower_input)
+        self.assertEqual(
+            upper_input["entries"][0]["normalized_destination"],
+            "bin/tool.exe",
+        )
+        self.assertNotIn("destination", upper_input["entries"][0])
+
     def test_layout_key_rejects_unsafe_layout_names(self) -> None:
         for name in (
             "../escape",

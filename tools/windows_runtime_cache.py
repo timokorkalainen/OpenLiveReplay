@@ -246,12 +246,11 @@ def layout_key(
         normalized_entries.append((normalized, destination, entry))
 
     encoded_entries = []
-    for normalized, destination, entry in sorted(
+    for normalized, _destination, entry in sorted(
         normalized_entries, key=lambda item: item[0]
     ):
         encoded_entries.append(
             {
-                "destination": destination.as_posix(),
                 "normalized_destination": normalized,
                 "entry": _entry_key_input(entry),
             }

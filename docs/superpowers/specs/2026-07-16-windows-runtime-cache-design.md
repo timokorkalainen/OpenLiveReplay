@@ -121,18 +121,22 @@ Dependency object keys are copied, required to be strings, and sorted before
 keying. Generated-entry policy identifiers are required to be nonempty stable
 strings before either their inputs or renderer can participate in a key.
 
-Destination spelling is also retained in the manifest so the published layout
-preserves the requested case while still rejecting case-insensitive
-collisions. Context binds material choices that may not otherwise appear in a
-file path, including selected plugin families, QML closure policy, platform
-plugins, configured roots, and graph rewrite policy.
+Destination spelling is excluded from the key input. It is retained only in
+separate manifest file records so the published layout preserves the first
+requested case while still rejecting case-insensitive collisions. A later
+request that changes only destination spelling therefore has the same object
+key and is a warm hit after the stored spelling strictly validates and
+normalizes to the requested identity. Context binds material choices that may
+not otherwise appear in a file path, including selected plugin families, QML
+closure policy, platform plugins, configured roots, and graph rewrite policy.
 
-`manifest.json` contains the key input, object key, layout name, creation time,
-and the final size and SHA-256 of every published file. Time is metadata and is
-not part of the content key. The manifest is written last in staging, before
-the whole object receives its immutable ACL. Atomic publication means a reader
-can observe either no final object or one complete object, never an in-place
-partial update.
+`manifest.json` contains the spelling-independent key input, object key,
+requested layout-name spelling, creation time, and separate file records with
+each requested destination spelling plus final size and SHA-256. Layout and
+destination spellings are metadata and are not part of the content key. The
+manifest is written last in staging, before the whole object receives its
+immutable ACL. Atomic publication means a reader can observe either no final
+object or one complete object, never an in-place partial update.
 
 ### Generated entries
 
