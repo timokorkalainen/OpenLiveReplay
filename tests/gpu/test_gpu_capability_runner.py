@@ -5,8 +5,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from array import array
 from pathlib import Path, PurePosixPath
 from unittest import mock
 
@@ -14,17 +16,20 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gpu_capability_command import RewrittenCommand, _environment_digest  # noqa: E402
+from gpu_capability_cache import PreprocessCache  # noqa: E402
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
     CompactTokenSequence,
     CompilerFamily,
     FileIdentity,
+    PreprocessedTranslationUnitView,
     PreprocessConfiguration,
 )
 from gpu_capability_runner import (  # noqa: E402
     ExecutionResult,
     _WindowsJob,
+    load_or_preprocess,
     preprocess_configuration,
     run_bounded_preprocessor,
 )
@@ -123,6 +128,29 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 limits or AuditLimits(rss_bytes=2**63 - 1),
                 deadline if deadline is not None else time.monotonic() + 10.0,
             )
+
+    @staticmethod
+    def altered_view(
+        view: PreprocessedTranslationUnitView,
+    ) -> PreprocessedTranslationUnitView:
+        spellings = tuple(
+            b"zease" if spelling == b"lease" else spelling
+            for spelling in object.__getattribute__(view.tokens, "_spellings")
+        )
+        columns = tuple(array("I", column) for column in view.tokens._packed_columns())
+        return PreprocessedTranslationUnitView(
+            view.configuration,
+            CompactTokenSequence._from_packed(
+                view.configuration,
+                spellings=spellings,
+                identities=object.__getattribute__(view.tokens, "_identities"),
+                spelling_ids=columns[0],
+                identity_ids=columns[1],
+                inclusion_ids=columns[2],
+                original_lines=columns[3],
+            ),
+            view.dependencies,
+        )
 
     def direct_command(self, mode: str, *extra: str) -> RewrittenCommand:
         return RewrittenCommand(
@@ -239,11 +267,11 @@ class BoundedPreprocessorTests(unittest.TestCase):
         self.assertGreater(result.observed_stdout_bytes, 0)
         self.assertIn(b"complete", output)
         self.assertTrue(child_pid_file.exists())
-        self.assertFalse(
-            self.process_is_alive(
-                int(child_pid_file.read_text(encoding="ascii"))
-            )
-        )
+        child_pid = int(child_pid_file.read_text(encoding="ascii"))
+        reap_deadline = time.monotonic() + 2.0
+        while self.process_is_alive(child_pid) and time.monotonic() < reap_deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.process_is_alive(child_pid))
 
     @staticmethod
     def process_is_alive(pid: int) -> bool:
@@ -540,6 +568,177 @@ class BoundedPreprocessorTests(unittest.TestCase):
         diagnostic = str(raised.exception)
         self.assertIn("consumer rejected partial stream", diagnostic)
         self.assertIn("exit=9", diagnostic)
+
+    def test_load_or_preprocess_reuses_validated_hit(self):
+        configuration = self.configuration("success")
+        cache = PreprocessCache(self.root / "cache")
+        expected = self.preprocess_fixture("success")
+        cache.publish(expected)
+        with mock.patch(
+            "gpu_capability_runner.preprocess_configuration",
+            side_effect=AssertionError("compiler invoked on hit"),
+        ):
+            actual = load_or_preprocess(
+                configuration,
+                self.production,
+                cache,
+                AuditLimits(rss_bytes=2**63 - 1),
+                time.monotonic() + 10.0,
+            )
+        self.assertEqual(actual.configuration, expected.configuration)
+        self.assertEqual(actual.tokens.packed_bytes, expected.tokens.packed_bytes)
+
+    def test_load_or_preprocess_publishes_only_success(self):
+        configuration = self.configuration("success")
+        cache = PreprocessCache(self.root / "cache")
+        expected = self.preprocess_fixture("success")
+        with mock.patch(
+            "gpu_capability_runner.preprocess_configuration", return_value=expected
+        ) as preprocess:
+            self.assertIs(
+                load_or_preprocess(
+                    configuration,
+                    self.production,
+                    cache,
+                    AuditLimits(rss_bytes=2**63 - 1),
+                    time.monotonic() + 10.0,
+                ),
+                expected,
+            )
+        self.assertEqual(preprocess.call_count, 2)
+        self.assertIsNotNone(cache.load(configuration))
+
+        failed_configuration = dataclasses.replace(configuration, digest="failed")
+        with mock.patch(
+            "gpu_capability_runner.preprocess_configuration",
+            side_effect=AuditInfrastructureError("compiler failed"),
+        ):
+            with self.assertRaisesRegex(AuditInfrastructureError, "compiler failed"):
+                load_or_preprocess(
+                    failed_configuration,
+                    self.production,
+                    cache,
+                    AuditLimits(rss_bytes=2**63 - 1),
+                    time.monotonic() + 10.0,
+                )
+        self.assertIsNone(cache.load(failed_configuration))
+
+    def test_load_or_preprocess_never_caches_old_tokens_against_new_dependency(self):
+        configuration = self.configuration("success")
+        cache = PreprocessCache(self.root / "cache")
+        old_view = self.preprocess_fixture("success")
+
+        calls = 0
+
+        def preprocess(*_arguments):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.source.write_text("changed after compiler read\n", encoding="utf-8")
+            return old_view
+
+        with mock.patch(
+            "gpu_capability_runner.preprocess_configuration", side_effect=preprocess
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "changed during preprocessing"
+            ):
+                load_or_preprocess(
+                    configuration,
+                    self.production,
+                    cache,
+                    AuditLimits(rss_bytes=2**63 - 1),
+                    time.monotonic() + 10.0,
+                )
+        self.assertEqual(calls, 2)
+        self.assertIsNone(cache.load(configuration))
+
+    def test_load_or_preprocess_rejects_transient_output_even_when_content_is_restored(self):
+        configuration = self.configuration("success")
+        cache = PreprocessCache(self.root / "cache")
+        discovery = self.preprocess_fixture("success")
+        accepted = self.altered_view(discovery)
+        original = self.source.read_bytes()
+        calls = 0
+
+        def preprocess(*_arguments):
+            nonlocal calls
+            if calls == 0:
+                calls += 1
+                return discovery
+            self.source.write_text("transient B\n", encoding="utf-8")
+            self.source.write_bytes(original)
+            return accepted
+
+        with mock.patch(
+            "gpu_capability_runner.preprocess_configuration", side_effect=preprocess
+        ), mock.patch.object(
+            CompactTokenSequence,
+            "__iter__",
+            side_effect=AssertionError("token iteration"),
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "nondeterministic preprocessed output"
+            ):
+                load_or_preprocess(
+                    configuration,
+                    self.production,
+                    cache,
+                    AuditLimits(rss_bytes=2**63 - 1),
+                    time.monotonic() + 10.0,
+                )
+        self.assertIsNone(cache.load(configuration))
+
+    def test_concurrent_callers_cannot_return_different_views_for_one_key(self):
+        configuration = self.configuration("success")
+        cache_root = self.root / "cache"
+        caches = (PreprocessCache(cache_root), PreprocessCache(cache_root))
+        first_view = self.preprocess_fixture("success")
+        second_view = self.altered_view(first_view)
+        views = {"first": first_view, "second": second_view}
+        entry = cache_root / caches[0]._configuration_key(configuration)
+        barrier = threading.Barrier(2)
+        real_rename = os.rename
+        successes: list[PreprocessedTranslationUnitView] = []
+        failures: list[BaseException] = []
+
+        def rename(source, destination) -> None:
+            if Path(source).name.startswith(".tmp-") and Path(destination) == entry:
+                barrier.wait(timeout=5.0)
+            real_rename(source, destination)
+
+        def preprocess(*_arguments):
+            return views[threading.current_thread().name]
+
+        def run(cache: PreprocessCache) -> None:
+            try:
+                successes.append(
+                    load_or_preprocess(
+                        configuration,
+                        self.production,
+                        cache,
+                        AuditLimits(rss_bytes=2**63 - 1),
+                        time.monotonic() + 10.0,
+                    )
+                )
+            except BaseException as error:
+                failures.append(error)
+
+        with mock.patch(
+            "gpu_capability_runner.preprocess_configuration", side_effect=preprocess
+        ), mock.patch("gpu_capability_cache.os.rename", side_effect=rename):
+            threads = [
+                threading.Thread(target=run, args=(cache,), name=name)
+                for cache, name in zip(caches, ("first", "second"))
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10.0)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertRegex(str(failures[0]), "concurrent cache winner differs")
 
 
 if __name__ == "__main__":

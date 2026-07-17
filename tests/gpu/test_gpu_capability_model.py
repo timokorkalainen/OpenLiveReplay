@@ -75,6 +75,37 @@ class ModelTests(unittest.TestCase):
             original_lines=array("I", (12, 12, 12, 12, 12, 12, 20)),
         )
 
+    def test_private_owned_packed_construction_avoids_copy_reserve_and_stays_read_only(self):
+        configuration = self.configuration()
+        limits = dataclasses.replace(AuditLimits(), rss_bytes=100_000)
+        columns = tuple(array("I", (0,)) for _ in range(4))
+        with self.assertRaisesRegex(AuditInfrastructureError, "RSS limit"):
+            CompactTokenSequence._from_packed(
+                configuration,
+                spellings=(b"lease",),
+                identities=(configuration.source,),
+                spelling_ids=columns[0],
+                identity_ids=columns[1],
+                inclusion_ids=columns[2],
+                original_lines=columns[3],
+                limits=limits,
+                rss_reader=lambda: 96_100,
+            )
+        owned = CompactTokenSequence._from_owned_packed(
+            configuration,
+            spellings=(b"lease",),
+            identities=(configuration.source,),
+            spelling_ids=array("I", (0,)),
+            identity_ids=array("I", (0,)),
+            inclusion_ids=array("I", (0,)),
+            original_lines=array("I", (1,)),
+            limits=limits,
+            rss_reader=lambda: 96_100,
+        )
+        self.assertEqual(owned[0].spelling, b"lease")
+        with self.assertRaises(TypeError):
+            owned._packed_columns()[0][0] = 1
+
     def test_limits_are_exact(self):
         limits = AuditLimits()
         self.assertEqual((limits.response_depth, limits.response_files), (8, 32))

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import enum
+import hashlib
+import json
 import os
 import stat
+import struct
 import sys
 from array import array
 from collections.abc import Iterable, Iterator, Sequence
@@ -305,6 +308,7 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         *,
         limits: AuditLimits = AuditLimits(),
         rss_reader: Callable[[], int] = _current_process_rss_bytes,
+        _adopt_columns: bool = False,
     ) -> None:
         _checked_rss(rss_reader, limits.rss_bytes)
         supplied_columns = (
@@ -366,14 +370,17 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         )
         columns: list[array] = []
         for column in supplied_columns:
-            _checked_rss(
-                rss_reader,
-                limits.rss_bytes,
-                reserve=_EMPTY_ARRAY_RSS_BYTES
-                + len(column) * column.itemsize
-                + _ARRAY_ALLOCATION_RSS_SLACK,
-            )
-            columns.append(_copy_packed_column(column))
+            if _adopt_columns:
+                columns.append(column)
+            else:
+                _checked_rss(
+                    rss_reader,
+                    limits.rss_bytes,
+                    reserve=_EMPTY_ARRAY_RSS_BYTES
+                    + len(column) * column.itemsize
+                    + _ARRAY_ALLOCATION_RSS_SLACK,
+                )
+                columns.append(_copy_packed_column(column))
             _checked_rss(rss_reader, limits.rss_bytes)
         object.__setattr__(self, "_configuration", configuration)
         object.__setattr__(self, "_spellings", spellings)
@@ -420,6 +427,35 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
             original_lines,
             limits=limits,
             rss_reader=rss_reader,
+        )
+
+    @classmethod
+    def _from_owned_packed(
+        cls,
+        configuration: PreprocessConfiguration,
+        *,
+        spellings: tuple[bytes, ...],
+        identities: tuple[FileIdentity | None, ...],
+        spelling_ids: array,
+        identity_ids: array,
+        inclusion_ids: array,
+        original_lines: array,
+        limits: AuditLimits = AuditLimits(),
+        rss_reader: Callable[[], int] = _current_process_rss_bytes,
+    ) -> "CompactTokenSequence":
+        """Consume uniquely-owned packed columns without a second full copy."""
+
+        return cls(
+            configuration,
+            spellings,
+            identities,
+            spelling_ids,
+            identity_ids,
+            inclusion_ids,
+            original_lines,
+            limits=limits,
+            rss_reader=rss_reader,
+            _adopt_columns=True,
         )
 
     @classmethod
@@ -569,6 +605,75 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
             _ReadOnlyPackedColumn(object.__getattribute__(self, slot))
             for slot in _PACKED_COLUMN_SLOTS
         )
+
+
+def _update_semantic_bytes(digest, value: bytes) -> None:
+    digest.update(struct.pack("<Q", len(value)))
+    digest.update(value)
+
+
+def _identity_semantic_bytes(identity: FileIdentity | None) -> bytes:
+    if identity is None:
+        return b"null"
+    return json.dumps(
+        {
+            "canonical": str(identity.canonical),
+            "relative": str(identity.relative) if identity.relative is not None else None,
+            "device": identity.device,
+            "inode": identity.inode,
+            "line_count": identity.line_count,
+            "production": identity.production,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def _preprocessed_view_semantic_digest(
+    view: PreprocessedTranslationUnitView,
+) -> str:
+    """Bind one full packed view without materializing token objects."""
+
+    digest = hashlib.sha256()
+    configuration = view.configuration
+    _update_semantic_bytes(
+        digest,
+        json.dumps(
+            {
+                "digest": configuration.digest,
+                "family": configuration.family.value,
+                "compiler": str(configuration.compiler),
+                "working_directory": str(configuration.working_directory),
+                "source": _identity_semantic_bytes(configuration.source).decode("ascii"),
+                "arguments": configuration.arguments,
+                "environment_digest": configuration.environment_digest,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii"),
+    )
+    tokens = view.tokens
+    spellings = object.__getattribute__(tokens, "_spellings")
+    identities = object.__getattribute__(tokens, "_identities")
+    digest.update(struct.pack("<Q", len(spellings)))
+    for spelling in spellings:
+        _update_semantic_bytes(digest, spelling)
+    digest.update(struct.pack("<Q", len(identities)))
+    for identity in identities:
+        _update_semantic_bytes(digest, _identity_semantic_bytes(identity))
+    for slot in _PACKED_COLUMN_SLOTS:
+        column = object.__getattribute__(tokens, slot)
+        byte_view = memoryview(column).cast("B")
+        digest.update(struct.pack("<Q", len(byte_view)))
+        for offset in range(0, len(byte_view), 64 * 1024):
+            digest.update(byte_view[offset : offset + 64 * 1024])
+        byte_view.release()
+    digest.update(struct.pack("<Q", len(view.dependencies)))
+    for dependency in view.dependencies:
+        _update_semantic_bytes(digest, _identity_semantic_bytes(dependency))
+    return digest.hexdigest()
 
 
 def requires_compile_entry(

@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from gpu_capability_cache import PreprocessCache
 from gpu_capability_command import (
     RewrittenCommand,
     _environment_digest,
@@ -27,6 +28,7 @@ from gpu_capability_model import (
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
     _current_process_rss_bytes,
+    _preprocessed_view_semantic_digest,
 )
 from gpu_capability_provenance import (
     PreprocessedStreamBuilder,
@@ -723,3 +725,52 @@ def preprocess_configuration(
             ),
             stderr_tail=(execution.stderr_tail if execution is not None else b""),
         ) from error
+
+
+def load_or_preprocess(
+    configuration: PreprocessConfiguration,
+    production: Mapping[PurePosixPath, FileIdentity],
+    cache: PreprocessCache,
+    limits: AuditLimits,
+    deadline: float,
+) -> PreprocessedTranslationUnitView:
+    """Return a validated cache hit or publish one complete compiler result."""
+
+    if not isinstance(cache, PreprocessCache):
+        raise AuditInfrastructureError("preprocess cache is invalid")
+    cached = cache.load(configuration)
+    if cached is not None:
+        return cached
+    discovery = preprocess_configuration(
+        configuration,
+        production,
+        limits,
+        deadline,
+    )
+    if discovery.configuration != configuration:
+        raise AuditInfrastructureError(
+            "preprocessor returned a mismatched discovery configuration"
+        )
+    discovery_semantic_digest = _preprocessed_view_semantic_digest(discovery)
+    try:
+        snapshots = cache._snapshot_dependencies(discovery.dependencies, force=True)
+    except OSError as error:
+        raise AuditInfrastructureError(
+            "dependency changed during preprocessing"
+        ) from error
+    del discovery
+    accepted = preprocess_configuration(
+        configuration,
+        production,
+        limits,
+        deadline,
+    )
+    if accepted.configuration != configuration:
+        raise AuditInfrastructureError(
+            "preprocessor returned a mismatched accepted configuration"
+        )
+    if _preprocessed_view_semantic_digest(accepted) != discovery_semantic_digest:
+        # Volatile macros are deliberately fail-closed: reproducible compiler
+        # output is required before it can be bound to a content snapshot.
+        raise AuditInfrastructureError("nondeterministic preprocessed output")
+    return cache._publish_stabilized(accepted, snapshots)
