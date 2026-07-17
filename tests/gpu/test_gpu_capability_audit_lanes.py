@@ -14,11 +14,13 @@ from gpu_capability_model import (  # noqa: E402
     AuditLimits,
     CompactTokenSequence,
     CompilerFamily,
+    CoverageReport,
     FileIdentity,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
     _current_process_rss_bytes,
 )
+import gpu_capability_source_audit as capability_audit  # noqa: E402
 from gpu_capability_source_audit import (  # noqa: E402
     OP_SCOPE_HEADER,
     REGISTRY_HEADER,
@@ -712,6 +714,1011 @@ class FindingAggregationTests(unittest.TestCase):
         early = self.finding(line=2)
         aggregated = aggregate_findings(((late, "cfg"), (early, "cfg")))
         self.assertEqual([item.finding.line for item in aggregated], [2, 30])
+
+
+class RawLaneTests(unittest.TestCase):
+    def setUp(self):
+        self.path = PurePosixPath("playback/gpu/example.cpp")
+
+    def findings(self, source: str):
+        return capability_audit.audit_raw_sources({self.path: source})
+
+    def test_compiler_covered_macro_definition_is_not_rejected_raw(self):
+        source = (
+            "#define X nativeHandle\n"
+            "#define CAT(a,b) a##b\n"
+            "lease.CAT(safe,X)();\n"
+        )
+        self.assertEqual(self.findings(source), [])
+
+    def test_direct_source_access_remains_rejected(self):
+        findings = self.findings("surface.nativeHandle();\n")
+        self.assertEqual(findings[0].line, 1)
+
+    def test_inactive_direct_spelling_is_still_raw_source(self):
+        findings = self.findings("#if 0\nsurface.nativeHandle();\n#endif\n")
+        self.assertTrue(any(item.line == 2 for item in findings))
+
+    def test_physical_splice_and_line_directives_fail_raw(self):
+        controls = (
+            "surface.native\\\nHandle();\n",
+            '#line 7 "playback/gpu/gpusurface.h"\n',
+            '#li\\\nne 7 "playback/gpu/gpusurface.h"\n',
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                self.assertNotEqual(self.findings(source), [])
+
+    def test_malformed_directive_fails_raw(self):
+        findings = self.findings("#define\n")
+        self.assertTrue(any("directive" in item.reason for item in findings))
+
+    def test_objective_c_import_is_a_valid_raw_directive(self):
+        self.assertEqual(self.findings("#import <Foundation/Foundation.h>\n"), [])
+
+    def test_quoted_and_angle_header_operands_survive_literal_masking(self):
+        for source in (
+            '#include "playback/gpu/gpusurface.h"\n',
+            "#include <memory>\n",
+            '#include /* configuration */ "playback/gpu/gpusurface.h"\n',
+            "#include/**/<memory>\n",
+            '#import "Foundation/Foundation.h"\n',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+    def test_directives_requiring_operands_fail_when_empty(self):
+        for source in (
+            "#if\n", "#include\n", "#import\n", "#include // comment only\n"
+        ):
+            with self.subTest(source=source):
+                findings = self.findings(source)
+                self.assertTrue(any("directive" in item.reason for item in findings))
+
+    def test_header_delimiters_and_trailing_tokens_are_validated(self):
+        for source in (
+            '#include "unterminated\n',
+            "#include <unterminated\n",
+            '#include "valid.h" trailing\n',
+            "#import <Foundation/Foundation.h> trailing\n",
+        ):
+            with self.subTest(source=source):
+                self.assertNotEqual(self.findings(source), [])
+
+    def test_conditional_directive_structure_is_balanced(self):
+        for source in (
+            "#if FLAG\n",
+            "#elif FLAG\n",
+            "#else\n",
+            "#endif\n",
+            "#if FLAG\n#else\n#else\n#endif\n",
+            "#if FLAG\n#else\n#elif OTHER\n#endif\n",
+        ):
+            with self.subTest(source=source):
+                self.assertNotEqual(self.findings(source), [])
+
+    def test_directive_trailing_tokens_and_macro_grammar_are_validated(self):
+        malformed = (
+            "#else trailing\n",
+            "#endif trailing\n",
+            "#define F(\n",
+            "#define F(a,,b) a\n",
+            "#define F(a, 1) a\n",
+            "#if (\n#endif\n",
+            "#if FLAG\n#elif )\n#endif\n",
+        )
+        for source in malformed:
+            with self.subTest(source=source):
+                self.assertNotEqual(self.findings(source), [])
+
+        valid = (
+            "#if defined(FLAG) && (VALUE + 1)\n"
+            "#else /* alternate */\n#endif // FLAG\n",
+            "#define F(a, ...) a\n",
+        )
+        for source in valid:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+    def test_preprocessing_expression_grammar_rejects_invalid_sequences(self):
+        malformed = (
+            "#if 1 2\n#endif\n",
+            "#if FLAG\n#elif 1 2\n#endif\n",
+            "#if +\n#endif\n",
+            "#if FLAG ? VALUE\n#endif\n",
+        )
+        for source in malformed:
+            with self.subTest(source=source):
+                self.assertNotEqual(self.findings(source), [])
+        valid = (
+            "#if defined(FLAG)\n#endif\n",
+            "#if FLAG ? VALUE : OTHER\n#endif\n",
+            "#if !FLAG || (VALUE + 1 >= 2)\n#endif\n",
+        )
+        for source in valid:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+    def test_preprocessing_integer_character_and_alternative_operator_atoms(self):
+        valid = (
+            "#if 0xCAFEuL && 0b1010'0101ULL\n#endif\n",
+            "#if 0777L bitand 01\n#endif\n",
+            "#if '\\n' or L'x'\n#endif\n",
+            "#if __cplusplus >= 202002L and not defined(OLD)\n#endif\n",
+            "#if CHECK(1.0, token)\n#endif\n",
+            '#if __has_include("foo.h")\n#endif\n',
+            '#if CHECK("x", 1)\n#endif\n',
+        )
+        for source in valid:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+        for source in (
+            "#if 1(2)\n#endif\n",
+            "#if 1.0\n#endif\n",
+            "#if 0x\n#endif\n",
+            "#if ''\n#endif\n",
+            "#if 1uu\n#endif\n",
+            "#if 1lul\n#endif\n",
+            "#if '\\x'\n#endif\n",
+        ):
+            with self.subTest(source=source):
+                self.assertNotEqual(self.findings(source), [])
+
+        for source in (
+            "#if '\\x1'\n#endif\n",
+            "#if '\\\\'\n#endif\n",
+            "#if '\\101'\n#endif\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+    def test_public_retirement_surfaces_remain_rejected(self):
+        controls = (
+            (
+                REGISTRY_HEADER,
+                "class GpuRetireRegistry final { public: void registerRetire(); };\n",
+            ),
+            (
+                OP_SCOPE_HEADER,
+                "class GpuOpScope final { public: void track(); };\n",
+            ),
+        )
+        for path, source in controls:
+            with self.subTest(path=path):
+                findings = capability_audit.audit_raw_sources({path: source})
+                self.assertNotEqual(findings, [])
+
+
+class SourceOnlyLaneTests(unittest.TestCase):
+    def setUp(self):
+        self.path = PurePosixPath("playback/gpu/example.cpp")
+
+    def findings(self, source: str):
+        return capability_audit.audit_source_only(self.path, source)
+
+    @staticmethod
+    def depth_source(count: int) -> str:
+        definitions = "".join(
+            f"#define M{index} M{index + 1}\n" for index in range(count - 1)
+        )
+        return definitions + f"#define M{count - 1} safe\nlease.M0();\n"
+
+    @staticmethod
+    def token_source(count: int) -> str:
+        return "#define M " + " ".join(("safe",) * count) + "\nlease.M();\n"
+
+    @staticmethod
+    def paste_source(count: int) -> str:
+        return "#define M " + "##".join(("a",) * (count + 1)) + "\nlease.M();\n"
+
+    def test_source_local_guarded_reconstruction_is_rejected(self):
+        findings = self.findings(
+            "#define CAT(a,b) a##b\nlease.CAT(native,Handle)();\n"
+        )
+        self.assertTrue(any("guarded identifier" in item.expression
+                            for item in findings))
+
+    def test_conditional_macro_definitions_are_fail_closed_in_both_orders(self):
+        controls = (
+            "#if FLAG\n#define M nativeHandle\n#else\n#define M safe\n#endif\nlease.M();\n",
+            "#if FLAG\n#define M safe\n#else\n#define M nativeHandle\n#endif\nlease.M();\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                findings = self.findings(source)
+                self.assertTrue(any(item.expression ==
+                                    "source-only conditional macro ambiguity"
+                                    for item in findings))
+
+    def test_unrelated_conditional_and_va_opt_macros_are_clean(self):
+        conditional = (
+            "#if FLAG\n#define VALUE 1\n#else\n#define VALUE 2\n#endif\n"
+            "int value = VALUE;\n"
+        )
+        va_opt = (
+            "#define PICK(...) 7 __VA_OPT__(+ 1)\n"
+            "int value = PICK(item);\n"
+        )
+        self.assertEqual(self.findings(conditional), [])
+        self.assertEqual(self.findings(va_opt), [])
+
+    def test_unconditional_redefinition_clears_conditional_state(self):
+        source = (
+            "#if FLAG\n#define M nativeHandle\n#else\n#define M safe\n#endif\n"
+            "#undef M\n#define M safe\nlease.M();\n"
+        )
+        self.assertEqual(self.findings(source), [])
+
+    def test_conditional_state_preserves_undefined_baseline(self):
+        findings = self.findings(
+            "#if FLAG\n#define M safe\n#endif\nlease.M();\n"
+        )
+        self.assertTrue(any(
+            item.expression == "source-only conditional macro ambiguity"
+            for item in findings
+        ))
+
+    def test_conditional_state_overflow_fails_with_named_complexity(self):
+        def source(count: int) -> str:
+            branches = ["#if V0\n#define M safe0\n"]
+            branches.extend(
+                f"#elif V{index}\n#define M safe{index}\n"
+                for index in range(1, count - 1)
+            )
+            branches.append(f"#else\n#define M safe{count - 1}\n")
+            return "".join(branches) + "#endif\nint value = M;\n"
+
+        self.assertEqual(self.findings(source(1024)), [])
+        findings = self.findings(source(1025))
+        self.assertTrue(any(
+            item.expression == "source-only conditional state complexity"
+            for item in findings
+        ))
+
+    def test_conditional_environments_preserve_cross_macro_correlation(self):
+        prefix = (
+            "#define CAT(a,b) CAT_I(a,b)\n#define CAT_I(a,b) a##b\n"
+        )
+        controls = (
+            prefix
+            + "#if FLAG\n#define A native\n#else\n#define A safe\n#endif\n"
+            "lease.CAT(A,Handle)();\n",
+            prefix
+            + "#if FLAG\n#define A native\n#define B Handle\n"
+            "#else\n#define A safe\n#define B Value\n#endif\n"
+            "lease.CAT(A,B)();\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only conditional macro ambiguity"
+                    for item in self.findings(source)
+                ))
+
+    def test_conditional_environments_honor_each_macro_kind(self):
+        controls = (
+            "#if FLAG\n#define M nativeHandle\n#else\n#define M() safe\n"
+            "#endif\n&GpuSurface::M;\n",
+            "#if FLAG\n#define M() safe\n#else\n#define M nativeHandle\n"
+            "#endif\n&GpuSurface::M;\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only conditional macro ambiguity"
+                    for item in self.findings(source)
+                ))
+
+    def test_same_name_macro_argument_prescan_precedes_outer_disable(self):
+        source = (
+            "#define F(x) x\n"
+            "#define A CAT\n"
+            "#define CAT(a,b) a##b\n"
+            "F(F(A))(native,Handle);\n"
+        )
+        self.assertTrue(any(
+            item.expression == "guarded identifier macro composition"
+            for item in self.findings(source)
+        ))
+
+    def test_parameter_prescan_depends_on_replacement_usage(self):
+        chain = "".join(
+            f"#define M{index} M{index + 1}\n" for index in range(96)
+        ) + "#define M96 safe\n"
+        safe = (
+            "#define S(x) #x\nS(M0);\n",
+            "#define IGNORE(x) safe\nIGNORE(M0);\n",
+            "#define CAT(a,b) a##b\nCAT(M0,x);\n",
+        )
+        for suffix in safe:
+            with self.subTest(suffix=suffix):
+                self.assertEqual(self.findings(chain + suffix), [])
+        findings = self.findings(chain + "#define ID(x) x\nlease.ID(M0)();\n")
+        self.assertTrue(any(
+            item.expression == "source-only macro expansion depth"
+            for item in findings
+        ))
+
+    def test_consumed_macro_arguments_are_not_independently_audited(self):
+        safe = (
+            "#define X nativeHandle\n#define S(x) #x\nS(X);\n",
+            "#define X nativeHandle\n#define CAT(a,b) a##b\nCAT(safe,X);\n",
+        )
+        for source in safe:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+        dangerous = (
+            "#define X nativeHandle\n#define ID(x) x\nID(X);\n",
+            "#define CAT(a,b) a##b\nlease.CAT(native,Handle)();\n",
+        )
+        for source in dangerous:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "guarded identifier macro composition"
+                    for item in self.findings(source)
+                ))
+
+    def test_chained_invocations_own_arguments_per_environment(self):
+        safe = (
+            "#define X nativeHandle\n#define S(x) #x\n"
+            "#define F() S\nF()(X);\n",
+            "#define X nativeHandle\n#define S(x) #x\n"
+            "#define F S\nF(X);\n",
+            "#define X nativeHandle\n#define S(x) #x\n"
+            "#if FLAG\n#define F(x) #x\n#else\n#define F S\n#endif\nF(X);\n",
+        )
+        for source in safe:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+        dangerous = (
+            "#define X nativeHandle\n#define ID(x) x\n"
+            "#define F() ID\nF()(X);\n",
+            "#define X nativeHandle\n#define ID(x) x\n"
+            "#if FLAG\n#define F(x) x\n#else\n#define F ID\n#endif\n"
+            "lease.F(X)();\n",
+        )
+        for source in dangerous:
+            with self.subTest(source=source):
+                self.assertNotEqual(self.findings(source), [])
+
+    def test_whole_expansion_is_audited_for_capabilities(self):
+        findings = self.findings(
+            "#define CALL surface.nativeHandle\nCALL();\n"
+        )
+        self.assertTrue(any("guarded identifier" in item.expression
+                            for item in findings))
+
+    def test_macro_generated_nonlocal_control_call_is_rejected(self):
+        findings = self.findings(
+            "#define CAT(a,b) a##b\nCAT(long,jmp)(env, 1);\n"
+        )
+        self.assertTrue(any(
+            item.expression == "guarded identifier macro composition"
+            for item in findings
+        ))
+
+    def test_va_opt_paste_expansion_fails_closed(self):
+        findings = self.findings(
+            "#define CAT(a,...) a __VA_OPT__(## __VA_ARGS__)\n"
+            "lease.CAT(native,Handle)();\n"
+        )
+        self.assertTrue(any("guarded identifier" in item.expression
+                            for item in findings))
+
+    def test_standalone_va_opt_expansion_runs_capability_policy(self):
+        dangerous = (
+            "#define CALL(...) surface __VA_OPT__(.nativeHandle())\n"
+            "CALL(enabled);\n"
+        )
+        self.assertTrue(any(
+            "guarded identifier" in item.expression
+            or item.expression == "source-only unsupported macro construct"
+            for item in self.findings(dangerous)
+        ))
+        self.assertEqual(self.findings(
+            "#define PICK(...) 7 __VA_OPT__(+ 1)\nint value = PICK(item);\n"
+        ), [])
+
+    def test_va_opt_emptiness_uses_prescanned_variadic_arguments(self):
+        safe = (
+            "#define EMPTY\n"
+            "#define CALL(...) surface __VA_OPT__(.nativeHandle())\n"
+            "CALL(EMPTY);\n"
+        )
+        dangerous = safe.replace("CALL(EMPTY)", "CALL(enabled)")
+        self.assertEqual(self.findings(safe), [])
+        self.assertTrue(any(
+            "guarded identifier" in item.expression
+            for item in self.findings(dangerous)
+        ))
+
+    def test_macro_generated_public_registry_member_is_rejected(self):
+        source = (
+            "#define RETIRE public: void registerRetire();\n"
+            "class GpuRetireRegistry { RETIRE };\n"
+        )
+        findings = capability_audit.audit_source_only(REGISTRY_HEADER, source)
+        self.assertTrue(any("registerRetire" in item.expression
+                            for item in findings))
+
+    def test_expansion_uses_capability_grammar_not_token_membership(self):
+        source = (
+            "#define MODE read\n#define STATE complete\n"
+            "int mode = MODE; int state = STATE;\n"
+        )
+        self.assertEqual(self.findings(source), [])
+
+    def test_macro_generated_private_registry_member_is_allowed(self):
+        source = (
+            "#define RETIRE private: void registerRetire();\n"
+            "class GpuRetireRegistry { RETIRE };\n"
+        )
+        self.assertEqual(
+            capability_audit.audit_source_only(REGISTRY_HEADER, source), []
+        )
+
+    def test_malformed_sensitive_expansion_fails_closed(self):
+        findings = self.findings("#define CALL(x) x\nlease.CALL(nativeHandle(;\n")
+        self.assertTrue(any("syntax" in item.expression for item in findings))
+
+    def test_expansion_depth_accepts_96_and_rejects_97(self):
+        self.assertEqual(self.findings(self.depth_source(96)), [])
+        findings = self.findings(self.depth_source(97))
+        self.assertTrue(any(item.expression == "source-only macro expansion depth"
+                            for item in findings))
+
+    def test_generated_tokens_accept_2048_and_reject_2049(self):
+        self.assertEqual(self.findings(self.token_source(2048)), [])
+        findings = self.findings(self.token_source(2049))
+        self.assertTrue(any(item.expression == "source-only macro token complexity"
+                            for item in findings))
+
+    def test_token_pastes_accept_1024_and_reject_1025(self):
+        self.assertEqual(self.findings(self.paste_source(1024)), [])
+        findings = self.findings(self.paste_source(1025))
+        self.assertTrue(any(item.expression == "source-only macro paste complexity"
+                            for item in findings))
+
+    def test_unknown_macros_in_sensitive_contexts_fail_closed(self):
+        controls = (
+            "UNKNOWN(scope).withRead(surface, callback);\n",
+            "lease.UNKNOWN();\n",
+            "GpuSyncReadScope scope; scope.withRead(surface, UNKNOWN(callback));\n",
+            "GpuSyncReadScope scope; scope.UNKNOWN();\n",
+            "GpuSyncReadScope scope; scope.withRead(surface, [](auto& lease) "
+            "{ UNKNOWN(return); });\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                findings = self.findings(source)
+                self.assertTrue(any("source-only macro ambiguity" == item.expression
+                                    for item in findings))
+
+    def test_lowercase_ambiguity_is_receiver_aware(self):
+        for source in (
+            "unknown(scope).withRead(surface, callback);\n",
+            "lease.unknown();\n",
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only macro ambiguity"
+                    for item in self.findings(source)
+                ))
+        self.assertEqual(self.findings("Logger::UNKNOWN();\n"), [])
+
+    def test_receiver_proof_uses_types_and_lease_bindings_not_names(self):
+        unrelated = (
+            "struct Logger { void withRead(); void unknown(); };\n"
+            "Logger scope; Logger lease; scope.withRead(); lease.unknown();\n"
+        )
+        self.assertEqual(self.findings(unrelated), [])
+
+        controls = (
+            "ALIAS.withRead(surface, callback);\n",
+            "GpuSyncReadScope unusual; auto token = unusual.read(surface); "
+            "token.unknown(); unusual.complete();\n",
+            "GpuSyncReadScope unusual; unusual.withRead(surface, "
+            "[](const GpuReadLease& token) { token.unknown(); });\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only macro ambiguity"
+                    for item in self.findings(source)
+                ))
+
+    def test_pointer_reference_receivers_and_lowercase_aliases(self):
+        unrelated = (
+            "struct Logger { void withRead(); void unknown(); };\n"
+            "Logger* scope; Logger& lease = logger;\n"
+            "scope->withRead(); lease.unknown();\n"
+        )
+        self.assertEqual(self.findings(unrelated), [])
+        self.assertTrue(any(
+            item.expression == "source-only macro ambiguity"
+            for item in self.findings("alias.withRead(surface, callback);\n")
+        ))
+
+    def test_arbitrary_typed_and_auto_receivers_are_proven_ordinary(self):
+        controls = (
+            "logger scope; scope.withRead();\n",
+            "ns::Logger<Item>* scope; scope->withRead();\n",
+            "auto lease = makeLogger(); lease.unknown();\n",
+            "void inspect(ns::Logger<Item>& lease) { lease.unknown(); }\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+        self.assertTrue(any(
+            item.expression == "source-only macro ambiguity"
+            for item in self.findings("alias.withRead(surface, callback);\n")
+        ))
+
+    def test_receiver_bindings_are_positioned_lexical_and_shadowable(self):
+        rejected = (
+            "alias.withRead(surface, callback); logger alias;\n",
+            "{ logger alias; } alias.withRead(surface, callback);\n",
+            "void f() { logger value; { GpuSyncReadScope value; value.unknown(); } }\n",
+        )
+        for source in rejected:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only macro ambiguity"
+                    for item in self.findings(source)
+                ))
+        clean = (
+            "void f() { GpuSyncReadScope value; { logger value; value.unknown(); } }\n",
+            "void f() { logger value; { GpuSyncReadScope value; } value.unknown(); }\n",
+        )
+        for source in clean:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+    def test_balanced_declarators_prove_ordinary_receivers(self):
+        controls = (
+            "logger scope(make()); scope.withRead();\n",
+            "logger scope{}; scope.withRead();\n",
+            "logger first, scope; scope.withRead();\n",
+            "ns::Logger<Item> first{}, *scope(makePtr()); scope->withRead();\n",
+            "[[maybe_unused]] logger scope; scope.withRead();\n",
+            "decltype(make()) scope; scope.withRead();\n",
+            "auto [scope, other] = makePair(); scope.withRead();\n",
+            "const auto& [scope, other] = makePair(); scope.withRead();\n",
+            "static auto [scope, other] = makePair(); scope.withRead();\n",
+            "void f() { for (Logger& scope : scopes) { scope.withRead(); } }\n",
+            "void f() { for (auto& scope : scopes) { scope.withRead(); } }\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+    def test_conditional_environments_cover_receivers_and_callbacks(self):
+        controls = (
+            "#if FLAG\n#define ALIAS scope\n#else\n#undef ALIAS\n#endif\n"
+            "ALIAS.withRead(surface, callback);\n",
+            "GpuSyncReadScope scope;\n#if FLAG\n#define CB callback\n"
+            "#else\n#undef CB\n#endif\nscope.withRead(surface, CB(callback));\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only conditional macro ambiguity"
+                    for item in self.findings(source)
+                ))
+
+    def test_conditional_member_macro_on_ordinary_receiver_is_clean(self):
+        source = (
+            "struct Logger { void safe(); void other(); }; Logger log;\n"
+            "#if FLAG\n#define M safe\n#else\n#define M other\n#endif\n"
+            "log.M();\n"
+        )
+        self.assertEqual(self.findings(source), [])
+
+    def test_conditional_state_overflow_rejects_external_sensitive_names(self):
+        conditionals = "".join(
+            f"#if F{index}\n#define M{index} 1\n#endif\n"
+            for index in range(12)
+        )
+        for suffix in (
+            "alias.withRead(surface, callback);\n",
+            "GpuSyncReadScope scope; scope.withRead(surface, CB(callback));\n",
+            "void f() { GpuSyncReadScope scope; scope.MEMBER(); }\n",
+            "alias.MEMBER();\n",
+            "void f() { GpuSyncReadScope scope; scope.DONE(); }\n",
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertTrue(any(
+                    item.expression == "source-only conditional state complexity"
+                    for item in self.findings(conditionals + suffix)
+                ))
+
+    def test_ordinary_withread_callback_is_not_capability_sensitive(self):
+        source = (
+            "struct Logger { template<class F> void withRead(int, F); };\n"
+            "void f() { Logger scope; scope.withRead(surface, SAFE(callback)); }\n"
+        )
+        self.assertEqual(self.findings(source), [])
+
+    def test_binding_scope_index_does_not_rescan_brace_pairs(self):
+        source = (
+            "void f() {\n"
+            + "{ Logger local; local.unknown();\n" * 64
+            + "}\n" * 64
+            + "}\n"
+        )
+        translated = capability_audit.translate_source(source)
+        _events, directive_ranges = capability_audit.source_macro_events(
+            translated.masked
+        )
+        with mock.patch.object(
+            capability_audit,
+            "enclosing_block",
+            wraps=capability_audit.enclosing_block,
+        ) as enclosing_probe:
+            capability_audit._source_only_declared_bindings(
+                translated.masked, directive_ranges
+            )
+        self.assertEqual(enclosing_probe.call_count, 0)
+
+    def test_type_alias_and_outer_declared_type_control_receiver_category(self):
+        capability = (
+            "void f() { using Scope = GpuSyncReadScope; Scope scope; "
+            "scope.unknown(); }\n",
+            "void f() { typedef GpuSyncReadScope Scope; Scope scope; "
+            "scope.unknown(); }\n",
+        )
+        for source in capability:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only macro ambiguity"
+                    for item in self.findings(source)
+                ))
+        ordinary = (
+            "void f() { vector<GpuSyncReadScope> scopes; scopes.withRead(); }\n",
+            "void f() { decltype(GpuSyncReadScope{}.desc()) desc; "
+            "desc.unknown(); }\n",
+        )
+        for source in ordinary:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+    def test_type_declarations_and_template_parameters_shadow_aliases(self):
+        controls = (
+            "using Scope = GpuSyncReadScope; void f() { struct Scope {}; "
+            "Scope scope; scope.unknown(); } Scope outer; outer.unknown();\n",
+            "using Scope = GpuSyncReadScope; template<class Scope> "
+            "void f() { Scope scope; scope.unknown(); }\n",
+            "using Scope = GpuSyncReadScope; template<class Scope> "
+            "void f(Scope scope) { scope.unknown(); } "
+            "Scope outer; outer.unknown();\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                findings = self.findings(source)
+                if "outer" in source:
+                    self.assertTrue(any(
+                        item.expression == "source-only macro ambiguity"
+                        and item.line == 1 for item in findings
+                    ))
+                    self.assertEqual(sum(
+                        item.reason.startswith("unresolved macro-like unknown")
+                        for item in findings
+                    ), 1)
+                else:
+                    self.assertEqual(findings, [])
+
+    def test_complex_receiver_requires_ordinary_or_documented_proof(self):
+        rejected = (
+            "s[0].withRead(surface, callback);\n",
+            "(s + 1)->withRead(surface, callback);\n",
+            "Logger value; move(value).withRead(surface, callback);\n",
+            "Logger value; evil::as_const(value).withRead(surface, callback);\n",
+            "Logger value; value.get().withRead(surface, callback);\n",
+        )
+        for source in rejected:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only macro ambiguity"
+                    for item in self.findings(source)
+                ))
+        clean = (
+            "Logger* s; s[0].withRead(); (s + 1)->withRead();\n",
+            "Logger value; std::move(value).withRead();\n",
+            "Logger value; std::as_const(value).withRead();\n",
+            "Logger value; std::ref(value).get().withRead();\n",
+            "std::reference_wrapper<Logger> value; value.get().withRead();\n",
+        )
+        for source in clean:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+    def test_alias_targets_preserve_strict_wrapper_provenance(self):
+        clean = (
+            "std::reference_wrapper<Logger> w; w.get().unknown();\n",
+            "using W = std::reference_wrapper<Logger>; W w; "
+            "w.get().unknown();\n",
+            "using W0 = std::reference_wrapper<Logger>; using W = W0; "
+            "W w; w.get().unknown();\n",
+        )
+        for source in clean:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+        rejected = (
+            "using W = std::reference_wrapper<GpuSyncReadScope>; W w; "
+            "w.get().unknown();\n",
+            "using W0 = std::reference_wrapper<GpuReadLease>; using W = W0; "
+            "W w; w.get().unknown();\n",
+            "using W = evil::reference_wrapper<Logger>; W w; "
+            "w.get().unknown();\n",
+            "using A = B; using B = A; A value; value.unknown();\n",
+        )
+        for source in rejected:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only macro ambiguity"
+                    for item in self.findings(source)
+                ))
+
+    def test_std_wrapper_alias_requires_positioned_namespace_provenance(self):
+        clean = (
+            "using L = Logger; using W = ::std::reference_wrapper<L>; "
+            "W w; w.get().unknown();\n",
+            "void f() { struct std {}; "
+            "using W = ::std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown(); }\n",
+            "void f() { struct std {}; } "
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "#define std evil\n#undef std\n"
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n#define std evil\n",
+        )
+        for source in clean:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+        rejected = (
+            "using S = GpuSyncReadScope; "
+            "using W = ::std::reference_wrapper<S>; "
+            "W w; w.get().unknown();\n",
+            "struct std {}; using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "struct std {}; using W = ::std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "void f() { struct std {}; "
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown(); }\n",
+            "namespace std = evil; "
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "#define std evil\n"
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "#define std evil\n"
+            "using W = ::std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "#if FLAG\n#define std evil\n#endif\n"
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+        )
+        for source in rejected:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only macro ambiguity"
+                    for item in self.findings(source)
+                ))
+
+    def test_std_namespace_definitions_are_positioned_provenance(self):
+        fake_wrapper = (
+            "template<class T> struct reference_wrapper { "
+            "GpuSyncReadScope& get(); }; "
+        )
+        clean = (
+            "namespace project { namespace std { " + fake_wrapper + "} } "
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "namespace project::std { " + fake_wrapper + "} "
+            "using W = ::std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "void f() { struct std {}; "
+            "using W = ::std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown(); }\n",
+            "using W = ::std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown(); "
+            "namespace std { " + fake_wrapper + "}\n",
+        )
+        for source in clean:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+        rejected = (
+            "namespace std { " + fake_wrapper + "} "
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "namespace std { " + fake_wrapper + "} "
+            "using W = ::std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "inline namespace std { " + fake_wrapper + "} "
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+            "namespace project { namespace std { " + fake_wrapper + "} "
+            "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown(); }\n",
+            "namespace project::std { " + fake_wrapper
+            + "using W = std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown(); }\n",
+            "namespace std::detail {} "
+            "using W = ::std::reference_wrapper<Logger>; "
+            "W w; w.get().unknown();\n",
+        )
+        for source in rejected:
+            with self.subTest(source=source):
+                self.assertTrue(any(
+                    item.expression == "source-only macro ambiguity"
+                    for item in self.findings(source)
+                ))
+
+    def test_isolated_same_name_use_before_declaration_stays_unresolved(self):
+        source = "".join(
+            f"void f{index}() {{ scope.withRead(); Logger scope; }}\n"
+            for index in range(128)
+        )
+        with mock.patch.object(
+            capability_audit,
+            "receiver_binding_references",
+            wraps=capability_audit.receiver_binding_references,
+        ) as receiver_probe:
+            findings = self.findings(source)
+        self.assertLessEqual(receiver_probe.call_count, 128)
+        self.assertGreaterEqual(sum(
+            item.expression == "source-only macro ambiguity" for item in findings
+        ), 128)
+
+    def test_many_read_result_bindings_are_indexed_once(self):
+        source = "".join(
+            f"void f{index}() {{ GpuSyncReadScope scope; "
+            "auto lease = scope.read(surface); lease.unknown(); "
+            "scope.complete(); }\n"
+            for index in range(128)
+        )
+        translated = capability_audit.translate_source(source)
+        _events, ranges = capability_audit.source_macro_events(translated.masked)
+        with mock.patch.object(
+            capability_audit,
+            "_source_binding_index",
+            wraps=capability_audit._source_binding_index,
+        ) as index_probe:
+            bindings = capability_audit._source_only_declared_bindings(
+                translated.masked, ranges
+            )
+        self.assertLessEqual(index_probe.call_count, 1)
+        self.assertEqual(sum(
+            binding.category == "lease" for binding in bindings
+        ), 128)
+
+    def test_va_opt_presence_retains_prescanned_variadic_commas(self):
+        prefix = (
+            "#define E\n"
+            "#define CALL(...) surface __VA_OPT__(.nativeHandle())\n"
+        )
+        self.assertEqual(self.findings(prefix + "CALL(E);\n"), [])
+        self.assertTrue(any(
+            item.expression == "guarded identifier macro composition"
+            for item in self.findings(prefix + "CALL(E,E);\n")
+        ))
+
+    def test_unused_macro_replacement_calls_do_not_enter_receiver_audit(self):
+        controls = (
+            "#define UNUSED surface.nativeHandle()\n",
+            "#define UNUSED scope.withRead(surface, callback)\n",
+            "#define UNUSED lease.complete()\n",
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source), [])
+
+    def test_nested_withread_ambiguity_uses_precomputed_delimiters(self):
+        depth = 64
+        source = (
+            "GpuSyncReadScope scope;\n"
+            + "scope.withRead(surface, [&] {\n" * depth
+            + "safe();\n"
+            + "});\n" * depth
+        )
+        with mock.patch.object(
+            capability_audit,
+            "matching_delimiter",
+            wraps=capability_audit.matching_delimiter,
+        ) as delimiter_probe, mock.patch.object(
+            capability_audit,
+            "_source_only_declared_bindings",
+            wraps=capability_audit._source_only_declared_bindings,
+        ) as binding_probe, mock.patch.object(
+            capability_audit,
+            "_source_binding_index",
+            wraps=capability_audit._source_binding_index,
+        ) as index_probe, mock.patch.object(
+            capability_audit,
+            "_source_scope_at_fallback",
+            wraps=capability_audit._source_scope_at_fallback,
+        ) as fallback_probe:
+            self.findings(source)
+        self.assertLessEqual(delimiter_probe.call_count, 1)
+        self.assertLessEqual(binding_probe.call_count, 2)
+        self.assertLessEqual(index_probe.call_count, 4)
+        self.assertEqual(fallback_probe.call_count, 0)
+
+    def test_adjacent_sensitive_calls_reuse_statement_tokenization(self):
+        source = (
+            "void audit() { GpuSyncReadScope scope;\n"
+            + "scope.withRead(surface, callback);\n" * 100
+            + "}\n"
+        )
+        with mock.patch.object(
+            capability_audit,
+            "canonical_scope_declaration",
+            wraps=capability_audit.canonical_scope_declaration,
+        ) as declaration_probe:
+            self.findings(source)
+        self.assertLessEqual(declaration_probe.call_count, 1)
+
+    def test_unrelated_unknown_macro_use_is_ignored(self):
+        self.assertEqual(self.findings("int value = UNKNOWN(1);\n"), [])
+
+
+class PipelineLaneTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = CompilerAuditLaneTests()
+        self.helper.setUp()
+        self.authoritative = PurePosixPath("playback/gpu/gpufence.h")
+        self.source_only = PurePosixPath("playback/gpu/inactive.cpp")
+
+    def test_pipeline_unions_raw_authoritative_and_source_only_findings(self):
+        view = self.helper.view((
+            self.helper.production(
+                str(self.authoritative), 31, b"surface.nativeHandle();"
+            ),
+        ))
+        sources = {
+            self.authoritative: "#define HANDLE nativeHandle\nsurface.HANDLE();\n",
+            self.source_only: (
+                "#define CAT(a,b) a##b\nlease.CAT(native,Handle)();\n"
+            ),
+        }
+        coverage = CoverageReport(
+            authoritative=frozenset((self.authoritative,)),
+            source_only=frozenset((self.source_only,)),
+            configurations=("cfg-a",),
+        )
+        findings, returned = capability_audit.audit_pipeline(sources, (view,), coverage)
+        self.assertEqual(returned, coverage)
+        configurations = {
+            configuration
+            for item in findings
+            for configuration in item.configurations
+        }
+        self.assertIn("cfg-a", configurations)
+        self.assertIn("source-only", configurations)
+
+    def test_authoritative_path_does_not_use_source_only_emulation(self):
+        view = self.helper.view((
+            self.helper.production(str(self.authoritative), 1, b"void safe();"),
+        ))
+        sources = {
+            self.authoritative: (
+                "#define CAT(a,b) a##b\nlease.CAT(native,Handle)();\n"
+            ),
+        }
+        coverage = CoverageReport(
+            authoritative=frozenset((self.authoritative,)),
+            source_only=frozenset(),
+            configurations=("cfg-a",),
+        )
+        findings, _returned = capability_audit.audit_pipeline(sources, (view,), coverage)
+        self.assertEqual(findings, [])
 
 
 if __name__ == "__main__":

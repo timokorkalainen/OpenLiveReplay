@@ -7,26 +7,22 @@ import argparse
 from array import array
 import bisect
 from collections.abc import Mapping
-import ctypes
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shlex
-import shutil
 import statistics
-import subprocess
 import sys
-import tempfile
 import time
 from typing import Callable, Iterable
 
 from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
+    CoverageReport,
     PreprocessedTranslationUnitView,
     SourceLocation,
+    _current_process_rss_bytes,
 )
 
 
@@ -496,6 +492,12 @@ def mask_non_code(source: str) -> str:
         current = source[index]
         following = source[index + 1] if index + 1 < len(source) else ""
         if state == "code":
+            if (current == "'" and index > 0
+                    and source[index - 1] in "0123456789abcdefABCDEF"
+                    and following in "0123456789abcdefABCDEF"):
+                # C++ digit separators are code punctuation, not character quotes.
+                index += 1
+                continue
             raw = (RAW_LITERAL_PREFIX.match(source, index)
                    if current in {"L", "R", "U", "u"} else None)
             if raw is not None:
@@ -896,9 +898,113 @@ def source_macro_events(masked: str) \
     return events, directives
 
 
+MAX_SOURCE_ONLY_GENERATED_WORK = 2048
+MAX_CONDITIONAL_ENVIRONMENTS = MAX_SOURCE_ONLY_GENERATED_WORK + 1
+
+
+def source_macro_environment_events(
+    masked: str,
+) -> tuple[
+    list[tuple[int, tuple[dict[str, MacroDefinition], ...] | None]],
+    list[tuple[int, int]],
+]:
+    """Model every reachable conditional macro environment without de-correlation."""
+
+    macro_events, directive_ranges = source_macro_events(masked)
+    mutations = {
+        (position, name): definition
+        for position, name, definition in macro_events
+    }
+
+    def clone(
+        environments: tuple[dict[str, MacroDefinition], ...] | None,
+    ) -> tuple[dict[str, MacroDefinition], ...] | None:
+        if environments is None:
+            return None
+        return tuple(dict(environment) for environment in environments)
+
+    def deduplicate(
+        environments: list[dict[str, MacroDefinition]],
+    ) -> tuple[dict[str, MacroDefinition], ...] | None:
+        unique: dict[
+            tuple[tuple[str, MacroDefinition], ...], dict[str, MacroDefinition]
+        ] = {}
+        for environment in environments:
+            key = tuple(sorted(environment.items()))
+            unique.setdefault(key, environment)
+            if len(unique) > MAX_CONDITIONAL_ENVIRONMENTS:
+                return None
+        return tuple(dict(environment) for environment in unique.values())
+
+    environments: tuple[dict[str, MacroDefinition], ...] | None = ({},)
+    frames: list[dict[str, object]] = []
+    events: list[
+        tuple[int, tuple[dict[str, MacroDefinition], ...] | None]
+    ] = []
+    offset = 0
+    for line in masked.splitlines(keepends=True):
+        stripped = line.lstrip()
+        directive = re.match(r"#\s*([A-Za-z_]\w*)\b(.*)", stripped)
+        if directive is None:
+            offset += len(line)
+            continue
+        name = directive.group(1)
+        event_position = offset + len(line)
+        if name in {"if", "ifdef", "ifndef"}:
+            frames.append({
+                "baseline": clone(environments),
+                "completed": [],
+                "saw_else": False,
+            })
+            environments = clone(environments)
+        elif name in {"elif", "elifdef", "elifndef", "else"} and frames:
+            frame = frames[-1]
+            completed = frame["completed"]
+            if environments is None:
+                frame["completed"] = None
+            elif completed is not None:
+                completed.extend(dict(environment) for environment in environments)
+            environments = clone(frame["baseline"])
+            if name == "else":
+                frame["saw_else"] = True
+        elif name == "endif" and frames:
+            frame = frames.pop()
+            completed = frame["completed"]
+            if environments is None or completed is None:
+                environments = None
+            else:
+                completed.extend(dict(environment) for environment in environments)
+                if not frame["saw_else"]:
+                    baseline = frame["baseline"]
+                    if baseline is None:
+                        environments = None
+                        events.append((event_position, environments))
+                        offset += len(line)
+                        continue
+                    completed.extend(dict(environment) for environment in baseline)
+                environments = deduplicate(completed)
+        elif name in {"define", "undef"}:
+            mutation = re.match(r"\s*([A-Za-z_]\w*)", directive.group(2))
+            if mutation is not None and environments is not None:
+                macro_name = mutation.group(1)
+                definition = mutations.get((event_position, macro_name))
+                changed: list[dict[str, MacroDefinition]] = []
+                for environment in environments:
+                    updated = dict(environment)
+                    if definition is None:
+                        updated.pop(macro_name, None)
+                    else:
+                        updated[macro_name] = definition
+                    changed.append(updated)
+                environments = deduplicate(changed)
+        events.append((event_position, clone(environments)))
+        offset += len(line)
+    return events, directive_ranges
+
+
 def guarded_macro_composition_findings(
         path: PurePosixPath, translated: TranslationText,
-        compiler_macros: Mapping[str, MacroDefinition] | frozenset[str] = frozenset()
+        *, source_only: bool = False,
         ) -> list[Finding]:
     """Reject source-visible macro calls whose identifier pieces form guarded names."""
     guarded = {
@@ -909,16 +1015,48 @@ def guarded_macro_composition_findings(
     guarded.update(REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset()))
     guarded.update(REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset()))
     tokens = cpp_tokens(translated.masked)
-    macro_events, directive_ranges = source_macro_events(translated.masked)
-    macros: dict[str, MacroDefinition] = (
-        dict(compiler_macros) if isinstance(compiler_macros, Mapping) else {})
+    environment_events, directive_ranges = source_macro_environment_events(
+        translated.masked
+    )
+    sensitive_ranges = (
+        _source_only_sensitive_ranges(translated.masked, directive_ranges)
+        if source_only else []
+    )
+    merged_sensitive_ranges: list[tuple[int, int]] = []
+    for start, stop, _role in sorted(sensitive_ranges):
+        if merged_sensitive_ranges and start <= merged_sensitive_ranges[-1][1]:
+            previous_start, previous_stop = merged_sensitive_ranges[-1]
+            merged_sensitive_ranges[-1] = (
+                previous_start, max(previous_stop, stop)
+            )
+        else:
+            merged_sensitive_ranges.append((start, stop))
+    sensitive_range_starts = tuple(
+        start for start, _stop in merged_sensitive_ranges
+    )
+
+    def token_has_sensitive_role(position: int) -> bool:
+        range_index = bisect.bisect_right(sensitive_range_starts, position) - 1
+        return (range_index >= 0
+                and position < merged_sensitive_ranges[range_index][1])
+    all_macro_names = {
+        name for _position, name, _definition in source_macro_events(
+            translated.masked
+        )[0]
+    }
+    directive_starts = tuple(start for start, _stop in directive_ranges)
+    macros: dict[str, MacroDefinition] = {}
+    environments: tuple[dict[str, MacroDefinition], ...] | None = ({},)
     event_index = 0
     findings: list[Finding] = []
 
     class ExpansionDepthExceeded(RuntimeError):
         pass
 
-    class ExpansionComplexityExceeded(RuntimeError):
+    class ExpansionTokenComplexityExceeded(RuntimeError):
+        pass
+
+    class ExpansionPasteComplexityExceeded(RuntimeError):
         pass
 
     class ExpansionSyntaxFailure(RuntimeError):
@@ -928,10 +1066,11 @@ def guarded_macro_composition_findings(
     class ExpansionToken:
         value: str
         hidden: frozenset[str] = frozenset()
+        source_index: int | None = None
 
     maximum_expansion_depth = 96
     maximum_continuous_macro_tokens = 256
-    maximum_generated_macro_tokens = 2048
+    maximum_generated_macro_tokens = MAX_SOURCE_ONLY_GENERATED_WORK
     maximum_macro_paste_operations = 1024
 
     @dataclass
@@ -941,12 +1080,12 @@ def guarded_macro_composition_findings(
 
         def reserve_tokens(self, count: int) -> None:
             if count < 0 or count > self.remaining_tokens:
-                raise ExpansionComplexityExceeded
+                raise ExpansionTokenComplexityExceeded
             self.remaining_tokens -= count
 
         def reserve_paste(self) -> None:
             if self.remaining_pastes <= 0:
-                raise ExpansionComplexityExceeded
+                raise ExpansionPasteComplexityExceeded
             self.remaining_pastes -= 1
 
     def value_call_arguments(values: tuple[ExpansionToken, ...], opening: int) \
@@ -972,7 +1111,9 @@ def guarded_macro_composition_findings(
     def with_hidden(values: tuple[ExpansionToken, ...], hidden: frozenset[str]) \
             -> tuple[ExpansionToken, ...]:
         return tuple(
-            ExpansionToken(value.value, value.hidden | hidden) for value in values)
+            ExpansionToken(
+                value.value, value.hidden | hidden, value.source_index
+            ) for value in values)
 
     def join_variadic(arguments: list[tuple[ExpansionToken, ...]],
                       hidden: frozenset[str]) -> tuple[ExpansionToken, ...]:
@@ -1015,7 +1156,8 @@ def guarded_macro_composition_findings(
     def expand_function(name: str, definition: MacroDefinition,
                         supplied: list[tuple[ExpansionToken, ...]], depth: int,
                         inherited_hidden: frozenset[str], budget: ExpansionBudget,
-                        suffix_truncated: bool) \
+                        suffix_truncated: bool,
+                        consumed_sources: set[int]) \
             -> tuple[ExpansionToken, ...]:
         if depth > maximum_expansion_depth:
             raise ExpansionDepthExceeded
@@ -1031,30 +1173,81 @@ def guarded_macro_composition_findings(
 
         fixed_parameters = definition.parameters[:fixed_count]
         raw_arguments = dict(zip(fixed_parameters, supplied[:fixed_count], strict=True))
+        replacement = definition.replacement
+        parameter_names = set(fixed_parameters)
+        if variadic is not None:
+            parameter_names.add(variadic)
+        normal_substitutions: set[str] = set()
+        for replacement_index, value in enumerate(replacement):
+            if value not in parameter_names:
+                continue
+            previous = replacement[replacement_index - 1] if replacement_index else ""
+            following = (
+                replacement[replacement_index + 1]
+                if replacement_index + 1 < len(replacement) else ""
+            )
+            if previous not in {"#", "##"} and following != "##":
+                normal_substitutions.add(value)
         prescanned_arguments = {
             parameter: expand_sequence(
-                with_hidden(argument, argument_hidden), depth + 1, budget,
-                suffix_truncated)
+                argument, depth + 1, budget, suffix_truncated,
+                consumed_sources
+            )
             for parameter, argument in raw_arguments.items()
+            if parameter in normal_substitutions
         }
+        variadic_has_tokens = False
         if variadic is not None:
             raw_variadic = supplied[fixed_count:]
             raw_arguments[variadic] = join_variadic(raw_variadic, argument_hidden)
-            prescanned_arguments[variadic] = join_variadic([
-                expand_sequence(
-                    with_hidden(argument, argument_hidden), depth + 1, budget,
-                    suffix_truncated)
-                for argument in raw_variadic
-            ], argument_hidden)
-
-        replacement = definition.replacement
+            if variadic in normal_substitutions or "__VA_OPT__" in replacement:
+                prescanned_variadic = [
+                    expand_sequence(
+                        argument, depth + 1, budget, suffix_truncated,
+                        consumed_sources
+                    )
+                    for argument in raw_variadic
+                ]
+                joined_prescanned_variadic = join_variadic(
+                    prescanned_variadic, argument_hidden
+                )
+                variadic_has_tokens = bool(joined_prescanned_variadic)
+                prescanned_arguments[variadic] = joined_prescanned_variadic
+        if "__VA_OPT__" in replacement:
+            if variadic is None:
+                raise ExpansionSyntaxFailure
+            resolved: list[str] = []
+            replacement_cursor = 0
+            while replacement_cursor < len(replacement):
+                if replacement[replacement_cursor] != "__VA_OPT__":
+                    resolved.append(replacement[replacement_cursor])
+                    replacement_cursor += 1
+                    continue
+                if (replacement_cursor + 1 >= len(replacement)
+                        or replacement[replacement_cursor + 1] != "("):
+                    raise ExpansionSyntaxFailure
+                depth_cursor = 1
+                closing_cursor = replacement_cursor + 2
+                while closing_cursor < len(replacement) and depth_cursor:
+                    if replacement[closing_cursor] == "(":
+                        depth_cursor += 1
+                    elif replacement[closing_cursor] == ")":
+                        depth_cursor -= 1
+                    closing_cursor += 1
+                if depth_cursor:
+                    raise ExpansionSyntaxFailure
+                if variadic_has_tokens:
+                    resolved.extend(
+                        replacement[replacement_cursor + 2:closing_cursor - 1]
+                    )
+                replacement_cursor = closing_cursor
+            replacement = tuple(resolved)
         substituted: list[ExpansionToken] = []
         cursor = 0
         while cursor < len(replacement):
             value = replacement[cursor]
             if (value == "#" and cursor + 1 < len(replacement)
                     and replacement[cursor + 1] in raw_arguments):
-                budget.reserve_tokens(1)
                 substituted.append(ExpansionToken(
                     "__macro_string_literal__", replacement_hidden))
                 cursor += 2
@@ -1065,28 +1258,31 @@ def guarded_macro_composition_findings(
                     or (cursor + 1 < len(replacement)
                         and replacement[cursor + 1] == "##"))
                 selected = (raw_arguments[value] if adjacent_to_paste
-                            else prescanned_arguments[value])
+                            else prescanned_arguments.get(value, raw_arguments[value]))
                 selected_with_hidden = with_hidden(selected, argument_hidden)
                 if adjacent_to_paste and not selected_with_hidden:
                     selected_with_hidden = (
                         ExpansionToken("__macro_placemarker__", replacement_hidden),)
-                budget.reserve_tokens(len(selected_with_hidden))
                 substituted.extend(selected_with_hidden)
             else:
-                budget.reserve_tokens(1)
                 substituted.append(ExpansionToken(value, replacement_hidden))
             cursor += 1
 
-        return paste_tokens(substituted, budget, replacement_hidden)
+        pasted = paste_tokens(substituted, budget, replacement_hidden)
+        budget.reserve_tokens(len(pasted))
+        return pasted
 
     def expand_sequence(values: tuple[ExpansionToken, ...], depth: int = 0,
                         budget: ExpansionBudget | None = None,
-                        suffix_truncated: bool = False) \
+                        suffix_truncated: bool = False,
+                        consumed_sources: set[int] | None = None) \
             -> tuple[ExpansionToken, ...]:
         if depth > maximum_expansion_depth:
             raise ExpansionDepthExceeded
         if budget is None:
             budget = ExpansionBudget()
+        if consumed_sources is None:
+            consumed_sources = set()
         expanded: list[ExpansionToken] = []
         cursor = 0
         while cursor < len(values):
@@ -1098,16 +1294,18 @@ def guarded_macro_composition_findings(
                 cursor += 1
                 continue
             if not definition.function_like:
+                if token.source_index is not None:
+                    consumed_sources.add(token.source_index)
                 replacement_hidden = token.hidden | {value}
-                budget.reserve_tokens(len(definition.replacement))
                 replacement_values = [
                     ExpansionToken(item, replacement_hidden)
                     for item in definition.replacement]
                 replacement = paste_tokens(
                     replacement_values, budget, replacement_hidden)
+                budget.reserve_tokens(len(replacement))
                 rescanned = expand_sequence(
                     replacement + values[cursor + 1:], depth + 1, budget,
-                    suffix_truncated)
+                    suffix_truncated, consumed_sources)
                 return tuple(expanded) + rescanned
             if (cursor + 1 >= len(values)
                     or values[cursor + 1].value != "("):
@@ -1117,15 +1315,22 @@ def guarded_macro_composition_findings(
             parsed = value_call_arguments(values, cursor + 1)
             if parsed is None:
                 if suffix_truncated:
-                    raise ExpansionComplexityExceeded
+                    raise ExpansionTokenComplexityExceeded
                 raise ExpansionSyntaxFailure
             arguments, closing = parsed
+            consumed_sources.update(
+                source_index
+                for source_index in (
+                    item.source_index for item in values[cursor:closing + 1]
+                )
+                if source_index is not None
+            )
             replacement = expand_function(
                 value, definition, arguments, depth + 1,
-                token.hidden, budget, suffix_truncated)
+                token.hidden, budget, suffix_truncated, consumed_sources)
             rescanned = expand_sequence(
                 replacement + values[closing + 1:], depth + 1, budget,
-                suffix_truncated)
+                suffix_truncated, consumed_sources)
             return tuple(expanded) + rescanned
         return tuple(expanded)
 
@@ -1137,30 +1342,62 @@ def guarded_macro_composition_findings(
         elif token.value == ")" and paren_stack:
             paren_closings[paren_stack.pop()] = token_index
     reported_postfix_complexity_lines: set[int] = set()
+    EnvironmentKey = tuple[tuple[str, MacroDefinition], ...]
+    owned_environments_by_token: dict[int, set[EnvironmentKey]] = {}
+
+    def environment_key(
+        environment: dict[str, MacroDefinition],
+    ) -> EnvironmentKey:
+        return tuple(sorted(environment.items()))
+
+    def token_is_in_directive(position: int) -> bool:
+        range_index = bisect.bisect_right(directive_starts, position) - 1
+        return (range_index >= 0
+                and position < directive_ranges[range_index][1])
 
     for index, token in enumerate(tokens[:-1]):
-        while (event_index < len(macro_events)
-               and macro_events[event_index][0] <= token.start):
-            _position, name, definition = macro_events[event_index]
-            if definition is None:
-                macros.pop(name, None)
-            else:
-                macros[name] = definition
+        while (event_index < len(environment_events)
+               and environment_events[event_index][0] <= token.start):
+            _event_position, environments = environment_events[event_index]
             event_index += 1
-        definition = macros.get(token.value)
         if (not re.fullmatch(r"[A-Za-z_]\w*", token.value)
-                or definition is None
-                or any(start <= token.start < end for start, end in directive_ranges)):
+                or token_is_in_directive(token.start)):
+            continue
+        role_sensitive = token_has_sensitive_role(token.start)
+        if environments is None:
+            if source_only and (token.value in all_macro_names or role_sensitive):
+                findings.append(Finding(
+                    path,
+                    translated.line_at(token.start),
+                    "source-only conditional state complexity",
+                    "conditional macro environment work exceeds the bounded audit limit; "
+                    "rejected fail-closed",
+                ))
+            continue
+        owned_environments = owned_environments_by_token.get(index, set())
+        token_environments = tuple(
+            environment for environment in environments
+            if environment_key(environment) not in owned_environments
+        )
+        if not token_environments:
+            continue
+        definitions = [
+            environment.get(token.value) for environment in token_environments
+        ]
+        definition = next(
+            (candidate for candidate in definitions if candidate is not None), None
+        )
+        if definition is None:
             continue
         too_complex = False
-        if definition.function_like:
-            if tokens[index + 1].value != "(":
-                continue
+        if tokens[index + 1].value == "(":
             closing = paren_closings.get(index + 1)
             if closing is None:
-                findings.append(Finding(
-                    path, translated.line_at(token.start), "macro expansion syntax",
-                    "macro expansion syntax is incomplete; rejected fail-closed"))
+                if any(candidate is not None and candidate.function_like
+                       for candidate in definitions):
+                    findings.append(Finding(
+                        path, translated.line_at(token.start), "macro expansion syntax",
+                        "macro expansion syntax is incomplete; rejected fail-closed"))
                 continue
             too_complex = closing - index + 1 > maximum_continuous_macro_tokens
             while closing + 1 < len(tokens) and tokens[closing + 1].value == "(":
@@ -1186,8 +1423,7 @@ def guarded_macro_composition_findings(
                and suffix_end - index < maximum_continuous_macro_tokens):
             suffix_token = tokens[suffix_end]
             if (suffix_end > index
-                    and any(start <= suffix_token.start < end
-                            for start, end in directive_ranges)):
+                    and token_is_in_directive(suffix_token.start)):
                 break
             suffix_end += 1
             if suffix_token.value in {";", "{", "}"}:
@@ -1195,34 +1431,208 @@ def guarded_macro_composition_findings(
         suffix_truncated = (
             suffix_end < len(tokens)
             and tokens[suffix_end - 1].value not in {";", "{", "}"}
-            and not any(start <= tokens[suffix_end].start < end
-                        for start, end in directive_ranges))
+            and not token_is_in_directive(tokens[suffix_end].start))
         invocation = tuple(
-            ExpansionToken(item.value) for item in tokens[index:suffix_end])
+            ExpansionToken(item.value, source_index=source_index)
+            for source_index, item in enumerate(
+                tokens[index:suffix_end], start=index
+            )
+        )
+        context_sensitive = role_sensitive
+        def expand_with(
+            environment: dict[str, MacroDefinition],
+            candidate: MacroDefinition,
+            budget: ExpansionBudget,
+        ) -> tuple[tuple[ExpansionToken, ...], set[int]]:
+            saved = dict(macros)
+            macros.clear()
+            macros.update(environment)
+            macros[token.value] = candidate
+            consumed_sources: set[int] = set()
+            try:
+                expansion = expand_sequence(
+                    invocation,
+                    budget=budget,
+                    suffix_truncated=suffix_truncated,
+                    consumed_sources=consumed_sources,
+                )
+                return expansion, consumed_sources
+            finally:
+                macros.clear()
+                macros.update(saved)
+
+        def expansion_policy(
+            candidate: tuple[ExpansionToken, ...],
+        ) -> str | None:
+            candidate_spellings = {item.value for item in candidate}
+            policy_spellings = set(guarded)
+            policy_spellings.update(
+                REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
+            )
+            policy_spellings.update(
+                REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset())
+            )
+            policy_spellings.update(
+                REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset())
+            )
+            if path == REGISTRY_HEADER:
+                policy_spellings.add("registerRetire")
+            if path == OP_SCOPE_HEADER:
+                policy_spellings.add("track")
+            if candidate_spellings.isdisjoint(policy_spellings):
+                return None
+            prefix = [
+                item.value for item in tokens[:index]
+                if not token_is_in_directive(item.start)
+            ]
+            rendered = " ".join(prefix + [item.value for item in candidate])
+            if audit_capability_uses(path, rendered, compiler_view=True):
+                return "guarded identifier macro composition"
+            if re.search(
+                r"(?:&\s*[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*\s*::|\.|->)\s*"
+                r"nativeHandle\b",
+                rendered,
+            ):
+                return "guarded identifier macro composition"
+            if re.search(r"\b(?:_longjmp|longjmp|siglongjmp)\s*\(", rendered):
+                return "guarded identifier macro composition"
+            if any(
+                re.search(rf"\b{re.escape(name)}\s*\(", rendered)
+                for name in REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
+            ):
+                return "guarded identifier macro composition"
+            if any(
+                re.search(
+                    rf"\b(?:const_cast|dynamic_cast|reinterpret_cast|static_cast)\s*"
+                    rf"<[^>]*\b{re.escape(name)}\b",
+                    rendered,
+                )
+                for name in REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset())
+            ):
+                return "guarded identifier macro composition"
+            if any(
+                re.search(
+                    rf"(?:\.|->)\s*{re.escape(name)}\s*\(", rendered
+                )
+                for name in REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset())
+            ):
+                return "guarded identifier macro composition"
+            policies = (
+                (REGISTRY_HEADER, "GpuRetireRegistry", "registerRetire",
+                 "GpuRetireRegistry::registerRetire()"),
+                (OP_SCOPE_HEADER, "GpuOpScope", "track", "GpuOpScope::track()"),
+            )
+            for policy_path, class_name, member_name, expression in policies:
+                if path != policy_path or member_name not in rendered:
+                    continue
+                if audit_public_member(
+                    path,
+                    rendered,
+                    class_name,
+                    rf"\b{re.escape(member_name)}\s*\(",
+                    expression,
+                    pretokenized=True,
+                ):
+                    return expression
+            return None
+
+        expansion_budget = ExpansionBudget()
+        expansion_records: list[
+            tuple[EnvironmentKey, tuple[ExpansionToken, ...], set[int]]
+        ] = []
+        undefined_environment = False
         try:
-            expansion = expand_sequence(
-                invocation, suffix_truncated=suffix_truncated)
+            expansion_budget.reserve_tokens(max(0, len(token_environments) - 1))
+            for environment, candidate in zip(
+                token_environments, definitions, strict=True
+            ):
+                if candidate is None:
+                    undefined_environment = True
+                    continue
+                expansion, consumed_sources = expand_with(
+                    environment, candidate, expansion_budget
+                )
+                expansion_records.append((
+                    environment_key(environment), expansion, consumed_sources
+                ))
         except ExpansionDepthExceeded:
             findings.append(Finding(
-                path, translated.line_at(token.start), "macro expansion depth",
+                path, translated.line_at(token.start),
+                ("source-only macro expansion depth" if source_only
+                 else "macro expansion depth"),
                 "macro expansion depth exceeded the bounded audit limit; rejected fail-closed"))
             continue
-        except ExpansionComplexityExceeded:
+        except ExpansionTokenComplexityExceeded:
             findings.append(Finding(
-                path, translated.line_at(token.start), "macro expansion complexity",
-                "macro expansion complexity exceeded the bounded audit limit; "
+                path, translated.line_at(token.start),
+                ("source-only conditional state complexity"
+                 if source_only and len(token_environments) > 1 else
+                 "source-only macro token complexity" if source_only
+                 else "macro expansion complexity"),
+                ("conditional environment and expansion work exceeds the bounded "
+                 "audit limit; rejected fail-closed"
+                 if source_only and len(token_environments) > 1 else
+                 "macro expansion complexity exceeded the bounded audit limit; "
+                 "rejected fail-closed")))
+            continue
+        except ExpansionPasteComplexityExceeded:
+            findings.append(Finding(
+                path, translated.line_at(token.start),
+                ("source-only macro paste complexity" if source_only
+                 else "macro expansion complexity"),
+                "macro token-paste complexity exceeds the bounded audit limit; "
                 "rejected fail-closed"))
             continue
         except ExpansionSyntaxFailure:
             findings.append(Finding(
-                path, translated.line_at(token.start), "macro expansion syntax",
+                path, translated.line_at(token.start),
+                ("source-only macro expansion syntax" if source_only
+                 else "macro expansion syntax"),
                 "macro expansion syntax is incomplete; rejected fail-closed"))
             continue
-        if not expansion or expansion[0].value not in guarded:
+
+        for environment, _expansion, consumed_sources in expansion_records:
+            for consumed_source in consumed_sources:
+                if consumed_source > index:
+                    owned_environments_by_token.setdefault(
+                        consumed_source, set()
+                    ).add(environment)
+        expansion_results = [
+            expansion for _environment, expansion, _consumed in expansion_records
+        ]
+        expansion_keys = {
+            tuple(item.value for item in expansion)
+            for expansion in expansion_results
+        }
+        conditional_effect = (
+            len(token_environments) > 1
+            and (undefined_environment or len(expansion_keys) > 1)
+        )
+        policy_expressions = {
+            expression
+            for expansion in expansion_results
+            if (expression := expansion_policy(expansion)) is not None
+        }
+        if conditional_effect and (context_sensitive or policy_expressions):
+            findings.append(Finding(
+                path,
+                translated.line_at(token.start),
+                "source-only conditional macro ambiguity",
+                "reachable conditional environments change capability-sensitive "
+                "grammar; rejected fail-closed",
+            ))
             continue
+        if not policy_expressions:
+            continue
+        policy_expression = sorted(policy_expressions)[0]
         findings.append(Finding(
-            path, translated.line_at(token.start), "guarded identifier macro composition",
-            "macro arguments cannot be composed into guarded GPU or non-local control names"))
+            path,
+            translated.line_at(token.start),
+            policy_expression,
+            ("macro expansion cannot generate a public GPU retirement surface"
+             if policy_expression != "guarded identifier macro composition" else
+             "macro arguments cannot be composed into guarded GPU or non-local control names"),
+        ))
     return findings
 
 
@@ -1887,6 +2297,31 @@ def receiver_binding_name(masked: str, call_position: int) -> str | None:
     """
     tokens = cpp_tokens(receiver_expression(masked, call_position))
 
+    def documented_std_call(
+        start: int, end: int, allowed: frozenset[str],
+    ) -> tuple[int, int] | None:
+        opening = next((index for index in range(start, end)
+                        if tokens[index].value == "("), None)
+        if opening is None or tokens[end - 1].value != ")":
+            return None
+        function_index = opening - 1
+        if (function_index >= start
+                and tokens[function_index].value in {">", ">>"}):
+            depth = len(tokens[function_index].value)
+            function_index -= 1
+            while function_index >= start and depth:
+                if tokens[function_index].value in {">", ">>"}:
+                    depth += len(tokens[function_index].value)
+                elif tokens[function_index].value in {"<", "<<"}:
+                    depth -= len(tokens[function_index].value)
+                function_index -= 1
+        if function_index < start or tokens[function_index].value not in allowed:
+            return None
+        prefix = [token.value for token in tokens[start:function_index]]
+        if prefix not in (["std", "::"], ["::", "std", "::"]):
+            return None
+        return opening + 1, end - 1
+
     def resolve(start: int, end: int) -> str | None:
         start, end = strip_transparent_parentheses(tokens, start, end)
         depth = 0
@@ -1914,24 +2349,18 @@ def receiver_binding_name(masked: str, call_position: int) -> str | None:
                 return resolve(angle_close + 1, end)
         if (end - start >= 5 and [token.value for token in tokens[end - 4:end]]
                 == [".", "get", "(", ")"]):
-            return resolve(start, end - 4)
-        opening = next((index for index in range(start, end)
-                        if tokens[index].value == "("), None)
-        if opening is not None and tokens[end - 1].value == ")":
-            function_index = opening - 1
-            if (function_index >= start
-                    and tokens[function_index].value in {">", ">>"}):
-                depth = len(tokens[function_index].value)
-                function_index -= 1
-                while function_index >= start and depth:
-                    if tokens[function_index].value in {">", ">>"}:
-                        depth += len(tokens[function_index].value)
-                    elif tokens[function_index].value in {"<", "<<"}:
-                        depth -= len(tokens[function_index].value)
-                    function_index -= 1
-            if (function_index >= start and tokens[function_index].value in {
-                    "as_const", "cref", "forward", "move", "ref"}):
-                return resolve(opening + 1, end - 1)
+            factory_argument = documented_std_call(
+                start, end - 4, frozenset({"cref", "ref"})
+            )
+            if factory_argument is not None:
+                return resolve(*factory_argument)
+            return None
+        std_argument = documented_std_call(
+            start, end,
+            frozenset({"as_const", "cref", "forward", "move", "ref"}),
+        )
+        if std_argument is not None:
+            return resolve(*std_argument)
         if (end - start == 1
                 and re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value)):
             return tokens[start].value
@@ -1944,11 +2373,12 @@ def receiver_binding_references(masked: str, call_position: int) -> set[str]:
     """Return unqualified value names conservatively referenced by a receiver."""
     receiver = receiver_expression(masked, call_position)
     tokens = cpp_tokens(receiver)
-    receiver_start = masked.rfind(receiver, 0, call_position)
+    receiver_start = call_position - len(receiver.rstrip())
+    selector_prefix = masked[max(0, receiver_start - 64):receiver_start]
     dependent_member_receiver = (
         receiver_start >= 0
         and re.search(r"(?:\.|->|::)\s*template\s*$",
-                      masked[:receiver_start]) is not None)
+                      selector_prefix) is not None)
     references: set[str] = set()
     for index, token in enumerate(tokens):
         if re.fullmatch(r"[A-Za-z_]\w*", token.value) is None:
@@ -2457,8 +2887,7 @@ def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
 
 
 def audit_capability_uses(path: PurePosixPath, source: str,
-                          compiler_macros: Mapping[str, MacroDefinition] | frozenset[str]
-                          = frozenset(), *, compiler_view: bool = False,
+                          *, compiler_view: bool = False,
                           compiler_translation_text: TranslationText | None = None
                           ) -> list[Finding]:
     translated = (compiler_translation_text if compiler_translation_text is not None
@@ -2469,10 +2898,16 @@ def audit_capability_uses(path: PurePosixPath, source: str,
     findings: list[Finding] = []
     if not compiler_view:
         findings.extend(preprocessor_capability_findings(path, translated))
-        findings.extend(guarded_macro_composition_findings(
-            path, translated, compiler_macros))
         findings.extend(phase_two_capability_findings(path, source, translated))
     calls = list(MEMBER_CALL.finditer(masked))
+    receiver_binding_index = {
+        call.start(): (
+            receiver_binding_name(masked, call.start()),
+            receiver_binding_references(masked, call.start()),
+        )
+        for call in calls
+        if call.group(1) in {"read", "withRead", "complete"}
+    }
     scope_bindings = scope_bindings_linear(masked, pairs)
     scopes_by_name: dict[str, list[ScopeBinding]] = {}
     for binding in scope_bindings:
@@ -2493,6 +2928,15 @@ def audit_capability_uses(path: PurePosixPath, source: str,
     completes_by_scope: dict[int, list[re.Match[str]]] = {}
     handle_bindings: list[HandleBinding] = []
     claimed_reads: set[int] = set()
+    canonical_scope_cache: dict[int, bool] = {}
+
+    def scope_is_canonical(scope: ScopeBinding) -> bool:
+        position = scope.declaration.position
+        if position not in canonical_scope_cache:
+            canonical_scope_cache[position] = canonical_scope_declaration(
+                masked, pairs, scope
+            )
+        return canonical_scope_cache[position]
 
     def audit_withread_callback(call: re.Match[str]) -> None:
         callback_block = withread_callback_block(masked, pairs, call)
@@ -2517,8 +2961,7 @@ def audit_capability_uses(path: PurePosixPath, source: str,
             continue
         scope = resolve_scope(scopes_by_name, masked, pairs, call, shadow_index)
         if scope is None:
-            receiver_name = receiver_binding_name(masked, call.start())
-            receiver_names = receiver_binding_references(masked, call.start())
+            receiver_name, receiver_names = receiver_binding_index[call.start()]
             referenced = [
                 binding for binding in scope_bindings
                 if binding.declaration.position < call.start() < binding.block[1]
@@ -2565,7 +3008,7 @@ def audit_capability_uses(path: PurePosixPath, source: str,
                 )
             lease = canonical_read_lease(masked, pairs, call, scope.declaration.name)
             call_block = immediate_block(pairs, call.start())
-            canonical = (canonical_scope_declaration(masked, pairs, scope)
+            canonical = (scope_is_canonical(scope)
                          and call_block == scope.block and lease is not None)
             if not canonical:
                 findings.append(
@@ -2581,7 +3024,7 @@ def audit_capability_uses(path: PurePosixPath, source: str,
                                                   call.start()))
         elif call.group(1) == "withRead":
             audit_withread_callback(call)
-            canonical_declaration = canonical_scope_declaration(masked, pairs, scope)
+            canonical_declaration = scope_is_canonical(scope)
             canonical_withread = (
                 canonical_declaration and immediate_block(pairs, call.start()) == scope.block)
             if canonical_withread or not canonical_declaration:
@@ -2589,7 +3032,7 @@ def audit_capability_uses(path: PurePosixPath, source: str,
             if canonical_withread:
                 acquisitions_by_scope.setdefault(scope_key, []).append(call)
         else:
-            if canonical_scope_declaration(masked, pairs, scope):
+            if scope_is_canonical(scope):
                 completes_by_scope.setdefault(scope_key, []).append(call)
 
     # A temporary scope has no named binding to resolve, but its type still
@@ -3098,274 +3541,1574 @@ def aggregate_findings(
     ]
 
 
-def audit_sources(sources: dict[PurePosixPath, str],
-                  compiler_macros: dict[PurePosixPath, dict[str, MacroDefinition]] | None = None) \
-        -> list[Finding]:
+_RAW_DIRECTIVES = frozenset({
+    "define", "elif", "elifdef", "elifndef", "else", "endif", "error",
+    "if", "ifdef", "ifndef", "import", "include", "include_next", "pragma",
+    "undef", "warning",
+})
+
+
+def _header_operand_after_leading_comments(tail: str) -> str:
+    remaining = tail.lstrip()
+    while remaining.startswith("/*"):
+        closing = remaining.find("*/", 2)
+        if closing < 0:
+            return ""
+        remaining = remaining[closing + 2:].lstrip()
+    if remaining.startswith("//"):
+        return ""
+    return remaining
+
+
+def _comments_and_whitespace_only(tail: str) -> bool:
+    remaining = tail.lstrip()
+    while remaining.startswith("/*"):
+        closing = remaining.find("*/", 2)
+        if closing < 0:
+            return False
+        remaining = remaining[closing + 2:].lstrip()
+    return not remaining or remaining.startswith("//")
+
+
+def _header_operand_is_well_formed(text_tail: str, masked_tail: str) -> bool:
+    operand = _header_operand_after_leading_comments(text_tail)
+    if not operand:
+        return False
+    if operand[0] == '<':
+        closing = operand.find(">", 1)
+        return closing > 1 and _comments_and_whitespace_only(operand[closing + 1:])
+    if operand[0] == '"':
+        escaped = False
+        closing = None
+        for index, char in enumerate(operand[1:], 1):
+            if char == '"' and not escaped:
+                closing = index
+                break
+            escaped = char == "\\" and not escaped
+            if char != "\\":
+                escaped = False
+        return (closing is not None
+                and _comments_and_whitespace_only(operand[closing + 1:]))
+    return bool(masked_tail)
+
+
+def _directive_expression_is_valid(masked_tail: str, text_tail: str) -> bool:
+    """Validate the bounded preprocessing-expression grammar without evaluating it."""
+
+    integer_suffix = (
+        r"(?:[uU](?:(?:ll|LL)|[lL]|[zZ])?|"
+        r"(?:(?:ll|LL)|[lL])(?:[uU])?|[zZ](?:[uU])?)?"
+    )
+    integer = re.compile(
+        r"(?:"
+        r"0[xX][0-9A-Fa-f](?:'?[0-9A-Fa-f])*|"
+        r"0[bB][01](?:'?[01])*|"
+        r"0(?:'?[0-7])*|"
+        r"[1-9](?:'?[0-9])*"
+        r")" + integer_suffix
+    )
+    character = re.compile(
+        r"(?:u8|u|U|L)?'(?:\\(?:[^\r\n]|\r?\n)|[^'\\\r\n])+'"
+    )
+    string_literal = re.compile(
+        r'(?:u8|u|U|L)?"(?:\\(?:[^\r\n]|\r?\n)|[^"\\\r\n])*"'
+    )
+    identifier = re.compile(r"[A-Za-z_]\w*")
+    alternatives = {
+        "and": "&&", "or": "||", "not": "!", "bitand": "&",
+        "bitor": "|", "xor": "^", "compl": "~", "not_eq": "!=",
+    }
+    punctuators = (
+        "&&", "||", "==", "!=", "<=", ">=", "<<", ">>",
+        "(", ")", "[", "]", "{", "}", "?", ":", "+", "-", "!",
+        "~", "|", "^", "&", "<", ">", "*", "/", "%", ",", ".",
+    )
+
+    def character_escape_sequence_is_valid(spelling: str) -> bool:
+        opening = spelling.find("'")
+        content = spelling[opening + 1:-1]
+        cursor = 0
+        while cursor < len(content):
+            if content[cursor] != "\\":
+                cursor += 1
+                continue
+            cursor += 1
+            if cursor >= len(content):
+                return False
+            escape = content[cursor]
+            if escape == "x":
+                cursor += 1
+                first_hex = cursor
+                while cursor < len(content) and content[cursor] in "0123456789abcdefABCDEF":
+                    cursor += 1
+                if cursor == first_hex:
+                    return False
+                continue
+            if escape in {"u", "U"}:
+                digits = 4 if escape == "u" else 8
+                sequence = content[cursor + 1:cursor + 1 + digits]
+                if (len(sequence) != digits
+                        or any(char not in "0123456789abcdefABCDEF"
+                               for char in sequence)):
+                    return False
+                cursor += digits + 1
+                continue
+            if escape in "01234567":
+                cursor += 1
+                consumed = 1
+                while (cursor < len(content) and consumed < 3
+                       and content[cursor] in "01234567"):
+                    cursor += 1
+                    consumed += 1
+                continue
+            if escape not in "'\"?\\abfnrtv":
+                return False
+            cursor += 1
+        return True
+
+    def lex_expression(source: str) -> list[str] | None:
+        result: list[str] = []
+        cursor = 0
+        while cursor < len(source):
+            if source[cursor].isspace():
+                cursor += 1
+                continue
+            if source.startswith("//", cursor):
+                break
+            if source.startswith("/*", cursor):
+                closing = source.find("*/", cursor + 2)
+                if closing < 0:
+                    return None
+                cursor = closing + 2
+                continue
+            quoted = string_literal.match(source, cursor)
+            if quoted is not None:
+                result.append("__opaque_string_argument__")
+                cursor = quoted.end()
+                continue
+            literal = character.match(source, cursor)
+            if literal is not None:
+                if not character_escape_sequence_is_valid(literal.group()):
+                    return None
+                result.append("__character_constant__")
+                cursor = literal.end()
+                continue
+            if source[cursor].isdigit():
+                number = integer.match(source, cursor)
+                if number is None:
+                    return None
+                result.append("__integer_constant__")
+                cursor = number.end()
+                continue
+            word = identifier.match(source, cursor)
+            if word is not None:
+                result.append(alternatives.get(word.group(), word.group()))
+                cursor = word.end()
+                continue
+            operator = next(
+                (candidate for candidate in punctuators
+                 if source.startswith(candidate, cursor)),
+                None,
+            )
+            if operator is None:
+                return None
+            result.append(operator)
+            cursor += len(operator)
+        return result
+
+    tokens = lex_expression(text_tail)
+    if tokens is None or not tokens:
+        return False
+    index = 0
+    binary_precedence = {
+        "||": 1, "&&": 2, "|": 3, "^": 4, "&": 5,
+        "==": 6, "!=": 6,
+        "<": 7, "<=": 7, ">": 7, ">=": 7,
+        "<<": 8, ">>": 8,
+        "+": 9, "-": 9,
+        "*": 10, "/": 10, "%": 10,
+    }
+
+    def consume_balanced_call() -> bool:
+        nonlocal index
+        if index >= len(tokens) or tokens[index] != "(":
+            return False
+        stack = [")"]
+        index += 1
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        while index < len(tokens) and stack:
+            value = tokens[index]
+            if value in pairs:
+                stack.append(pairs[value])
+            elif value == stack[-1]:
+                stack.pop()
+            elif value in {")", "]", "}"}:
+                return False
+            index += 1
+        return not stack
+
+    def parse_primary() -> bool:
+        nonlocal index
+        if index >= len(tokens):
+            return False
+        value = tokens[index]
+        if value in {"+", "-", "!", "~"}:
+            index += 1
+            return parse_primary()
+        if value == "defined":
+            index += 1
+            if index < len(tokens) and tokens[index] == "(":
+                index += 1
+                if (index >= len(tokens)
+                        or re.fullmatch(r"[A-Za-z_]\w*", tokens[index]) is None):
+                    return False
+                index += 1
+                if index >= len(tokens) or tokens[index] != ")":
+                    return False
+                index += 1
+                return True
+            if (index >= len(tokens)
+                    or re.fullmatch(r"[A-Za-z_]\w*", tokens[index]) is None):
+                return False
+            index += 1
+            return True
+        if value == "(":
+            index += 1
+            if not parse_expression(0):
+                return False
+            if index >= len(tokens) or tokens[index] != ")":
+                return False
+            index += 1
+            return True
+        is_identifier = (
+            value not in {
+                "__integer_constant__", "__character_constant__",
+                "__opaque_string_argument__",
+            }
+            and re.fullmatch(r"[A-Za-z_]\w*", value) is not None
+        )
+        if (not is_identifier
+                and value not in {"__integer_constant__", "__character_constant__"}):
+            return False
+        index += 1
+        # A function-like macro invocation is an opaque primary until macro
+        # expansion (for example __has_include(<header>) or QT_VERSION_CHECK()).
+        if is_identifier and index < len(tokens) and tokens[index] == "(":
+            return consume_balanced_call()
+        return True
+
+    def parse_expression(minimum_precedence: int) -> bool:
+        nonlocal index
+        if not parse_primary():
+            return False
+        while index < len(tokens):
+            operator = tokens[index]
+            precedence = binary_precedence.get(operator)
+            if precedence is None or precedence < minimum_precedence:
+                break
+            index += 1
+            if not parse_expression(precedence + 1):
+                return False
+        if minimum_precedence == 0 and index < len(tokens) and tokens[index] == "?":
+            index += 1
+            if not parse_expression(0):
+                return False
+            if index >= len(tokens) or tokens[index] != ":":
+                return False
+            index += 1
+            if not parse_expression(0):
+                return False
+        return True
+
+    return parse_expression(0) and index == len(tokens)
+
+
+def _function_macro_parameters_are_valid(tail: str) -> bool:
+    name = re.match(r"[A-Za-z_]\w*", tail)
+    if name is None:
+        return False
+    remainder = tail[name.end():]
+    if not remainder.startswith("("):
+        return True
+    closing = matching_delimiter(remainder, 0, "(", ")")
+    if closing is None:
+        return False
+    raw_parameters = remainder[1:closing]
+    if not raw_parameters.strip():
+        return True
+    parameters = [parameter.strip() for parameter in raw_parameters.split(",")]
+    if any(not parameter for parameter in parameters):
+        return False
+    normalized: list[str] = []
+    for index, parameter in enumerate(parameters):
+        variadic = parameter == "..." or parameter.endswith("...")
+        spelling = parameter[:-3].strip() if parameter.endswith("...") else parameter
+        if variadic and index != len(parameters) - 1:
+            return False
+        if parameter != "..." and re.fullmatch(r"[A-Za-z_]\w*", spelling) is None:
+            return False
+        if spelling and spelling in normalized:
+            return False
+        if spelling:
+            normalized.append(spelling)
+    return True
+
+
+def _raw_lane_translation(path: PurePosixPath, source: str) \
+        -> tuple[TranslationText, list[Finding]]:
+    """Mask macro directives while retaining physical/directive diagnostics."""
+
+    translated = translate_source(source)
+    masked = list(translated.masked)
+    findings: list[Finding] = []
+    conditional_stack: list[tuple[int, bool]] = []
+    offset = 0
+    logical_texts = translated.text.splitlines(keepends=True)
+    logical_masks = translated.masked.splitlines(keepends=True)
+    for logical_text, logical in zip(logical_texts, logical_masks, strict=True):
+        stripped = logical.lstrip()
+        if stripped.startswith("#"):
+            directive = re.match(r"#\s*([A-Za-z_]\w*)\b(.*)", stripped.rstrip("\r\n"))
+            text_directive = re.match(
+                r"#\s*([A-Za-z_]\w*)\b(.*)",
+                logical_text.lstrip().rstrip("\r\n"),
+            )
+            name = directive.group(1) if directive is not None else ""
+            tail = directive.group(2).strip() if directive is not None else ""
+            text_tail = (
+                text_directive.group(2).strip()
+                if text_directive is not None else ""
+            )
+            line = translated.line_at(offset + len(logical) - len(stripped))
+            operand_required = {
+                "define", "elif", "elifdef", "elifndef", "if", "ifdef",
+                "ifndef", "undef",
+            }
+            header_operand_missing = (
+                name in {"import", "include", "include_next"}
+                and not _header_operand_is_well_formed(text_tail, tail)
+            )
+            malformed = (
+                directive is None
+                or name not in _RAW_DIRECTIVES.union({"line"})
+                or (name in operand_required
+                    and not (text_tail if name in {"if", "elif"} else tail))
+                or header_operand_missing
+                or (name in {"define", "undef"}
+                    and re.match(r"[A-Za-z_]\w*", tail) is None)
+                or (name in {"ifdef", "ifndef", "elifdef", "elifndef", "undef"}
+                    and re.fullmatch(r"[A-Za-z_]\w*", tail) is None)
+                or (name == "define"
+                    and not _function_macro_parameters_are_valid(tail))
+                or (name in {"if", "elif"}
+                    and not _directive_expression_is_valid(tail, text_tail))
+                or (name in {"else", "endif"} and bool(tail))
+            )
+            if name in {"if", "ifdef", "ifndef"}:
+                conditional_stack.append((line, False))
+            elif name in {"elif", "elifdef", "elifndef"}:
+                if not conditional_stack or conditional_stack[-1][1]:
+                    malformed = True
+            elif name == "else":
+                if not conditional_stack or conditional_stack[-1][1]:
+                    malformed = True
+                else:
+                    opening_line, _unused = conditional_stack[-1]
+                    conditional_stack[-1] = (opening_line, True)
+            elif name == "endif":
+                if not conditional_stack:
+                    malformed = True
+                else:
+                    conditional_stack.pop()
+            if name == "line":
+                findings.append(Finding(
+                    path,
+                    line,
+                    "source-authored #line directive",
+                    "source-authored line directives cannot alter capability provenance",
+                ))
+            elif malformed:
+                findings.append(Finding(
+                    path,
+                    line,
+                    "malformed preprocessor directive",
+                    "malformed directive syntax is rejected fail-closed",
+                ))
+            if name in {"define", "undef"}:
+                for index in range(offset, offset + len(logical)):
+                    if translated.masked[index] not in "\r\n":
+                        masked[index] = " "
+        offset += len(logical)
+    for opening_line, _saw_else in conditional_stack:
+        findings.append(Finding(
+            path,
+            opening_line,
+            "unterminated conditional directive",
+            "conditional preprocessing directives must be structurally balanced",
+        ))
+    grammar_text = "".join(masked)
+    return TranslationText(
+        translated.original,
+        grammar_text,
+        grammar_text,
+        translated.source_lines,
+        translated.splice_boundaries,
+    ), findings
+
+
+def audit_raw_sources(sources: Mapping[PurePosixPath, str]) -> list[Finding]:
+    """Audit source facts that preprocessing may erase, across every branch."""
+
     findings: list[Finding] = []
     for path, source in sources.items():
         if not is_production_path(path):
             continue
-        path_macros = (compiler_macros.get(path, frozenset())
-                       if compiler_macros is not None else frozenset())
-        findings.extend(audit_capability_uses(path, source, path_macros))
-        if compiler_macros is not None:
-            findings.extend(compiler_macro_findings(
-                path, source, compiler_macros.get(path, frozenset())))
+        translated, directive_findings = _raw_lane_translation(path, source)
+        findings.extend(directive_findings)
+        findings.extend(phase_two_capability_findings(path, source, translated))
+        findings.extend(audit_capability_uses(
+            path,
+            translated.text,
+            compiler_view=True,
+            compiler_translation_text=translated,
+        ))
     if REGISTRY_HEADER in sources:
-        findings.extend(audit_public_member(REGISTRY_HEADER, sources[REGISTRY_HEADER],
-                                            "GpuRetireRegistry", r"\bregisterRetire\s*\(",
-                                            "GpuRetireRegistry::registerRetire()"))
+        translated, _unused = _raw_lane_translation(
+            REGISTRY_HEADER, sources[REGISTRY_HEADER]
+        )
+        findings.extend(audit_public_member(
+            REGISTRY_HEADER,
+            translated.text,
+            "GpuRetireRegistry",
+            r"\bregisterRetire\s*\(",
+            "GpuRetireRegistry::registerRetire()",
+            pretokenized=True,
+        ))
     if OP_SCOPE_HEADER in sources:
-        findings.extend(audit_public_member(OP_SCOPE_HEADER, sources[OP_SCOPE_HEADER],
-                                            "GpuOpScope", r"\btrack\s*\(",
-                                            "GpuOpScope::track()"))
-    return findings
+        translated, _unused = _raw_lane_translation(
+            OP_SCOPE_HEADER, sources[OP_SCOPE_HEADER]
+        )
+        findings.extend(audit_public_member(
+            OP_SCOPE_HEADER,
+            translated.text,
+            "GpuOpScope",
+            r"\btrack\s*\(",
+            "GpuOpScope::track()",
+            pretokenized=True,
+        ))
+    return sorted(
+        set(findings),
+        key=lambda item: (item.path.as_posix(), item.line, item.expression, item.reason),
+    )
 
 
-def compiler_macro_findings(path: PurePosixPath, source: str,
-                            macro_names: Mapping[str, MacroDefinition] | frozenset[str]
-                            ) -> list[Finding]:
-    reviewed: dict[str, str] = {}
-    reviewed.update({name: "approved native-handle consumer"
-                     for name in REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())})
-    reviewed.update({name: "approved native-handle method"
-                     for name in REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset())})
-    reviewed.update({name: "approved native-handle type"
-                     for name in REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset())})
+_MACRO_LIKE_IDENTIFIER = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+
+
+@dataclass(frozen=True)
+class SourceBinding:
+    name: str
+    category: str
+    declaration: int
+    scope_start: int
+    scope_stop: int
+
+
+@dataclass(frozen=True)
+class SourceTypeAlias:
+    name: str
+    target: tuple[str, ...]
+    target_position: int
+    declaration: int
+    scope_start: int
+    scope_stop: int
+
+
+@dataclass(frozen=True)
+class SourceNamespaceDefinition:
+    declaration: int
+    scope_start: int
+    scope_stop: int
+    global_definition: bool
+
+
+def _source_only_declared_bindings(
+    masked: str,
+    directive_ranges: list[tuple[int, int]],
+) -> list[SourceBinding]:
+    """Index positioned lexical bindings with balanced declarator parsing."""
+
+    directive_starts = tuple(start for start, _stop in directive_ranges)
+
+    def in_directive(position: int) -> bool:
+        range_index = bisect.bisect_right(directive_starts, position) - 1
+        return (range_index >= 0
+                and position < directive_ranges[range_index][1])
+
+    tokens = [token for token in cpp_tokens(masked) if not in_directive(token.start)]
+    pairs = brace_pairs(masked)
+    brace_closings = {opening: closing for opening, closing in pairs}
+    token_scopes: dict[int, tuple[int, int]] = {}
+    scope_stack: list[tuple[int, int]] = []
+    for token in tokens:
+        if token.value == "}" and scope_stack:
+            scope_stack.pop()
+        token_scopes[token.start] = scope_stack[-1] if scope_stack else (0, len(masked))
+        if token.value == "{" and token.start in brace_closings:
+            scope_stack.append((token.start, brace_closings[token.start]))
+    bindings: list[SourceBinding] = []
+    aliases_by_name: dict[str, list[SourceTypeAlias]] = {}
+    std_namespace_definitions: list[SourceNamespaceDefinition] = []
+    ordinary_type_shadow = ("__source_only_ordinary_type_shadow__",)
+    root_scope = (0, len(masked))
+    macro_environment_events, _macro_directive_ranges = (
+        source_macro_environment_events(masked)
+    )
+    macro_environment_positions = tuple(
+        position for position, _environments in macro_environment_events
+    )
+
+    def lexical_scope(position: int) -> tuple[int, int]:
+        return token_scopes.get(position, (0, len(masked)))
+
+    def balanced_type_prefix(values: list[str]) -> bool:
+        first_identifier = 1 if values and values[0] == "::" else 0
+        if (len(values) <= first_identifier
+                or not re.fullmatch(
+                    r"[A-Za-z_]\w*", values[first_identifier]
+                )):
+            return False
+        forbidden = {".", "->", "?", "+", "-", "/", "%", "!", "||", "&&"}
+        if any(value in forbidden for value in values):
+            return False
+        angle_depth = 0
+        for value in values:
+            if value == "<":
+                angle_depth += 1
+            elif value == ">":
+                angle_depth -= 1
+            elif value == ">>":
+                angle_depth -= 2
+            if angle_depth < 0:
+                return False
+        return angle_depth == 0
+
+    def top_level_chunks(items: list[CppToken]) -> list[list[CppToken]]:
+        chunks: list[list[CppToken]] = []
+        start = 0
+        depths = {"(": 0, "[": 0, "{": 0, "<": 0}
+        closing = {")": "(", "]": "[", "}": "{", ">": "<"}
+        for index, item in enumerate(items):
+            value = item.value
+            if value in depths:
+                depths[value] += 1
+            elif value == ">>" and depths["<"]:
+                depths["<"] = max(0, depths["<"] - 2)
+            elif value in closing and depths[closing[value]]:
+                depths[closing[value]] -= 1
+            elif value == "," and not any(depths.values()):
+                chunks.append(items[start:index])
+                start = index + 1
+        chunks.append(items[start:])
+        return [chunk for chunk in chunks if chunk]
+
+    def declarator_lhs(items: list[CppToken]) -> list[CppToken]:
+        angle_depth = 0
+        index = 0
+        while index < len(items):
+            item = items[index]
+            value = item.value
+            if value == "<":
+                angle_depth += 1
+            elif value == ">" and angle_depth:
+                angle_depth -= 1
+            elif value == ">>" and angle_depth:
+                angle_depth = max(0, angle_depth - 2)
+            elif (not angle_depth and value == "(" and index > 0
+                  and items[index - 1].value == "decltype"):
+                depth = 1
+                index += 1
+                while index < len(items) and depth:
+                    if items[index].value == "(":
+                        depth += 1
+                    elif items[index].value == ")":
+                        depth -= 1
+                    index += 1
+                continue
+            elif not angle_depth and value in {"=", "(", "{"}:
+                return items[:index]
+            index += 1
+        return items
+
+    type_prefixes = {
+        "const", "constexpr", "extern", "inline", "mutable", "register",
+        "static", "thread_local", "volatile",
+    }
+
+    def outer_type_name(type_values: list[str]) -> str | None:
+        values = list(type_values)
+        while values and values[0] in type_prefixes:
+            values.pop(0)
+        while values and values[-1] in {"*", "&", "&&", "const", "volatile"}:
+            values.pop()
+        if not values or values[0] == "decltype":
+            return None
+        template = values.index("<") if "<" in values else len(values)
+        identifiers = [
+            value for value in values[:template]
+            if re.fullmatch(r"[A-Za-z_]\w*", value)
+        ]
+        return identifiers[-1] if identifiers else None
+
+    def std_macro_is_reachable(position: int) -> bool:
+        event_index = bisect.bisect_right(
+            macro_environment_positions, position
+        ) - 1
+        environments = (
+            ({},) if event_index < 0
+            else macro_environment_events[event_index][1]
+        )
+        return (environments is None
+                or any("std" in environment for environment in environments))
+
+    def visible_std_shadow(position: int, globally_qualified: bool) -> bool:
+        for alias in aliases_by_name.get("std", ()):
+            if (alias.declaration > position
+                    or not alias.scope_start < position < alias.scope_stop):
+                continue
+            if (globally_qualified
+                    and (alias.scope_start, alias.scope_stop) != root_scope):
+                continue
+            return True
+        for definition in std_namespace_definitions:
+            if (definition.declaration > position
+                    or not (definition.scope_start
+                            < position < definition.scope_stop)):
+                continue
+            if globally_qualified and not definition.global_definition:
+                continue
+            return True
+        return False
+
+    def real_std_namespace(position: int, globally_qualified: bool) -> bool:
+        return (not std_macro_is_reachable(position)
+                and not visible_std_shadow(position, globally_qualified))
+
+    def classify_type_category(
+        type_values: list[str],
+        position: int,
+        seen: frozenset[str],
+    ) -> str | None:
+        while type_values and type_values[-1] in {"*", "&", "&&", "const", "volatile"}:
+            type_values.pop()
+        normalized = list(type_values)
+        while normalized and normalized[0] in type_prefixes:
+            normalized.pop(0)
+        if normalized and normalized[0] == "decltype":
+            return "ordinary"
+        if not balanced_type_prefix(type_values):
+            return None
+        outer_name = outer_type_name(type_values)
+        if outer_name == "reference_wrapper" and "<" in normalized:
+            template_opening = normalized.index("<")
+            type_head = normalized[:template_opening]
+            globally_qualified = type_head == [
+                "::", "std", "::", "reference_wrapper"
+            ]
+            if (type_head in (["std", "::", "reference_wrapper"],
+                              ["::", "std", "::", "reference_wrapper"])
+                    and real_std_namespace(position, globally_qualified)):
+                template_closing = len(normalized) - 1
+                while (template_closing > template_opening
+                       and normalized[template_closing] != ">"):
+                    template_closing -= 1
+                if template_closing > template_opening + 1:
+                    wrapped = classify_type_category(
+                        normalized[template_opening + 1:template_closing],
+                        position,
+                        seen,
+                    )
+                    if wrapped is not None:
+                        return f"reference_wrapper:{wrapped}"
+        if outer_name == "GpuSyncReadScope":
+            return "scope"
+        if outer_name == "GpuReadLease":
+            return "lease"
+        if outer_name is not None:
+            alias_category = resolve_alias_category(
+                outer_name, position, seen
+            )
+            if alias_category is not None:
+                return alias_category
+        return "ordinary"
+
+    def resolve_alias_category(name: str, position: int,
+                               seen: frozenset[str] = frozenset()) -> str | None:
+        if name in seen:
+            return "unresolved"
+        alias = max((
+            candidate for candidate in aliases_by_name.get(name, ())
+            if (candidate.declaration <= position
+                and candidate.scope_start < position < candidate.scope_stop)
+        ), key=lambda candidate: candidate.declaration, default=None)
+        if alias is None:
+            # A known but not-yet-visible alias target is invalid C++; retain a
+            # fail-closed category rather than laundering it into an ordinary
+            # type. This also terminates mutually recursive alias graphs.
+            return "unresolved" if name in aliases_by_name else None
+        if alias.target == ordinary_type_shadow:
+            return "ordinary"
+        return classify_type_category(
+            list(alias.target), alias.target_position, seen | {name}
+        )
+
+    def category_for(type_values: list[str], position: int) -> str | None:
+        return classify_type_category(type_values, position, frozenset())
+
+    def add_type_alias(items: list[CppToken]) -> bool:
+        if not items:
+            return False
+        name_token: CppToken | None = None
+        target: list[CppToken] = []
+        if items[0].value == "using" and len(items) >= 4:
+            equals = next((
+                index for index, item in enumerate(items) if item.value == "="
+            ), None)
+            if equals == 2 and re.fullmatch(
+                    r"[A-Za-z_]\w*", items[1].value):
+                name_token = items[1]
+                target = items[equals + 1:]
+        elif items[0].value == "namespace" and len(items) >= 4:
+            equals = next((
+                index for index, item in enumerate(items) if item.value == "="
+            ), None)
+            if equals == 2 and re.fullmatch(
+                    r"[A-Za-z_]\w*", items[1].value):
+                name_token = items[1]
+                target = items[equals + 1:]
+        elif items[0].value == "typedef" and len(items) >= 3:
+            name_index = next((
+                index for index in range(len(items) - 1, 0, -1)
+                if re.fullmatch(r"[A-Za-z_]\w*", items[index].value)
+            ), None)
+            if name_index is not None:
+                name_token = items[name_index]
+                target = items[1:name_index]
+        if name_token is None or not target:
+            return False
+        scope_start, scope_stop = lexical_scope(name_token.start)
+        aliases_by_name.setdefault(name_token.value, []).append(SourceTypeAlias(
+            name_token.value, tuple(item.value for item in target),
+            target[0].start, name_token.end, scope_start, scope_stop,
+        ))
+        return True
+
+    def add_ordinary_type_shadow(
+        name_token: CppToken,
+        forced_scope: tuple[int, int] | None = None,
+        declaration: int | None = None,
+    ) -> None:
+        scope_start, scope_stop = forced_scope or lexical_scope(name_token.start)
+        aliases_by_name.setdefault(name_token.value, []).append(SourceTypeAlias(
+            name_token.value,
+            ordinary_type_shadow,
+            name_token.start,
+            name_token.end if declaration is None else declaration,
+            scope_start,
+            scope_stop,
+        ))
+
+    # Type declarations and template type parameters live in the same lookup
+    # namespace as aliases. Record their lexical shadowing before parsing value
+    # declarations so a prior capability alias cannot leak through the new type.
+    template_parameter_tokens: set[int] = set()
+    token_index = 0
+    while token_index + 1 < len(tokens):
+        if (tokens[token_index].value != "template"
+                or tokens[token_index + 1].value != "<"):
+            token_index += 1
+            continue
+        opening = token_index + 1
+        depth = 1
+        closing = opening + 1
+        while closing < len(tokens) and depth > 0:
+            if tokens[closing].value == "<":
+                depth += 1
+            elif tokens[closing].value == ">":
+                depth -= 1
+            elif tokens[closing].value == ">>":
+                depth -= 2
+            closing += 1
+        if depth > 0:
+            token_index += 1
+            continue
+        closing -= 1
+        template_parameter_tokens.update(range(opening + 1, closing))
+        body_index = next((
+            cursor for cursor in range(closing + 1, len(tokens))
+            if tokens[cursor].value in {"{", ";"}
+        ), None)
+        template_scope: tuple[int, int] | None = None
+        if (body_index is not None and tokens[body_index].value == "{"
+                and tokens[body_index].start in brace_closings):
+            template_scope = (
+                tokens[token_index].start - 1,
+                brace_closings[tokens[body_index].start],
+            )
+        elif body_index is not None:
+            template_scope = (
+                tokens[token_index].start - 1,
+                tokens[body_index].end,
+            )
+        parameter_depth = 1
+        cursor = opening + 1
+        while cursor < closing:
+            value = tokens[cursor].value
+            if value == "<":
+                parameter_depth += 1
+            elif value == ">":
+                parameter_depth -= 1
+            elif value == ">>":
+                parameter_depth -= 2
+            elif (parameter_depth == 1 and value in {"class", "typename"}
+                  and cursor + 1 < closing
+                  and re.fullmatch(
+                      r"[A-Za-z_]\w*", tokens[cursor + 1].value
+                  )):
+                add_ordinary_type_shadow(
+                    tokens[cursor + 1], template_scope,
+                    tokens[cursor + 1].end,
+                )
+                cursor += 1
+            cursor += 1
+        token_index = closing + 1
+
+    for declaration_index, token in enumerate(tokens):
+        if (declaration_index in template_parameter_tokens
+                or token.value not in {"class", "enum", "struct", "union"}):
+            continue
+        name_index = declaration_index + 1
+        if (token.value == "enum" and name_index < len(tokens)
+                and tokens[name_index].value in {"class", "struct"}):
+            name_index += 1
+        if (name_index >= len(tokens)
+                or name_index in template_parameter_tokens
+                or re.fullmatch(
+                    r"[A-Za-z_]\w*", tokens[name_index].value
+                ) is None
+                or (name_index + 1 < len(tokens)
+                    and tokens[name_index + 1].value == "::")):
+            continue
+        add_ordinary_type_shadow(tokens[name_index])
+
+    # Namespace definitions participate in deciding whether a spelled ``std``
+    # denotes the external standard namespace. Keep definitions separate from
+    # type aliases: unqualified lookup follows the enclosing lexical namespace,
+    # while leading ``::std`` is affected only by a root definition.
+    for namespace_index, token in enumerate(tokens):
+        if token.value != "namespace":
+            continue
+        cursor = namespace_index + 1
+        if (cursor >= len(tokens)
+                or re.fullmatch(r"[A-Za-z_]\w*", tokens[cursor].value) is None):
+            continue
+        component_indices = [cursor]
+        cursor += 1
+        while cursor < len(tokens) and tokens[cursor].value == "::":
+            cursor += 1
+            if cursor < len(tokens) and tokens[cursor].value == "inline":
+                cursor += 1
+            if (cursor >= len(tokens)
+                    or re.fullmatch(
+                        r"[A-Za-z_]\w*", tokens[cursor].value
+                    ) is None):
+                component_indices = []
+                break
+            component_indices.append(cursor)
+            cursor += 1
+        if (not component_indices or cursor >= len(tokens)
+                or tokens[cursor].value != "{"):
+            continue
+        body_closing = brace_closings.get(tokens[cursor].start)
+        if body_closing is None:
+            continue
+        enclosing_scope = lexical_scope(token.start)
+        body_scope = (tokens[cursor].start, body_closing)
+        for component_number, component_index in enumerate(component_indices):
+            component = tokens[component_index]
+            if component.value != "std":
+                continue
+            first_component = component_number == 0
+            visibility_scope = enclosing_scope if first_component else body_scope
+            std_namespace_definitions.append(SourceNamespaceDefinition(
+                component.end,
+                visibility_scope[0],
+                visibility_scope[1],
+                first_component and enclosing_scope == root_scope,
+            ))
+
+    def add_statement_declarations(items: list[CppToken],
+                                   forced_scope: tuple[int, int] | None = None) -> None:
+        # Member-call statements can contain arbitrarily large nested callback
+        # bodies. They cannot begin a declaration, so reject before balanced
+        # declarator splitting rather than rescanning every nested suffix.
+        if len(items) > 1 and items[1].value in {".", "->"}:
+            return
+        while len(items) >= 4 and items[0].value == "[" and items[1].value == "[":
+            depth = 1
+            cursor = 2
+            while cursor + 1 < len(items) and depth:
+                if items[cursor].value == "[" and items[cursor + 1].value == "[":
+                    depth += 1
+                    cursor += 2
+                    continue
+                if items[cursor].value == "]" and items[cursor + 1].value == "]":
+                    depth -= 1
+                    cursor += 2
+                    continue
+                cursor += 1
+            if depth:
+                return
+            items = items[cursor:]
+        auto_index = next((
+            index for index, item in enumerate(items)
+            if item.value == "auto"
+        ), None)
+        allowed_before_auto = {
+            "const", "constexpr", "static", "thread_local", "volatile",
+        }
+        structured_opening = None
+        if (auto_index is not None
+                and all(item.value in allowed_before_auto
+                        for item in items[:auto_index])):
+            candidate_opening = next((
+                index for index, item in enumerate(items[auto_index + 1:], auto_index + 1)
+                if item.value == "["
+            ), None)
+            if (candidate_opening is not None
+                    and all(item.value in {"&", "&&", "const", "volatile"}
+                            for item in items[auto_index + 1:candidate_opening])):
+                structured_opening = candidate_opening
+        if structured_opening is not None:
+            depth = 1
+            closing = structured_opening + 1
+            while closing < len(items) and depth:
+                if items[closing].value == "[":
+                    depth += 1
+                elif items[closing].value == "]":
+                    depth -= 1
+                closing += 1
+            if depth:
+                return
+            for name_token in items[structured_opening + 1:closing - 1]:
+                if re.fullmatch(r"[A-Za-z_]\w*", name_token.value) is None:
+                    continue
+                scope_start, scope_stop = forced_scope or lexical_scope(name_token.start)
+                bindings.append(SourceBinding(
+                    name_token.value, "ordinary", name_token.end,
+                    scope_start, scope_stop,
+                ))
+            return
+        chunks = top_level_chunks(items)
+        if not chunks:
+            return
+        first_lhs = declarator_lhs(chunks[0])
+        if (len(first_lhs) < 2
+                or first_lhs[0].value in {
+                    "class", "enum", "for", "if", "return", "struct", "switch",
+                    "typedef", "union", "using", "while",
+                }):
+            return
+        first_name_index = next((
+            index for index in range(len(first_lhs) - 1, -1, -1)
+            if re.fullmatch(r"[A-Za-z_]\w*", first_lhs[index].value)
+        ), None)
+        if first_name_index is None or first_name_index == 0:
+            return
+        common_type = [item.value for item in first_lhs[:first_name_index]]
+        category = category_for(list(common_type), first_lhs[0].start)
+        if category is None:
+            return
+        for chunk_index, chunk in enumerate(chunks):
+            lhs = declarator_lhs(chunk)
+            name_index = next((
+                index for index in range(len(lhs) - 1, -1, -1)
+                if re.fullmatch(r"[A-Za-z_]\w*", lhs[index].value)
+            ), None)
+            if name_index is None or (chunk_index == 0 and name_index == 0):
+                continue
+            name_token = lhs[name_index]
+            if chunk_index:
+                prefix = [item.value for item in lhs[:name_index]]
+                if any(value not in {"*", "&", "&&", "const", "volatile"}
+                       for value in prefix):
+                    continue
+            scope_start, scope_stop = forced_scope or lexical_scope(name_token.start)
+            bindings.append(SourceBinding(
+                name_token.value, category, name_token.end, scope_start, scope_stop
+            ))
+
+    closing_to_opening: dict[int, int] = {}
+    delimiter_stack: list[tuple[str, int]] = []
+    opening_for = {")": "(", "]": "[", "}": "{"}
+    for index, token in enumerate(tokens):
+        if token.value in {"(", "[", "{"}:
+            delimiter_stack.append((token.value, index))
+        elif token.value in opening_for and delimiter_stack:
+            expected = opening_for[token.value]
+            if delimiter_stack[-1][0] == expected:
+                _value, opening = delimiter_stack.pop()
+                closing_to_opening[index] = opening
+
+    for semicolon, token in enumerate(tokens):
+        if token.value != ";":
+            continue
+        cursor = semicolon - 1
+        while cursor >= 0:
+            value = tokens[cursor].value
+            if value in {")", "]"} and cursor in closing_to_opening:
+                cursor = closing_to_opening[cursor] - 1
+                continue
+            if value == "}" and cursor in closing_to_opening:
+                following = tokens[cursor + 1].value if cursor + 1 < semicolon else ";"
+                if cursor == semicolon - 1 or following == ",":
+                    cursor = closing_to_opening[cursor] - 1
+                    continue
+                break
+            if value in {";", "{", "}"}:
+                break
+            cursor -= 1
+        statement_items = tokens[cursor + 1:semicolon]
+        if not add_type_alias(statement_items):
+            add_statement_declarations(statement_items)
+
+    opening_stack: list[int] = []
+    closing_to_opening: dict[int, int] = {}
+    for index, token in enumerate(tokens):
+        if token.value == "(":
+            opening_stack.append(index)
+        elif token.value == ")" and opening_stack:
+            closing_to_opening[index] = opening_stack.pop()
+    for closing, opening in closing_to_opening.items():
+        if closing + 1 >= len(tokens) or tokens[closing + 1].value != "{":
+            continue
+        start = opening + 1
+        depth = 0
+        segment_start = start
+        segments: list[list[CppToken]] = []
+        for index in range(start, closing):
+            value = tokens[index].value
+            if value in {"(", "[", "<"}:
+                depth += 1
+            elif value in {")", "]", ">"}:
+                depth = max(0, depth - 1)
+            if value == "," and depth == 0:
+                segments.append(tokens[segment_start:index])
+                segment_start = index + 1
+        segments.append(tokens[segment_start:closing])
+        body_opening = tokens[closing + 1]
+        body_closing = brace_closings.get(body_opening.start)
+        body_pair = (
+            (body_opening.start, body_closing)
+            if body_closing is not None else None
+        )
+        if body_pair is None:
+            continue
+        for segment in segments:
+            range_colon = next((
+                index for index, item in enumerate(segment)
+                if item.value == ":"
+            ), None)
+            declaration_segment = (
+                segment[:range_colon] if range_colon is not None else segment
+            )
+            add_statement_declarations(declaration_segment, body_pair)
+
+    read_result = re.compile(
+        r"\b(?:const\s+)?auto\s+([A-Za-z_]\w*)\s*=\s*"
+        r"([A-Za-z_]\w*)\s*\.\s*read\s*\("
+    )
+    binding_index = _source_binding_index(bindings, masked)
+    binding_positions: dict[tuple[str, int], list[int]] = {}
+    for binding_position, binding in enumerate(bindings):
+        binding_positions.setdefault(
+            (binding.name, binding.declaration), []
+        ).append(binding_position)
+    for match in read_result.finditer(masked):
+        scope_binding = _resolve_source_binding(
+            binding_index, match.group(2), match.start(2)
+        )
+        if scope_binding is None or scope_binding.category != "scope":
+            continue
+        name_position = match.start(1)
+        scope_start, scope_stop = lexical_scope(name_position)
+        lease_binding = SourceBinding(
+            match.group(1), "lease", match.end(1), scope_start, scope_stop
+        )
+        positions = binding_positions.get(
+            (lease_binding.name, lease_binding.declaration), []
+        )
+        if positions:
+            for binding_position in positions:
+                bindings[binding_position] = lease_binding
+        else:
+            binding_positions.setdefault(
+                (lease_binding.name, lease_binding.declaration), []
+            ).append(len(bindings))
+            bindings.append(lease_binding)
+    return sorted(set(bindings), key=lambda binding: (
+        binding.declaration, binding.scope_start, binding.name, binding.category
+    ))
+
+
+@dataclass(frozen=True)
+class SourceBindingBucket:
+    records: tuple[SourceBinding, ...]
+    declarations: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class SourceBindingIndex:
+    by_name_scope: Mapping[
+        str, Mapping[tuple[int, int], SourceBindingBucket]
+    ]
+    parents: Mapping[tuple[int, int], tuple[int, int] | None]
+    children: Mapping[tuple[int, int], tuple[tuple[int, int], ...]]
+    child_starts: Mapping[tuple[int, int], tuple[int, ...]]
+    scopes_by_token: Mapping[int, tuple[int, int]]
+    root: tuple[int, int]
+    nearest_scope_cache: dict[
+        tuple[str, tuple[int, int]], tuple[int, int] | None
+    ]
+
+    def scope_at(self, position: int) -> tuple[int, int]:
+        direct = self.scopes_by_token.get(position)
+        if direct is not None:
+            return direct
+        return _source_scope_at_fallback(self, position)
+
+    def nearest_binding_scope(
+        self, name: str, scope: tuple[int, int] | None,
+    ) -> tuple[int, int] | None:
+        path: list[tuple[int, int]] = []
+        scoped = self.by_name_scope.get(name, {})
+        cursor = scope
+        result: tuple[int, int] | None = None
+        while cursor is not None:
+            key = (name, cursor)
+            if key in self.nearest_scope_cache:
+                result = self.nearest_scope_cache[key]
+                break
+            path.append(cursor)
+            if cursor in scoped:
+                result = cursor
+                break
+            cursor = self.parents.get(cursor)
+        for visited in path:
+            self.nearest_scope_cache[(name, visited)] = result
+        return result
+
+
+def _source_scope_at_fallback(
+    binding_index: SourceBindingIndex, position: int,
+) -> tuple[int, int]:
+    scope = binding_index.root
+    while True:
+        children = binding_index.children.get(scope, ())
+        starts = binding_index.child_starts.get(scope, ())
+        child_index = bisect.bisect_right(starts, position) - 1
+        if child_index < 0:
+            return scope
+        child = children[child_index]
+        if not child[0] < position < child[1]:
+            return scope
+        scope = child
+
+
+def _resolve_source_binding(
+    binding_index: SourceBindingIndex,
+    name: str,
+    position: int,
+) -> SourceBinding | None:
+    scope = binding_index.nearest_binding_scope(
+        name, binding_index.scope_at(position)
+    )
+    scoped = binding_index.by_name_scope.get(name, {})
+    while scope is not None:
+        bucket = scoped.get(scope)
+        if bucket is not None:
+            record_index = bisect.bisect_right(
+                bucket.declarations, position
+            ) - 1
+            if record_index >= 0:
+                return bucket.records[record_index]
+        scope = binding_index.nearest_binding_scope(
+            name, binding_index.parents.get(scope)
+        )
+    return None
+
+
+def _source_binding_index(
+    bindings: Iterable[SourceBinding],
+    masked: str,
+) -> SourceBindingIndex:
+    root = (0, len(masked))
+    pairs = sorted(brace_pairs(masked))
+    brace_closings = {opening: closing for opening, closing in pairs}
+    parents: dict[tuple[int, int], tuple[int, int] | None] = {root: None}
+    children_lists: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    stack: list[tuple[int, int]] = []
+    for pair in pairs:
+        while stack and pair[0] > stack[-1][1]:
+            stack.pop()
+        parent = stack[-1] if stack else root
+        parents[pair] = parent
+        children_lists.setdefault(parent, []).append(pair)
+        stack.append(pair)
+    grouped: dict[str, dict[tuple[int, int], list[SourceBinding]]] = {}
+    for binding in bindings:
+        scope = (binding.scope_start, binding.scope_stop)
+        grouped.setdefault(binding.name, {}).setdefault(scope, []).append(binding)
+    by_name_scope: dict[
+        str, dict[tuple[int, int], SourceBindingBucket]
+    ] = {}
+    for name, scoped in grouped.items():
+        by_name_scope[name] = {}
+        for scope, records in scoped.items():
+            ordered = tuple(sorted(records, key=lambda binding: binding.declaration))
+            by_name_scope[name][scope] = SourceBindingBucket(
+                ordered, tuple(binding.declaration for binding in ordered)
+            )
+    children = {
+        scope: tuple(sorted(records))
+        for scope, records in children_lists.items()
+    }
+    scopes_by_token: dict[int, tuple[int, int]] = {}
+    lexical_stack: list[tuple[int, int]] = []
+    for token in cpp_tokens(masked):
+        if token.value == "}" and lexical_stack:
+            lexical_stack.pop()
+        scopes_by_token[token.start] = lexical_stack[-1] if lexical_stack else root
+        if token.value == "{" and token.start in brace_closings:
+            lexical_stack.append((token.start, brace_closings[token.start]))
+    return SourceBindingIndex(
+        by_name_scope,
+        parents,
+        children,
+        {
+            scope: tuple(pair[0] for pair in records)
+            for scope, records in children.items()
+        },
+        scopes_by_token,
+        root,
+        {},
+    )
+
+
+def _source_only_receiver_proof(
+    masked: str,
+    call_position: int,
+    bindings: SourceBindingIndex,
+) -> tuple[str | None, str | None]:
+    """Return a proven receiver category and any unresolved value name.
+
+    Complex operator receivers are accepted only when every referenced value is
+    an ordinary binding. Calls are limited to the transparent standard-library
+    forms understood by ``receiver_binding_name``; arbitrary wrappers and
+    member ``get()`` calls do not inherit the category of an identifier merely
+    mentioned inside them.
+    """
+
+    receiver_name = receiver_binding_name(masked, call_position)
+    if receiver_name is not None:
+        binding = _resolve_source_binding(
+            bindings, receiver_name, call_position
+        )
+        if binding is None:
+            return None, receiver_name
+        if binding.category.startswith("reference_wrapper:"):
+            return "ordinary", None
+        return binding.category, None
+
+    receiver_tokens = cpp_tokens(receiver_expression(masked, call_position))
+    start, stop = strip_transparent_parentheses(
+        receiver_tokens, 0, len(receiver_tokens)
+    )
+    if (stop - start >= 5
+            and [token.value for token in receiver_tokens[stop - 4:stop]]
+            == [".", "get", "(", ")"]):
+        base_start, base_stop = strip_transparent_parentheses(
+            receiver_tokens, start, stop - 4
+        )
+        if (base_stop - base_start == 1
+                and re.fullmatch(
+                    r"[A-Za-z_]\w*", receiver_tokens[base_start].value
+                )):
+            wrapper_name = receiver_tokens[base_start].value
+            wrapper_binding = _resolve_source_binding(
+                bindings, wrapper_name, call_position
+            )
+            if wrapper_binding is None:
+                return None, wrapper_name
+            if wrapper_binding.category.startswith("reference_wrapper:"):
+                return wrapper_binding.category.split(":", 1)[1], None
+        return None, None
+
+    # Parentheses that remain after stripping the whole receiver denote a call
+    # or a nested subexpression. The only transparent calls are resolved above.
+    if any(
+        token.value in {"(", ")", "{", "}"}
+        for token in receiver_tokens[start:stop]
+    ):
+        references = receiver_binding_references(masked, call_position)
+        unresolved = next((
+            name for name in sorted(references)
+            if _resolve_source_binding(bindings, name, call_position) is None
+        ), None)
+        return None, unresolved
+
+    references = receiver_binding_references(masked, call_position)
+    if not references:
+        return None, None
+    categories: list[str] = []
+    for name in sorted(references):
+        binding = _resolve_source_binding(bindings, name, call_position)
+        if binding is None:
+            return None, name
+        categories.append(
+            "ordinary" if binding.category.startswith("reference_wrapper:")
+            else binding.category
+        )
+    if all(category == "ordinary" for category in categories):
+        return "ordinary", None
+    return next(
+        category for category in categories if category != "ordinary"
+    ), None
+
+
+def _source_only_sensitive_ranges(
+    masked: str, directive_ranges: list[tuple[int, int]],
+) -> list[tuple[int, int, str]]:
+    """Precompute capability-sensitive receiver/member/callback call ranges."""
+
+    directive_starts = tuple(start for start, _stop in directive_ranges)
+
+    def in_directive(position: int) -> bool:
+        range_index = bisect.bisect_right(directive_starts, position) - 1
+        return (range_index >= 0
+                and position < directive_ranges[range_index][1])
+
+    bindings = _source_binding_index(
+        _source_only_declared_bindings(masked, directive_ranges), masked
+    )
+    parenthesis_closings = {
+        opening: closing for opening, closing in delimiter_pairs(masked, "(", ")")
+    }
+    ranges: list[tuple[int, int, str]] = []
+    for call in MEMBER_CALL.finditer(masked):
+        if in_directive(call.start()):
+            continue
+        operation = call.group(1)
+        if operation not in {"read", "withRead", "complete", "nativeHandle"}:
+            continue
+        receiver_category, _unresolved = _source_only_receiver_proof(
+            masked, call.start(), bindings
+        )
+        if receiver_category == "ordinary":
+            continue
+        receiver = receiver_expression(masked, call.start())
+        receiver_start = max(0, call.start() - len(receiver.rstrip()))
+        closing = parenthesis_closings.get(call.end() - 1)
+        call_stop = closing + 1 if closing is not None else call.end()
+        ranges.append((receiver_start, call.start(), "receiver"))
+        ranges.append((call.start(), call.end(), "member"))
+        if operation == "withRead":
+            ranges.append((call.end(), call_stop, "callback"))
+        elif operation == "complete":
+            ranges.append((call.start(), call_stop, "completion"))
+    generic_member = re.compile(r"(?:\.|->|::)\s*([A-Za-z_]\w*)\s*\(")
+    for call in generic_member.finditer(masked):
+        if in_directive(call.start()) or masked.startswith("::", call.start()):
+            continue
+        receiver_category, _unresolved = _source_only_receiver_proof(
+            masked, call.start(), bindings
+        )
+        if receiver_category == "ordinary":
+            continue
+        receiver = receiver_expression(masked, call.start())
+        receiver_start = max(0, call.start() - len(receiver.rstrip()))
+        ranges.append((receiver_start, call.start(), "receiver"))
+        ranges.append((call.start(), call.end(), "member"))
+    return ranges
+
+
+def _source_only_unknown_macro_findings(
+    path: PurePosixPath, translated: TranslationText
+) -> list[Finding]:
+    """Reject unresolved macro-like names only where they can change capability grammar."""
+
+    masked = translated.masked
+    environment_events, directive_ranges = source_macro_environment_events(masked)
+    directive_starts = tuple(start for start, _stop in directive_ranges)
+    sensitive: list[tuple[int, str]] = []
+    sensitive_intervals: list[tuple[int, int]] = []
+
+    def in_directive(position: int) -> bool:
+        range_index = bisect.bisect_right(directive_starts, position) - 1
+        return (range_index >= 0
+                and position < directive_ranges[range_index][1])
+
+    def add_interval(start: int, stop: int) -> None:
+        if start < stop:
+            sensitive_intervals.append((start, stop))
+
+    parenthesis_closings: dict[int, int] = {}
+    parenthesis_stack: list[int] = []
+    for token in cpp_tokens(masked):
+        if token.value == "(":
+            parenthesis_stack.append(token.start)
+        elif token.value == ")" and parenthesis_stack:
+            parenthesis_closings[parenthesis_stack.pop()] = token.start
+
+    bindings = _source_binding_index(
+        _source_only_declared_bindings(masked, directive_ranges), masked
+    )
+    for call in MEMBER_CALL.finditer(masked):
+        if in_directive(call.start()):
+            continue
+        operation = call.group(1)
+        if operation not in {"read", "withRead", "complete", "nativeHandle"}:
+            continue
+        receiver = receiver_expression(masked, call.start())
+        receiver_start = call.start() - len(receiver.rstrip())
+        receiver_category, unresolved_receiver = _source_only_receiver_proof(
+            masked, call.start(), bindings
+        )
+        if receiver_category == "ordinary":
+            continue
+        add_interval(max(0, receiver_start), call.start())
+        if receiver_category is None:
+            marker = unresolved_receiver or operation
+            receiver_position = masked.rfind(
+                marker, max(0, receiver_start), call.end()
+            )
+            if receiver_position >= 0:
+                sensitive.append((receiver_position, marker))
+        closing = parenthesis_closings.get(call.end() - 1)
+        if operation == "withRead" and closing is not None:
+            add_interval(call.end(), closing)
+
+    merged_intervals: list[tuple[int, int]] = []
+    for start, stop in sorted(sensitive_intervals):
+        if merged_intervals and start <= merged_intervals[-1][1]:
+            previous_start, previous_stop = merged_intervals[-1]
+            merged_intervals[-1] = (previous_start, max(previous_stop, stop))
+        else:
+            merged_intervals.append((start, stop))
+    for start, stop in merged_intervals:
+        for match in _MACRO_LIKE_IDENTIFIER.finditer(masked, start, stop):
+            prefix_end = match.start()
+            while prefix_end > start and masked[prefix_end - 1].isspace():
+                prefix_end -= 1
+            prefix = masked[max(start, prefix_end - 2):prefix_end]
+            if (in_directive(match.start())
+                    or prefix.endswith(".")
+                    or prefix.endswith("->")
+                    or prefix.endswith("::")):
+                continue
+            sensitive.append((match.start(1), match.group(1)))
+
+    known_capability_methods = {
+        "complete", "desc", "nativeHandle", "nativeSubresource", "read",
+        "valid", "withRead",
+    }
+    unknown_member = re.compile(r"(?:\.|->|::)\s*([A-Za-z_]\w*)\s*\(")
+    for match in unknown_member.finditer(masked):
+        if in_directive(match.start()):
+            continue
+        # A qualified static/type call is not an object receiver binding.
+        if masked.startswith("::", match.start()):
+            continue
+        receiver_category, _unresolved = _source_only_receiver_proof(
+            masked, match.start(), bindings
+        )
+        if (receiver_category != "ordinary"
+                and match.group(1) not in known_capability_methods):
+            sensitive.append((match.start(1), match.group(1)))
+
     findings: list[Finding] = []
-    for name, expression in reviewed.items():
-        if name not in macro_names or not re.search(rf"\b{re.escape(name)}\b", source):
+    environments: tuple[dict[str, MacroDefinition], ...] | None = ({},)
+    event_index = 0
+    for position, name in sorted(set(sensitive)):
+        while (event_index < len(environment_events)
+               and environment_events[event_index][0] <= position):
+            _event_position, environments = environment_events[event_index]
+            event_index += 1
+        # Conditional alternatives are audited by the per-environment expansion
+        # phase. This phase reports names that are unresolved in every reachable
+        # environment, never a lexical-final branch approximation.
+        if environments is None or any(name in environment for environment in environments):
             continue
         findings.append(Finding(
-            path, line_number(source, re.search(rf"\b{re.escape(name)}\b", source).start()),
-            f"{expression} cannot be hidden or shadowed",
-            "the production compiler reports the reviewed spelling as a macro"))
+            path,
+            translated.line_at(position),
+            "source-only macro ambiguity",
+            f"unresolved macro-like {name} occurs in a capability-sensitive context",
+        ))
     return findings
 
 
-def reviewed_macro_names(path: PurePosixPath) -> frozenset[str]:
-    names = set(REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset()))
-    names.update(REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset()))
-    names.update(REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset()))
-    return frozenset(names)
+def audit_source_only(path: PurePosixPath, source: str) -> list[Finding]:
+    """Conservatively audit one path without claiming compiler coverage."""
+
+    if not is_production_path(path):
+        return []
+    translated = translate_source(source)
+    findings = list(audit_raw_sources({path: source}))
+    findings.extend(guarded_macro_composition_findings(
+        path, translated, source_only=True
+    ))
+    findings.extend(_source_only_unknown_macro_findings(path, translated))
+    return sorted(
+        set(findings),
+        key=lambda item: (item.path.as_posix(), item.line, item.expression, item.reason),
+    )
 
 
-def compile_entry_file(entry: dict[str, object], database: Path) -> Path:
-    directory = Path(str(entry["directory"]))
-    if not directory.is_absolute():
-        directory = database.parent / directory
-    source = Path(str(entry["file"]))
-    return (source if source.is_absolute() else directory / source).resolve()
+def audit_pipeline(
+    sources: Mapping[PurePosixPath, str],
+    views: Iterable[PreprocessedTranslationUnitView],
+    coverage: CoverageReport,
+) -> tuple[list[AggregatedFinding], CoverageReport]:
+    """Union the three disjoint audit lanes without inventing native coverage."""
+
+    observations: list[tuple[Finding, str]] = [
+        (finding, "raw-source") for finding in audit_raw_sources(sources)
+    ]
+    for view in views:
+        observations.extend(
+            (finding, view.configuration.digest)
+            for finding in audit_preprocessed_view(
+                view, AuditLimits(), _current_process_rss_bytes
+            )
+        )
+    for path in sorted(coverage.source_only, key=PurePosixPath.as_posix):
+        source = sources.get(path)
+        if source is None:
+            raise AuditInfrastructureError(
+                f"source-only coverage references missing production path: {path}"
+            )
+        observations.extend(
+            (finding, "source-only")
+            for finding in audit_source_only(path, source)
+        )
+    return aggregate_findings(observations), coverage
 
 
-def compile_entry_arguments(entry: dict[str, object]) -> list[str]:
-    structured = entry.get("arguments")
-    if isinstance(structured, list):
-        return [str(argument) for argument in structured]
-    command = entry.get("command")
-    if not isinstance(command, str):
-        raise RuntimeError("compile command has neither arguments nor command")
-    if os.name != "nt":
-        return shlex.split(command, posix=True)
-    argc = ctypes.c_int()
-    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
-    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    argv = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
-    if not argv:
-        raise OSError(ctypes.get_last_error(), "CommandLineToArgvW failed")
-    try:
-        return [argv[index] for index in range(argc.value)]
-    finally:
-        kernel32.LocalFree(argv)
+def audit_sources(sources: Mapping[PurePosixPath, str]) -> list[Finding]:
+    """Compatibility spelling for the raw lane; compiler tables are intentionally absent."""
 
-
-def compiler_index_after_launchers(arguments: list[str]) -> int:
-    """Locate the compiler while rejecting ambiguous launcher option syntax."""
-    launchers = {"ccache", "distcc", "icecc", "sccache"}
-    ccache_value_options = {
-        "--compiler", "--compiler-check", "--compiler-type", "--config-path", "--dir",
-        "--namespace", "--set-config", "--trim-dir", "-o",
-    }
-    ccache_flag_options = {"--ccache-skip"}
-    index = 0
-    while index < len(arguments) - 1:
-        launcher = Path(arguments[index]).name.lower().removesuffix(".exe")
-        if launcher not in launchers:
-            break
-        index += 1
-        if launcher != "ccache":
-            continue
-        while index < len(arguments):
-            option = arguments[index]
-            if option == "--":
-                index += 1
-                break
-            option_name = option.partition("=")[0]
-            if option_name in ccache_value_options:
-                if "=" in option:
-                    index += 1
-                else:
-                    if index + 1 >= len(arguments):
-                        raise RuntimeError(f"ccache option requires a value: {option}")
-                    index += 2
-                continue
-            if option in ccache_flag_options:
-                index += 1
-                continue
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*=.*", option):
-                index += 1
-                continue
-            if option.startswith("-"):
-                raise RuntimeError(f"unsupported ccache launcher option: {option}")
-            break
-    if index >= len(arguments):
-        raise RuntimeError("compile command has launchers but no compiler")
-    return index
-
-
-def compiler_probe_command(arguments: list[str]) -> list[str]:
-    if not arguments:
-        raise RuntimeError("compile command has no executable")
-    compiler_index = compiler_index_after_launchers(arguments)
-
-    compiler = Path(arguments[compiler_index]).name.lower().removesuffix(".exe")
-    probe_flags = ["/nologo", "/EP", "/d1PP"] if compiler == "cl" else ["-dM", "-E"]
-    filtered: list[str] = []
-    index = 0
-    while index < len(arguments):
-        value = arguments[index]
-        lowered = value.lower()
-        if index < compiler_index:
-            filtered.append(value)
-            index += 1
-            continue
-        if value in {"-c", "-MD", "-MMD"} or lowered == "/c":
-            index += 1
-            continue
-        if value in {"-o", "-MF", "-MT", "-MQ"}:
-            index += 2
-            continue
-        if (value.startswith(("-MF", "-MT", "-MQ"))
-                or lowered.startswith(("/fo", "/fd"))):
-            index += 1
-            continue
-        filtered.append(value)
-        index += 1
-    insertion = compiler_index + 1
-    return [*filtered[:insertion], *probe_flags, *filtered[insertion:]]
-
-
-COMPILER_MACRO_SENTINELS = frozenset({"__cplusplus", "__GNUC__", "__clang__", "_MSC_VER"})
-
-
-def compiler_macro_definitions(output: str) -> dict[str, MacroDefinition]:
-    events, _directives = source_macro_events(output)
-    definitions: dict[str, MacroDefinition] = {}
-    for _position, name, definition in events:
-        if definition is None:
-            definitions.pop(name, None)
-        else:
-            definitions[name] = definition
-    return definitions
-
-
-def source_requires_compile_entry(path: PurePosixPath, all_entry_paths: set[PurePosixPath]) -> bool:
-    if path.suffix.lower() in {".h", ".hh", ".hpp"}:
-        return False
-    apple_active = any(candidate.suffix.lower() == ".mm" for candidate in all_entry_paths)
-    windows_active = any(
-        "win" in candidate.parts
-        or candidate.name.endswith(("_mediafoundation.cpp", "_win.cpp"))
-        for candidate in all_entry_paths)
-    if path.suffix.lower() == ".mm":
-        return apple_active
-    if ("win" in path.parts
-            or path.name.endswith(("_mediafoundation.cpp", "_win.cpp"))):
-        return windows_active
-    return True
-
-
-def load_compiler_macro_tables(root: Path, compile_commands: Path | None,
-                               sources: dict[PurePosixPath, str]) \
-        -> dict[PurePosixPath, dict[str, MacroDefinition]]:
-    if compile_commands is None:
-        return {}
-    if not compile_commands.is_file():
-        raise RuntimeError(f"compile database does not exist: {compile_commands}")
-    entries = json.loads(compile_commands.read_text(encoding="utf-8-sig"))
-    if not isinstance(entries, list):
-        raise RuntimeError("compile database root must be an array")
-    source_by_absolute = {
-        str((root / path).resolve()).replace("\\", "/").casefold(): path
-        for path in sources
-    }
-    resolved_entries: list[tuple[dict[str, object], PurePosixPath | None]] = []
-    all_entry_paths: set[PurePosixPath] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise RuntimeError("compile database entry must be an object")
-        entry_file = compile_entry_file(entry, compile_commands)
-        absolute = str(entry_file).replace("\\", "/").casefold()
-        path = source_by_absolute.get(absolute)
-        try:
-            all_entry_paths.add(PurePosixPath(entry_file.relative_to(root).as_posix()))
-        except ValueError:
-            pass
-        resolved_entries.append((entry, path))
-
-    relevant = {
-        path for path, source in sources.items()
-        if reviewed_macro_names(path).intersection(re.findall(r"[A-Za-z_]\w*", source))
-    }
-    available = {path for _entry, path in resolved_entries if path in relevant}
-    missing = sorted(
-        (path for path in relevant
-         if source_requires_compile_entry(path, all_entry_paths) and path not in available),
-        key=str)
-    if missing:
-        raise RuntimeError(
-            "compile database has no relevant entry for: "
-            + ", ".join(str(path) for path in missing))
-
-    tables: dict[PurePosixPath, dict[str, MacroDefinition]] = {}
-    failures: list[str] = []
-    for entry, path in resolved_entries:
-        if path is None:
-            continue
-        if path not in relevant:
-            continue
-        arguments = compile_entry_arguments(entry)
-        command = compiler_probe_command(arguments)
-        directory = Path(str(entry["directory"]))
-        if not directory.is_absolute():
-            directory = compile_commands.parent / directory
-        completed = subprocess.run(
-            command, cwd=directory, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=20, check=False)
-        if completed.returncode != 0:
-            failures.append(
-                f"{path} ({completed.returncode}): "
-                + completed.stderr.strip()[-400:])
-            continue
-        definitions = compiler_macro_definitions(completed.stdout)
-        if not definitions or not COMPILER_MACRO_SENTINELS.intersection(definitions):
-            failures.append(f"{path}: compiler macro dump is empty or lacks a sentinel")
-            continue
-        table = tables.setdefault(path, {})
-        for name, definition in definitions.items():
-            previous = table.get(name)
-            if previous is not None and previous != definition:
-                failures.append(
-                    f"{path}: compiler macro {name} differs between configurations")
-                continue
-            table[name] = definition
-    if failures:
-        raise RuntimeError("compiler macro probe failed: " + "; ".join(failures))
-    return tables
+    return audit_raw_sources(sources)
 
 
 def is_production_path(path: PurePosixPath) -> bool:
@@ -4260,116 +6003,13 @@ def mutation_self_tests() -> None:
          "withRead() requires an inline callback body"),
     )
     for path, source, expected in cases:
-        rendered = "\n".join(finding.render() for finding in audit_capability_uses(path, source))
+        findings = audit_capability_uses(path, source)
+        if "#define" in source or "#undef" in source:
+            findings.extend(audit_source_only(path, source))
+        rendered = "\n".join(finding.render() for finding in findings)
         if expected not in rendered:
             raise AssertionError(
                 f"source-audit mutation survived ({expected}):\nsource: {source}\n{rendered}")
-
-    compiler_spoof_path = PurePosixPath("playback/output/win/wingpuimportedge.cpp")
-    compiler_spoof_source = (
-        "auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());")
-    compiler_spoof = compiler_macro_findings(
-        compiler_spoof_path, compiler_spoof_source, frozenset({"ID3D11Texture2D"}))
-    if not compiler_spoof:
-        raise AssertionError("compiler-reported native-handle type macro survived")
-    if compiler_macro_findings(compiler_spoof_path, compiler_spoof_source, frozenset()):
-        raise AssertionError("absent compiler macro produced a spoof finding")
-
-    with tempfile.TemporaryDirectory(prefix="gpu audit ") as temporary:
-        fixture_root = Path(temporary) / "compile db fixture"
-        fixture_source = fixture_root / compiler_spoof_path
-        fixture_source.parent.mkdir(parents=True)
-        fixture_source.write_text(compiler_spoof_source, encoding="utf-8")
-        fake_compiler = fixture_root / "fake compiler.py"
-        fake_compiler.write_text(
-            "import sys\n"
-            "if '--fail' in sys.argv: raise SystemExit(9)\n"
-            "print('#define __cplusplus 202002L')\n"
-            "if '-DCONFIG_A' in sys.argv: print('#define ID3D11Texture2D SpoofA')\n"
-            "if '-DCONFIG_B' in sys.argv: print('#define GetDevice SpoofB')\n",
-            encoding="utf-8")
-        assignment_wrapper = fixture_root / "compiler_check=content"
-        assignment_wrapper.write_text(
-            "import runpy, sys\n"
-            "script = sys.argv[1]\n"
-            "sys.argv = sys.argv[1:]\n"
-            "runpy.run_path(script, run_name='__main__')\n",
-            encoding="utf-8")
-        launcher = fixture_root / ("ccache.exe" if os.name == "nt" else "ccache")
-        shutil.copy2(sys.executable, launcher)
-        if os.name == "nt":
-            for dll in Path(sys.executable).parent.glob("python*.dll"):
-                shutil.copy2(dll, fixture_root / dll.name)
-        relative_file = compiler_spoof_path.as_posix()
-        first_arguments = [str(launcher), str(fake_compiler), "-DCONFIG_A", "-c",
-                           relative_file, "-o", "first.o"]
-        second_arguments = [str(launcher), str(fake_compiler), "-DCONFIG_B", "-c",
-                            relative_file, "-o", "second.o"]
-        assignment_arguments = [
-            str(launcher), assignment_wrapper.name, str(fake_compiler), "-DCONFIG_A",
-            "-c", relative_file, "-o", "assignment.o"]
-        quoted_command = (subprocess.list2cmdline(second_arguments) if os.name == "nt"
-                          else shlex.join(second_arguments))
-        compile_database = fixture_root / "compile_commands.json"
-        compile_database.write_text(json.dumps([
-            {"directory": str(fixture_root), "file": relative_file,
-             "arguments": first_arguments},
-            {"directory": str(fixture_root), "file": relative_file,
-             "command": quoted_command},
-            {"directory": str(fixture_root), "file": relative_file,
-             "arguments": assignment_arguments},
-        ]), encoding="utf-8")
-        loaded = load_compiler_macro_tables(
-            fixture_root, compile_database, {compiler_spoof_path: compiler_spoof_source})
-        if set(loaded.get(compiler_spoof_path, {})) != {
-                "ID3D11Texture2D", "GetDevice", "__cplusplus"}:
-            raise AssertionError(
-                "compiler loader did not resolve ccache, quoted paths, relative files, "
-                f"and duplicate configurations: {loaded}")
-
-        failed_database = fixture_root / "failed_compile_commands.json"
-        failed_database.write_text(json.dumps([{
-            "directory": str(fixture_root), "file": relative_file,
-            "arguments": [str(launcher), str(fake_compiler), "--fail", "-c",
-                          relative_file],
-        }]), encoding="utf-8")
-        try:
-            load_compiler_macro_tables(
-                fixture_root, failed_database, {compiler_spoof_path: compiler_spoof_source})
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("failed relevant compiler probe did not fail closed")
-
-        empty_compiler = fixture_root / "empty compiler.py"
-        empty_compiler.write_text("raise SystemExit(0)\n", encoding="utf-8")
-        empty_database = fixture_root / "empty_compile_commands.json"
-        empty_database.write_text(json.dumps([{
-            "directory": str(fixture_root), "file": relative_file,
-            "arguments": [str(launcher), str(empty_compiler), "-c", relative_file],
-        }]), encoding="utf-8")
-        try:
-            load_compiler_macro_tables(
-                fixture_root, empty_database, {compiler_spoof_path: compiler_spoof_source})
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("empty successful compiler macro probe did not fail closed")
-
-        missing_database = fixture_root / "missing_compile_commands.json"
-        missing_database.write_text(json.dumps([{
-            "directory": str(fixture_root),
-            "file": "playback/output/win/other.cpp",
-            "arguments": [str(launcher), str(fake_compiler), "-c",
-                          "playback/output/win/other.cpp"],
-        }]), encoding="utf-8")
-        try:
-            load_compiler_macro_tables(
-                fixture_root, missing_database, {compiler_spoof_path: compiler_spoof_source})
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("missing relevant compile command did not fail closed")
 
     ordinary_join = audit_capability_uses(
         PurePosixPath("playback/gpu/gpufence.h"),
@@ -4385,253 +6025,6 @@ def mutation_self_tests() -> None:
     if safe_join_macro:
         raise AssertionError("non-paste function macro was treated as paste:\n" +
                              "\n".join(finding.render() for finding in safe_join_macro))
-
-    compiler_safe_join = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void safe() { JOIN(native, Handle); }",
-        {"JOIN": MacroDefinition(
-            True, ("consume", "(", "a", ",", "b", ")"), ("a", "b"))})
-    if compiler_safe_join:
-        raise AssertionError("compiler-reported non-paste macro was treated as paste:\n" +
-                             "\n".join(finding.render() for finding in compiler_safe_join))
-
-    compiler_wrapped_paste = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { lease.PASTE(LEFT, RIGHT)(); }",
-        {
-            "PASTE": MacroDefinition(
-                True, ("PASTE_I", "(", "left", ",", "right", ")"),
-                ("left", "right")),
-            "PASTE_I": MacroDefinition(
-                True, ("left", "##", "right"), ("left", "right")),
-            "LEFT": MacroDefinition(False, ("native",)),
-            "RIGHT": MacroDefinition(False, ("Handle",)),
-        })
-    if not any("guarded identifier macro composition" in finding.expression
-               for finding in compiler_wrapped_paste):
-        raise AssertionError("compiler-reported two-stage paste wrapper survived")
-
-    compiler_variadic_paste = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { lease.PASTE(native, Handle)(); }",
-        {
-            "PASTE": MacroDefinition(
-                True, ("PASTE_I", "(", "__VA_ARGS__", ")"), (),
-                "__VA_ARGS__"),
-            "PASTE_I": MacroDefinition(
-                True, ("left", "##", "right"), ("left", "right")),
-        })
-    if not any("guarded identifier macro composition" in finding.expression
-               for finding in compiler_variadic_paste):
-        raise AssertionError("compiler variadic paste forwarding survived")
-
-    compiler_prescanned_paste = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { lease.PASTE(ID(native), Handle)(); }",
-        {
-            "PASTE": MacroDefinition(
-                True, ("PASTE_I", "(", "left", ",", "right", ")"),
-                ("left", "right")),
-            "PASTE_I": MacroDefinition(
-                True, ("left", "##", "right"), ("left", "right")),
-            "ID": MacroDefinition(True, ("value",), ("value",)),
-        })
-    if not any("guarded identifier macro composition" in finding.expression
-               for finding in compiler_prescanned_paste):
-        raise AssertionError("compiler argument prescan paste survived")
-
-    compiler_zero_arg = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { lease.TOKEN()(); }",
-        {"TOKEN": MacroDefinition(True, ("nativeHandle",), ())})
-    if not any("guarded identifier macro composition" in finding.expression
-               for finding in compiler_zero_arg):
-        raise AssertionError("compiler zero-argument guarded macro survived")
-
-    compiler_callable_alias = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { lease.ALIAS(native, Handle)(); }",
-        {
-            "ALIAS": MacroDefinition(False, ("PASTE",)),
-            "PASTE": MacroDefinition(True, ("left", "##", "right"),
-                                     ("left", "right")),
-        })
-    if not any("guarded identifier macro composition" in finding.expression
-               for finding in compiler_callable_alias):
-        raise AssertionError("compiler callable object alias survived rescan")
-
-    compiler_postfix_callable_alias = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { "
-        "lease.WRAP()(native, Handle)(); }",
-        {
-            "WRAP": MacroDefinition(True, ("PASTE",), ()),
-            "PASTE": MacroDefinition(True, ("left", "##", "right"),
-                                     ("left", "right")),
-        })
-    if not any("guarded identifier macro composition" in finding.expression
-               for finding in compiler_postfix_callable_alias):
-        raise AssertionError("compiler postfix callable alias survived rescan")
-
-    compiler_token_origin_alias = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { "
-        "lease.F(call)(F(native), Handle)(); }",
-        {
-            "F": MacroDefinition(True, ("F_I", "(", "value", ")"), ("value",)),
-            "F_I": MacroDefinition(True, ("F_", "##", "value"), ("value",)),
-            "F_call": MacroDefinition(False, ("PASTE",)),
-            "F_native": MacroDefinition(False, ("native",)),
-            "PASTE": MacroDefinition(
-                True, ("PASTE_I", "(", "left", ",", "right", ")"),
-                ("left", "right")),
-            "PASTE_I": MacroDefinition(
-                True, ("left", "##", "right"), ("left", "right")),
-        })
-    if not any("guarded identifier macro composition" in finding.expression
-               for finding in compiler_token_origin_alias):
-        raise AssertionError("original postfix macro was hidden by replacement state")
-
-    compiler_object_tail_alias = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { "
-        "lease.OPEN native, Handle)(); }",
-        {
-            "OPEN": MacroDefinition(False, ("PASTE", "(")),
-            "PASTE": MacroDefinition(
-                True, ("PASTE_I", "(", "left", ",", "right", ")"),
-                ("left", "right")),
-            "PASTE_I": MacroDefinition(
-                True, ("left", "##", "right"), ("left", "right")),
-        })
-    if not any("guarded identifier macro composition" in finding.expression
-               for finding in compiler_object_tail_alias):
-        raise AssertionError("compiler object macro did not consume its original tail")
-
-    compiler_safe_object_tail = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void safe(const GpuReadLease& lease) { "
-        "lease.OPEN other, Handle)(); }",
-        {
-            "OPEN": MacroDefinition(False, ("PASTE", "(")),
-            "PASTE": MacroDefinition(
-                True, ("PASTE_I", "(", "left", ",", "right", ")"),
-                ("left", "right")),
-            "PASTE_I": MacroDefinition(
-                True, ("left", "##", "right"), ("left", "right")),
-        })
-    if compiler_safe_object_tail:
-        raise AssertionError("safe compiler object-tail macro was rejected:\n" +
-                             "\n".join(
-                                 finding.render() for finding in compiler_safe_object_tail))
-
-    compiler_malformed_replacement = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void malformed(const GpuReadLease& lease) { lease.OPEN(); }",
-        {
-            "OPEN": MacroDefinition(True, ("PASTE", "("), ()),
-            "PASTE": MacroDefinition(
-                True, ("left", "##", "right"), ("left", "right")),
-        })
-    if not any("macro expansion syntax" in finding.reason
-               for finding in compiler_malformed_replacement):
-        raise AssertionError("malformed compiler replacement did not fail closed structurally")
-
-    compiler_wide_replacement = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bounded(const GpuReadLease& lease) { lease.WIDE(n)(); }",
-        {
-            "WIDE": MacroDefinition(
-                True, tuple(
-                    token
-                    for index in range(4096)
-                    for token in (("value", "##") if index < 4095 else ("value",))),
-                ("value",)),
-        })
-    if not any("macro expansion complexity" in finding.reason
-               for finding in compiler_wide_replacement):
-        raise AssertionError("wide compiler replacement did not fail closed deliberately")
-
-    compiler_guarded_object_alias = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { lease.GUARD(); }",
-        {"GUARD": MacroDefinition(False, ("nativeHandle",))})
-    if not any("guarded identifier macro composition" in finding.expression
-               for finding in compiler_guarded_object_alias):
-        raise AssertionError("compiler guarded object alias survived rescan")
-
-    compiler_raw_paste = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void safe(const GpuReadLease& lease) { lease.CAT(LEFT, RIGHT)(); }",
-        {
-            "CAT": MacroDefinition(
-                True, ("left", "##", "right"), ("left", "right")),
-            "LEFT": MacroDefinition(False, ("native",)),
-            "RIGHT": MacroDefinition(False, ("Handle",)),
-        })
-    if compiler_raw_paste:
-        raise AssertionError("raw paste operands were incorrectly prescanned:\n" +
-                             "\n".join(finding.render() for finding in compiler_raw_paste))
-
-    deep_macros: dict[str, MacroDefinition] = {
-        f"WRAP{index}": MacroDefinition(
-            True,
-            ((f"WRAP{index + 1}", "(", "value", ")")
-             if index < 799 else ("value",)),
-            ("value",))
-        for index in range(800)
-    }
-    deep_macro_findings = audit_capability_uses(
-        PurePosixPath("playback/gpu/gpufence.h"),
-        "void bad(const GpuReadLease& lease) { lease.WRAP0(nativeHandle)(); }",
-        deep_macros)
-    if not any("macro expansion depth" in finding.reason
-               for finding in deep_macro_findings):
-        raise AssertionError("deep macro expansion did not fail closed deliberately")
-
-    recursive_macro_controls = (
-        audit_capability_uses(
-            PurePosixPath("playback/gpu/gpufence.h"), "void safe() { F(); }",
-            {"F": MacroDefinition(True, ("F", "(", ")"), ())})
-        + audit_capability_uses(
-            PurePosixPath("playback/gpu/gpufence.h"), "void safe() { F(); }",
-            {
-                "F": MacroDefinition(True, ("G", "(", ")"), ()),
-                "G": MacroDefinition(True, ("F", "(", ")"), ()),
-            }))
-    if recursive_macro_controls:
-        raise AssertionError("benign recursive macro control was rejected:\n" +
-                             "\n".join(
-                                 finding.render() for finding in recursive_macro_controls))
-
-    windows_command = (
-        '"C:\\Program Files\\ccache\\ccache.exe" --config-path "ccache config.conf" '
-        '"C:\\Program Files\\LLVM\\bin\\clang++.exe" '
-        '-I"C:\\SDK Path\\include" -c playback\\gpu\\file.cpp -o file.obj')
-    if os.name == "nt":
-        windows_arguments = compile_entry_arguments({"command": windows_command})
-        if windows_arguments != [
-                r"C:\Program Files\ccache\ccache.exe", "--config-path", "ccache config.conf",
-                r"C:\Program Files\LLVM\bin\clang++.exe", r"-IC:\SDK Path\include",
-                "-c", r"playback\gpu\file.cpp", "-o", "file.obj"]:
-            raise AssertionError(
-                f"Windows compile command was split incorrectly: {windows_arguments}")
-        windows_probe = compiler_probe_command(windows_arguments)
-        if windows_probe[3:6] != [
-                r"C:\Program Files\LLVM\bin\clang++.exe", "-dM", "-E"]:
-            raise AssertionError(
-                f"Windows parsing/launcher pipeline misplaced probe flags: {windows_probe}")
-    optioned_probe = compiler_probe_command([
-        "ccache", "--config-path", "ccache.conf", "g++", "-c", "file.cpp", "-o", "file.o"])
-    if optioned_probe != [
-            "ccache", "--config-path", "ccache.conf", "g++", "-dM", "-E", "file.cpp"]:
-        raise AssertionError(f"ccache options hid the compiler probe insertion: {optioned_probe}")
-    assignment_probe = compiler_probe_command([
-        "ccache", "compiler_check=content", "g++", "-c", "file.cpp"])
-    if assignment_probe != [
-            "ccache", "compiler_check=content", "g++", "-dM", "-E", "file.cpp"]:
-        raise AssertionError(
-            f"ccache assignment hid the compiler probe insertion: {assignment_probe}")
 
     mapped_splice = "// line 1\nlease.nat" + chr(92) + "\nive" + chr(92) + "\nHandle();\n"
     mapped_findings = phase_two_capability_findings(
@@ -4968,7 +6361,52 @@ def nested_phase_two_source(count: int) -> str:
 
 
 def nested_macro_postfix_source(count: int) -> str:
-    return "void nested() { " + ("M()(" * count) + "value" + (")" * count) + "; }"
+    return "#define M() safe\nvoid nested() { " + ("M()(" * count) + "value" + (")" * count) + "; }"
+
+
+def nested_ambiguity_source(count: int) -> str:
+    return (
+        "GpuSyncReadScope scope;\n"
+        + "scope.withRead(surface, [&] {\n" * count
+        + "safe();\n"
+        + "});\n" * count
+    )
+
+
+def nested_ordinary_callback_source(count: int) -> str:
+    return (
+        "void nested() {\n"
+        + "".join(
+            f"Logger scope{index}; scope{index}.withRead(surface, [&] {{\n"
+            for index in range(count)
+        )
+        + "safe();\n"
+        + "});\n" * count
+        + "}\n"
+    )
+
+
+def isolated_use_before_declaration_source(count: int) -> str:
+    return "".join(
+        f"void isolated{index}() {{ scope.withRead(); Logger scope; }}\n"
+        for index in range(count)
+    )
+
+
+def read_result_binding_source(count: int) -> str:
+    return "".join(
+        f"void read_result{index}() {{ GpuSyncReadScope scope; "
+        "auto lease = scope.read(surface); lease.unknown(); }}\n"
+        for index in range(count)
+    )
+
+
+def adjacent_sensitive_source(count: int) -> str:
+    return (
+        "void audit() { GpuSyncReadScope scope;\n"
+        + "scope.withRead(surface, callback);\n" * count
+        + "}\n"
+    )
 
 
 def performance_self_tests() -> str:
@@ -5016,13 +6454,12 @@ def performance_self_tests() -> str:
         count: translate_source(nested_macro_postfix_source(count))
         for count in counts
     }
-    postfix_macros = {"M": MacroDefinition(True, ("safe",), ())}
     postfix_samples: dict[int, list[float]] = {count: [] for count in counts}
     for order in (counts, tuple(reversed(counts)), (8192, 16384, 4096)):
         for count in order:
             started = time.perf_counter()
             findings = guarded_macro_composition_findings(
-                path, postfix_sources[count], postfix_macros)
+                path, postfix_sources[count], source_only=True)
             postfix_samples[count].append(time.perf_counter() - started)
             if not any("macro postfix complexity" in finding.reason
                        for finding in findings):
@@ -5046,17 +6483,10 @@ def performance_self_tests() -> str:
             + f", ratios={postfix_adjacent[0]:.3f}/"
             f"{postfix_adjacent[1]:.3f}/{postfix_aggregate:.3f}")
 
-    wide_source = translate_source(
-        "void bounded(const GpuReadLease& lease) { lease.WIDE(n)(); }")
-    wide_macros = {
-        count: {
-            "WIDE": MacroDefinition(
-                True, tuple(
-                    token
-                    for index in range(count)
-                    for token in (("value", "##") if index < count - 1 else ("value",))),
-                ("value",)),
-        }
+    wide_sources = {
+        count: translate_source(
+            "#define WIDE(value) " + " ## ".join("value" for _ in range(count))
+            + "\nvoid bounded(const GpuReadLease& lease) { lease.WIDE(n)(); }")
         for count in counts
     }
     wide_samples: dict[int, list[float]] = {count: [] for count in counts}
@@ -5064,9 +6494,9 @@ def performance_self_tests() -> str:
         for count in order:
             started = time.perf_counter()
             findings = guarded_macro_composition_findings(
-                path, wide_source, wide_macros[count])
+                path, wide_sources[count], source_only=True)
             wide_samples[count].append(time.perf_counter() - started)
-            if not any("macro expansion complexity" in finding.reason
+            if not any("complexity" in finding.reason
                        for finding in findings):
                 raise AssertionError(
                     f"wide macro replacement did not fail closed at {count}")
@@ -5085,6 +6515,279 @@ def performance_self_tests() -> str:
                 for count in counts)
             + f", ratios={wide_adjacent[0]:.3f}/"
             f"{wide_adjacent[1]:.3f}/{wide_aggregate:.3f}")
+    ambiguity_counts = (100, 200, 400, 800)
+    ambiguity_sources = {
+        count: translate_source(nested_ambiguity_source(count))
+        for count in ambiguity_counts
+    }
+    ambiguity_samples: dict[int, list[float]] = {
+        count: [] for count in ambiguity_counts
+    }
+    for order in (
+        ambiguity_counts,
+        tuple(reversed(ambiguity_counts)),
+        (200, 800, 100, 400),
+    ):
+        for count in order:
+            started = time.perf_counter()
+            _source_only_unknown_macro_findings(path, ambiguity_sources[count])
+            ambiguity_samples[count].append(time.perf_counter() - started)
+    ambiguity_scores = {
+        count: min(ambiguity_samples[count]) for count in ambiguity_counts
+    }
+    ambiguity_adjacent = tuple(
+        ambiguity_scores[right] / ambiguity_scores[left]
+        for left, right in zip(ambiguity_counts, ambiguity_counts[1:])
+    )
+    ambiguity_aggregate = (
+        ambiguity_scores[800] / ambiguity_scores[100]
+    )
+    if max(ambiguity_adjacent) > 3.25 or ambiguity_aggregate > 12.0:
+        raise AssertionError(
+            "nested withRead ambiguity audit is not near-linear: "
+            + ", ".join(
+                f"{count}={ambiguity_scores[count]:.4f}s samples="
+                + "/".join(
+                    f"{sample:.4f}" for sample in ambiguity_samples[count]
+                )
+                for count in ambiguity_counts
+            )
+            + ", ratios="
+            + "/".join(f"{ratio:.3f}" for ratio in ambiguity_adjacent)
+            + f"/{ambiguity_aggregate:.3f}"
+        )
+    nested_sources = {
+        count: nested_ambiguity_source(count) for count in ambiguity_counts
+    }
+    nested_samples: dict[int, list[float]] = {
+        count: [] for count in ambiguity_counts
+    }
+    for order in (ambiguity_counts, tuple(reversed(ambiguity_counts))):
+        for count in order:
+            started = time.perf_counter()
+            nested_findings = audit_source_only(path, nested_sources[count])
+            nested_samples[count].append(time.perf_counter() - started)
+            if not nested_findings:
+                raise AssertionError(
+                    f"end-to-end nested withRead control lost findings at {count}"
+                )
+    nested_scores = {
+        count: min(nested_samples[count]) for count in ambiguity_counts
+    }
+    nested_adjacent = tuple(
+        nested_scores[right] / nested_scores[left]
+        for left, right in zip(ambiguity_counts, ambiguity_counts[1:])
+    )
+    nested_aggregate = nested_scores[800] / nested_scores[100]
+    if max(nested_adjacent) > 3.25 or nested_aggregate > 12.0:
+        raise AssertionError(
+            "end-to-end nested withRead audit is not near-linear: "
+            + ", ".join(
+                f"{count}={nested_scores[count]:.4f}s samples="
+                + "/".join(f"{sample:.4f}" for sample in nested_samples[count])
+                for count in ambiguity_counts
+            )
+            + ", ratios=" + "/".join(
+                f"{ratio:.3f}" for ratio in nested_adjacent
+            )
+            + f"/{nested_aggregate:.3f}"
+        )
+    ordinary_sources = {
+        count: nested_ordinary_callback_source(count)
+        for count in ambiguity_counts
+    }
+    ordinary_samples: dict[int, list[float]] = {
+        count: [] for count in ambiguity_counts
+    }
+    for order in (ambiguity_counts, tuple(reversed(ambiguity_counts))):
+        for count in order:
+            started = time.perf_counter()
+            ordinary_findings = audit_source_only(path, ordinary_sources[count])
+            ordinary_samples[count].append(time.perf_counter() - started)
+            if ordinary_findings:
+                raise AssertionError(
+                    "ordinary nested callback control produced capability findings "
+                    f"at {count}: {ordinary_findings[:3]}"
+                )
+    ordinary_scores = {
+        count: min(ordinary_samples[count]) for count in ambiguity_counts
+    }
+    ordinary_adjacent = tuple(
+        ordinary_scores[right] / ordinary_scores[left]
+        for left, right in zip(ambiguity_counts, ambiguity_counts[1:])
+    )
+    ordinary_aggregate = ordinary_scores[800] / ordinary_scores[100]
+    if max(ordinary_adjacent) > 3.25 or ordinary_aggregate > 12.0:
+        raise AssertionError(
+            "ordinary nested callback audit is not near-linear: "
+            + ", ".join(
+                f"{count}={ordinary_scores[count]:.4f}s samples="
+                + "/".join(f"{sample:.4f}" for sample in ordinary_samples[count])
+                for count in ambiguity_counts
+            )
+            + ", ratios=" + "/".join(
+                f"{ratio:.3f}" for ratio in ordinary_adjacent
+            )
+            + f"/{ordinary_aggregate:.3f}"
+        )
+    isolated_counts = (500, 1000, 2000, 4000)
+    isolated_translations = {
+        count: translate_source(isolated_use_before_declaration_source(count))
+        for count in isolated_counts
+    }
+    isolated_binding_samples: dict[int, list[float]] = {
+        count: [] for count in isolated_counts
+    }
+    for order in (isolated_counts, tuple(reversed(isolated_counts))):
+        for count in order:
+            translated = isolated_translations[count]
+            _events, ranges = source_macro_events(translated.masked)
+            started = time.perf_counter()
+            isolated_bindings = _source_only_declared_bindings(
+                translated.masked, ranges
+            )
+            _source_binding_index(isolated_bindings, translated.masked)
+            isolated_binding_samples[count].append(time.perf_counter() - started)
+            if len(isolated_bindings) != count:
+                raise AssertionError(
+                    f"isolated binding index lost declarations at {count}"
+                )
+    isolated_binding_scores = {
+        count: min(isolated_binding_samples[count]) for count in isolated_counts
+    }
+    isolated_binding_adjacent = tuple(
+        isolated_binding_scores[right] / isolated_binding_scores[left]
+        for left, right in zip(isolated_counts, isolated_counts[1:])
+    )
+    isolated_binding_aggregate = (
+        isolated_binding_scores[4000] / isolated_binding_scores[500]
+    )
+    if (max(isolated_binding_adjacent) > 3.25
+            or isolated_binding_aggregate > 12.0):
+        raise AssertionError(
+            "isolated positioned-binding index is not near-linear: "
+            + ", ".join(
+                f"{count}={isolated_binding_scores[count]:.4f}s samples="
+                + "/".join(
+                    f"{sample:.4f}" for sample in isolated_binding_samples[count]
+                )
+                for count in isolated_counts
+            )
+            + ", ratios=" + "/".join(
+                f"{ratio:.3f}" for ratio in isolated_binding_adjacent
+            )
+            + f"/{isolated_binding_aggregate:.3f}"
+        )
+    read_result_counts = (500, 1000, 2000, 4000)
+    read_result_translations = {
+        count: translate_source(read_result_binding_source(count))
+        for count in read_result_counts
+    }
+    read_result_samples: dict[int, list[float]] = {
+        count: [] for count in read_result_counts
+    }
+    for order in (read_result_counts, tuple(reversed(read_result_counts))):
+        for count in order:
+            translated = read_result_translations[count]
+            _events, ranges = source_macro_events(translated.masked)
+            started = time.perf_counter()
+            read_bindings = _source_only_declared_bindings(
+                translated.masked, ranges
+            )
+            read_result_samples[count].append(time.perf_counter() - started)
+            if sum(
+                binding.category == "lease" for binding in read_bindings
+            ) != count:
+                raise AssertionError(
+                    f"read-result binding inference lost leases at {count}"
+                )
+    read_result_scores = {
+        count: min(read_result_samples[count]) for count in read_result_counts
+    }
+    read_result_adjacent = tuple(
+        read_result_scores[right] / read_result_scores[left]
+        for left, right in zip(read_result_counts, read_result_counts[1:])
+    )
+    read_result_aggregate = (
+        read_result_scores[4000] / read_result_scores[500]
+    )
+    if (max(read_result_adjacent) > 3.25
+            or read_result_aggregate > 12.0):
+        raise AssertionError(
+            "read-result binding inference is not near-linear: "
+            + ", ".join(
+                f"{count}={read_result_scores[count]:.4f}s samples="
+                + "/".join(
+                    f"{sample:.4f}" for sample in read_result_samples[count]
+                )
+                for count in read_result_counts
+            )
+            + ", ratios=" + "/".join(
+                f"{ratio:.3f}" for ratio in read_result_adjacent
+            )
+            + f"/{read_result_aggregate:.3f}"
+        )
+    isolated_audit_counts = (2000, 4000, 8000)
+    isolated_audit_sources = {
+        count: isolated_use_before_declaration_source(count)
+        for count in isolated_audit_counts
+    }
+    isolated_audit_scores: dict[int, float] = {}
+    for count in isolated_audit_counts:
+        started = time.perf_counter()
+        isolated_findings = audit_source_only(
+            path, isolated_audit_sources[count]
+        )
+        isolated_audit_scores[count] = time.perf_counter() - started
+        if len(isolated_findings) < count:
+            raise AssertionError(
+                f"isolated full audit lost unresolved receivers at {count}"
+            )
+    isolated_audit_adjacent = (
+        isolated_audit_scores[4000] / isolated_audit_scores[2000],
+        isolated_audit_scores[8000] / isolated_audit_scores[4000],
+    )
+    isolated_audit_aggregate = (
+        isolated_audit_scores[8000] / isolated_audit_scores[2000]
+    )
+    if (max(isolated_audit_adjacent) > 3.25
+            or isolated_audit_aggregate > 5.75):
+        raise AssertionError(
+            "isolated full source audit is not near-linear: "
+            + ", ".join(
+                f"{count}={isolated_audit_scores[count]:.4f}s"
+                for count in isolated_audit_counts
+            )
+            + f", ratios={isolated_audit_adjacent[0]:.3f}/"
+            f"{isolated_audit_adjacent[1]:.3f}/"
+            f"{isolated_audit_aggregate:.3f}"
+        )
+    adjacent_sources = {
+        count: adjacent_sensitive_source(count) for count in counts
+    }
+    adjacent_scores: dict[int, float] = {}
+    for count in counts:
+        started = time.perf_counter()
+        adjacent_findings = audit_source_only(path, adjacent_sources[count])
+        adjacent_scores[count] = time.perf_counter() - started
+        if len(adjacent_findings) < count:
+            raise AssertionError(
+                f"adjacent sensitive-call audit lost findings at {count}"
+            )
+    adjacent_call_ratios = (
+        adjacent_scores[8192] / adjacent_scores[4096],
+        adjacent_scores[16384] / adjacent_scores[8192],
+    )
+    adjacent_call_aggregate = adjacent_scores[16384] / adjacent_scores[4096]
+    if max(adjacent_call_ratios) > 3.25 or adjacent_call_aggregate > 5.75:
+        raise AssertionError(
+            "adjacent sensitive-call audit is not near-linear: "
+            + ", ".join(
+                f"{count}={adjacent_scores[count]:.4f}s" for count in counts
+            )
+            + f", ratios={adjacent_call_ratios[0]:.3f}/"
+            f"{adjacent_call_ratios[1]:.3f}/{adjacent_call_aggregate:.3f}"
+        )
     return (
         ", ".join(f"{count}={scores[count]:.4f}s" for count in counts)
         + f", ratios={adjacent[0]:.3f}/{adjacent[1]:.3f}/{aggregate:.3f}; "
@@ -5094,7 +6797,58 @@ def performance_self_tests() -> str:
         f"{postfix_adjacent[1]:.3f}/{postfix_aggregate:.3f}; wide "
         + ", ".join(f"{count}={wide_scores[count]:.4f}s" for count in counts)
         + f", ratios={wide_adjacent[0]:.3f}/"
-        f"{wide_adjacent[1]:.3f}/{wide_aggregate:.3f}")
+        f"{wide_adjacent[1]:.3f}/{wide_aggregate:.3f}; ambiguity "
+        + ", ".join(
+            f"{count}={ambiguity_scores[count]:.4f}s"
+            for count in ambiguity_counts
+        )
+        + ", ratios="
+        + "/".join(f"{ratio:.3f}" for ratio in ambiguity_adjacent)
+        + f"/{ambiguity_aggregate:.3f}; nested "
+        + ", ".join(
+            f"{count}={nested_scores[count]:.4f}s"
+            for count in ambiguity_counts
+        )
+        + ", ratios=" + "/".join(
+            f"{ratio:.3f}" for ratio in nested_adjacent
+        )
+        + f"/{nested_aggregate:.3f}; ordinary "
+        + ", ".join(
+            f"{count}={ordinary_scores[count]:.4f}s"
+            for count in ambiguity_counts
+        )
+        + ", ratios=" + "/".join(
+            f"{ratio:.3f}" for ratio in ordinary_adjacent
+        )
+        + f"/{ordinary_aggregate:.3f}; isolated-bindings "
+        + ", ".join(
+            f"{count}={isolated_binding_scores[count]:.4f}s"
+            for count in isolated_counts
+        )
+        + ", ratios=" + "/".join(
+            f"{ratio:.3f}" for ratio in isolated_binding_adjacent
+        )
+        + f"/{isolated_binding_aggregate:.3f}; read-results "
+        + ", ".join(
+            f"{count}={read_result_scores[count]:.4f}s"
+            for count in read_result_counts
+        )
+        + ", ratios=" + "/".join(
+            f"{ratio:.3f}" for ratio in read_result_adjacent
+        )
+        + f"/{read_result_aggregate:.3f}; isolated-audit "
+        + ", ".join(
+            f"{count}={isolated_audit_scores[count]:.4f}s"
+            for count in isolated_audit_counts
+        )
+        + f", ratios={isolated_audit_adjacent[0]:.3f}/"
+        f"{isolated_audit_adjacent[1]:.3f}/"
+        f"{isolated_audit_aggregate:.3f}; adjacent "
+        + ", ".join(
+            f"{count}={adjacent_scores[count]:.4f}s" for count in counts
+        )
+        + f", ratios={adjacent_call_ratios[0]:.3f}/"
+        f"{adjacent_call_ratios[1]:.3f}/{adjacent_call_aggregate:.3f}")
 
 
 def load_production_sources(root: Path) -> dict[PurePosixPath, str]:
@@ -5110,6 +6864,8 @@ def load_production_sources(root: Path) -> dict[PurePosixPath, str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
+    # Preserve the committed CTest interface while the compiler-authoritative
+    # lane consumes preprocessed views instead of the deleted macro table.
     parser.add_argument("--compile-commands", type=Path)
     parser.add_argument("--performance-only", action="store_true")
     args = parser.parse_args()
@@ -5120,8 +6876,7 @@ def main() -> int:
     mutation_self_tests()
     root = args.source_root.resolve()
     sources = load_production_sources(root)
-    compiler_macros = load_compiler_macro_tables(root, args.compile_commands, sources)
-    findings = audit_sources(sources, compiler_macros)
+    findings = audit_raw_sources(sources)
     if findings:
         for finding in sorted(findings, key=lambda item: (str(item.path), item.line, item.expression)):
             print(finding.render())
