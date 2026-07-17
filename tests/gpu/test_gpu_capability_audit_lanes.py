@@ -1,4 +1,6 @@
 import dataclasses
+import contextlib
+import io
 import sys
 import tracemalloc
 import unittest
@@ -1667,6 +1669,150 @@ class SourceOnlyLaneTests(unittest.TestCase):
 
     def test_unrelated_unknown_macro_use_is_ignored(self):
         self.assertEqual(self.findings("int value = UNKNOWN(1);\n"), [])
+
+
+class LiveCompilerCliTests(unittest.TestCase):
+    def test_repeated_live_compilers_are_typed_and_duplicates_fail(self):
+        parser = getattr(capability_audit, "parse_live_compiler_options", None)
+        self.assertTrue(callable(parser))
+        if not callable(parser):
+            return
+        parsed = parser((
+            f"gcc={sys.executable}",
+            f"clang={Path(sys.executable).with_name('clang.exe')}",
+        ))
+        self.assertEqual(set(parsed), {CompilerFamily.GCC, CompilerFamily.CLANG})
+        self.assertEqual(parsed[CompilerFamily.GCC], Path(sys.executable).resolve())
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "duplicate live compiler family"
+        ):
+            parser((
+                f"gcc={sys.executable}", f"gcc={sys.executable}",
+            ))
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "unsupported live compiler family"
+        ):
+            parser(("cuda=nvcc",))
+
+    def test_required_missing_fails_and_optional_absent_is_explicit(self):
+        live_runner = getattr(capability_audit, "run_live_only", None)
+        self.assertTrue(callable(live_runner))
+        if not callable(live_runner):
+            return
+        messages: list[str] = []
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "required live compiler family is missing: gcc"
+        ):
+            live_runner(
+                {},
+                frozenset({CompilerFamily.GCC}),
+                suite_runner=lambda *_args: self.fail("runner must not be called"),
+                printer=messages.append,
+            )
+
+        calls: list[tuple[Path, CompilerFamily]] = []
+        live_runner(
+            {CompilerFamily.GCC: Path(sys.executable).resolve()},
+            frozenset(),
+            suite_runner=lambda compiler, family, _budget: calls.append((compiler, family)),
+            printer=messages.append,
+        )
+        self.assertEqual(calls, [
+            (Path(sys.executable).resolve(), CompilerFamily.GCC)
+        ])
+        self.assertEqual(sum("SKIP: optional live compiler" in line
+                             for line in messages), 3)
+
+    def test_one_total_live_budget_is_shared_across_all_families(self):
+        live_runner = getattr(capability_audit, "run_live_only", None)
+        self.assertTrue(callable(live_runner))
+        if not callable(live_runner):
+            return
+        now = [100.0]
+        budgets = []
+
+        def suite(_compiler, _family, budget):
+            budgets.append(budget)
+            budget.remaining_seconds()
+            now[0] += 10.0
+
+        live_runner(
+            {
+                CompilerFamily.GCC: Path(sys.executable).resolve(),
+                CompilerFamily.CLANG: Path(sys.executable).resolve(),
+            },
+            frozenset(),
+            suite_runner=suite,
+            printer=lambda _message: None,
+            clock=lambda: now[0],
+            total_seconds=240.0,
+        )
+        self.assertEqual(len(budgets), 2)
+        self.assertIs(budgets[0], budgets[1])
+        self.assertEqual(budgets[0].deadline, 340.0)
+
+    def test_live_budget_expiry_after_suite_is_infrastructure_failure(self):
+        live_runner = getattr(capability_audit, "run_live_only", None)
+        self.assertTrue(callable(live_runner))
+        if not callable(live_runner):
+            return
+        now = [25.0]
+
+        def overrun(_compiler, _family, budget):
+            budget.remaining_seconds()
+            now[0] = 266.0
+
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "total execution deadline"
+        ):
+            live_runner(
+                {CompilerFamily.GCC: Path(sys.executable).resolve()},
+                frozenset(),
+                suite_runner=overrun,
+                printer=lambda _message: None,
+                clock=lambda: now[0],
+                total_seconds=240.0,
+            )
+
+    def test_live_cli_normalizes_suite_oserror_to_status_two(self):
+        import test_gpu_capability_live_compilers as live_module
+
+        output = io.StringIO()
+        arguments = (
+            "gpu_capability_source_audit.py",
+            "--source-root", ".",
+            "--live-only",
+            "--live-compiler", f"gcc={sys.executable}",
+            "--require-live-family", "gcc",
+        )
+        with (
+            mock.patch.object(sys, "argv", arguments),
+            mock.patch.object(
+                live_module,
+                "run_live_compiler_suite",
+                side_effect=OSError("fixture disk unavailable"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            status = capability_audit.main()
+        self.assertEqual(status, 2)
+        self.assertIn("live compiler execution failed", output.getvalue())
+
+    def test_live_cli_returns_infrastructure_status_for_missing_requirement(self):
+        self.assertTrue(hasattr(capability_audit, "run_live_only"))
+        if not hasattr(capability_audit, "run_live_only"):
+            return
+        output = io.StringIO()
+        arguments = (
+            "gpu_capability_source_audit.py",
+            "--source-root", ".",
+            "--live-only",
+            "--require-live-family", "gcc",
+        )
+        with mock.patch.object(sys, "argv", arguments), contextlib.redirect_stdout(output):
+            status = capability_audit.main()
+        self.assertEqual(status, 2)
+        self.assertIn("required live compiler family is missing: gcc", output.getvalue())
 
 
 class PipelineLaneTests(unittest.TestCase):

@@ -19,6 +19,7 @@ from typing import Callable, Iterable
 from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
+    CompilerFamily,
     CoverageReport,
     PreprocessedTranslationUnitView,
     SourceLocation,
@@ -6861,6 +6862,144 @@ def load_production_sources(root: Path) -> dict[PurePosixPath, str]:
     return sources
 
 
+def parse_live_compiler_options(
+    values: tuple[str, ...],
+) -> dict[CompilerFamily, Path]:
+    """Parse repeated ``FAMILY=PATH`` selections without probing compilers."""
+
+    selected: dict[CompilerFamily, Path] = {}
+    for value in values:
+        if not isinstance(value, str) or "=" not in value:
+            raise AuditInfrastructureError(
+                "live compiler must use FAMILY=PATH"
+            )
+        family_value, separator, path_value = value.partition("=")
+        if not separator or not family_value or not path_value:
+            raise AuditInfrastructureError(
+                "live compiler must use FAMILY=PATH"
+            )
+        try:
+            family = CompilerFamily(family_value)
+        except ValueError as error:
+            raise AuditInfrastructureError(
+                f"unsupported live compiler family: {family_value}"
+            ) from error
+        if family in selected:
+            raise AuditInfrastructureError(
+                f"duplicate live compiler family: {family.value}"
+            )
+        selected[family] = Path(path_value).expanduser().resolve(strict=False)
+    return selected
+
+
+def parse_required_live_families(
+    values: tuple[str, ...],
+) -> frozenset[CompilerFamily]:
+    required: set[CompilerFamily] = set()
+    for value in values:
+        try:
+            family = CompilerFamily(value)
+        except ValueError as error:
+            raise AuditInfrastructureError(
+                f"unsupported live compiler family: {value}"
+            ) from error
+        if family in required:
+            raise AuditInfrastructureError(
+                f"duplicate required live compiler family: {family.value}"
+            )
+        required.add(family)
+    return frozenset(required)
+
+
+@dataclass(frozen=True)
+class LiveExecutionBudget:
+    """One monotonic deadline shared by every live fixture and family."""
+
+    deadline: float
+    clock: Callable[[], float]
+
+    @classmethod
+    def start(
+        cls,
+        total_seconds: float = AuditLimits().total_seconds,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> "LiveExecutionBudget":
+        if (
+            not callable(clock)
+            or not isinstance(total_seconds, (int, float))
+            or isinstance(total_seconds, bool)
+            or total_seconds <= 0
+        ):
+            raise AuditInfrastructureError("live execution budget is invalid")
+        return cls(float(clock()) + float(total_seconds), clock)
+
+    def remaining_seconds(self) -> float:
+        remaining = self.deadline - float(self.clock())
+        if remaining <= 0:
+            raise AuditInfrastructureError(
+                "live compiler total execution deadline exceeded"
+            )
+        return remaining
+
+
+def run_live_only(
+    compilers: Mapping[CompilerFamily, Path],
+    required: frozenset[CompilerFamily],
+    *,
+    suite_runner: Callable[[Path, CompilerFamily, LiveExecutionBudget], None],
+    printer: Callable[[str], None] = print,
+    clock: Callable[[], float] = time.monotonic,
+    total_seconds: float = AuditLimits().total_seconds,
+) -> None:
+    """Run selected families and report every optional absence explicitly."""
+
+    if (not isinstance(compilers, Mapping)
+            or not isinstance(required, frozenset)
+            or not callable(suite_runner)
+            or not callable(printer)):
+        raise AuditInfrastructureError("live compiler inputs are invalid")
+    missing = sorted(
+        required - set(compilers), key=lambda family: family.value
+    )
+    if missing:
+        raise AuditInfrastructureError(
+            "required live compiler family is missing: "
+            + ", ".join(family.value for family in missing)
+        )
+    budget = LiveExecutionBudget.start(total_seconds, clock)
+    for family in CompilerFamily:
+        compiler = compilers.get(family)
+        if compiler is None:
+            printer(
+                "SKIP: optional live compiler family "
+                f"{family.value}: no executable selected"
+            )
+            continue
+        if not isinstance(compiler, Path):
+            raise AuditInfrastructureError(
+                f"live compiler path is invalid: {family.value}"
+            )
+        try:
+            canonical = compiler.resolve(strict=True)
+        except OSError as error:
+            raise AuditInfrastructureError(
+                f"live compiler executable is unavailable: {family.value}={compiler}"
+            ) from error
+        if not canonical.is_file():
+            raise AuditInfrastructureError(
+                f"live compiler executable is not a file: {family.value}={canonical}"
+            )
+        budget.remaining_seconds()
+        try:
+            suite_runner(canonical, family, budget)
+        except OSError as error:
+            raise AuditInfrastructureError(
+                f"live compiler execution failed: {family.value}: {error}"
+            ) from error
+        budget.remaining_seconds()
+        printer(f"PASS: live compiler capability parity: {family.value}={canonical}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
@@ -6868,8 +7007,36 @@ def main() -> int:
     # lane consumes preprocessed views instead of the deleted macro table.
     parser.add_argument("--compile-commands", type=Path)
     parser.add_argument("--performance-only", action="store_true")
+    parser.add_argument("--live-only", action="store_true")
+    parser.add_argument("--live-compiler", action="append", default=[])
+    parser.add_argument("--require-live-family", action="append", default=[])
     args = parser.parse_args()
 
+    if args.live_only:
+        if args.performance_only or args.compile_commands is not None:
+            parser.error(
+                "--live-only cannot be combined with compiler audit or performance mode"
+            )
+        try:
+            compilers = parse_live_compiler_options(tuple(args.live_compiler))
+            required = parse_required_live_families(
+                tuple(args.require_live_family)
+            )
+            from test_gpu_capability_live_compilers import (
+                run_live_compiler_suite,
+            )
+            run_live_only(
+                compilers,
+                required,
+                suite_runner=run_live_compiler_suite,
+            )
+        except AuditInfrastructureError as error:
+            print(f"FAIL: GPU capability live compiler infrastructure: {error}")
+            return 2
+        print("PASS: GPU capability live compiler parity")
+        return 0
+    if args.live_compiler or args.require_live_family:
+        parser.error("live compiler selections require --live-only")
     if args.performance_only:
         print("PASS: GPU capability source-audit performance: " + performance_self_tests())
         return 0
