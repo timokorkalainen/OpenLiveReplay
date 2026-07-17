@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from array import array
+import bisect
 from collections.abc import Mapping
 import ctypes
 from dataclasses import dataclass
@@ -18,7 +20,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Iterable
+from typing import Callable, Iterable
+
+from gpu_capability_model import (
+    AuditInfrastructureError,
+    AuditLimits,
+    PreprocessedTranslationUnitView,
+    SourceLocation,
+)
 
 
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".mm"}
@@ -79,6 +88,31 @@ REVIEWED_NATIVE_HANDLE_TYPES = {
         frozenset({"ID3D11Texture2D"}),
 }
 
+_CAPABILITY_CANDIDATE_SPELLINGS = frozenset({
+    b"GpuOpScope",
+    b"GpuRetireRegistry",
+    b"GpuSyncReadScope",
+    b"_longjmp",
+    b"complete",
+    b"longjmp",
+    b"nativeHandle",
+    b"read",
+    b"registerRetire",
+    b"siglongjmp",
+    b"track",
+    b"withRead",
+}).union(
+    name.encode("ascii")
+    for table in (
+        REVIEWED_NATIVE_HANDLE_SINKS,
+        REVIEWED_NATIVE_HANDLE_METHODS,
+        REVIEWED_NATIVE_HANDLE_MEMBER_SINKS,
+        REVIEWED_NATIVE_HANDLE_TYPES,
+    )
+    for names in table.values()
+    for name in names
+)
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -89,6 +123,347 @@ class Finding:
 
     def render(self) -> str:
         return f"{self.path}:{self.line}: forbidden expression {self.expression}: {self.reason}"
+
+
+@dataclass(frozen=True)
+class AggregatedFinding:
+    finding: Finding
+    configurations: tuple[str, ...]
+
+
+class AuditBuffer:
+    """Bounded full-TU grammar text with offsets back to packed provenance runs."""
+
+    _BLOCK_BYTES = 64 * 1024
+    _RUN_BLOCK = 4096
+    _RUN_COLUMN_COUNT = 10
+
+    def __init__(
+        self,
+        text: str,
+        view: PreprocessedTranslationUnitView,
+        columns: tuple[array, ...],
+        origin_production: bytes,
+        peak_rss_bytes: int,
+    ) -> None:
+        self.text = text
+        self._view = view
+        (
+            self._run_starts,
+            self._run_stops,
+            self._token_run_starts,
+            self._token_run_stops,
+            self._identity_ids,
+            self._origin_ids,
+            self._inclusion_ids,
+            self._original_lines,
+            self._run_change_prefix,
+            self._production_prefix,
+        ) = columns
+        self._line_starts = self._run_starts
+        self._origin_production = origin_production
+        self.peak_rss_bytes = peak_rss_bytes
+
+    @staticmethod
+    def _sample_rss(
+        rss_reader: Callable[[], int], limit: int, peak: int, *, reserve: int = 0
+    ) -> int:
+        try:
+            current = int(rss_reader())
+        except (OSError, TypeError, ValueError) as error:
+            raise AuditInfrastructureError("cannot sample coordinator RSS") from error
+        if current < 0:
+            raise AuditInfrastructureError("coordinator RSS sample is negative")
+        peak = max(peak, current)
+        if current + reserve >= limit:
+            raise AuditInfrastructureError("coordinator RSS limit exceeded")
+        return peak
+
+    @staticmethod
+    def _audit_spelling(spelling: bytes) -> bytes:
+        if spelling.startswith((b'"', b"'")):
+            return b" " * len(spelling)
+        alternatives = {
+            b"%:%:": b"##  ",
+            b"<:": b"[ ",
+            b":>": b"] ",
+            b"<%": b"{ ",
+            b"%>": b"} ",
+            b"%:": b"# ",
+        }
+        return alternatives.get(spelling, spelling)
+
+    @classmethod
+    def from_preprocessed(
+        cls,
+        view: PreprocessedTranslationUnitView,
+        limits: AuditLimits,
+        rss_reader: Callable[[], int],
+    ) -> "AuditBuffer":
+        tokens = view.tokens
+        normalized = bytearray()
+        columns = tuple(array("I") for _unused in range(cls._RUN_COLUMN_COUNT))
+        (
+            run_starts,
+            run_stops,
+            token_starts,
+            token_stops,
+            identity_ids,
+            origin_ids,
+            inclusion_ids,
+            original_lines,
+            change_prefix,
+            production_prefix,
+        ) = columns
+        production_prefix.append(0)
+        origin_ids_by_key: dict[tuple[Path | None, PurePosixPath | None, bool], int] = {}
+        origin_production = bytearray()
+        peak_rss = cls._sample_rss(rss_reader, limits.rss_bytes, 0)
+        bytes_since_sample = 0
+
+        def mapping_bytes(extra_runs: int = 0) -> int:
+            runs = len(run_starts) + extra_runs
+            return (runs * (cls._RUN_COLUMN_COUNT - 1) + runs + 1) * 4
+
+        def retained_bytes(
+            *, extra_normalized: int = 0, extra_runs: int = 0,
+            extra_origins: int = 0,
+        ) -> int:
+            return (
+                len(normalized)
+                + extra_normalized
+                + mapping_bytes(extra_runs)
+                + len(origin_production)
+                + extra_origins
+            )
+
+        def append(piece: bytes) -> None:
+            nonlocal bytes_since_sample, peak_rss
+            projected = retained_bytes(extra_normalized=len(piece))
+            if projected > limits.retained_token_bytes:
+                raise AuditInfrastructureError("normalized audit byte limit exceeded")
+            if bytes_since_sample + len(piece) >= cls._BLOCK_BYTES:
+                peak_rss = cls._sample_rss(
+                    rss_reader,
+                    limits.rss_bytes,
+                    peak_rss,
+                    reserve=cls._BLOCK_BYTES,
+                )
+                bytes_since_sample = 0
+            normalized.extend(piece)
+            bytes_since_sample += len(piece)
+
+        for packed_run in tokens.iter_runs():
+            if len(run_starts) % cls._RUN_BLOCK == 0:
+                reserve = cls._RUN_BLOCK * (cls._RUN_COLUMN_COUNT * 4 + 1)
+                peak_rss = cls._sample_rss(
+                    rss_reader, limits.rss_bytes, peak_rss, reserve=reserve
+                )
+            if retained_bytes(extra_runs=1) > limits.retained_token_bytes:
+                raise AuditInfrastructureError("normalized audit byte limit exceeded")
+            normalized_start = len(normalized)
+            for token_index in range(packed_run.start, packed_run.stop):
+                if token_index != packed_run.start:
+                    append(b" ")
+                spelling_id = tokens.spelling_id_at(token_index)
+                append(cls._audit_spelling(tokens.spelling_for(spelling_id)))
+            append(b"\n")
+            if retained_bytes(extra_runs=1) > limits.retained_token_bytes:
+                raise AuditInfrastructureError("normalized audit byte limit exceeded")
+            identity = tokens.identity_for(packed_run.identity_id)
+            origin_key = (
+                identity.canonical if identity is not None else None,
+                identity.relative if identity is not None else None,
+                bool(identity is not None and identity.production),
+            )
+            origin_id = origin_ids_by_key.get(origin_key)
+            if origin_id is None:
+                if (
+                    retained_bytes(extra_runs=1, extra_origins=1)
+                    > limits.retained_token_bytes
+                ):
+                    raise AuditInfrastructureError("normalized audit byte limit exceeded")
+                identity_bytes = sum(
+                    len(str(value).encode("utf-8", errors="surrogatepass"))
+                    for value in origin_key[:2] if value is not None
+                )
+                peak_rss = cls._sample_rss(
+                    rss_reader,
+                    limits.rss_bytes,
+                    peak_rss,
+                    reserve=1025 + identity_bytes,
+                )
+                origin_id = len(origin_ids_by_key)
+                origin_ids_by_key[origin_key] = origin_id
+                origin_production.append(int(origin_key[2]))
+            changes = change_prefix[-1] if change_prefix else 0
+            if (
+                origin_ids
+                and (
+                    origin_ids[-1] != origin_id
+                    or inclusion_ids[-1] != packed_run.inclusion_instance
+                )
+            ):
+                changes += 1
+            run_starts.append(normalized_start)
+            run_stops.append(len(normalized))
+            token_starts.append(packed_run.start)
+            token_stops.append(packed_run.stop)
+            identity_ids.append(packed_run.identity_id)
+            origin_ids.append(origin_id)
+            inclusion_ids.append(packed_run.inclusion_instance)
+            original_lines.append(packed_run.original_line)
+            change_prefix.append(changes)
+            production_prefix.append(production_prefix[-1] + int(origin_key[2]))
+        if retained_bytes() > limits.retained_token_bytes:
+            raise AuditInfrastructureError("normalized audit byte limit exceeded")
+        peak_rss = cls._sample_rss(
+            rss_reader,
+            limits.rss_bytes,
+            peak_rss,
+            reserve=len(normalized) + len(origin_production),
+        )
+        immutable_origin_production = bytes(origin_production)
+        try:
+            text = normalized.decode("latin-1", errors="strict")
+        except UnicodeDecodeError as error:  # pragma: no cover - latin-1 is total
+            raise AuditInfrastructureError("cannot normalize preprocessed audit bytes") from error
+        peak_rss = cls._sample_rss(rss_reader, limits.rss_bytes, peak_rss)
+        return cls(text, view, columns, immutable_origin_production, peak_rss)
+
+    def reserve_rss(
+        self,
+        rss_reader: Callable[[], int],
+        limit: int,
+        reserve: int,
+    ) -> None:
+        self.peak_rss_bytes = self._sample_rss(
+            rss_reader, limit, self.peak_rss_bytes, reserve=reserve
+        )
+
+    def _run_index_at(self, offset: int) -> int:
+        if not self._run_starts:
+            raise IndexError("empty audit buffer has no source location")
+        if offset < 0 or offset > len(self.text):
+            raise IndexError("audit buffer offset out of range")
+        if offset == len(self.text):
+            return len(self._run_starts) - 1
+        run_index = bisect.bisect_right(self._run_starts, offset) - 1
+        if run_index < 0:
+            raise IndexError("audit buffer offset has no source location")
+        return run_index
+
+    def location_at(self, offset: int) -> SourceLocation:
+        run_index = self._run_index_at(offset)
+        return SourceLocation(
+            identity=self._view.tokens.identity_for(self._identity_ids[run_index]),
+            inclusion_instance=self._inclusion_ids[run_index],
+            line=self._original_lines[run_index],
+            configuration_digest=self._view.configuration.digest,
+        )
+
+    def location_for_line(self, line: int) -> SourceLocation:
+        if line < 1 or line > len(self._line_starts):
+            raise AuditInfrastructureError(
+                f"grammar finding references invalid normalized line {line}"
+            )
+        return self.location_at(self._line_starts[line - 1])
+
+    def candidate_paths(self) -> tuple[PurePosixPath, ...]:
+        result: set[PurePosixPath] = set()
+        for run_index in range(len(self._run_starts)):
+            identity = self._view.tokens.identity_for(self._identity_ids[run_index])
+            if (
+                identity is not None
+                and identity.production
+                and identity.relative is not None
+                and is_production_path(identity.relative)
+            ):
+                result.add(identity.relative)
+        return tuple(sorted(result, key=PurePosixPath.as_posix))
+
+    def has_capability_spelling(self) -> bool:
+        for run_index in range(len(self._run_starts)):
+            for token_index in range(
+                self._token_run_starts[run_index], self._token_run_stops[run_index]
+            ):
+                if self.token_spelling(token_index) in _CAPABILITY_CANDIDATE_SPELLINGS:
+                    return True
+        return False
+
+    def token_spelling(self, token_index: int) -> bytes:
+        return self._view.tokens.spelling_for(
+            self._view.tokens.spelling_id_at(token_index)
+        )
+
+    def token_provenance_key(self, token_index: int) -> tuple[int, int, bool]:
+        run_index = bisect.bisect_right(self._token_run_starts, token_index) - 1
+        if run_index < 0 or token_index >= self._token_run_stops[run_index]:
+            raise IndexError("packed token index has no audit provenance run")
+        origin_id = self._origin_ids[run_index]
+        return (
+            origin_id,
+            self._inclusion_ids[run_index],
+            bool(self._origin_production[origin_id]),
+        )
+
+    def position_provenance_key(self, offset: int) -> tuple[int, int, bool]:
+        run_index = self._run_index_at(offset)
+        origin_id = self._origin_ids[run_index]
+        return (
+            origin_id,
+            self._inclusion_ids[run_index],
+            bool(self._origin_production[origin_id]),
+        )
+
+    def require_same_origin(self, start: int, stop: int) -> None:
+        if start < 0 or stop <= start or stop > len(self.text):
+            raise AuditInfrastructureError("invalid capability grammar provenance range")
+        first_run = self._run_index_at(start)
+        last_run = self._run_index_at(stop - 1)
+        mismatch = self._run_change_prefix[last_run] != self._run_change_prefix[first_run]
+        production = (
+            self._production_prefix[last_run + 1]
+            > self._production_prefix[first_run]
+        )
+        if mismatch and production:
+            raise AuditInfrastructureError(
+                "mixed provenance in guarded GPU capability expression"
+            )
+
+    def require_same_positions(self, *positions: int) -> None:
+        if not positions:
+            return
+        keys = [self.position_provenance_key(position) for position in positions]
+        if len(set(keys)) > 1 and any(key[2] for key in keys):
+            raise AuditInfrastructureError(
+                "mixed provenance in guarded GPU capability expression"
+            )
+
+    def path_has_spelling(
+        self,
+        path: PurePosixPath,
+        spelling: bytes,
+        inclusion_instance: int | None = None,
+    ) -> bool:
+        for run_index in range(len(self._run_starts)):
+            identity = self._view.tokens.identity_for(self._identity_ids[run_index])
+            if (
+                identity is None
+                or identity.relative != path
+                or not identity.production
+                or (
+                    inclusion_instance is not None
+                    and self._inclusion_ids[run_index] != inclusion_instance
+                )
+            ):
+                continue
+            for token_index in range(
+                self._token_run_starts[run_index], self._token_run_stops[run_index]
+            ):
+                if self.token_spelling(token_index) == spelling:
+                    return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -218,8 +593,13 @@ class TranslationText:
     masked: str
     source_lines: tuple[int, ...]
     splice_boundaries: tuple[int, ...]
+    normalized_line_starts: tuple[int, ...] = ()
 
     def line_at(self, position: int) -> int:
+        if self.normalized_line_starts:
+            return max(
+                1, bisect.bisect_right(self.normalized_line_starts, position)
+            )
         if 0 <= position < len(self.source_lines):
             return self.source_lines[position]
         return self.source_lines[-1] if self.source_lines else 1
@@ -307,6 +687,17 @@ def translate_source(source: str) -> TranslationText:
     masked = normalize_alternative_tokens(mask_non_code(text))
     return TranslationText(
         source, text, masked, tuple(source_lines), tuple(splice_boundaries))
+
+
+def compiler_translation(source: str) -> TranslationText:
+    """Use already token-normalized compiler text without per-character line tables."""
+
+    line_starts = array("I", (0,))
+    offset = source.find("\n")
+    while offset >= 0 and offset + 1 < len(source):
+        line_starts.append(offset + 1)
+        offset = source.find("\n", offset + 1)
+    return TranslationText(source, source, source, (), (), tuple(line_starts))
 
 
 def brace_pairs(masked: str) -> list[tuple[int, int]]:
@@ -1723,17 +2114,21 @@ def has_intervening_potentially_throwing_call(masked: str, start: int, end: int)
     return False
 
 
-def resolve_scope(scope_bindings: list[ScopeBinding], masked: str,
+def resolve_scope(scope_bindings: list[ScopeBinding] | dict[str, list[ScopeBinding]], masked: str,
                   pairs: list[tuple[int, int]],
-                  call: re.Match[str]) -> ScopeBinding | None:
+                  call: re.Match[str], shadow_index=None) -> ScopeBinding | None:
     receiver = receiver_binding_name(masked, call.start())
+    available = (scope_bindings.get(receiver, ())
+                 if isinstance(scope_bindings, dict) and receiver is not None
+                 else scope_bindings if not isinstance(scope_bindings, dict) else ())
     candidates = [
-        binding for binding in scope_bindings
+        binding for binding in available
         if binding.declaration.position <= call.start() < binding.block[1]
         and binding.block[0] < call.start()
         and receiver == binding.declaration.name
         and not name_is_shadowed(binding.declaration.name, binding.declaration.position,
-                                 binding.declaration.end, masked, pairs, call.start())
+                                 binding.declaration.end, masked, pairs, call.start(),
+                                 shadow_index)
     ]
     if not candidates:
         return None
@@ -1975,10 +2370,39 @@ def lambda_init_capture_shadows(masked: str, pairs: list[tuple[int, int]], name:
     return False
 
 
+def build_shadow_index(
+    masked: str, pairs: list[tuple[int, int]]
+) -> dict[str, tuple[tuple[int, tuple[int, int] | None], ...]]:
+    tokens = cpp_tokens(masked)
+    known_types = declared_type_names(tokens)
+    declarators = [
+        token for index, token in enumerate(tokens)
+        if re.fullmatch(r"[A-Za-z_]\w*", token.value)
+        and token_is_declarator_name(tokens, index, known_types)
+    ]
+    blocks = blocks_for_positions(masked, pairs, [token.start for token in declarators])
+    mutable: dict[str, list[tuple[int, tuple[int, int] | None]]] = {}
+    for token in declarators:
+        mutable.setdefault(token.value, []).append((token.start, blocks.get(token.start)))
+    return {name: tuple(entries) for name, entries in mutable.items()}
+
+
 def name_is_shadowed(name: str, declaration_start: int, declaration_end: int,
-                     masked: str, pairs: list[tuple[int, int]], call_position: int) -> bool:
+                     masked: str, pairs: list[tuple[int, int]], call_position: int,
+                     shadow_index: dict[str, tuple[
+                         tuple[int, tuple[int, int] | None], ...
+                     ]] | None = None) -> bool:
     if lambda_init_capture_shadows(masked, pairs, name, call_position):
         return True
+    if shadow_index is not None:
+        for position, block in shadow_index.get(name, ()):
+            if position <= declaration_end:
+                continue
+            if position >= call_position:
+                break
+            if block is not None and block[0] < call_position < block[1]:
+                return True
+        return False
     # Keep tokens following the candidate name available to the declarator
     # classifier.  Truncating at the call's member operator turns an expression
     # such as ``std::as_const(scope).read()`` into the declaration-shaped tail
@@ -1999,13 +2423,14 @@ def name_is_shadowed(name: str, declaration_start: int, declaration_end: int,
 
 
 def handle_binding_is_shadowed(binding: HandleBinding, masked: str,
-                               pairs: list[tuple[int, int]], call_position: int) -> bool:
+                               pairs: list[tuple[int, int]], call_position: int,
+                               shadow_index=None) -> bool:
     return name_is_shadowed(binding.name, binding.position, binding.position,
-                            masked, pairs, call_position)
+                            masked, pairs, call_position, shadow_index)
 
 
 def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
-                              binding: HandleBinding) -> bool:
+                              binding: HandleBinding, shadow_index=None) -> bool:
     """Keep the lease in synchronous blocks while excluding nested callable bodies."""
     allowed_methods = {"desc", "nativeHandle", "nativeSubresource", "valid"}
     tokens = cpp_tokens(masked, binding.position, binding.block[1])
@@ -2018,7 +2443,7 @@ def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
             if any(item.value == "GpuReadLease" for item in declaration_tokens):
                 continue
         if name_is_shadowed(binding.name, binding.position, binding.position,
-                            masked, pairs, token.start):
+                            masked, pairs, token.start, shadow_index):
             continue
         if not stays_in_synchronous_blocks(masked, pairs, binding.block, token.start):
             return False
@@ -2033,16 +2458,26 @@ def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
 
 def audit_capability_uses(path: PurePosixPath, source: str,
                           compiler_macros: Mapping[str, MacroDefinition] | frozenset[str]
-                          = frozenset()) -> list[Finding]:
-    translated = translate_source(source)
+                          = frozenset(), *, compiler_view: bool = False,
+                          compiler_translation_text: TranslationText | None = None
+                          ) -> list[Finding]:
+    translated = (compiler_translation_text if compiler_translation_text is not None
+                  else compiler_translation(source) if compiler_view
+                  else translate_source(source))
     masked = translated.masked
     pairs = brace_pairs(masked)
-    findings = preprocessor_capability_findings(path, translated)
-    findings.extend(guarded_macro_composition_findings(
-        path, translated, compiler_macros))
-    findings.extend(phase_two_capability_findings(path, source, translated))
+    findings: list[Finding] = []
+    if not compiler_view:
+        findings.extend(preprocessor_capability_findings(path, translated))
+        findings.extend(guarded_macro_composition_findings(
+            path, translated, compiler_macros))
+        findings.extend(phase_two_capability_findings(path, source, translated))
     calls = list(MEMBER_CALL.finditer(masked))
     scope_bindings = scope_bindings_linear(masked, pairs)
+    scopes_by_name: dict[str, list[ScopeBinding]] = {}
+    for binding in scope_bindings:
+        scopes_by_name.setdefault(binding.declaration.name, []).append(binding)
+    shadow_index = build_shadow_index(masked, pairs)
     bound_scope_positions = {
         binding.declaration.position for binding in scope_bindings
     }
@@ -2080,7 +2515,7 @@ def audit_capability_uses(path: PurePosixPath, source: str,
     for call in calls:
         if call.group(1) not in {"read", "withRead", "complete"}:
             continue
-        scope = resolve_scope(scope_bindings, masked, pairs, call)
+        scope = resolve_scope(scopes_by_name, masked, pairs, call, shadow_index)
         if scope is None:
             receiver_name = receiver_binding_name(masked, call.start())
             receiver_names = receiver_binding_references(masked, call.start())
@@ -2093,7 +2528,7 @@ def audit_capability_uses(path: PurePosixPath, source: str,
                 and not name_is_shadowed(binding.declaration.name,
                                          binding.declaration.position,
                                          binding.declaration.end, masked, pairs,
-                                         call.start())
+                                         call.start(), shadow_index)
             ]
             if referenced:
                 if call.group(1) == "withRead":
@@ -2181,11 +2616,12 @@ def audit_capability_uses(path: PurePosixPath, source: str,
     for call in native_calls:
         binding = native_bindings[call.start()]
         if (binding is not None
-                and handle_binding_is_shadowed(binding, masked, pairs, call.start())):
+                and handle_binding_is_shadowed(
+                    binding, masked, pairs, call.start(), shadow_index)):
             native_bindings[call.start()] = None
 
     for binding in handle_bindings:
-        if not lease_binding_stays_local(masked, pairs, binding):
+        if not lease_binding_stays_local(masked, pairs, binding, shadow_index):
             findings.append(Finding(
                 path, translated.line_at(binding.position), binding.name,
                 "lease reference must remain inside the immediate callback body"))
@@ -2312,11 +2748,27 @@ def audit_capability_uses(path: PurePosixPath, source: str,
     return findings
 
 
-def audit_public_member(path: PurePosixPath, source: str, class_name: str,
-                        member_pattern: str, expression: str) -> list[Finding]:
-    masked = mask_non_code(source)
-    class_match = re.search(rf"\bclass\s+{re.escape(class_name)}\b[^{{;]*{{", masked)
+def audit_public_member(
+    path: PurePosixPath,
+    source: str,
+    class_name: str,
+    member_pattern: str,
+    expression: str,
+    *,
+    candidate_line: Callable[[int], bool] | None = None,
+    pretokenized: bool = False,
+) -> list[Finding]:
+    masked = source if pretokenized else mask_non_code(source)
+    class_match = next((
+        match for match in re.finditer(
+            rf"\bclass\s+{re.escape(class_name)}\b[^{{;]*{{", masked
+        )
+        if candidate_line is None
+        or candidate_line(line_number(source, match.start()))
+    ), None)
     if not class_match:
+        if candidate_line is not None:
+            return []
         return [Finding(path, 1, class_name, "audited class declaration was not found")]
     opening = masked.find("{", class_match.start(), class_match.end())
     pair = next((candidate for candidate in brace_pairs(masked) if candidate[0] == opening), None)
@@ -2341,6 +2793,309 @@ def audit_public_member(path: PurePosixPath, source: str, class_name: str,
             )
         offset += len(line)
     return findings
+
+
+def _validate_capability_expression_provenance(
+    buffer: AuditBuffer, translated: TranslationText
+) -> None:
+    """Resolve GPU grammar first, then validate only its required token ranges."""
+
+    masked = translated.masked
+    pairs = brace_pairs(masked)
+    calls = list(MEMBER_CALL.finditer(masked))
+    scopes = scope_bindings_linear(masked, pairs)
+    scopes_by_name: dict[str, list[ScopeBinding]] = {}
+    for scope in scopes:
+        scopes_by_name.setdefault(scope.declaration.name, []).append(scope)
+    shadow_index = build_shadow_index(masked, pairs)
+    handle_bindings: list[HandleBinding] = []
+
+    def require_tokens(tokens: list[CppToken]) -> None:
+        if tokens:
+            buffer.require_same_origin(tokens[0].start, tokens[-1].end)
+
+    def call_span(call: re.Match[str]) -> tuple[int, int] | None:
+        expression = receiver_expression(masked, call.start())
+        expression_end = call.start()
+        while expression_end > 0 and masked[expression_end - 1].isspace():
+            expression_end -= 1
+        start = expression_end - len(expression)
+        closing = matching_delimiter(masked, call.end() - 1, "(", ")")
+        return None if closing is None else (start, closing + 1)
+
+    for scope in scopes:
+        buffer.require_same_origin(
+            scope.declaration.position, scope.declaration.end
+        )
+
+    for call in calls:
+        operation = call.group(1)
+        if operation not in {"read", "withRead", "complete"}:
+            continue
+        scope = resolve_scope(scopes_by_name, masked, pairs, call, shadow_index)
+        if scope is None:
+            continue
+        span = call_span(call)
+        if span is not None:
+            buffer.require_same_origin(*span)
+        buffer.require_same_positions(
+            scope.declaration.position, call.start(1)
+        )
+        if operation == "read":
+            lease = canonical_read_lease(
+                masked, pairs, call, scope.declaration.name
+            )
+            if lease is not None:
+                statement = statement_tokens(masked, pairs, call.start())
+                require_tokens(statement)
+                block = immediate_block(pairs, call.start())
+                if block is not None:
+                    handle_bindings.append(HandleBinding(
+                        lease[0], lease[1], block,
+                        scope.declaration.position, call.start(),
+                    ))
+        elif operation == "withRead":
+            bindings = callback_lease_bindings(masked, pairs, call)
+            for binding in bindings:
+                buffer.require_same_positions(
+                    scope.declaration.position, call.start(1), binding.position
+                )
+            handle_bindings.extend(bindings)
+        else:
+            require_tokens(statement_tokens(masked, pairs, call.start()))
+
+    native_calls = [call for call in calls if call.group(1) == "nativeHandle"]
+    for call in native_calls:
+        span = call_span(call)
+        if span is not None:
+            buffer.require_same_origin(*span)
+        binding = resolve_handle_binding(handle_bindings, masked, pairs, call)
+        if binding is not None:
+            positions = [binding.position, call.start(1)]
+            if binding.scope_position is not None:
+                positions.append(binding.scope_position)
+            if binding.read_position is not None:
+                positions.append(binding.read_position)
+            buffer.require_same_positions(*positions)
+
+    # Native-handle declarations, aliases, casts, typed consumers, methods, and
+    # direct sinks are all statement-local in the locked grammar. A declaration
+    # is itself a guarded construct, so validate its complete required-token
+    # range when any part is production even if nativeHandle came from an
+    # external expansion. Wholly external declarations remain out of scope.
+    def is_native_handle_declaration(tokens: list[CppToken]) -> bool:
+        values = [token.value for token in tokens]
+        for index, value in enumerate(values):
+            if value != "nativeHandle":
+                continue
+            if index and values[index - 1] in {".", "->", "::", "&"}:
+                continue
+            if values[index + 1:index + 4] != ["(", ")", "const"]:
+                continue
+            prefix = values[:index]
+            if "void" in prefix and "*" in prefix:
+                return True
+        return False
+
+    statement: list[CppToken] = []
+    has_production_native = False
+    for token in cpp_tokens(masked):
+        if token.value in {"{", "}"}:
+            statement = []
+            has_production_native = False
+            continue
+        statement.append(token)
+        if token.value == "nativeHandle":
+            has_production_native = (
+                has_production_native
+                or buffer.position_provenance_key(token.start)[2]
+            )
+        if token.value == ";":
+            declaration = is_native_handle_declaration(statement)
+            any_production = declaration and any(
+                buffer.position_provenance_key(item.start)[2]
+                for item in statement
+            )
+            if has_production_native or any_production:
+                require_tokens(statement)
+            statement = []
+            has_production_native = False
+
+    public_policies = (
+        ("GpuRetireRegistry", r"\bregisterRetire\s*\("),
+        ("GpuOpScope", r"\btrack\s*\("),
+    )
+    for class_name, member_pattern in public_policies:
+        for class_match in re.finditer(
+            rf"\bclass\s+{re.escape(class_name)}\b[^{{;]*{{", masked
+        ):
+            opening = masked.find("{", class_match.start(), class_match.end())
+            body = next((pair for pair in pairs if pair[0] == opening), None)
+            if body is None:
+                continue
+            for member in re.finditer(member_pattern, masked[opening + 1:body[1]]):
+                member_position = opening + 1 + member.start()
+                buffer.require_same_positions(class_match.start(), member_position)
+                require_tokens(statement_tokens(masked, pairs, member_position))
+
+
+def _capability_policy_key(path: PurePosixPath) -> tuple[object, ...]:
+    return (
+        path == LEASE_HEADER,
+        path in SYNC_READ_ALLOWLIST,
+        path in SURFACE_INTERNAL_HANDLE_PATHS,
+        tuple(sorted(REVIEWED_NATIVE_HANDLE_SINKS.get(path, ()))),
+        tuple(sorted(REVIEWED_NATIVE_HANDLE_METHODS.get(path, ()))),
+        tuple(sorted(REVIEWED_NATIVE_HANDLE_MEMBER_SINKS.get(path, ()))),
+        tuple(sorted(REVIEWED_NATIVE_HANDLE_TYPES.get(path, ()))),
+    )
+
+
+def _map_candidate_findings(
+    buffer: AuditBuffer,
+    candidate_paths: frozenset[PurePosixPath],
+    findings: Iterable[Finding],
+) -> list[Finding]:
+    mapped: list[Finding] = []
+    for finding in findings:
+        location = buffer.location_for_line(finding.line)
+        identity = location.identity
+        if (
+            identity is None
+            or not identity.production
+            or identity.relative not in candidate_paths
+        ):
+            continue
+        mapped.append(Finding(
+            identity.relative,
+            location.line,
+            finding.expression,
+            finding.reason,
+        ))
+    return mapped
+
+
+def audit_preprocessed_view(
+    view: PreprocessedTranslationUnitView,
+    limits: AuditLimits,
+    rss_reader: Callable[[], int],
+) -> list[Finding]:
+    """Apply the established capability grammar to one authoritative full-TU view."""
+
+    buffer = AuditBuffer.from_preprocessed(view, limits, rss_reader)
+    if not buffer.has_capability_spelling():
+        return []
+    candidate_paths = buffer.candidate_paths()
+    translated = TranslationText(
+        buffer.text,
+        buffer.text,
+        buffer.text,
+        (),
+        (),
+        buffer._line_starts,
+    )
+    buffer.reserve_rss(rss_reader, limits.rss_bytes, len(buffer.text) * 48)
+    _validate_capability_expression_provenance(buffer, translated)
+    buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
+    findings: list[Finding] = []
+    grouped_paths: dict[tuple[object, ...], list[PurePosixPath]] = {}
+    for path in candidate_paths:
+        grouped_paths.setdefault(_capability_policy_key(path), []).append(path)
+    for paths in grouped_paths.values():
+        representative = paths[0]
+        allowed = frozenset(paths)
+        buffer.reserve_rss(rss_reader, limits.rss_bytes, len(buffer.text) * 48)
+        candidate_findings = audit_capability_uses(
+            representative,
+            buffer.text,
+            compiler_view=True,
+            compiler_translation_text=translated,
+        )
+        buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
+        findings.extend(_map_candidate_findings(
+            buffer,
+            allowed,
+            candidate_findings,
+        ))
+
+    public_policies = (
+        (
+            REGISTRY_HEADER,
+            "GpuRetireRegistry",
+            r"\bregisterRetire\s*\(",
+            "GpuRetireRegistry::registerRetire()",
+        ),
+        (
+            OP_SCOPE_HEADER,
+            "GpuOpScope",
+            r"\btrack\s*\(",
+            "GpuOpScope::track()",
+        ),
+    )
+    candidate_path_set = set(candidate_paths)
+    for path, class_name, member_pattern, expression in public_policies:
+        if path not in candidate_path_set:
+            continue
+        if not buffer.path_has_spelling(path, class_name.encode("ascii")):
+            continue
+
+        def candidate_line(
+            line: int,
+            *,
+            expected: PurePosixPath = path,
+        ) -> bool:
+            location = buffer.location_for_line(line)
+            identity = location.identity
+            return bool(
+                identity is not None
+                and identity.production
+                and identity.relative == expected
+            )
+
+        buffer.reserve_rss(rss_reader, limits.rss_bytes, len(buffer.text) * 16)
+        public_findings = audit_public_member(
+            path,
+            buffer.text,
+            class_name,
+            member_pattern,
+            expression,
+            candidate_line=candidate_line,
+            pretokenized=True,
+        )
+        buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
+        findings.extend(_map_candidate_findings(
+            buffer,
+            frozenset((path,)),
+            public_findings,
+        ))
+
+    unique = set(findings)
+    return sorted(
+        unique,
+        key=lambda finding: (
+            finding.path.as_posix(),
+            finding.line,
+            finding.expression,
+            finding.reason,
+        ),
+    )
+
+
+def aggregate_findings(
+    findings: Iterable[tuple[Finding, str]],
+) -> list[AggregatedFinding]:
+    configurations: dict[Finding, set[str]] = {}
+    for finding, configuration in findings:
+        configurations.setdefault(finding, set()).add(configuration)
+    return [
+        AggregatedFinding(finding, tuple(sorted(configurations[finding])))
+        for finding in sorted(
+            configurations,
+            key=lambda item: (
+                item.path.as_posix(), item.line, item.expression, item.reason
+            ),
+        )
+    ]
 
 
 def audit_sources(sources: dict[PurePosixPath, str],
