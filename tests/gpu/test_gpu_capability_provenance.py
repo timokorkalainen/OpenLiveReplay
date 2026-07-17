@@ -396,6 +396,63 @@ class ProvenanceTests(unittest.TestCase):
                         {identity.relative: identity},
                     )
 
+    def test_dependency_validation_rejects_external_hardlink_to_production(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "playback" / "a.cpp"
+            alias = root / "generated" / "a.cpp"
+            source.parent.mkdir()
+            alias.parent.mkdir()
+            source.write_text("int x;\n", encoding="utf-8")
+            try:
+                os.link(source, alias)
+            except OSError as error:
+                self.skipTest(f"hardlinks unavailable: {error}")
+
+            metadata = source.stat()
+            identity = FileIdentity(
+                source.resolve(),
+                PurePosixPath("playback/a.cpp"),
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+                1,
+                True,
+            )
+            with self.assertRaisesRegex(AuditInfrastructureError, "aliases production"):
+                validate_dependency_identities(
+                    (alias,), root, {identity.relative: identity}
+                )
+
+    def test_dependency_validation_rejects_duplicate_production_filesystem_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "playback" / "a.cpp"
+            second = root / "playback" / "b.cpp"
+            first.parent.mkdir()
+            first.write_text("int x;\n", encoding="utf-8")
+            try:
+                os.link(first, second)
+            except OSError as error:
+                self.skipTest(f"hardlinks unavailable: {error}")
+
+            metadata = first.stat()
+            device = int(metadata.st_dev)
+            inode = int(metadata.st_ino)
+            first_identity = FileIdentity(
+                first.resolve(), PurePosixPath("playback/a.cpp"), device, inode, 1, True
+            )
+            second_identity = FileIdentity(
+                second.resolve(), PurePosixPath("playback/b.cpp"), device, inode, 1, True
+            )
+            production = {
+                first_identity.relative: first_identity,
+                second_identity.relative: second_identity,
+            }
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "filesystem identity aliases production path"
+            ):
+                validate_dependency_identities((), root, production)
+
     def test_reject_source_line_spoofs_direct_spliced_and_aliases(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

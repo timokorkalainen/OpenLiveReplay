@@ -280,6 +280,7 @@ def validate_dependency_identities(
     if not source_root.is_absolute():
         raise _fail("source root must be absolute")
     production_by_key: dict[str, FileIdentity] = {}
+    production_by_filesystem_id: dict[tuple[int, int], FileIdentity] = {}
     for relative, identity in production.items():
         if relative != identity.relative or not identity.production:
             raise _fail("production identity table is inconsistent")
@@ -287,6 +288,15 @@ def validate_dependency_identities(
         if key in production_by_key:
             raise _fail("production identity table has a canonical collision")
         production_by_key[key] = identity
+        if identity.device is not None and identity.inode not in (None, 0):
+            filesystem_id = (identity.device, identity.inode)
+            previous = production_by_filesystem_id.get(filesystem_id)
+            if previous is not None:
+                raise _fail(
+                    f"{relative}: filesystem identity aliases production path "
+                    f"{previous.relative}"
+                )
+            production_by_filesystem_id[filesystem_id] = identity
 
     aliases: dict[str, str] = {}
     result: list[FileIdentity] = []
@@ -329,12 +339,22 @@ def validate_dependency_identities(
                 raise _fail("production dependency changed after enumeration")
             result.append(locked)
             continue
+        raw_device = getattr(metadata, "st_dev", None)
+        raw_inode = getattr(metadata, "st_ino", None)
+        device = int(raw_device) if isinstance(raw_device, int) else None
+        inode = int(raw_inode) if isinstance(raw_inode, int) and raw_inode != 0 else None
+        if (
+            device is not None
+            and inode is not None
+            and (device, inode) in production_by_filesystem_id
+        ):
+            raise _fail("dependency filesystem identity aliases production path")
         result.append(
             FileIdentity(
                 canonical=canonical,
                 relative=None,
-                device=getattr(metadata, "st_dev", None),
-                inode=getattr(metadata, "st_ino", None),
+                device=device,
+                inode=inode,
                 line_count=_physical_line_count(canonical),
                 production=False,
             )
