@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -114,6 +115,16 @@ _MSVC_AMBIGUOUS_PREFIX_OPTIONS = (
 )
 _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
+_COMPILER_INSPECTION_LOCK = threading.Lock()
+_COMPILER_INSPECTION_MEMO: dict[
+    tuple[Path, tuple[int, int, int, int, int], str, CompilerFamily],
+    tuple[CompilerFamily, str],
+] = {}
+
+
+def _clear_compiler_inspection_memo_for_tests() -> None:
+    with _COMPILER_INSPECTION_LOCK:
+        _COMPILER_INSPECTION_MEMO.clear()
 
 
 @dataclass(frozen=True)
@@ -957,6 +968,48 @@ def _compiler_fingerprint(
     return hasher.hexdigest()
 
 
+def _inspect_compiler(
+    compiler: Path,
+    family_hint: CompilerFamily,
+    working_directory: Path,
+    environment: Mapping[str, str],
+    environment_digest: str,
+) -> tuple[CompilerFamily, str]:
+    """Inspect one stable compiler/environment pair once per audit process."""
+
+    with _COMPILER_INSPECTION_LOCK:
+        compiler_snapshot = _compiler_metadata_snapshot(compiler)
+        key = (compiler, compiler_snapshot, environment_digest, family_hint)
+        cached = _COMPILER_INSPECTION_MEMO.get(key)
+        if cached is not None:
+            if _compiler_metadata_snapshot(compiler) != compiler_snapshot:
+                raise AuditInfrastructureError(
+                    "compiler executable changed during compiler version probe: "
+                    f"{compiler}"
+                )
+            return cached
+        version_output = _probe_compiler_version(
+            compiler,
+            family_hint,
+            working_directory,
+            environment,
+        )
+        if _compiler_metadata_snapshot(compiler) != compiler_snapshot:
+            raise AuditInfrastructureError(
+                "compiler executable changed during compiler version probe: "
+                f"{compiler}"
+            )
+        family = identify_compiler(compiler, version_output)
+        fingerprint = _compiler_fingerprint(
+            compiler,
+            _normalize_version_output(version_output),
+            compiler_snapshot,
+        )
+        result = (family, fingerprint)
+        _COMPILER_INSPECTION_MEMO[key] = result
+        return result
+
+
 def _canonical_argument_path(value: str, cwd: Path) -> Path:
     path = Path(value)
     if not path.is_absolute():
@@ -1798,14 +1851,14 @@ def make_configuration(
     _reject_driver_dialect_overrides(compiler_arguments)
     family_hint = _family_from_name(compiler_argument)
     compiler = _resolve_compiler(compiler_argument, cwd, environment)
-    compiler_snapshot = _compiler_metadata_snapshot(compiler)
-    version_output = _probe_compiler_version(compiler, family_hint, cwd, environment)
-    if _compiler_metadata_snapshot(compiler) != compiler_snapshot:
-        raise AuditInfrastructureError(
-            f"compiler executable changed during compiler version probe: {compiler}"
-        )
-    family = identify_compiler(compiler, version_output)
-    normalized_version = _normalize_version_output(version_output)
+    environment_digest = _environment_digest(environment)
+    family, compiler_fingerprint = _inspect_compiler(
+        compiler,
+        family_hint,
+        cwd,
+        environment,
+        environment_digest,
+    )
     if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
         _reject_msvc_environment_arguments(environment)
     expanded_arguments = expand_response_files(
@@ -1849,10 +1902,6 @@ def make_configuration(
     if not _same_path(source_inputs[0], source_path):
         raise AuditInfrastructureError("compile command source does not match database entry")
 
-    environment_digest = _environment_digest(environment)
-    compiler_fingerprint = _compiler_fingerprint(
-        compiler, normalized_version, compiler_snapshot
-    )
     semantic = {
         "schema": 1,
         "family": family.value,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import json
 import os
 import queue
 import signal
@@ -18,17 +20,22 @@ from gpu_capability_cache import PreprocessCache
 from gpu_capability_command import (
     RewrittenCommand,
     _environment_digest,
+    decode_compile_entry,
+    make_configuration,
     rewrite_preprocess_command,
 )
 from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
     CompilerFamily,
+    CoverageReport,
     FileIdentity,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
     _current_process_rss_bytes,
     _preprocessed_view_semantic_digest,
+    enumerate_production_identities,
+    requires_compile_entry,
 )
 from gpu_capability_provenance import (
     PreprocessedStreamBuilder,
@@ -301,11 +308,23 @@ def run_bounded_preprocessor(
     limits: AuditLimits,
     deadline: float,
     consume_stdout: Callable[[bytes], None],
+    cancel_event: threading.Event | None = None,
 ) -> ExecutionResult:
     """Execute one rewritten command without retaining its stdout stream."""
 
     _validate_execution_inputs(command, configuration, limits, deadline, consume_stdout)
     started = time.monotonic()
+    if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+        raise AuditInfrastructureError("preprocess cancellation event is invalid")
+    if cancel_event is not None and cancel_event.is_set():
+        raise _diagnostic(
+            configuration,
+            "coordinator cancelled before launch",
+            exit_status="not-started",
+            elapsed_seconds=0.0,
+            observed_stdout_bytes=0,
+            stderr_tail=b"",
+        )
     if deadline <= started:
         raise _diagnostic(
             configuration,
@@ -331,6 +350,15 @@ def run_bounded_preprocessor(
         raise _diagnostic(
             configuration,
             "compiler environment digest mismatch",
+            exit_status="not-started",
+            elapsed_seconds=time.monotonic() - started,
+            observed_stdout_bytes=0,
+            stderr_tail=b"",
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        raise _diagnostic(
+            configuration,
+            "coordinator cancelled before launch",
             exit_status="not-started",
             elapsed_seconds=time.monotonic() - started,
             observed_stdout_bytes=0,
@@ -440,6 +468,13 @@ def run_bounded_preprocessor(
         tree_terminated = False
         while not stdout_complete:
             now = time.monotonic()
+            if cancel_event is not None and cancel_event.is_set():
+                failure = (
+                    "coordinator cancelled after another configuration failed",
+                    "terminated",
+                    now - started,
+                )
+                break
             if now >= effective_deadline:
                 failure = (
                     deadline_reason,
@@ -501,6 +536,13 @@ def run_bounded_preprocessor(
 
         while failure is None and process.poll() is None:
             now = time.monotonic()
+            if cancel_event is not None and cancel_event.is_set():
+                failure = (
+                    "coordinator cancelled after another configuration failed",
+                    "terminated",
+                    now - started,
+                )
+                break
             if now >= effective_deadline:
                 failure = (
                     deadline_reason,
@@ -662,6 +704,7 @@ def preprocess_configuration(
     production: Mapping[PurePosixPath, FileIdentity],
     limits: AuditLimits,
     deadline: float,
+    cancel_event: threading.Event | None = None,
 ) -> PreprocessedTranslationUnitView:
     """Preprocess, validate dependencies, then finalize one complete packed view."""
 
@@ -691,6 +734,7 @@ def preprocess_configuration(
                 limits,
                 deadline,
                 builder.feed,
+                cancel_event,
             )
             if rewritten.dependency_format == "gcc-depfile":
                 dependency_paths = parse_gcc_dependencies(dependency_output)
@@ -733,6 +777,7 @@ def load_or_preprocess(
     cache: PreprocessCache,
     limits: AuditLimits,
     deadline: float,
+    cancel_event: threading.Event | None = None,
 ) -> PreprocessedTranslationUnitView:
     """Return a validated cache hit or publish one complete compiler result."""
 
@@ -741,11 +786,16 @@ def load_or_preprocess(
     cached = cache.load(configuration)
     if cached is not None:
         return cached
+    if cancel_event is not None and cancel_event.is_set():
+        raise AuditInfrastructureError(
+            f"configuration {configuration.digest} cancelled before preprocessing"
+        )
     discovery = preprocess_configuration(
         configuration,
         production,
         limits,
         deadline,
+        cancel_event,
     )
     if discovery.configuration != configuration:
         raise AuditInfrastructureError(
@@ -764,6 +814,7 @@ def load_or_preprocess(
         production,
         limits,
         deadline,
+        cancel_event,
     )
     if accepted.configuration != configuration:
         raise AuditInfrastructureError(
@@ -774,3 +825,468 @@ def load_or_preprocess(
         # output is required before it can be bound to a content snapshot.
         raise AuditInfrastructureError("nondeterministic preprocessed output")
     return cache._publish_stabilized(accepted, snapshots)
+
+
+def _json_object_without_duplicates(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise AuditInfrastructureError(
+                f"compile database object has duplicate key: {name}"
+            )
+        result[name] = value
+    return result
+
+
+def _configuration_semantics(
+    configuration: PreprocessConfiguration,
+) -> tuple[object, ...]:
+    return (
+        configuration.family,
+        configuration.compiler,
+        configuration.working_directory,
+        configuration.source,
+        configuration.arguments,
+        configuration.environment_digest,
+        configuration.digest,
+    )
+
+
+def _database_path(root: Path, database: Path) -> Path:
+    if not isinstance(database, Path):
+        raise AuditInfrastructureError("compile database path is invalid")
+    candidate = database if database.is_absolute() else root / database
+    try:
+        canonical = candidate.resolve(strict=True)
+    except OSError as error:
+        raise AuditInfrastructureError(
+            f"compile database is unavailable: {candidate}"
+        ) from error
+    if not canonical.is_file():
+        raise AuditInfrastructureError(
+            f"compile database must be one ordinary file: {canonical}"
+        )
+    return canonical
+
+
+def _load_database_entries(database: Path) -> tuple[tuple[int, Mapping[str, object]], ...]:
+    try:
+        document = json.loads(
+            database.read_text(encoding="utf-8-sig"),
+            object_pairs_hook=_json_object_without_duplicates,
+        )
+    except AuditInfrastructureError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise AuditInfrastructureError(
+            f"cannot decode compile database {database}: {error}"
+        ) from error
+    if not isinstance(document, list):
+        raise AuditInfrastructureError("compile database root must be an array")
+    indexed: list[tuple[int, Mapping[str, object]]] = []
+    for index, entry in enumerate(document):
+        if not isinstance(entry, Mapping):
+            raise AuditInfrastructureError(
+                f"compile database entry must be an object: {database}:{index}"
+            )
+        indexed.append((index, entry))
+    try:
+        return tuple(
+            sorted(
+                indexed,
+                key=lambda item: (
+                    json.dumps(
+                        item[1],
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    item[0],
+                ),
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise AuditInfrastructureError(
+            f"compile database contains a non-JSON entry: {database}"
+        ) from error
+
+
+def _entry_is_production(
+    entry: Mapping[str, object],
+    database: Path,
+    source_root: Path,
+    production: Mapping[PurePosixPath, FileIdentity],
+) -> bool:
+    directory_value = entry.get("directory")
+    file_value = entry.get("file")
+    if (
+        not isinstance(directory_value, str)
+        or not directory_value
+        or "\0" in directory_value
+    ):
+        raise AuditInfrastructureError(
+            "compile command directory must be a non-empty string"
+        )
+    if not isinstance(file_value, str) or not file_value or "\0" in file_value:
+        raise AuditInfrastructureError(
+            "compile command file must be a non-empty string"
+        )
+    lexical_directory = Path(directory_value)
+    if not lexical_directory.is_absolute():
+        lexical_directory = database.parent / lexical_directory
+    lexical_directory = Path(os.path.abspath(lexical_directory))
+    lexical_source = Path(file_value)
+    if not lexical_source.is_absolute():
+        lexical_source = lexical_directory / lexical_source
+    lexical_source = Path(os.path.abspath(lexical_source))
+    try:
+        lexical_directory.relative_to(source_root)
+        relative = lexical_source.relative_to(source_root)
+    except ValueError as error:
+        raise AuditInfrastructureError(
+            "compile command directory or source is outside production root: "
+            f"{lexical_source}"
+        ) from error
+    if not relative.parts or relative.parts[0].casefold() not in {
+        "playback",
+        "recorder_engine",
+    }:
+        return False
+
+    working_directory, _arguments = decode_compile_entry(
+        entry,
+        database,
+        windows=os.name == "nt",
+    )
+    source = Path(file_value)
+    if not source.is_absolute():
+        source = working_directory / source
+    try:
+        source = source.resolve(strict=True)
+    except OSError as error:
+        raise AuditInfrastructureError(
+            f"compile entry source is unavailable: {file_value}"
+        ) from error
+
+    for identity in production.values():
+        if source == identity.canonical:
+            return True
+    try:
+        metadata = source.stat()
+    except OSError as error:
+        raise AuditInfrastructureError(
+            f"compile entry source is unavailable: {source}"
+        ) from error
+    source_file_id = (
+        int(metadata.st_dev),
+        int(metadata.st_ino) if int(metadata.st_ino) else None,
+    )
+    for identity in production.values():
+        identity_file_id = (identity.device, identity.inode)
+        if identity_file_id[1] is not None and source_file_id == identity_file_id:
+            raise AuditInfrastructureError(
+                f"compile entry source aliases production file: {source}"
+            )
+    return False
+
+
+def collect_configurations(
+    root: Path,
+    databases: tuple[Path, ...],
+    environment: Mapping[str, str],
+) -> tuple[PreprocessConfiguration, ...]:
+    """Normalize every database entry and coalesce only semantic duplicates."""
+
+    if not isinstance(root, Path):
+        raise AuditInfrastructureError("production root is invalid")
+    lexical_root = root.absolute()
+    if not isinstance(databases, tuple) or not databases:
+        raise AuditInfrastructureError("at least one compile database is required")
+    # This validates environment keys and values before compiler probing begins.
+    _environment_digest(environment)
+    production = enumerate_production_identities(lexical_root)
+    # Enumeration has already rejected every aliasing root component, so this
+    # resolution cannot hide a symlink/reparse traversal from identity checks.
+    canonical_root = lexical_root.resolve(strict=True)
+    canonical_databases = sorted(
+        {_database_path(lexical_root, database) for database in databases},
+        key=lambda path: (str(path).casefold(), str(path)),
+    )
+    limits = AuditLimits()
+    by_digest: dict[str, PreprocessConfiguration] = {}
+    for database in canonical_databases:
+        for entry_index, entry in _load_database_entries(database):
+            if not _entry_is_production(
+                entry,
+                database,
+                canonical_root,
+                production,
+            ):
+                continue
+            configuration = make_configuration(
+                entry,
+                database,
+                entry_index,
+                canonical_root,
+                production,
+                environment,
+                limits,
+            )
+            previous = by_digest.get(configuration.digest)
+            if previous is None:
+                by_digest[configuration.digest] = configuration
+            elif _configuration_semantics(previous) != _configuration_semantics(
+                configuration
+            ):
+                raise AuditInfrastructureError(
+                    f"configuration digest collision: {configuration.digest}"
+                )
+    return tuple(by_digest[digest] for digest in sorted(by_digest))
+
+
+def _configuration_is_objcpp(configuration: PreprocessConfiguration) -> bool:
+    if configuration.source.canonical.suffix.casefold() == ".mm":
+        return True
+    arguments = configuration.arguments
+    for index, argument in enumerate(arguments):
+        lowered = argument.casefold()
+        if lowered == "-x" and index + 1 < len(arguments):
+            if arguments[index + 1].casefold() in {"objective-c++", "objective-c++-cpp-output"}:
+                return True
+        if lowered.startswith("-x") and lowered[2:] in {
+            "objective-c++",
+            "objective-c++-cpp-output",
+        }:
+            return True
+        if lowered.startswith("/clang:-x") and lowered[9:] in {
+            "objective-c++",
+            "objective-c++-cpp-output",
+        }:
+            return True
+    return False
+
+
+def _is_windows_backend_path(path: PurePosixPath) -> bool:
+    parts = tuple(part.casefold() for part in path.parts)
+    stem = path.stem.casefold()
+    return "win" in parts[:-1] or stem.endswith(("_win", "_mediafoundation"))
+
+
+def _validated_orchestration_inputs(
+    configurations: tuple[PreprocessConfiguration, ...],
+    production: Mapping[PurePosixPath, FileIdentity],
+    cache: PreprocessCache,
+    limits: AuditLimits,
+) -> tuple[PreprocessConfiguration, ...]:
+    if not isinstance(configurations, tuple) or not configurations:
+        raise AuditInfrastructureError("no usable compile configurations")
+    if not isinstance(cache, PreprocessCache):
+        raise AuditInfrastructureError("preprocess cache is invalid")
+    if not isinstance(limits, AuditLimits):
+        raise AuditInfrastructureError("audit limits are invalid")
+    if (
+        not isinstance(limits.workers, int)
+        or isinstance(limits.workers, bool)
+        or limits.workers <= 0
+        or not isinstance(limits.total_seconds, (int, float))
+        or isinstance(limits.total_seconds, bool)
+        or limits.total_seconds <= 0
+    ):
+        raise AuditInfrastructureError("orchestration limits are invalid")
+    _source_root(production)
+    by_digest: dict[str, PreprocessConfiguration] = {}
+    for configuration in configurations:
+        if not isinstance(configuration, PreprocessConfiguration):
+            raise AuditInfrastructureError("preprocess configuration is invalid")
+        relative = configuration.source.relative
+        if relative is None or production.get(relative) != configuration.source:
+            raise AuditInfrastructureError(
+                "configuration source is not in the production identity table: "
+                f"{configuration.digest}"
+            )
+        previous = by_digest.get(configuration.digest)
+        if previous is None:
+            by_digest[configuration.digest] = configuration
+        elif _configuration_semantics(previous) != _configuration_semantics(
+            configuration
+        ):
+            raise AuditInfrastructureError(
+                f"configuration digest collision: {configuration.digest}"
+            )
+    return tuple(by_digest[digest] for digest in sorted(by_digest))
+
+
+def _coverage_path(
+    identity: FileIdentity | None,
+    production: Mapping[PurePosixPath, FileIdentity],
+) -> PurePosixPath | None:
+    if identity is None:
+        return None
+    if not identity.production:
+        return None
+    relative = identity.relative
+    if relative is None or production.get(relative) != identity:
+        raise AuditInfrastructureError(
+            f"preprocessed view contains an unknown production identity: {identity.canonical}"
+        )
+    return relative
+
+
+def _view_production_provenance(
+    view: PreprocessedTranslationUnitView,
+    production: Mapping[PurePosixPath, FileIdentity],
+) -> frozenset[PurePosixPath]:
+    reached: set[PurePosixPath] = set()
+    tokens = view.tokens
+    for run in tokens.iter_runs():
+        relative = _coverage_path(tokens.identity_for(run.identity_id), production)
+        if relative is not None:
+            reached.add(relative)
+    return frozenset(reached)
+
+
+def preprocess_all(
+    configurations: tuple[PreprocessConfiguration, ...],
+    production: Mapping[PurePosixPath, FileIdentity],
+    cache: PreprocessCache,
+    limits: AuditLimits,
+) -> tuple[tuple[PreprocessedTranslationUnitView, ...], CoverageReport]:
+    """Preprocess every semantic configuration under one bounded coordinator."""
+
+    ordered = _validated_orchestration_inputs(configurations, production, cache, limits)
+    configured_families = frozenset(item.family for item in ordered)
+    has_objcpp = any(_configuration_is_objcpp(item) for item in ordered)
+    has_windows_backend = any(
+        item.source.relative is not None
+        and _is_windows_backend_path(item.source.relative)
+        for item in ordered
+    )
+    active = frozenset(
+        path
+        for path in production
+        if requires_compile_entry(
+            path,
+            configured_families,
+            has_objcpp,
+            has_windows_backend,
+        )
+    )
+    configured_sources = frozenset(
+        item.source.relative for item in ordered if item.source.relative is not None
+    )
+    missing_commands = sorted(active - configured_sources, key=lambda path: path.as_posix())
+    if missing_commands:
+        raise AuditInfrastructureError(
+            "active source has no compile command: "
+            + ", ".join(path.as_posix() for path in missing_commands)
+        )
+
+    cancellation = threading.Event()
+    deadline = time.monotonic() + limits.total_seconds
+    views: dict[str, PreprocessedTranslationUnitView] = {}
+    failures: list[tuple[str, str]] = []
+    iterator = iter(ordered)
+
+    def execute(configuration: PreprocessConfiguration) -> PreprocessedTranslationUnitView:
+        return load_or_preprocess(
+            configuration,
+            production,
+            cache,
+            limits,
+            deadline,
+            cancellation,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(limits.workers, len(ordered)),
+        thread_name_prefix="gpu-capability-preprocess",
+    ) as executor:
+        pending: dict[
+            concurrent.futures.Future[PreprocessedTranslationUnitView],
+            PreprocessConfiguration,
+        ] = {}
+        for _ in range(min(limits.workers, len(ordered))):
+            configuration = next(iterator, None)
+            if configuration is not None:
+                pending[executor.submit(execute, configuration)] = configuration
+
+        while pending:
+            completed, _ = concurrent.futures.wait(
+                pending,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in sorted(completed, key=lambda item: pending[item].digest):
+                configuration = pending.pop(future)
+                try:
+                    view = future.result()
+                    if view.configuration != configuration:
+                        raise AuditInfrastructureError(
+                            "preprocessor returned a mismatched orchestration configuration"
+                        )
+                    views[configuration.digest] = view
+                except Exception as error:
+                    failures.append((configuration.digest, str(error)))
+            if failures:
+                cancellation.set()
+                continue
+            while len(pending) < limits.workers:
+                configuration = next(iterator, None)
+                if configuration is None:
+                    break
+                pending[executor.submit(execute, configuration)] = configuration
+
+    if failures:
+        details = "; ".join(
+            f"digest={digest}: {message}"
+            for digest, message in sorted(failures, key=lambda item: (item[0], item[1]))
+        )
+        raise AuditInfrastructureError(
+            f"GPU capability preprocessing configurations failed: {details}"
+        )
+
+    ordered_views = tuple(views[item.digest] for item in ordered)
+    authoritative: set[PurePosixPath] = set()
+    missing_view_sources: list[tuple[str, PurePosixPath]] = []
+    for view in ordered_views:
+        reached = _view_production_provenance(view, production)
+        authoritative.update(reached)
+        source = view.configuration.source
+        assert source.relative is not None
+        if source.relative in reached:
+            continue
+        # A physically empty main source has no token whose marker can carry
+        # provenance. Its own validated configuration and manifest membership
+        # are the only complete evidence available; headers never get this
+        # exception because they are not configuration main sources.
+        if source.line_count == 0 and source in view.dependencies:
+            authoritative.add(source.relative)
+            continue
+        missing_view_sources.append((view.configuration.digest, source.relative))
+    if missing_view_sources:
+        details = ", ".join(
+            f"digest={digest} source={path.as_posix()}"
+            for digest, path in sorted(
+                missing_view_sources,
+                key=lambda item: (item[0], item[1].as_posix()),
+            )
+        )
+        raise AuditInfrastructureError(
+            f"configuration view lacks main-source provenance: {details}"
+        )
+    missing_authoritative = sorted(
+        active - authoritative,
+        key=lambda path: path.as_posix(),
+    )
+    if missing_authoritative:
+        raise AuditInfrastructureError(
+            "active source lacks authoritative compiler coverage: "
+            + ", ".join(path.as_posix() for path in missing_authoritative)
+        )
+    source_only = frozenset(set(production) - authoritative)
+    return ordered_views, CoverageReport(
+        authoritative=frozenset(authoritative),
+        source_only=source_only,
+        configurations=tuple(item.digest for item in ordered),
+    )

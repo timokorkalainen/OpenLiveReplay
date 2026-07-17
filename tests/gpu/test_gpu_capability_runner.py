@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import gpu_capability_command as capability_command  # noqa: E402
 from gpu_capability_command import RewrittenCommand, _environment_digest  # noqa: E402
 from gpu_capability_cache import PreprocessCache  # noqa: E402
 from gpu_capability_model import (  # noqa: E402
@@ -29,7 +31,9 @@ from gpu_capability_model import (  # noqa: E402
 from gpu_capability_runner import (  # noqa: E402
     ExecutionResult,
     _WindowsJob,
+    collect_configurations,
     load_or_preprocess,
+    preprocess_all,
     preprocess_configuration,
     run_bounded_preprocessor,
 )
@@ -173,6 +177,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
         limits: AuditLimits | None = None,
         deadline: float | None = None,
         extra: tuple[str, ...] = (),
+        cancel_event: threading.Event | None = None,
     ) -> tuple[ExecutionResult, bytes]:
         chunks: list[bytes] = []
         result = run_bounded_preprocessor(
@@ -181,6 +186,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
             limits or AuditLimits(rss_bytes=2**63 - 1),
             deadline if deadline is not None else time.monotonic() + 10.0,
             chunks.append,
+            cancel_event,
         )
         return result, b"".join(chunks)
 
@@ -249,6 +255,41 @@ class BoundedPreprocessorTests(unittest.TestCase):
             if child_pid_file.exists():
                 break
             time.sleep(0.01)
+        self.assertTrue(child_pid_file.exists())
+        child_pid = int(child_pid_file.read_text(encoding="ascii"))
+        self.assertFalse(self.process_is_alive(child_pid))
+
+    def test_coordinator_cancellation_terminates_active_process_group(self):
+        child_pid_file = self.root / "cancelled-child.pid"
+        cancellation = threading.Event()
+
+        def cancel_after_launch() -> None:
+            deadline = time.monotonic() + 2.0
+            while not child_pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            cancellation.set()
+
+        trigger = threading.Thread(target=cancel_after_launch)
+        trigger.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(AuditInfrastructureError, "coordinator cancelled"):
+                self.run_direct(
+                    "child-sleep",
+                    limits=dataclasses.replace(
+                        AuditLimits(), invocation_seconds=10.0, rss_bytes=2**63 - 1
+                    ),
+                    extra=(
+                        "--child-pid-file",
+                        str(child_pid_file),
+                        "--sleep-seconds",
+                        "30",
+                    ),
+                    cancel_event=cancellation,
+                )
+        finally:
+            trigger.join(timeout=3.0)
+        self.assertLess(time.monotonic() - started, 3.0)
         self.assertTrue(child_pid_file.exists())
         child_pid = int(child_pid_file.read_text(encoding="ascii"))
         self.assertFalse(self.process_is_alive(child_pid))
@@ -357,6 +398,29 @@ class BoundedPreprocessorTests(unittest.TestCase):
                     time.monotonic() + 10.0,
                     lambda _chunk: None,
                 )
+        popen.assert_not_called()
+
+    def test_coordinator_cancellation_during_setup_fails_before_launch(self):
+        cancellation = threading.Event()
+        configuration = self.configuration("success")
+
+        def snapshot(_environment):
+            cancellation.set()
+            return configuration.environment_digest
+
+        with mock.patch(
+            "gpu_capability_runner._environment_digest", side_effect=snapshot
+        ), mock.patch("gpu_capability_runner.subprocess.Popen") as popen, self.assertRaisesRegex(
+            AuditInfrastructureError, "coordinator cancelled before launch"
+        ):
+            run_bounded_preprocessor(
+                self.direct_command("success"),
+                configuration,
+                AuditLimits(rss_bytes=2**63 - 1),
+                time.monotonic() + 10.0,
+                lambda _chunk: None,
+                cancellation,
+            )
         popen.assert_not_called()
 
     def test_exact_environment_snapshot_is_passed_to_popen(self):
@@ -739,6 +803,606 @@ class BoundedPreprocessorTests(unittest.TestCase):
         self.assertEqual(len(successes), 1)
         self.assertEqual(len(failures), 1)
         self.assertRegex(str(failures[0]), "concurrent cache winner differs")
+
+
+class OrchestrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.build = self.root / "build"
+        self.build.mkdir()
+        (self.root / "playback").mkdir()
+        (self.root / "recorder_engine").mkdir()
+        self.compiler = self.root / "toolchain" / "g++.exe"
+        self.compiler.parent.mkdir()
+        self.compiler.write_bytes(b"compiler-a")
+        self.environment = {"PATH": str(self.compiler.parent), "GPU_MODE": "on"}
+        self.cache = PreprocessCache((self.root / "cache").resolve())
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def write_source(self, relative: str, text: str = "int value;\n") -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path.resolve()
+
+    @staticmethod
+    def identity(path: Path, relative: str) -> FileIdentity:
+        metadata = path.stat()
+        content = path.read_text(encoding="utf-8")
+        line_count = 0 if not content else content.count("\n") + (
+            0 if content.endswith("\n") else 1
+        )
+        return FileIdentity(
+            canonical=path.resolve(),
+            relative=PurePosixPath(relative),
+            device=int(metadata.st_dev),
+            inode=int(metadata.st_ino) if int(metadata.st_ino) else None,
+            line_count=line_count,
+            production=True,
+        )
+
+    def entry(
+        self,
+        relative: str,
+        *,
+        defines: tuple[str, ...] = (),
+        compiler: Path | None = None,
+        directory: str = ".",
+    ) -> dict[str, object]:
+        source_from_build = Path("..") / Path(relative)
+        return {
+            "directory": directory,
+            "file": str(source_from_build),
+            "arguments": [
+                str(compiler or self.compiler),
+                "-c",
+                *(f"-D{value}" for value in defines),
+                str(source_from_build),
+            ],
+        }
+
+    def database(self, name: str, entries: object) -> Path:
+        path = self.build / name
+        path.write_text(json.dumps(entries), encoding="utf-8")
+        return path
+
+    def collect(self, databases: tuple[Path, ...]):
+        with mock.patch(
+            "gpu_capability_command._probe_compiler_version",
+            return_value=b"g++.exe (GCC) 13.1.0\n",
+        ):
+            return collect_configurations(self.root, databases, self.environment)
+
+    def configuration(
+        self,
+        identity: FileIdentity,
+        digest: str,
+        *,
+        family: CompilerFamily = CompilerFamily.GCC,
+        arguments: tuple[str, ...] = (),
+    ) -> PreprocessConfiguration:
+        return PreprocessConfiguration(
+            entry_id=f"db:{digest}",
+            family=family,
+            compiler=self.compiler.resolve(),
+            working_directory=self.build.resolve(),
+            source=identity,
+            arguments=(*arguments, str(identity.canonical)),
+            environment_digest=_environment_digest(dict(os.environ)),
+            digest=digest,
+        )
+
+    @staticmethod
+    def view(
+        configuration: PreprocessConfiguration,
+        dependencies: tuple[FileIdentity, ...],
+        token_identities: tuple[FileIdentity, ...] | None = None,
+    ) -> PreprocessedTranslationUnitView:
+        if token_identities is None:
+            token_identities = (configuration.source,)
+        identities = tuple(dict.fromkeys(token_identities))
+        identity_ids = {identity: index for index, identity in enumerate(identities)}
+        tokens = CompactTokenSequence._from_token_fields(
+            configuration,
+            spellings=(b"token",),
+            identities=identities,
+            fields=(
+                (0, identity_ids[identity], index + 1, 1)
+                for index, identity in enumerate(token_identities)
+            ),
+        ) if token_identities else CompactTokenSequence.empty(configuration)
+        return PreprocessedTranslationUnitView(
+            configuration,
+            tokens,
+            dependencies,
+        )
+
+    def test_distinct_defines_are_both_audited_and_exact_duplicates_coalesce(self):
+        self.write_source("playback/file.cpp")
+        database = self.database(
+            "compile_commands.json",
+            (
+                self.entry("playback/file.cpp", defines=("MODE=1",)),
+                self.entry("playback/file.cpp", defines=("MODE=2",)),
+                self.entry("playback/file.cpp", defines=("MODE=1",)),
+            ),
+        )
+
+        configurations = self.collect((database,))
+
+        self.assertEqual(len(configurations), 2)
+        self.assertNotEqual(configurations[0].digest, configurations[1].digest)
+        self.assertEqual(
+            {
+                argument
+                for item in configurations
+                for argument in item.arguments
+                if argument.startswith("-D")
+            },
+            {"-DMODE=1", "-DMODE=2"},
+        )
+
+    def test_large_database_inspects_one_stable_compiler_once(self):
+        entries = []
+        for index in range(251):
+            relative = f"playback/generated/source{index:03d}.cpp"
+            self.write_source(relative)
+            entries.append(self.entry(relative))
+        database = self.database("compile_commands.json", entries)
+
+        def version_probe(*_args, **_kwargs):
+            time.sleep(0.01)
+            return b"g++.exe (GCC) 13.1.0\n"
+
+        started = time.monotonic()
+        with mock.patch(
+            "gpu_capability_command._probe_compiler_version",
+            side_effect=version_probe,
+        ) as probe, mock.patch(
+            "gpu_capability_command._compiler_fingerprint",
+            wraps=capability_command._compiler_fingerprint,
+        ) as fingerprint:
+            configurations = collect_configurations(
+                self.root,
+                (database,),
+                self.environment,
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(len(configurations), 251)
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(fingerprint.call_count, 1)
+        self.assertLess(elapsed, 2.0)
+
+    def test_collection_sorts_databases_and_entries_deterministically(self):
+        self.write_source("playback/a.cpp")
+        self.write_source("playback/b.cpp")
+        first = self.database("z.json", (self.entry("playback/b.cpp"),))
+        second = self.database("a.json", (self.entry("playback/a.cpp"),))
+
+        forward = self.collect((first, second))
+        reverse = self.collect((second, first))
+
+        self.assertEqual(forward, reverse)
+        self.assertEqual(
+            tuple(item.digest for item in forward),
+            tuple(sorted(item.digest for item in forward)),
+        )
+
+    def test_collection_accepts_relative_database_directory_and_file(self):
+        source = self.write_source("playback/file.cpp")
+        self.database("compile_commands.json", (self.entry("playback/file.cpp"),))
+
+        configurations = self.collect((Path("build/compile_commands.json"),))
+
+        self.assertEqual(configurations[0].working_directory, self.build.resolve())
+        self.assertEqual(configurations[0].source.canonical, source)
+
+    def test_collection_ignores_repository_nonproduction_entries(self):
+        self.write_source("playback/file.cpp")
+        self.write_source("tests/helper.cpp")
+        database = self.database(
+            "compile_commands.json",
+            (
+                self.entry("tests/helper.cpp"),
+                self.entry("playback/file.cpp"),
+            ),
+        )
+
+        configurations = self.collect((database,))
+
+        self.assertEqual(len(configurations), 1)
+        self.assertEqual(
+            configurations[0].source.relative,
+            PurePosixPath("playback/file.cpp"),
+        )
+
+    def test_collection_skips_missing_in_root_test_autogen_entry_before_resolve(self):
+        self.write_source("playback/file.cpp")
+        generated_directory = self.build / "gpu"
+        generated_directory.mkdir()
+        missing_generated = {
+            "directory": str(generated_directory),
+            "file": "gpu_tests_autogen/mocs_compilation.cpp",
+            "arguments": [
+                str(self.compiler),
+                "-c",
+                "gpu_tests_autogen/mocs_compilation.cpp",
+            ],
+        }
+        database = self.database(
+            "compile_commands.json",
+            (missing_generated, self.entry("playback/file.cpp")),
+        )
+
+        configurations = self.collect((database,))
+
+        self.assertEqual(len(configurations), 1)
+        self.assertEqual(
+            configurations[0].source.relative,
+            PurePosixPath("playback/file.cpp"),
+        )
+
+    def test_collection_keeps_missing_production_entry_fail_closed(self):
+        missing = {
+            "directory": str(self.build),
+            "file": "../playback/missing.cpp",
+            "arguments": [
+                str(self.compiler),
+                "-c",
+                "../playback/missing.cpp",
+            ],
+        }
+        database = self.database("compile_commands.json", (missing,))
+
+        with self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "compile entry source is unavailable.*missing.cpp",
+        ):
+            self.collect((database,))
+
+    def test_collection_rejects_non_array_non_object_and_outside_source(self):
+        invalid_root = self.database("root.json", {"not": "an array"})
+        invalid_entry = self.database("entry.json", ("not-an-object",))
+        outside = self.root.parent / f"{self.root.name}-outside.cpp"
+        outside.write_text("int outside;\n", encoding="utf-8")
+        outside_entry = {
+            "directory": str(self.build),
+            "file": str(outside),
+            "arguments": [str(self.compiler), "-c", str(outside)],
+        }
+        outside_db = self.database("outside.json", (outside_entry,))
+        try:
+            for database, message in (
+                (invalid_root, "root must be an array"),
+                (invalid_entry, "entry must be an object"),
+                (outside_db, "outside production root"),
+            ):
+                with self.subTest(database=database), self.assertRaisesRegex(
+                    AuditInfrastructureError, message
+                ):
+                    self.collect((database,))
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_missing_active_generic_source_fails_without_fallback(self):
+        a_path = self.write_source("playback/a.cpp")
+        missing_path = self.write_source("playback/missing.cpp")
+        a = self.identity(a_path, "playback/a.cpp")
+        missing = self.identity(missing_path, "playback/missing.cpp")
+        configuration = self.configuration(a, "a")
+
+        with mock.patch(
+            "gpu_capability_runner.load_or_preprocess"
+        ) as execute, self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "active source has no compile command.*playback/missing.cpp",
+        ):
+            preprocess_all(
+                (configuration,),
+                {a.relative: a, missing.relative: missing},
+                self.cache,
+                AuditLimits(workers=1, rss_bytes=2**63 - 1),
+            )
+        execute.assert_not_called()
+
+    def test_platform_classifier_activates_apple_and_windows_from_configurations(self):
+        generic_path = self.write_source("playback/generic.cpp")
+        apple_main_path = self.write_source("playback/gpu/backend.mm")
+        apple_peer_path = self.write_source("playback/gpu/adapter_apple.cpp")
+        windows_main_path = self.write_source("playback/output/win/backend.cpp")
+        windows_peer_path = self.write_source("playback/output/adapter_win.cpp")
+        generic = self.identity(generic_path, "playback/generic.cpp")
+        apple_main = self.identity(apple_main_path, "playback/gpu/backend.mm")
+        apple_peer = self.identity(apple_peer_path, "playback/gpu/adapter_apple.cpp")
+        windows_main = self.identity(windows_main_path, "playback/output/win/backend.cpp")
+        windows_peer = self.identity(windows_peer_path, "playback/output/adapter_win.cpp")
+        production = {item.relative: item for item in (
+            generic, apple_main, apple_peer, windows_main, windows_peer
+        )}
+
+        for configurations, missing in (
+            (
+                (self.configuration(generic, "generic"), self.configuration(apple_main, "apple")),
+                "playback/gpu/adapter_apple.cpp",
+            ),
+            (
+                (
+                    self.configuration(generic, "generic"),
+                    self.configuration(windows_main, "windows"),
+                ),
+                "playback/output/adapter_win.cpp",
+            ),
+        ):
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                AuditInfrastructureError, f"active source has no compile command.*{missing}"
+            ):
+                preprocess_all(
+                    configurations,
+                    production,
+                    self.cache,
+                    AuditLimits(workers=1, rss_bytes=2**63 - 1),
+                )
+
+    def test_coverage_separates_reached_headers_from_inactive_and_unreached_files(self):
+        paths = {
+            relative: self.write_source(relative)
+            for relative in (
+                "playback/a.cpp",
+                "playback/gpu/adapter_apple.cpp",
+                "playback/output/adapter_win.cpp",
+                "playback/reached.h",
+                "playback/unreached.hpp",
+            )
+        }
+        identities = {relative: self.identity(path, relative) for relative, path in paths.items()}
+        production = {item.relative: item for item in identities.values()}
+        configuration = self.configuration(identities["playback/a.cpp"], "cfg")
+        result = self.view(
+            configuration,
+            (identities["playback/a.cpp"], identities["playback/reached.h"]),
+            (identities["playback/a.cpp"], identities["playback/reached.h"]),
+        )
+
+        with mock.patch("gpu_capability_runner.load_or_preprocess", return_value=result):
+            views, coverage = preprocess_all(
+                (configuration,),
+                production,
+                self.cache,
+                AuditLimits(workers=1, rss_bytes=2**63 - 1),
+            )
+
+        self.assertEqual(views, (result,))
+        self.assertEqual(
+            coverage.authoritative,
+            frozenset({PurePosixPath("playback/a.cpp"), PurePosixPath("playback/reached.h")}),
+        )
+        self.assertEqual(
+            coverage.source_only,
+            frozenset({
+                PurePosixPath("playback/gpu/adapter_apple.cpp"),
+                PurePosixPath("playback/output/adapter_win.cpp"),
+                PurePosixPath("playback/unreached.hpp"),
+            }),
+        )
+        self.assertEqual(coverage.configurations, ("cfg",))
+
+    def test_different_compiler_configurations_are_all_returned_in_digest_order(self):
+        source_path = self.write_source("playback/a.cpp")
+        source = self.identity(source_path, "playback/a.cpp")
+        first = self.configuration(source, "z", arguments=("-DMODE=1",))
+        second = self.configuration(
+            source,
+            "a",
+            family=CompilerFamily.CLANG,
+            arguments=("-DMODE=2",),
+        )
+        results = {item.digest: self.view(item, (source,)) for item in (first, second)}
+
+        for workers in (1, 4):
+            with self.subTest(workers=workers), mock.patch(
+                "gpu_capability_runner.load_or_preprocess",
+                side_effect=lambda configuration, *_args, **_kwargs: results[configuration.digest],
+            ):
+                views, coverage = preprocess_all(
+                    (first, second),
+                    {source.relative: source},
+                    self.cache,
+                    AuditLimits(workers=workers, rss_bytes=2**63 - 1),
+                )
+
+            self.assertEqual(tuple(view.configuration.digest for view in views), ("a", "z"))
+            self.assertEqual(coverage.configurations, ("a", "z"))
+
+    def test_active_main_source_must_be_reached_by_its_validated_view(self):
+        source_path = self.write_source("playback/a.cpp")
+        source = self.identity(source_path, "playback/a.cpp")
+        configuration = self.configuration(source, "cfg")
+        incomplete = self.view(configuration, (), ())
+
+        with mock.patch(
+            "gpu_capability_runner.load_or_preprocess", return_value=incomplete
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "configuration view lacks main-source provenance.*playback/a.cpp",
+        ):
+            preprocess_all(
+                (configuration,),
+                {source.relative: source},
+                self.cache,
+                AuditLimits(workers=1, rss_bytes=2**63 - 1),
+            )
+
+    def test_crossed_main_provenance_does_not_satisfy_per_configuration_coverage(self):
+        first = self.identity(
+            self.write_source("playback/first.cpp"),
+            "playback/first.cpp",
+        )
+        second = self.identity(
+            self.write_source("playback/second.cpp"),
+            "playback/second.cpp",
+        )
+        first_configuration = self.configuration(first, "first")
+        second_configuration = self.configuration(second, "second")
+        results = {
+            "first": self.view(
+                first_configuration,
+                (first, second),
+                (second,),
+            ),
+            "second": self.view(
+                second_configuration,
+                (first, second),
+                (first,),
+            ),
+        }
+
+        with mock.patch(
+            "gpu_capability_runner.load_or_preprocess",
+            side_effect=lambda configuration, *_args: results[configuration.digest],
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "configuration view lacks main-source provenance.*first.*second",
+        ):
+            preprocess_all(
+                (first_configuration, second_configuration),
+                {first.relative: first, second.relative: second},
+                self.cache,
+                AuditLimits(workers=2, rss_bytes=2**63 - 1),
+            )
+
+    def test_manifest_only_header_remains_source_only(self):
+        source = self.identity(
+            self.write_source("playback/source.cpp"),
+            "playback/source.cpp",
+        )
+        header = self.identity(
+            self.write_source("playback/manifest_only.h"),
+            "playback/manifest_only.h",
+        )
+        configuration = self.configuration(source, "cfg")
+        result = self.view(configuration, (source, header), (source,))
+
+        with mock.patch(
+            "gpu_capability_runner.load_or_preprocess", return_value=result
+        ):
+            _views, coverage = preprocess_all(
+                (configuration,),
+                {source.relative: source, header.relative: header},
+                self.cache,
+                AuditLimits(workers=1, rss_bytes=2**63 - 1),
+            )
+
+        self.assertEqual(coverage.authoritative, frozenset({source.relative}))
+        self.assertEqual(coverage.source_only, frozenset({header.relative}))
+
+    def test_empty_active_main_is_explicitly_covered_without_token_provenance(self):
+        source = self.identity(
+            self.write_source("playback/empty.cpp", ""),
+            "playback/empty.cpp",
+        )
+        header = self.identity(
+            self.write_source("playback/empty.h", ""),
+            "playback/empty.h",
+        )
+        configuration = self.configuration(source, "empty")
+        result = self.view(configuration, (source, header), ())
+
+        with mock.patch(
+            "gpu_capability_runner.load_or_preprocess", return_value=result
+        ):
+            _views, coverage = preprocess_all(
+                (configuration,),
+                {source.relative: source, header.relative: header},
+                self.cache,
+                AuditLimits(workers=1, rss_bytes=2**63 - 1),
+            )
+
+        self.assertEqual(coverage.authoritative, frozenset({source.relative}))
+        self.assertEqual(coverage.source_only, frozenset({header.relative}))
+
+    def test_worker_bound_and_stop_scheduling_after_infrastructure_failure(self):
+        identities = []
+        configurations = []
+        for index in range(5):
+            relative = f"playback/source{index}.cpp"
+            identity = self.identity(self.write_source(relative), relative)
+            identities.append(identity)
+            configurations.append(self.configuration(identity, str(index)))
+        production = {item.relative: item for item in identities}
+        active = 0
+        maximum_active = 0
+        started: list[str] = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        def execute(configuration, *_args, **_kwargs):
+            nonlocal active, maximum_active
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+                started.append(configuration.digest)
+            try:
+                barrier.wait(timeout=2.0)
+                if configuration.digest == "0":
+                    raise AuditInfrastructureError("primary failure")
+                time.sleep(0.05)
+                return self.view(configuration, (configuration.source,))
+            finally:
+                with lock:
+                    active -= 1
+
+        with mock.patch(
+            "gpu_capability_runner.load_or_preprocess", side_effect=execute
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "primary failure"
+        ):
+            preprocess_all(
+                tuple(configurations),
+                production,
+                self.cache,
+                AuditLimits(workers=2, rss_bytes=2**63 - 1),
+            )
+
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual(set(started), {"0", "1"})
+
+    def test_aggregated_failure_diagnostics_are_deterministic(self):
+        identities = []
+        configurations = []
+        for digest in ("z", "a"):
+            relative = f"playback/{digest}.cpp"
+            identity = self.identity(self.write_source(relative), relative)
+            identities.append(identity)
+            configurations.append(self.configuration(identity, digest))
+        production = {item.relative: item for item in identities}
+        barrier = threading.Barrier(2)
+
+        def execute(configuration, *_args, **_kwargs):
+            barrier.wait(timeout=2.0)
+            if configuration.digest == "a":
+                time.sleep(0.02)
+            raise AuditInfrastructureError(f"failure-{configuration.digest}")
+
+        with mock.patch(
+            "gpu_capability_runner.load_or_preprocess", side_effect=execute
+        ), self.assertRaises(
+            AuditInfrastructureError
+        ) as raised:
+            preprocess_all(
+                tuple(configurations),
+                production,
+                self.cache,
+                AuditLimits(workers=2, rss_bytes=2**63 - 1),
+            )
+
+        diagnostic = str(raised.exception)
+        self.assertLess(diagnostic.index("digest=a"), diagnostic.index("digest=z"))
+        self.assertIn("failure-a", diagnostic)
+        self.assertIn("failure-z", diagnostic)
 
 
 if __name__ == "__main__":

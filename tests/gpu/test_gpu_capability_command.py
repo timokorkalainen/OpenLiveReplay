@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tracemalloc
 import unittest
@@ -17,6 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gpu_capability_command import (  # noqa: E402
     RewrittenCommand,
+    _clear_compiler_inspection_memo_for_tests,
+    _compiler_metadata_snapshot,
     decode_compile_entry,
     expand_response_files,
     identify_compiler,
@@ -512,6 +515,9 @@ class ConfigurationTests(unittest.TestCase):
         metadata_changed = self.make()
         self.assertNotEqual(content_changed.digest, metadata_changed.digest)
 
+        # A version change with otherwise identical process-local memo inputs
+        # represents a subsequent audit process.
+        _clear_compiler_inspection_memo_for_tests()
         with mock.patch(
             "gpu_capability_command._probe_compiler_version",
             return_value=b"g++.exe (GCC) 14.0.0\n",
@@ -562,6 +568,80 @@ class ConfigurationTests(unittest.TestCase):
         second = self.make(index=9)
         self.assertNotEqual(first.entry_id, second.entry_id)
         self.assertEqual(first.digest, second.digest)
+
+    def test_concurrent_configuration_builds_share_one_stable_inspection(self):
+        _clear_compiler_inspection_memo_for_tests()
+        barrier = threading.Barrier(4)
+        configurations = []
+        failures = []
+
+        def build(index: int) -> None:
+            try:
+                barrier.wait(timeout=2.0)
+                configurations.append(
+                    make_configuration(
+                        self.entry(),
+                        self.database,
+                        index,
+                        self.source_root,
+                        self.production,
+                        self.environment,
+                        AuditLimits(),
+                    )
+                )
+            except BaseException as error:
+                failures.append(error)
+
+        with mock.patch(
+            "gpu_capability_command._probe_compiler_version",
+            return_value=b"g++.exe (GCC) 13.1.0\n",
+        ) as probe:
+            threads = [threading.Thread(target=build, args=(index,)) for index in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5.0)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertFalse(failures)
+        self.assertEqual(len(configurations), 4)
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(len({item.digest for item in configurations}), 1)
+
+    def test_memo_hit_rejects_compiler_replacement_after_key_snapshot(self):
+        baseline = self.make()
+        replaced = False
+
+        def replace_after_snapshot(compiler: Path):
+            nonlocal replaced
+            snapshot = _compiler_metadata_snapshot(compiler)
+            if not replaced:
+                replaced = True
+                compiler.write_bytes(b"compiler-replaced-after-cache-key")
+            return snapshot
+
+        with mock.patch(
+            "gpu_capability_command._compiler_metadata_snapshot",
+            side_effect=replace_after_snapshot,
+        ), mock.patch(
+            "gpu_capability_command._probe_compiler_version"
+        ) as probe, self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "compiler executable changed during compiler version probe",
+        ):
+            make_configuration(
+                self.entry(),
+                self.database,
+                4,
+                self.source_root,
+                self.production,
+                self.environment,
+                AuditLimits(),
+            )
+
+        self.assertTrue(replaced)
+        probe.assert_not_called()
+        self.assertRegex(baseline.digest, r"^[0-9a-f]{64}$")
 
     def test_source_validation_rejects_stdin_multiple_and_mismatch(self):
         controls = (
