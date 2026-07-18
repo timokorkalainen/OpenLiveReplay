@@ -859,3 +859,322 @@ def enumerate_production_identities(root: Path) -> dict[PurePosixPath, FileIdent
             )
 
     return dict(sorted(identities.items(), key=lambda item: item[0].as_posix()))
+import re
+AUDIT_RESULT_SCHEMA_BYTES = b"olr-gpu-capability-audit-result-v1"
+_LOWER_HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
+_STABLE_DEPENDENCY_ROLE = re.compile(r"[a-z0-9][a-z0-9._-]*(?::[a-z0-9][a-z0-9._-]*)?\Z")
+_LOCAL_DEPENDENCY_FIELDS = (
+    "stable_role",
+    "role_relative_path",
+    "canonical",
+    "relative",
+    "device",
+    "inode",
+    "line_count",
+    "production",
+    "sha256",
+)
+
+
+def _validate_digest(value: object, label: str) -> str:
+    if not isinstance(value, str) or _LOWER_HEX_256.fullmatch(value) is None:
+        raise AuditInfrastructureError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _validate_role_relative_path(
+    stable_role: object,
+    role_relative_path: object,
+) -> tuple[str, PurePosixPath]:
+    if (
+        not isinstance(stable_role, str)
+        or _STABLE_DEPENDENCY_ROLE.fullmatch(stable_role) is None
+    ):
+        raise AuditInfrastructureError("dependency stable role is invalid")
+    if not isinstance(role_relative_path, PurePosixPath):
+        raise AuditInfrastructureError("dependency role-relative path is invalid")
+    path_text = role_relative_path.as_posix()
+    if (
+        not path_text
+        or path_text == "."
+        or role_relative_path.is_absolute()
+        or "\\" in path_text
+        or any(part in ("", ".", "..") for part in role_relative_path.parts)
+        or role_relative_path.suffix.casefold() not in _SOURCE_SUFFIXES
+    ):
+        raise AuditInfrastructureError("dependency role-relative path is invalid")
+    if stable_role == "production" and (
+        not role_relative_path.parts
+        or role_relative_path.parts[0] not in _PRODUCTION_ROOTS
+    ):
+        raise AuditInfrastructureError(
+            "production dependency path is outside the production roots"
+        )
+    return stable_role, role_relative_path
+
+
+def _validate_file_identity(identity: object, *, stable_role: str, path: PurePosixPath) -> FileIdentity:
+    if not isinstance(identity, FileIdentity):
+        raise AuditInfrastructureError("dependency file identity is invalid")
+    _validate_native_canonical_path(identity.canonical)
+    if identity.relative is not None and not isinstance(identity.relative, PurePosixPath):
+        raise AuditInfrastructureError("dependency relative identity is invalid")
+    for label, value in (("device", identity.device), ("inode", identity.inode)):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise AuditInfrastructureError(f"dependency {label} identity is invalid")
+    if (
+        not isinstance(identity.line_count, int)
+        or isinstance(identity.line_count, bool)
+        or identity.line_count < 0
+    ):
+        raise AuditInfrastructureError("dependency line count is invalid")
+    if not isinstance(identity.production, bool):
+        raise AuditInfrastructureError("dependency production identity is invalid")
+    is_production = stable_role == "production"
+    if identity.production != is_production:
+        raise AuditInfrastructureError("dependency role and production identity disagree")
+    if is_production and identity.relative != path:
+        raise AuditInfrastructureError("production dependency identity path disagrees")
+    if not is_production and identity.relative is not None:
+        raise AuditInfrastructureError("external dependency identity must be role-relative")
+    return identity
+
+
+def _validate_native_canonical_path(value: object) -> Path:
+    if not isinstance(value, Path):
+        raise AuditInfrastructureError("dependency canonical identity is invalid")
+    _validate_native_canonical_text(str(value))
+    return value
+
+
+def _validate_native_canonical_text(text: object) -> str:
+    if not isinstance(text, str) or not text or text == "." or "\0" in text:
+        raise AuditInfrastructureError("dependency canonical identity is invalid")
+    if text.endswith(("/", "\\")):
+        raise AuditInfrastructureError("dependency canonical identity is not canonical")
+
+    drive_match = re.match(r"\A[A-Za-z]:([\\/])", text)
+    if drive_match is not None:
+        separator = drive_match.group(1)
+        tail = text[3:]
+        if not tail or (("\\" if separator == "/" else "/") in tail):
+            raise AuditInfrastructureError(
+                "dependency canonical identity is not canonical"
+            )
+        components = tail.split(separator)
+    elif text.startswith(("//", "\\\\")):
+        separator = text[0]
+        if text.startswith(separator * 3):
+            raise AuditInfrastructureError(
+                "dependency canonical identity is not canonical"
+            )
+        tail = text[2:]
+        if ("\\" if separator == "/" else "/") in tail:
+            raise AuditInfrastructureError(
+                "dependency canonical identity is not canonical"
+            )
+        components = tail.split(separator)
+        if len(components) < 3:
+            raise AuditInfrastructureError(
+                "dependency UNC identity must name a file below a share"
+            )
+    elif text.startswith("/"):
+        if "\\" in text:
+            raise AuditInfrastructureError(
+                "dependency canonical identity is not canonical"
+            )
+        components = text[1:].split("/")
+    else:
+        raise AuditInfrastructureError("dependency canonical identity must be absolute")
+    if any(part in ("", ".", "..") for part in components):
+        raise AuditInfrastructureError("dependency canonical identity is not canonical")
+    return text
+
+
+@dataclass(frozen=True, slots=True)
+class DependencyDigest:
+    stable_role: str
+    role_relative_path: PurePosixPath
+    identity: FileIdentity
+    sha256: str
+
+    def __post_init__(self) -> None:
+        stable_role, path = _validate_role_relative_path(
+            self.stable_role, self.role_relative_path
+        )
+        _validate_file_identity(self.identity, stable_role=stable_role, path=path)
+        _validate_digest(self.sha256, "dependency content")
+
+
+@dataclass(frozen=True, slots=True)
+class AuditResultFinding:
+    path: PurePosixPath
+    line: int
+    expression: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        _stable_role, path = _validate_role_relative_path("production", self.path)
+        if (
+            not isinstance(self.line, int)
+            or isinstance(self.line, bool)
+            or self.line < 1
+        ):
+            raise AuditInfrastructureError("audit result finding line is invalid")
+        if not isinstance(self.expression, str) or not self.expression:
+            raise AuditInfrastructureError("audit result finding expression is invalid")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise AuditInfrastructureError("audit result finding reason is invalid")
+        if path != self.path:
+            raise AuditInfrastructureError("audit result finding path is invalid")
+
+
+def portable_dependency_key(dependency: DependencyDigest) -> bytes:
+    if not isinstance(dependency, DependencyDigest):
+        raise AuditInfrastructureError("portable dependency is invalid")
+    payload = bytearray()
+    for value in (
+        dependency.stable_role.encode("ascii"),
+        dependency.role_relative_path.as_posix().encode("utf-8"),
+        dependency.sha256.encode("ascii"),
+    ):
+        payload.extend(struct.pack("<Q", len(value)))
+        payload.extend(value)
+    return bytes(payload)
+
+
+def _audit_finding_key(finding: AuditResultFinding) -> tuple[str, int, str, str]:
+    return (
+        finding.path.as_posix(),
+        finding.line,
+        finding.expression,
+        finding.reason,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationAuditResult:
+    configuration_digest: str
+    audit_engine_fingerprint: str
+    dependencies: tuple[DependencyDigest, ...]
+    reached_production: tuple[PurePosixPath, ...]
+    findings: tuple[AuditResultFinding, ...]
+
+    def __post_init__(self) -> None:
+        _validate_digest(self.configuration_digest, "configuration")
+        _validate_digest(self.audit_engine_fingerprint, "audit engine fingerprint")
+        if not isinstance(self.dependencies, tuple) or any(
+            not isinstance(item, DependencyDigest) for item in self.dependencies
+        ):
+            raise AuditInfrastructureError("audit result dependencies are invalid")
+        dependency_keys = tuple(portable_dependency_key(item) for item in self.dependencies)
+        if dependency_keys != tuple(sorted(dependency_keys)) or len(set(dependency_keys)) != len(dependency_keys):
+            raise AuditInfrastructureError("audit result dependencies are not unique and sorted")
+        if not isinstance(self.reached_production, tuple):
+            raise AuditInfrastructureError("audit result reached-production paths are invalid")
+        reached_keys: list[str] = []
+        for path in self.reached_production:
+            _stable_role, validated = _validate_role_relative_path("production", path)
+            reached_keys.append(validated.as_posix())
+        if tuple(reached_keys) != tuple(sorted(reached_keys)) or len(set(reached_keys)) != len(reached_keys):
+            raise AuditInfrastructureError("audit result reached-production paths are not unique and sorted")
+        if not isinstance(self.findings, tuple) or any(
+            not isinstance(item, AuditResultFinding) for item in self.findings
+        ):
+            raise AuditInfrastructureError("audit result findings are invalid")
+        finding_keys = tuple(_audit_finding_key(item) for item in self.findings)
+        if finding_keys != tuple(sorted(finding_keys)) or len(set(finding_keys)) != len(finding_keys):
+            raise AuditInfrastructureError("audit result findings are not unique and sorted")
+
+
+def encode_local_dependency_digest(dependency: DependencyDigest) -> bytes:
+    if not isinstance(dependency, DependencyDigest):
+        raise AuditInfrastructureError("local dependency is invalid")
+    identity = dependency.identity
+    record = {
+        "stable_role": dependency.stable_role,
+        "role_relative_path": dependency.role_relative_path.as_posix(),
+        "canonical": str(identity.canonical),
+        "relative": identity.relative.as_posix() if identity.relative is not None else None,
+        "device": identity.device,
+        "inode": identity.inode,
+        "line_count": identity.line_count,
+        "production": identity.production,
+        "sha256": dependency.sha256,
+    }
+    return json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def _decode_role_relative_path(value: object) -> PurePosixPath:
+    if not isinstance(value, str) or not value:
+        raise AuditInfrastructureError("local dependency role-relative path is invalid")
+    if (
+        "\\" in value
+        or value.startswith("/")
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        raise AuditInfrastructureError("local dependency role-relative path is invalid")
+    return PurePosixPath(value)
+
+
+def decode_local_dependency_digest(
+    payload: bytes,
+    *,
+    expected: DependencyDigest | None = None,
+) -> DependencyDigest:
+    if not isinstance(payload, bytes):
+        raise AuditInfrastructureError("local dependency payload is invalid")
+    try:
+        pairs = json.loads(
+            payload.decode("ascii"),
+            object_pairs_hook=lambda items: items,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+    except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+        raise AuditInfrastructureError("local dependency payload is invalid") from error
+    if (
+        not isinstance(pairs, list)
+        or tuple(key for key, _value in pairs) != _LOCAL_DEPENDENCY_FIELDS
+    ):
+        raise AuditInfrastructureError("local dependency schema is invalid")
+    values = dict(pairs)
+    stable_role = values["stable_role"]
+    role_path_text = values["role_relative_path"]
+    canonical = values["canonical"]
+    relative_text = values["relative"]
+    if not isinstance(canonical, str):
+        raise AuditInfrastructureError("local dependency path fields are invalid")
+    _validate_native_canonical_text(canonical)
+    if relative_text is not None and not isinstance(relative_text, str):
+        raise AuditInfrastructureError("local dependency relative identity is invalid")
+    identity = FileIdentity(
+        canonical=Path(canonical),
+        relative=(
+            _decode_role_relative_path(relative_text)
+            if relative_text is not None
+            else None
+        ),
+        device=values["device"],
+        inode=values["inode"],
+        line_count=values["line_count"],
+        production=values["production"],
+    )
+    try:
+        decoded = DependencyDigest(
+            stable_role=stable_role,
+            role_relative_path=_decode_role_relative_path(role_path_text),
+            identity=identity,
+            sha256=values["sha256"],
+        )
+    except (TypeError, ValueError) as error:
+        raise AuditInfrastructureError("local dependency payload is invalid") from error
+    if encode_local_dependency_digest(decoded) != payload:
+        raise AuditInfrastructureError(
+            "canonical local dependency payload does not round trip exactly"
+        )
+    if expected is not None:
+        if not isinstance(expected, DependencyDigest) or decoded != expected:
+            raise AuditInfrastructureError("local dependency identity was replaced")
+    return decoded

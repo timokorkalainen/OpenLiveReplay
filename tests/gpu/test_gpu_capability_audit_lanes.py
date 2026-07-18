@@ -1,11 +1,16 @@
 import dataclasses
 import contextlib
 import io
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import tracemalloc
 import unittest
 from array import array
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from unittest import mock
 
 
@@ -23,6 +28,7 @@ from gpu_capability_model import (  # noqa: E402
     _current_process_rss_bytes,
 )
 import gpu_capability_source_audit as capability_audit  # noqa: E402
+import gpu_capability_model as capability_model  # noqa: E402
 from gpu_capability_source_audit import (  # noqa: E402
     OP_SCOPE_HEADER,
     REGISTRY_HEADER,
@@ -33,6 +39,285 @@ from gpu_capability_source_audit import (  # noqa: E402
     aggregate_findings,
     audit_preprocessed_view,
 )
+
+
+class AuditEngineFingerprintTests(unittest.TestCase):
+    def test_dataclass_generated_init_and_repr_are_attested(self):
+        baseline = capability_audit.audit_engine_fingerprint()
+
+        def replacement_init(self, *_args, **_kwargs):
+            object.__setattr__(self, "stable_role", "mutated")
+
+        def replacement_repr(_self):
+            return "mutated-dependency"
+
+        for method_name, replacement in (
+            ("__init__", replacement_init),
+            ("__repr__", replacement_repr),
+        ):
+            with self.subTest(method=method_name), mock.patch.object(
+                capability_model.DependencyDigest, method_name, replacement
+            ):
+                self.assertNotEqual(
+                    capability_audit.audit_engine_fingerprint(), baseline
+                )
+
+    def test_unrelated_relative_semantic_string_is_not_an_origin_role(self):
+        relative = "tests/gpu/gpu_capability_model.py"
+        role = "python-module:gpu_capability_model"
+        relative_payload = capability_audit._marshal_live_semantic_object(relative)
+        role_payload = capability_audit._marshal_live_semantic_object(role)
+        self.assertIn(relative.encode("utf-8"), relative_payload)
+        self.assertNotEqual(relative_payload, role_payload)
+        relative_fingerprint = capability_audit._audit_engine_fingerprint_from_marshaled_graph(
+            (("semantic.fixture", relative_payload),)
+        )
+        role_fingerprint = capability_audit._audit_engine_fingerprint_from_marshaled_graph(
+            (("semantic.fixture", role_payload),)
+        )
+        self.assertNotEqual(relative_fingerprint, role_fingerprint)
+
+    def test_mapping_proxy_encoding_is_canonical_with_shared_values(self):
+        shared = frozenset({"shared-value"})
+        first = MappingProxyType({
+            PurePosixPath("playback/a.h"): shared,
+            PurePosixPath("playback/b.h"): shared,
+        })
+        reversed_insertion = MappingProxyType({
+            PurePosixPath("playback/b.h"): shared,
+            PurePosixPath("playback/a.h"): shared,
+        })
+        self.assertEqual(
+            capability_audit._marshal_live_semantic_object(first),
+            capability_audit._marshal_live_semantic_object(reversed_insertion),
+        )
+        with mock.patch.object(
+            capability_audit, "REVIEWED_NATIVE_HANDLE_SINKS", first
+        ):
+            first_fingerprint = capability_audit.audit_engine_fingerprint()
+        with mock.patch.object(
+            capability_audit,
+            "REVIEWED_NATIVE_HANDLE_SINKS",
+            reversed_insertion,
+        ):
+            reversed_fingerprint = capability_audit.audit_engine_fingerprint()
+        self.assertEqual(first_fingerprint, reversed_fingerprint)
+
+        first_key = type("DuplicateSemanticKey", (), {})
+        second_key = type("DuplicateSemanticKey", (), {})
+        for key in (first_key, second_key):
+            key.__module__ = "external_semantic_fixture"
+            key.__qualname__ = "DuplicateSemanticKey"
+        duplicate_semantic_keys = MappingProxyType({
+            first_key: frozenset({"first"}),
+            second_key: frozenset({"second"}),
+        })
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "duplicate semantic keys"
+        ):
+            capability_audit._marshal_live_semantic_object(duplicate_semantic_keys)
+
+    def test_frozenset_encoding_is_canonical_with_shared_nested_values(self):
+        source_directory = Path(__file__).resolve().parent
+        script = (
+            "import hashlib,sys; sys.path.insert(0,sys.argv[1]); "
+            "import gpu_capability_source_audit as a; "
+            "shared=frozenset({'shared'}); "
+            "value=frozenset(((shared,'a'),(shared,'b'))); "
+            "print(hashlib.sha256(a._marshal_live_semantic_object(value)).hexdigest())"
+        )
+        fingerprints = []
+        for seed in ("1", "2"):
+            completed = subprocess.run(
+                (sys.executable, "-c", script, str(source_directory)),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ, "PYTHONHASHSEED": seed},
+            )
+            fingerprints.append(completed.stdout.strip())
+        self.assertEqual(fingerprints[0], fingerprints[1])
+
+    def test_mutable_target_module_dataclass_is_rejected_fail_closed(self):
+        @dataclasses.dataclass
+        class MutableSemanticFixture:
+            value: int = 1
+
+        MutableSemanticFixture.__module__ = capability_audit.__name__
+        with mock.patch.object(
+            capability_audit,
+            "MUTABLE_SEMANTIC_FIXTURE",
+            MutableSemanticFixture,
+            create=True,
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "dataclass class is mutable"
+            ):
+                capability_audit.audit_engine_fingerprint()
+
+    def test_live_semantic_graph_is_exhaustive_sorted_and_recomputed(self):
+        graph = capability_audit._enumerate_live_semantic_graph()
+        names = tuple(name for name, _loaded_object in graph)
+        self.assertEqual(names, tuple(sorted(names)))
+        self.assertEqual(len(names), len(set(names)))
+        for expected in (
+            "gpu_capability_model.ConfigurationAuditResult",
+            "gpu_capability_model.DependencyDigest",
+            "gpu_capability_source_audit.cpp_tokens",
+            "gpu_capability_source_audit._header_operand_after_leading_comments",
+        ):
+            self.assertIn(expected, names)
+
+        marshaled = tuple(
+            (name, capability_audit._marshal_live_semantic_object(loaded_object))
+            for name, loaded_object in graph
+        )
+        framed_baseline = capability_audit._audit_engine_fingerprint_from_marshaled_graph(
+            marshaled
+        )
+        for index, (name, payload) in enumerate(marshaled):
+            mutated = marshaled[:index] + ((name, payload + b"semantic-mutation"),) + marshaled[index + 1:]
+            with self.subTest(framed_component=name):
+                self.assertNotEqual(
+                    capability_audit._audit_engine_fingerprint_from_marshaled_graph(mutated),
+                    framed_baseline,
+                )
+
+        baseline = capability_audit.audit_engine_fingerprint()
+
+        def mutated_cpp_tokens(*_args, **_kwargs):
+            return []
+
+        with mock.patch.object(capability_audit, "cpp_tokens", mutated_cpp_tokens):
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+        self.assertEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+    def test_transitive_helper_global_and_policy_table_rebinding_changes_digest(self):
+        baseline = capability_audit.audit_engine_fingerprint()
+
+        def mutated_helper(_tail):
+            return "mutated"
+
+        mutations = (
+            (capability_audit, "_header_operand_after_leading_comments", mutated_helper),
+            (
+                capability_audit,
+                "_RAW_DIRECTIVES",
+                frozenset((*capability_audit._RAW_DIRECTIVES, "mutated")),
+            ),
+            (capability_model, "AUDIT_RESULT_SCHEMA_BYTES", b"different-schema"),
+        )
+        for owner, name, replacement in mutations:
+            with self.subTest(name=name), mock.patch.object(owner, name, replacement):
+                self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+    def test_task1_policy_globals_are_deeply_immutable(self):
+        self.assertIsInstance(capability_audit.SOURCE_SUFFIXES, frozenset)
+        tables = (
+            capability_audit.REVIEWED_NATIVE_HANDLE_SINKS,
+            capability_audit.REVIEWED_NATIVE_HANDLE_METHODS,
+            capability_audit.REVIEWED_NATIVE_HANDLE_MEMBER_SINKS,
+            capability_audit.REVIEWED_NATIVE_HANDLE_TYPES,
+        )
+        for table in tables:
+            self.assertIsInstance(table, MappingProxyType)
+            with self.assertRaises(TypeError):
+                table[PurePosixPath("replacement.cpp")] = frozenset({"sink"})
+            self.assertTrue(all(isinstance(value, frozenset) for value in table.values()))
+
+        with mock.patch.object(capability_audit, "SOURCE_SUFFIXES", {".cpp"}):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "unsupported loaded semantic object"
+            ):
+                capability_audit.audit_engine_fingerprint()
+
+    def test_recomputation_does_not_read_the_filesystem(self):
+        baseline = capability_audit.audit_engine_fingerprint()
+        with (
+            mock.patch("builtins.open", side_effect=AssertionError("filesystem read")),
+            mock.patch.object(Path, "read_bytes", side_effect=AssertionError("filesystem read")),
+            mock.patch.object(Path, "read_text", side_effect=AssertionError("filesystem read")),
+        ):
+            self.assertEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+    def test_audit_fingerprint_is_portable_across_absolute_import_roots(self):
+        source_directory = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first" / "gpu"
+            second = root / "second" / "gpu"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            for name in ("gpu_capability_model.py", "gpu_capability_source_audit.py"):
+                shutil.copyfile(source_directory / name, first / name)
+                shutil.copyfile(source_directory / name, second / name)
+
+            script = (
+                "import sys; sys.path[:0] = [sys.argv[1], sys.argv[2]]; "
+                "import gpu_capability_source_audit as a; print(a.audit_engine_fingerprint())"
+            )
+
+            def fingerprint(path: Path) -> str:
+                completed = subprocess.run(
+                    (sys.executable, "-c", script, str(path), str(source_directory)),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                return completed.stdout.strip()
+
+            self.assertEqual(fingerprint(first), fingerprint(second))
+            mutated = (second / "gpu_capability_source_audit.py").read_text(encoding="utf-8")
+            self.assertIn(
+                'AUDIT_ENGINE_STAGE_BYTES = b"task-1-model-and-source-audit"',
+                mutated,
+            )
+            (second / "gpu_capability_source_audit.py").write_text(
+                mutated.replace(
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-1-model-and-source-audit"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-1-model-and-source-audit-mutated"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assertNotEqual(fingerprint(first), fingerprint(second))
+
+    def test_windows_relative_forward_slash_import_attests_loaded_engine(self):
+        source_directory = Path(__file__).resolve().parent
+        repository_root = source_directory.parents[1]
+        script = (
+            "import sys; sys.path.insert(0,'tests/gpu'); "
+            "import gpu_capability_source_audit as a; "
+            "print(a.audit_engine_fingerprint())"
+        )
+        completed = subprocess.run(
+            (sys.executable, "-c", script),
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertRegex(completed.stdout.strip(), r"\A[0-9a-f]{64}\Z")
+
+    def test_parent_recomputes_attestation_and_rejects_caller_mismatch(self):
+        actual = capability_audit.audit_engine_fingerprint()
+        self.assertEqual(capability_audit._attest_loaded_audit_engine(actual), actual)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "loaded audit engine attestation"
+        ):
+            capability_audit._attest_loaded_audit_engine("0" * 64)
+
+        def mutated_cpp_tokens(*_args, **_kwargs):
+            return []
+
+        with mock.patch.object(capability_audit, "cpp_tokens", mutated_cpp_tokens):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "loaded audit engine attestation"
+            ):
+                capability_audit._attest_loaded_audit_engine(actual)
 
 
 class CompilerAuditLaneTests(unittest.TestCase):

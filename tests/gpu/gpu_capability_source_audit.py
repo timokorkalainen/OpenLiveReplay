@@ -7,16 +7,25 @@ import argparse
 from array import array
 import bisect
 from collections.abc import Mapping
+import dataclasses
 from dataclasses import dataclass
+import enum
+import hashlib
+import hmac
 import os
 from pathlib import Path, PurePosixPath
 import re
 import statistics
+import struct
 import sys
 import time
+import types
+from types import MappingProxyType
 from typing import Callable, Iterable
 
+import gpu_capability_model as _gpu_capability_model
 from gpu_capability_model import (
+    AUDIT_RESULT_SCHEMA_BYTES,
     AuditInfrastructureError,
     AuditLimits,
     CompilerFamily,
@@ -27,7 +36,7 @@ from gpu_capability_model import (
 )
 
 
-SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".mm"}
+SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".mm"})
 PRODUCTION_ROOTS = ("playback", "recorder_engine")
 LEASE_HEADER = PurePosixPath("playback/gpu/gpusurfacelease.h")
 REGISTRY_HEADER = PurePosixPath("playback/gpu/gpuretireregistry.h")
@@ -46,7 +55,7 @@ SURFACE_INTERNAL_HANDLE_PATHS = frozenset({
     PurePosixPath("playback/output/win/d3d11gpusurface.h"),
 })
 
-REVIEWED_NATIVE_HANDLE_SINKS = {
+REVIEWED_NATIVE_HANDLE_SINKS = MappingProxyType({
     PurePosixPath("playback/gpu/gpufence.h"): frozenset({"isCompatibleWithNativeHandle"}),
     PurePosixPath("playback/gpu/applegpusurface_apple.mm"): frozenset({
         "CVPixelBufferCreateWithIOSurface", "IOSurfaceGetHeight", "IOSurfaceGetWidth",
@@ -60,21 +69,21 @@ REVIEWED_NATIVE_HANDLE_SINKS = {
     PurePosixPath("playback/output/win/wingpuimportedge.cpp"): frozenset({
         "CopySubresourceRegion",
     }),
-}
+})
 
-REVIEWED_NATIVE_HANDLE_METHODS = {
+REVIEWED_NATIVE_HANDLE_METHODS = MappingProxyType({
     PurePosixPath("recorder_engine/codec/nativevideoencoder_mediafoundation.cpp"):
         frozenset({"GetDevice"}),
     PurePosixPath("playback/output/win/wingpuimportedge.cpp"):
         frozenset({"GetDesc", "GetDevice"}),
-}
+})
 
-REVIEWED_NATIVE_HANDLE_MEMBER_SINKS = {
+REVIEWED_NATIVE_HANDLE_MEMBER_SINKS = MappingProxyType({
     PurePosixPath("playback/output/win/wingpuimportedge.cpp"):
         frozenset({"CopySubresourceRegion"}),
-}
+})
 
-REVIEWED_NATIVE_HANDLE_TYPES = {
+REVIEWED_NATIVE_HANDLE_TYPES = MappingProxyType({
     PurePosixPath("playback/gpu/applegpusurface_apple.mm"):
         frozenset({"IOSurfaceRef"}),
     PurePosixPath("recorder_engine/codec/nativevideoencoder_videotoolbox.mm"):
@@ -83,7 +92,7 @@ REVIEWED_NATIVE_HANDLE_TYPES = {
         frozenset({"ID3D11Texture2D"}),
     PurePosixPath("playback/output/win/wingpuimportedge.cpp"):
         frozenset({"ID3D11Texture2D"}),
-}
+})
 
 _CAPABILITY_CANDIDATE_SPELLINGS = frozenset({
     b"GpuOpScope",
@@ -6998,6 +7007,555 @@ def run_live_only(
             ) from error
         budget.remaining_seconds()
         printer(f"PASS: live compiler capability parity: {family.value}={canonical}")
+
+
+AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v1"
+AUDIT_ENGINE_STAGE_BYTES = b"task-1-model-and-source-audit"
+_AUDIT_ENGINE_TARGET_MODULES = (
+    _gpu_capability_model,
+    sys.modules[__name__],
+)
+_AUDIT_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
+    "gpu_capability_source_audit": frozenset({"_RUNTIME_OBSERVER_LOCK"}),
+    "gpu_capability_model": frozenset(),
+})
+
+
+def _capture_module_origins_and_identities_at_import(
+    module_names: tuple[str, ...],
+) -> tuple[tuple[str, str, tuple[object, ...]], ...]:
+    captured: list[tuple[str, str, tuple[object, ...]]] = []
+    for module_name in module_names:
+        module = sys.modules.get(module_name)
+        specification = getattr(module, "__spec__", None)
+        origin = getattr(specification, "origin", None)
+        origin_role = f"python-module:{module_name}"
+        if not isinstance(origin, str) or origin in ("built-in", "frozen"):
+            captured.append((module_name, origin_role, (origin, None, None, None, None)))
+            continue
+        try:
+            metadata = os.stat(origin, follow_symlinks=False)
+            identity = (
+                origin,
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+                int(metadata.st_size),
+                int(metadata.st_mtime_ns),
+            )
+        except OSError:
+            identity = (origin, None, None, None, None)
+        captured.append((module_name, origin_role, identity))
+    return tuple(captured)
+
+
+_IMPORTED_MODULE_IDENTITIES = _capture_module_origins_and_identities_at_import(
+    tuple(module.__name__ for module in _AUDIT_ENGINE_TARGET_MODULES)
+)
+
+
+def _canonical_module_origin_spelling(value: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise AuditInfrastructureError("audit engine module origin is invalid")
+    return os.path.normcase(os.path.normpath(os.path.abspath(value)))
+
+
+def _build_module_origin_path_roles(
+    identities: tuple[tuple[str, str, tuple[object, ...]], ...],
+) -> MappingProxyType:
+    roles: dict[str, str] = {}
+    for _module_name, role, identity in identities:
+        origin = identity[0]
+        if origin is None:
+            continue
+        canonical = _canonical_module_origin_spelling(str(origin))
+        previous = roles.get(canonical)
+        if previous is not None and previous != role:
+            raise AuditInfrastructureError(
+                "audit engine module origins have conflicting semantic roles"
+            )
+        roles[canonical] = role
+    return MappingProxyType(roles)
+
+
+_MODULE_ORIGIN_PATH_ROLES = _build_module_origin_path_roles(
+    _IMPORTED_MODULE_IDENTITIES
+)
+
+
+def _update_framed(digest, value: bytes) -> None:
+    if not isinstance(value, bytes):
+        raise AuditInfrastructureError("audit engine frame is invalid")
+    digest.update(struct.pack("<Q", len(value)))
+    digest.update(value)
+
+
+def _semantic_origin_role(value: object) -> str:
+    module_name = getattr(value, "__module__", None)
+    qualified_name = getattr(value, "__qualname__", None)
+    if not isinstance(module_name, str):
+        module_name = type(value).__module__
+    if not isinstance(qualified_name, str):
+        qualified_name = getattr(value, "__name__", type(value).__qualname__)
+    return f"{module_name}:{qualified_name}"
+
+
+def _normalized_semantic_string(value: str) -> str:
+    if not os.path.isabs(value):
+        return value
+    try:
+        canonical = _canonical_module_origin_spelling(value)
+    except (AuditInfrastructureError, OSError, ValueError):
+        return value
+    return _MODULE_ORIGIN_PATH_ROLES.get(canonical, value)
+
+
+def _normalized_code_filename(value: str) -> str:
+    try:
+        canonical = _canonical_module_origin_spelling(value)
+    except (AuditInfrastructureError, OSError, ValueError):
+        return value
+    return _MODULE_ORIGIN_PATH_ROLES.get(canonical, value)
+
+
+class _LiveSemanticEncoder:
+    """Deterministic structural encoder for the already-loaded audit engine."""
+
+    def __init__(self) -> None:
+        # Retain the object as well as its ID. Structural encoding constructs
+        # short-lived tuples; keeping them alive prevents a recycled ID from
+        # being mistaken for a semantic cycle later in the same walk.
+        self._seen: dict[int, tuple[int, object]] = {}
+
+    @staticmethod
+    def _frame(tag: bytes, pieces: Iterable[bytes] = ()) -> bytes:
+        payload = bytearray(tag)
+        for piece in pieces:
+            payload.extend(struct.pack("<Q", len(piece)))
+            payload.extend(piece)
+        return bytes(payload)
+
+    def _cycle_or_mark(self, value: object) -> bytes | None:
+        identity = id(value)
+        previous = self._seen.get(identity)
+        if previous is not None and previous[1] is value:
+            return self._frame(b"cycle", (str(previous[0]).encode("ascii"),))
+        self._seen[identity] = (len(self._seen), value)
+        return None
+
+    def encode(self, value: object) -> bytes:
+        if value is None:
+            return b"none"
+        if value is Ellipsis:
+            return b"ellipsis"
+        if isinstance(value, bool):
+            return b"bool:1" if value else b"bool:0"
+        if isinstance(value, int):
+            return self._frame(b"int", (str(value).encode("ascii"),))
+        if isinstance(value, float):
+            return self._frame(b"float", (struct.pack("!d", value),))
+        if isinstance(value, complex):
+            return self._frame(
+                b"complex", (struct.pack("!d", value.real), struct.pack("!d", value.imag))
+            )
+        if isinstance(value, bytes):
+            return self._frame(b"bytes", (value,))
+        if isinstance(value, str):
+            return self._frame(
+                b"str", (_normalized_semantic_string(value).encode("utf-8"),)
+            )
+        if isinstance(value, PurePosixPath):
+            if value.is_absolute() or any(part in ("", ".", "..") for part in value.parts):
+                raise AuditInfrastructureError("audit engine contains an invalid POSIX path")
+            return self._frame(b"posix-path", (value.as_posix().encode("utf-8"),))
+        if isinstance(value, Path):
+            normalized = _normalized_semantic_string(str(value))
+            return self._frame(b"native-path", (normalized.encode("utf-8"),))
+        if isinstance(value, re.Pattern):
+            return self._frame(
+                b"regex", (self.encode(value.pattern), self.encode(value.flags))
+            )
+        if isinstance(value, enum.Enum):
+            return self._frame(
+                b"enum-member",
+                (
+                    _semantic_origin_role(type(value)).encode("utf-8"),
+                    value.name.encode("utf-8"),
+                    self.encode(value.value),
+                ),
+            )
+        if isinstance(value, types.CodeType):
+            return self._encode_code(value)
+        if isinstance(value, types.FunctionType):
+            if value.__module__ in {module.__name__ for module in _AUDIT_ENGINE_TARGET_MODULES}:
+                return self._encode_function(value)
+            return self._frame(b"imported-function", (_semantic_origin_role(value).encode("utf-8"),))
+        if isinstance(value, (types.BuiltinFunctionType, types.BuiltinMethodType)):
+            return self._frame(b"imported-callable", (_semantic_origin_role(value).encode("utf-8"),))
+        if isinstance(value, type):
+            if value.__module__ in {module.__name__ for module in _AUDIT_ENGINE_TARGET_MODULES}:
+                return self._encode_class(value)
+            return self._frame(b"imported-class", (_semantic_origin_role(value).encode("utf-8"),))
+        if isinstance(value, types.ModuleType):
+            return self._frame(b"imported-module", (value.__name__.encode("utf-8"),))
+        if isinstance(value, tuple):
+            cycle = self._cycle_or_mark(value)
+            if cycle is not None:
+                return cycle
+            return self._frame(b"tuple", tuple(self.encode(item) for item in value))
+        if isinstance(value, frozenset):
+            cycle = self._cycle_or_mark(value)
+            if cycle is not None:
+                return cycle
+            ordered_items = sorted((
+                (_LiveSemanticEncoder().encode(item), item)
+                for item in value
+            ), key=lambda encoded_item: encoded_item[0])
+            element_encodings = tuple(item[0] for item in ordered_items)
+            if len(set(element_encodings)) != len(element_encodings):
+                raise AuditInfrastructureError(
+                    "audit engine frozenset has duplicate semantic elements"
+                )
+            return self._frame(
+                b"frozenset",
+                tuple(self.encode(item) for _element_encoding, item in ordered_items),
+            )
+        if isinstance(value, MappingProxyType):
+            cycle = self._cycle_or_mark(value)
+            if cycle is not None:
+                return cycle
+            # Establish canonical key order using isolated encoders before the
+            # main walk assigns cycle ordinals. Otherwise a shared immutable
+            # value is expanded under whichever key was inserted first.
+            ordered_items = sorted((
+                (
+                    _LiveSemanticEncoder().encode(key),
+                    key,
+                    item,
+                )
+                for key, item in value.items()
+            ), key=lambda encoded_item: encoded_item[0])
+            key_encodings = tuple(item[0] for item in ordered_items)
+            if len(set(key_encodings)) != len(key_encodings):
+                raise AuditInfrastructureError(
+                    "audit engine mapping has duplicate semantic keys"
+                )
+            pairs = tuple(
+                (self.encode(key), self.encode(item))
+                for _key_encoding, key, item in ordered_items
+            )
+            return self._frame(
+                b"mapping-proxy",
+                tuple(self._frame(b"item", pair) for pair in pairs),
+            )
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            parameters = getattr(type(value), "__dataclass_params__", None)
+            if parameters is None or not parameters.frozen:
+                raise AuditInfrastructureError("audit engine dataclass state is mutable")
+            cycle = self._cycle_or_mark(value)
+            if cycle is not None:
+                return cycle
+            pieces = [_semantic_origin_role(type(value)).encode("utf-8")]
+            for field in dataclasses.fields(value):
+                field_value = getattr(value, field.name)
+                if type(value) is _gpu_capability_model.AuditLimits and field.name == "workers":
+                    field_value = "host-cpu-derived-worker-default"
+                pieces.append(self._frame(b"field", (field.name.encode("utf-8"), self.encode(field_value))))
+            return self._frame(b"frozen-dataclass", pieces)
+        raise AuditInfrastructureError(
+            "audit engine contains unsupported loaded semantic object: "
+            f"{type(value).__module__}.{type(value).__qualname__}"
+        )
+
+    def _encode_code(self, code: types.CodeType) -> bytes:
+        cycle = self._cycle_or_mark(code)
+        if cycle is not None:
+            return cycle
+        metadata = (
+            code.co_argcount,
+            code.co_posonlyargcount,
+            code.co_kwonlyargcount,
+            code.co_nlocals,
+            code.co_stacksize,
+            code.co_flags,
+        )
+        return self._frame(
+            b"code",
+            (
+                self.encode(metadata),
+                self.encode(code.co_code),
+                self.encode(code.co_consts),
+                self.encode(code.co_names),
+                self.encode(code.co_varnames),
+                self.encode(code.co_freevars),
+                self.encode(code.co_cellvars),
+                self.encode(code.co_linetable),
+                self.encode(code.co_exceptiontable),
+                self.encode(_normalized_code_filename(code.co_filename)),
+                self.encode(code.co_name),
+                self.encode(code.co_qualname),
+            ),
+        )
+
+    def _encode_function(self, function: types.FunctionType) -> bytes:
+        cycle = self._cycle_or_mark(function)
+        if cycle is not None:
+            return cycle
+        defaults = function.__defaults__
+        if (
+            function is _gpu_capability_model.AuditLimits.__init__
+            and defaults
+        ):
+            defaults = (*defaults[:-1], "host-cpu-derived-worker-default")
+        pieces = [
+            _semantic_origin_role(function).encode("utf-8"),
+            self._encode_code(function.__code__),
+            self.encode(defaults),
+        ]
+        keyword_defaults = function.__kwdefaults__ or {}
+        pieces.append(self._frame(
+            b"keyword-defaults",
+            tuple(
+                self._frame(b"item", (key.encode("utf-8"), self.encode(value)))
+                for key, value in sorted(keyword_defaults.items())
+            ),
+        ))
+        pieces.append(self._frame(
+            b"annotations",
+            tuple(
+                self._frame(b"item", (key.encode("utf-8"), self.encode(value)))
+                for key, value in sorted(function.__annotations__.items())
+            ),
+        ))
+        if function.__closure__ is None:
+            pieces.append(b"no-closure")
+        else:
+            closure_values: list[bytes] = []
+            for free_name, cell in zip(
+                function.__code__.co_freevars, function.__closure__, strict=True
+            ):
+                try:
+                    cell_value = cell.cell_contents
+                except ValueError:
+                    closure_values.append(b"empty-cell")
+                    continue
+                if (
+                    function.__name__ == "__repr__"
+                    and free_name == "repr_running"
+                    and isinstance(cell_value, set)
+                ):
+                    closure_values.append(b"dataclass-repr-runtime-guard")
+                else:
+                    closure_values.append(self.encode(cell_value))
+            pieces.append(self._frame(b"closure", closure_values))
+        global_pieces: list[bytes] = []
+        exclusions = _AUDIT_RUNTIME_STATE_EXCLUSIONS.get(function.__module__, frozenset())
+        for name in sorted(set(function.__code__.co_names)):
+            if name not in function.__globals__:
+                continue
+            if name in exclusions:
+                encoded = b"excluded-runtime-state"
+            elif name == "_IMPORTED_MODULE_IDENTITIES":
+                encoded = self.encode(tuple(
+                    (module_name, role)
+                    for module_name, role, _identity in _IMPORTED_MODULE_IDENTITIES
+                ))
+            elif name == "_MODULE_ORIGIN_PATH_ROLES":
+                encoded = self.encode(frozenset(_MODULE_ORIGIN_PATH_ROLES.values()))
+            else:
+                encoded = self.encode(function.__globals__[name])
+            global_pieces.append(self._frame(b"global", (name.encode("utf-8"), encoded)))
+        pieces.append(self._frame(b"globals", global_pieces))
+        return self._frame(b"function", pieces)
+
+    def _encode_class(self, class_object: type) -> bytes:
+        cycle = self._cycle_or_mark(class_object)
+        if cycle is not None:
+            return cycle
+        pieces = [
+            _semantic_origin_role(class_object).encode("utf-8"),
+            self.encode(class_object.__bases__),
+        ]
+        if issubclass(class_object, enum.Enum):
+            pieces.append(self._frame(
+                b"enum-members",
+                tuple(
+                    self._frame(b"member", (name.encode("utf-8"), self.encode(member.value)))
+                    for name, member in class_object.__members__.items()
+                ),
+            ))
+        if dataclasses.is_dataclass(class_object):
+            parameters = getattr(class_object, "__dataclass_params__", None)
+            if parameters is None or not parameters.frozen:
+                raise AuditInfrastructureError("audit engine dataclass class is mutable")
+            parameter_pieces = []
+            for parameter_name in (
+                "init",
+                "repr",
+                "eq",
+                "order",
+                "unsafe_hash",
+                "frozen",
+                "match_args",
+                "kw_only",
+                "slots",
+                "weakref_slot",
+            ):
+                parameter_value = getattr(
+                    parameters, parameter_name, "parameter-unavailable"
+                )
+                parameter_pieces.append(self._frame(
+                    b"parameter",
+                    (
+                        parameter_name.encode("ascii"),
+                        self.encode(parameter_value),
+                    ),
+                ))
+            pieces.append(self._frame(b"dataclass-parameters", parameter_pieces))
+            field_pieces: list[bytes] = []
+            for field in dataclasses.fields(class_object):
+                default = field.default
+                if class_object is _gpu_capability_model.AuditLimits and field.name == "workers":
+                    default = "host-cpu-derived-worker-default"
+                default_bytes = (
+                    b"missing"
+                    if default is dataclasses.MISSING
+                    else self.encode(default)
+                )
+                factory = field.default_factory
+                factory_bytes = (
+                    b"missing"
+                    if factory is dataclasses.MISSING
+                    else self.encode(factory)
+                )
+                field_pieces.append(self._frame(
+                    b"field",
+                    (
+                        field.name.encode("utf-8"),
+                        self.encode(field.type),
+                        default_bytes,
+                        factory_bytes,
+                    ),
+                ))
+            pieces.append(self._frame(b"dataclass-fields", field_pieces))
+        for name, member in sorted(class_object.__dict__.items()):
+            if name in ("__dict__", "__weakref__", "__module__", "__doc__"):
+                continue
+            encoded: bytes | None = None
+            if isinstance(member, staticmethod):
+                encoded = self._frame(b"staticmethod", (self.encode(member.__func__),))
+            elif isinstance(member, classmethod):
+                encoded = self._frame(b"classmethod", (self.encode(member.__func__),))
+            elif isinstance(member, property):
+                encoded = self._frame(
+                    b"property",
+                    tuple(
+                        self.encode(accessor) if accessor is not None else b"none"
+                        for accessor in (member.fget, member.fset, member.fdel)
+                    ),
+                )
+            elif isinstance(member, types.FunctionType):
+                encoded = self.encode(member)
+            elif isinstance(member, (types.MemberDescriptorType, types.GetSetDescriptorType)):
+                encoded = self._frame(b"descriptor", (name.encode("utf-8"),))
+            elif isinstance(class_object, enum.EnumMeta) and isinstance(member, class_object):
+                continue
+            elif name.isupper():
+                encoded = self.encode(member)
+            if encoded is not None:
+                pieces.append(self._frame(b"class-member", (name.encode("utf-8"), encoded)))
+        return self._frame(b"class", pieces)
+
+
+def _marshal_live_semantic_object(loaded_object: object) -> bytes:
+    return _LiveSemanticEncoder().encode(loaded_object)
+
+
+def _is_semantic_constant_name(name: str) -> bool:
+    return (
+        not name.startswith("__")
+        and any(character.isalpha() for character in name)
+        and name.upper() == name
+        and name not in {"_IMPORTED_MODULE_IDENTITIES"}
+    )
+
+
+def _walk_live_semantic_graph_cycle_safe(
+    *,
+    target_modules: tuple[types.ModuleType, ...],
+    runtime_state_exclusions: Mapping[str, frozenset[str]],
+) -> tuple[tuple[str, object], ...]:
+    roots: dict[str, object] = {}
+    for module in target_modules:
+        excluded = runtime_state_exclusions.get(module.__name__, frozenset())
+        for name, value in vars(module).items():
+            if name in excluded:
+                continue
+            owned = (
+                isinstance(value, (types.FunctionType, type))
+                and getattr(value, "__module__", None) == module.__name__
+            )
+            if owned or _is_semantic_constant_name(name):
+                roots[f"{module.__name__}.{name}"] = value
+    return tuple(sorted(roots.items()))
+
+
+def _enumerate_live_semantic_graph() -> tuple[tuple[str, object], ...]:
+    return _walk_live_semantic_graph_cycle_safe(
+        target_modules=_AUDIT_ENGINE_TARGET_MODULES,
+        runtime_state_exclusions=_AUDIT_RUNTIME_STATE_EXCLUSIONS,
+    )
+
+
+def _audit_engine_fingerprint_from_marshaled_graph(
+    graph: tuple[tuple[str, bytes], ...],
+) -> str:
+    if not isinstance(graph, tuple):
+        raise AuditInfrastructureError("marshaled audit engine graph is invalid")
+    names: list[str] = []
+    digest = hashlib.sha256()
+    _update_framed(digest, AUDIT_ENGINE_GRAPH_SCHEMA_BYTES)
+    _update_framed(digest, AUDIT_ENGINE_STAGE_BYTES)
+    for entry in graph:
+        if (
+            not isinstance(entry, tuple)
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+            or not isinstance(entry[1], bytes)
+        ):
+            raise AuditInfrastructureError("marshaled audit engine entry is invalid")
+        name, payload = entry
+        try:
+            encoded_name = name.encode("ascii")
+        except UnicodeEncodeError as error:
+            raise AuditInfrastructureError("audit engine component name is invalid") from error
+        names.append(name)
+        _update_framed(digest, encoded_name)
+        _update_framed(digest, payload)
+    if tuple(names) != tuple(sorted(names)) or len(set(names)) != len(names):
+        raise AuditInfrastructureError("marshaled audit engine graph is not unique and sorted")
+    for module_name, origin_role, _local_identity in _IMPORTED_MODULE_IDENTITIES:
+        _update_framed(digest, f"module-root:{module_name}".encode("ascii"))
+        _update_framed(digest, origin_role.encode("ascii"))
+    return digest.hexdigest()
+
+
+def audit_engine_fingerprint() -> str:
+    graph = tuple(
+        (name, _marshal_live_semantic_object(loaded_object))
+        for name, loaded_object in _enumerate_live_semantic_graph()
+    )
+    return _audit_engine_fingerprint_from_marshaled_graph(graph)
+
+
+def _attest_loaded_audit_engine(expected: str | None = None) -> str:
+    actual = audit_engine_fingerprint()
+    if expected is not None and (
+        not isinstance(expected, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+        or not hmac.compare_digest(actual, expected)
+    ):
+        raise AuditInfrastructureError("loaded audit engine attestation mismatch")
+    return actual
 
 
 def main() -> int:

@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import os
 import stat
 import subprocess
@@ -15,12 +16,16 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gpu_capability_model import (  # noqa: E402
+    AUDIT_RESULT_SCHEMA_BYTES,
     UINT32_MAX,
+    AuditResultFinding,
     AuditInfrastructureError,
     AuditLimits,
     CompactTokenSequence,
     CompilerFamily,
     CoverageReport,
+    ConfigurationAuditResult,
+    DependencyDigest,
     FileIdentity,
     PackedTokenRun,
     PreprocessedToken,
@@ -28,8 +33,12 @@ from gpu_capability_model import (  # noqa: E402
     PreprocessConfiguration,
     SourceLocation,
     _check_casefold_collision,
+    _validate_native_canonical_text,
     _walk_production_entries,
+    decode_local_dependency_digest,
+    encode_local_dependency_digest,
     enumerate_production_identities,
+    portable_dependency_key,
     requires_compile_entry,
 )
 
@@ -74,6 +83,287 @@ class ModelTests(unittest.TestCase):
             inclusion_ids=array("I", (4, 4, 4, 4, 4, 4, 5)),
             original_lines=array("I", (12, 12, 12, 12, 12, 12, 20)),
         )
+
+    def dependency(
+        self,
+        *,
+        identity: FileIdentity | None = None,
+        sha256: str = "b" * 64,
+    ) -> DependencyDigest:
+        return DependencyDigest(
+            stable_role="production",
+            role_relative_path=PurePosixPath("playback/gpu/example.cpp"),
+            identity=identity or self.identity(),
+            sha256=sha256,
+        )
+
+    def test_configuration_audit_result_is_compact_frozen_and_sorted(self):
+        dependency = self.dependency()
+        finding = AuditResultFinding(
+            path=PurePosixPath("playback/gpu/example.cpp"),
+            line=7,
+            expression="nativeHandle()",
+            reason="outside lease",
+        )
+        result = ConfigurationAuditResult(
+            configuration_digest="c" * 64,
+            audit_engine_fingerprint="a" * 64,
+            dependencies=(dependency,),
+            reached_production=(PurePosixPath("playback/gpu/example.cpp"),),
+            findings=(finding,),
+        )
+        self.assertEqual(AUDIT_RESULT_SCHEMA_BYTES, b"olr-gpu-capability-audit-result-v1")
+        self.assertFalse(hasattr(result, "tokens"))
+        self.assertFalse(hasattr(result, "__dict__"))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            result.configuration_digest = "other"
+
+        valid_fields = {
+            field.name: getattr(result, field.name)
+            for field in dataclasses.fields(result)
+        }
+        invalid_cases = (
+            {**valid_fields, "configuration_digest": "C" * 64},
+            {**valid_fields, "dependencies": (dependency, dependency)},
+            {
+                **valid_fields,
+                "reached_production": (
+                    PurePosixPath("playback/z.cpp"),
+                    PurePosixPath("playback/a.cpp"),
+                ),
+            },
+            {**valid_fields, "findings": ({
+                "path": finding.path,
+                "line": True,
+                "expression": finding.expression,
+                "reason": finding.reason,
+            },)},
+        )
+        for index, invalid in enumerate(invalid_cases):
+            with self.subTest(index=index), self.assertRaises(AuditInfrastructureError):
+                if index == 3:
+                    bad_finding = AuditResultFinding(**invalid["findings"][0])
+                    invalid = {**invalid, "findings": (bad_finding,)}
+                ConfigurationAuditResult(**invalid)
+
+    def test_dependency_digest_portable_key_and_exact_local_codec_are_separate(self):
+        digest = self.dependency()
+        relocated = dataclasses.replace(
+            digest,
+            identity=dataclasses.replace(
+                digest.identity,
+                canonical=Path("E:/relocated/playback/gpu/example.cpp"),
+                device=99,
+                inode=101,
+            ),
+        )
+        self.assertEqual(portable_dependency_key(digest), portable_dependency_key(relocated))
+        self.assertNotEqual(
+            encode_local_dependency_digest(digest),
+            encode_local_dependency_digest(relocated),
+        )
+
+        encoded = encode_local_dependency_digest(digest)
+        pairs = json.loads(encoded.decode("ascii"), object_pairs_hook=list)
+        self.assertEqual(tuple(key for key, _value in pairs), (
+            "stable_role",
+            "role_relative_path",
+            "canonical",
+            "relative",
+            "device",
+            "inode",
+            "line_count",
+            "production",
+            "sha256",
+        ))
+        self.assertEqual(decode_local_dependency_digest(encoded), digest)
+
+        mutations = {
+            "missing-field": pairs[:-1],
+            "unknown-field": pairs + [("unknown", 1)],
+            "reordered-field": (pairs[1], pairs[0], *pairs[2:]),
+            "wrong-type": tuple(
+                (key, True if key == "line_count" else value)
+                for key, value in pairs
+            ),
+            "replacement-identity": tuple(
+                (key, 999 if key == "inode" else value)
+                for key, value in pairs
+            ),
+        }
+        for name, mutated_pairs in mutations.items():
+            mutated = json.dumps(
+                dict(mutated_pairs), ensure_ascii=True, separators=(",", ":")
+            ).encode("ascii")
+            with self.subTest(name=name):
+                if name == "replacement-identity":
+                    decoded = decode_local_dependency_digest(mutated)
+                    self.assertNotEqual(decoded, digest)
+                    with self.assertRaisesRegex(
+                        AuditInfrastructureError, "identity was replaced"
+                    ):
+                        decode_local_dependency_digest(mutated, expected=digest)
+                else:
+                    with self.assertRaises(AuditInfrastructureError):
+                        decode_local_dependency_digest(mutated)
+
+        for invalid_path in ("playback/./a.h", "playback/../a.h", "playback//a.h"):
+            mutated = dict(pairs)
+            mutated["role_relative_path"] = invalid_path
+            with self.subTest(invalid_path=invalid_path), self.assertRaises(
+                AuditInfrastructureError
+            ):
+                decode_local_dependency_digest(
+                    json.dumps(mutated, separators=(",", ":")).encode("ascii")
+                )
+
+        for invalid_canonical in (
+            "",
+            ".",
+            "relative.cpp",
+            "D:/repo/../repo/playback/gpu/example.cpp",
+        ):
+            mutated = dict(pairs)
+            mutated["canonical"] = invalid_canonical
+            with self.subTest(invalid_canonical=invalid_canonical), self.assertRaises(
+                AuditInfrastructureError
+            ):
+                decode_local_dependency_digest(
+                    json.dumps(mutated, separators=(",", ":")).encode("ascii")
+                )
+
+        for invalid_canonical in (
+            Path("."),
+            Path("relative.cpp"),
+            Path("D:/repo/../repo/playback/gpu/example.cpp"),
+        ):
+            with self.subTest(direct_canonical=invalid_canonical), self.assertRaises(
+                AuditInfrastructureError
+            ):
+                dataclasses.replace(
+                    digest,
+                    identity=dataclasses.replace(
+                        digest.identity, canonical=invalid_canonical
+                    ),
+                )
+
+    def test_native_canonical_path_spellings_are_exact_and_round_trip(self):
+        digest = self.dependency()
+        encoded = encode_local_dependency_digest(digest)
+        decoded = decode_local_dependency_digest(encoded, expected=digest)
+        self.assertEqual(encode_local_dependency_digest(decoded), encoded)
+
+        pairs = json.loads(encoded.decode("ascii"), object_pairs_hook=list)
+        malformed = (
+            "C://repo/file.cpp",
+            "C:\\\\repo\\file.cpp",
+            "C:/repo/file.cpp/",
+            "/repo/file.cpp/",
+            "//a",
+            "///repo/file.cpp",
+            "C:repo/file.cpp",
+            "C:/repo\\file.cpp",
+            "C:/repo//file.cpp",
+            "\\\\server\\share",
+            "\\\\server\\\\share\\file.cpp",
+            "\\server\\share\\file.cpp",
+        )
+        for spelling in malformed:
+            mutated_pairs = tuple(
+                (key, spelling if key == "canonical" else value)
+                for key, value in pairs
+            )
+            payload = json.dumps(
+                dict(mutated_pairs), ensure_ascii=True, separators=(",", ":")
+            ).encode("ascii")
+            with self.subTest(decode=spelling), self.assertRaises(
+                AuditInfrastructureError
+            ):
+                decode_local_dependency_digest(payload, expected=digest)
+            with self.subTest(raw_decode=spelling), self.assertRaises(
+                AuditInfrastructureError
+            ):
+                decode_local_dependency_digest(payload)
+
+            malformed_identity = dataclasses.replace(
+                digest.identity, canonical=spelling
+            )
+            with self.subTest(direct=spelling), self.assertRaises(
+                AuditInfrastructureError
+            ):
+                dataclasses.replace(digest, identity=malformed_identity)
+
+        for spelling in (
+            "/repo/playback/gpu/example.cpp",
+            "C:/repo/playback/gpu/example.cpp",
+            "//server/share/playback/gpu/example.cpp",
+        ):
+            with self.subTest(valid_raw=spelling):
+                self.assertEqual(_validate_native_canonical_text(spelling), spelling)
+
+        valid_spellings = [
+            Path("C:/repo/playback/gpu/example.cpp"),
+            Path("//server/share/playback/gpu/example.cpp"),
+        ]
+        if os.name != "nt":
+            valid_spellings.append(Path("/repo/playback/gpu/example.cpp"))
+        for canonical in valid_spellings:
+            with self.subTest(valid=canonical):
+                candidate = dataclasses.replace(
+                    digest,
+                    identity=dataclasses.replace(
+                        digest.identity, canonical=canonical
+                    ),
+                )
+                candidate_bytes = encode_local_dependency_digest(candidate)
+                self.assertEqual(
+                    encode_local_dependency_digest(
+                        decode_local_dependency_digest(
+                            candidate_bytes, expected=candidate
+                        )
+                    ),
+                    candidate_bytes,
+                )
+
+        noncanonical_json = json.dumps(
+            dict(pairs), ensure_ascii=True, indent=1
+        ).encode("ascii")
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "canonical local dependency payload"
+        ):
+            decode_local_dependency_digest(noncanonical_json, expected=digest)
+
+    def test_compact_result_model_rejects_invalid_paths_roles_and_ordering(self):
+        identity = self.identity()
+        invalid_dependencies = (
+            dict(stable_role="", role_relative_path=PurePosixPath("playback/a.h")),
+            dict(stable_role="production", role_relative_path=PurePosixPath("../a.h")),
+            dict(stable_role="production", role_relative_path=PurePosixPath("sdk/a.h")),
+            dict(stable_role="production", role_relative_path=PurePosixPath("playback/a.txt")),
+        )
+        for fields in invalid_dependencies:
+            with self.subTest(fields=fields), self.assertRaises(AuditInfrastructureError):
+                DependencyDigest(identity=identity, sha256="a" * 64, **fields)
+
+        first = self.dependency(sha256="a" * 64)
+        second = dataclasses.replace(
+            first,
+            role_relative_path=PurePosixPath("playback/gpu/another.h"),
+            identity=dataclasses.replace(
+                first.identity,
+                canonical=Path("D:/repo/playback/gpu/another.h"),
+                relative=PurePosixPath("playback/gpu/another.h"),
+            ),
+        )
+        self.assertGreater(portable_dependency_key(first), portable_dependency_key(second))
+        with self.assertRaises(AuditInfrastructureError):
+            ConfigurationAuditResult(
+                configuration_digest="c" * 64,
+                audit_engine_fingerprint="a" * 64,
+                dependencies=(first, second),
+                reached_production=(),
+                findings=(),
+            )
 
     def test_private_owned_packed_construction_avoids_copy_reserve_and_stays_read_only(self):
         configuration = self.configuration()
