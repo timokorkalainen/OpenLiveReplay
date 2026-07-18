@@ -45,6 +45,24 @@ _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _MAX_RECORD_BYTES = 16 * 1024 * 1024
 _DEFAULT_CACHE_OPERATION_SECONDS = 240.0
 _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_LOCK_NAMESPACE_MAGIC = b"OLRLN001"
+_LOCK_NAMESPACE_LANE_COUNT = 8
+_LOCK_NAMESPACE_HEADER_FORMAT = "<8sII"
+_LOCK_NAMESPACE_HEADER_BYTES = struct.calcsize(_LOCK_NAMESPACE_HEADER_FORMAT)
+_LOCK_NAMESPACE_IDENTITY_FORMAT = "<QQ"
+_LOCK_NAMESPACE_IDENTITY_BYTES = struct.calcsize(_LOCK_NAMESPACE_IDENTITY_FORMAT)
+_LOCK_NAMESPACE_RECORD_BYTES = _LOCK_NAMESPACE_IDENTITY_BYTES + hashlib.sha256().digest_size
+_LOCK_NAMESPACE_SLOT_BYTES = _LOCK_NAMESPACE_RECORD_BYTES * 2
+_LOCK_NAMESPACE_BYTES = (
+    1
+    + _LOCK_NAMESPACE_HEADER_BYTES
+    + _LOCK_NAMESPACE_LANE_COUNT * _LOCK_NAMESPACE_SLOT_BYTES
+)
+# The ledger is the lane-generation authority while the pinned cache root and
+# namespace-carrier generation remain stable.  A filesystem-only scheme cannot
+# discover an open POSIX inode after an uncooperative process replaces every
+# name for both that inode and its authority; callers therefore fail closed on
+# authority replacement rather than claiming protection across that event.
 _hash_cache: dict[tuple[object, ...], str] = {}
 _hash_lock = threading.Lock()
 
@@ -57,8 +75,80 @@ def _lock_carrier_anchor_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.anchor")
 
 
-def _before_lock_carrier_temporary_cleanup(_path: Path) -> None:
-    """Test seam for deterministic lock-carrier cleanup race coverage."""
+def _before_lock_carrier_temporary_quarantine(_path: Path) -> None:
+    """Test seam immediately before atomic lock-temporary quarantine."""
+
+
+def _after_lock_carrier_temporary_quarantine(
+    _path: Path, _quarantine: Path
+) -> None:
+    """Test seam after quarantine has detached cleanup from the public name."""
+
+
+def _rename_lock_carrier_temporary_to_quarantine(
+    source: Path, quarantine: Path
+) -> None:
+    """Atomically move to an unused private name without replacing a collision."""
+    if os.name == "nt":
+        os.rename(source, quarantine)
+        return
+    import ctypes
+    import errno
+
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    quarantine_bytes = os.fsencode(quarantine)
+    if sys.platform.startswith("linux"):
+        renameat2 = getattr(library, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace quarantine is unavailable",
+                str(source),
+            )
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,
+            source_bytes,
+            -100,
+            quarantine_bytes,
+            1,
+        )
+    elif sys.platform == "darwin":
+        renamex_np = getattr(library, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace quarantine is unavailable",
+                str(source),
+            )
+        renamex_np.argtypes = (
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(source_bytes, quarantine_bytes, 0x00000004)
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace quarantine is unavailable",
+            str(source),
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            str(quarantine),
+        )
 
 
 def _cleanup_owned_lock_carrier_temporary(
@@ -68,25 +158,68 @@ def _cleanup_owned_lock_carrier_temporary(
 ) -> None:
     if expected_identity is None:
         return
-    _before_lock_carrier_temporary_cleanup(path)
+    quarantine = path.with_name(f".quarantine-lock-{uuid.uuid4().hex}")
+    _before_lock_carrier_temporary_quarantine(path)
     try:
-        metadata = path.lstat()
+        _rename_lock_carrier_temporary_to_quarantine(path, quarantine)
     except FileNotFoundError:
         return
     except OSError as cleanup_error:
         raise AuditInfrastructureError(
-            "cache lock carrier temporary was replaced"
+            "cannot quarantine cache lock carrier temporary after "
+            f"{type(original_error).__name__}: {original_error}"
         ) from cleanup_error
-    if (
-        _is_link(metadata)
-        or not stat.S_ISREG(metadata.st_mode)
-        or _file_ownership_identity(metadata) != expected_identity
-    ):
-        raise AuditInfrastructureError(
-            "cache lock carrier temporary was replaced"
-        ) from original_error
+    _after_lock_carrier_temporary_quarantine(path, quarantine)
     try:
-        path.unlink()
+        stream = quarantine.open("r+b")
+    except OSError as cleanup_error:
+        raise AuditInfrastructureError(
+            "cache lock carrier quarantine changed"
+        ) from cleanup_error
+    with stream:
+        try:
+            metadata = quarantine.lstat()
+            opened = os.fstat(stream.fileno())
+        except OSError as cleanup_error:
+            raise AuditInfrastructureError(
+                "cache lock carrier quarantine changed"
+            ) from cleanup_error
+        if (
+            _is_link(metadata)
+            or not stat.S_ISREG(metadata.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or int(getattr(metadata, "st_nlink", 1)) != 1
+            or int(getattr(opened, "st_nlink", 1)) != 1
+            or _file_ownership_identity(metadata) != expected_identity
+            or _file_ownership_identity(opened) != expected_identity
+        ):
+            raise AuditInfrastructureError(
+                "cache lock carrier temporary was replaced; replacement preserved "
+                f"at {quarantine}"
+            ) from original_error
+        # POSIX has no portable unlink-by-file-descriptor operation.  The final
+        # path unlink is scoped to this unexposed 128-bit random private name;
+        # an observed replacement is preserved above, but we do not claim to
+        # defeat a same-user process that guesses and races that exact name.
+        if os.name != "nt":
+            try:
+                quarantine.unlink()
+                final = os.fstat(stream.fileno())
+            except OSError as cleanup_error:
+                raise AuditInfrastructureError(
+                    "cannot remove cache lock carrier temporary after "
+                    f"{type(original_error).__name__}: {original_error}"
+                ) from cleanup_error
+            if (
+                _file_ownership_identity(final) != expected_identity
+                or int(getattr(final, "st_nlink", 0)) != 0
+            ):
+                raise AuditInfrastructureError(
+                    "cache lock carrier quarantine changed while removing it"
+                ) from original_error
+            return
+    try:
+        quarantine.unlink()
     except OSError as cleanup_error:
         raise AuditInfrastructureError(
             "cannot remove cache lock carrier temporary after "
@@ -99,10 +232,24 @@ def _initialize_lock_carrier_anchor(anchor: Path) -> None:
     temporary_identity: tuple[int, int] | None = None
     try:
         with temporary.open("x+b") as stream:
-            stream.write(b"1")
+            opened = os.fstat(stream.fileno())
+            visible = temporary.lstat()
+            opened_identity = _file_ownership_identity(opened)
+            if (
+                opened_identity is None
+                or _is_link(visible)
+                or not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(visible.st_mode)
+                or int(getattr(opened, "st_nlink", 1)) != 1
+                or int(getattr(visible, "st_nlink", 1)) != 1
+                or _file_ownership_identity(visible) != opened_identity
+            ):
+                raise OSError("cache lock carrier temporary ownership is unsafe")
+            temporary_identity = opened_identity
+            if stream.write(b"1") != 1:
+                raise OSError("cache lock carrier temporary write was incomplete")
             stream.flush()
             os.fsync(stream.fileno())
-            temporary_identity = _file_ownership_identity(os.fstat(stream.fileno()))
         try:
             if os.name == "nt":
                 os.rename(temporary, anchor)
@@ -120,7 +267,10 @@ def _initialize_lock_carrier_anchor(anchor: Path) -> None:
         raise
 
 
-def _open_lock_carrier_pair(path: Path):
+def _open_lock_carrier_pair(
+    path: Path,
+    allowed_sizes: tuple[int, ...] = (1,),
+):
     anchor = _lock_carrier_anchor_path(path)
     try:
         anchor.lstat()
@@ -130,7 +280,7 @@ def _open_lock_carrier_pair(path: Path):
         except FileNotFoundError:
             _initialize_lock_carrier_anchor(anchor)
         else:
-            if int(existing.st_size) != 1:
+            if int(existing.st_size) not in allowed_sizes:
                 raise OSError("cache lock carrier is uninitialized")
             try:
                 os.link(path, anchor)
@@ -140,7 +290,7 @@ def _open_lock_carrier_pair(path: Path):
     if (
         _is_link(anchor_metadata)
         or not stat.S_ISREG(anchor_metadata.st_mode)
-        or int(anchor_metadata.st_size) != 1
+        or int(anchor_metadata.st_size) not in allowed_sizes
         or int(getattr(anchor_metadata, "st_nlink", 0)) not in (1, 2)
     ):
         raise OSError("cache lock carrier anchor is unsafe")
@@ -160,7 +310,7 @@ def _open_lock_carrier_pair(path: Path):
         anchor_stream = anchor.open("r+b")
         stream = path.open("r+b")
         _SharedCacheFileLock._assert_carrier_at(
-            path, stream, anchor_stream
+            path, stream, anchor_stream, allowed_sizes
         )
         return stream, anchor_stream
     except BaseException:
@@ -169,6 +319,139 @@ def _open_lock_carrier_pair(path: Path):
         if anchor_stream is not None:
             anchor_stream.close()
         raise
+
+
+def _read_lock_namespace_bytes(stream, offset: int, count: int) -> bytes:
+    stream.seek(offset)
+    value = stream.read(count)
+    if len(value) != count:
+        raise OSError("cache lock namespace ledger is incomplete")
+    return value
+
+
+def _lock_namespace_record(lane: int, identity: tuple[int, int]) -> bytes:
+    device, inode = identity
+    if not (0 <= device < 2**64 and 0 < inode < 2**64):
+        raise OSError("cache lock lane identity is not representable")
+    value = struct.pack(_LOCK_NAMESPACE_IDENTITY_FORMAT, device, inode)
+    digest = hashlib.sha256(
+        b"OpenLiveReplay cache lock lane generation\0"
+        + lane.to_bytes(4, "little")
+        + value
+    ).digest()
+    return value + digest
+
+
+def _decode_lock_namespace_record(lane: int, value: bytes) -> tuple[int, int]:
+    if len(value) != _LOCK_NAMESPACE_RECORD_BYTES:
+        raise OSError("cache lock namespace generation record is incomplete")
+    identity_bytes = value[:_LOCK_NAMESPACE_IDENTITY_BYTES]
+    identity = struct.unpack(_LOCK_NAMESPACE_IDENTITY_FORMAT, identity_bytes)
+    if value != _lock_namespace_record(lane, identity):
+        raise OSError("cache lock namespace generation record is invalid")
+    return identity
+
+
+def _lock_namespace_lane_index(path: Path) -> int:
+    _prefix, separator, suffix = path.name.rpartition("-")
+    if not separator or not suffix.endswith(".lock"):
+        raise OSError("cache lock lane name is invalid")
+    digits = suffix[:-len(".lock")]
+    if not digits.isascii() or not digits.isdecimal():
+        raise OSError("cache lock lane name is invalid")
+    lane = int(digits)
+    if not 0 <= lane < _LOCK_NAMESPACE_LANE_COUNT:
+        raise OSError("cache lock lane is outside the namespace ledger")
+    return lane
+
+
+def _validate_lock_namespace_ledger(stream) -> None:
+    header = _read_lock_namespace_bytes(
+        stream, 1, _LOCK_NAMESPACE_HEADER_BYTES
+    )
+    if header != struct.pack(
+        _LOCK_NAMESPACE_HEADER_FORMAT,
+        _LOCK_NAMESPACE_MAGIC,
+        _LOCK_NAMESPACE_LANE_COUNT,
+        _LOCK_NAMESPACE_RECORD_BYTES,
+    ):
+        raise OSError("cache lock namespace ledger header is invalid")
+    empty = bytes(_LOCK_NAMESPACE_RECORD_BYTES)
+    for lane in range(_LOCK_NAMESPACE_LANE_COUNT):
+        offset = (
+            1
+            + _LOCK_NAMESPACE_HEADER_BYTES
+            + lane * _LOCK_NAMESPACE_SLOT_BYTES
+        )
+        slot = _read_lock_namespace_bytes(
+            stream, offset, _LOCK_NAMESPACE_SLOT_BYTES
+        )
+        first = slot[:_LOCK_NAMESPACE_RECORD_BYTES]
+        second = slot[_LOCK_NAMESPACE_RECORD_BYTES:]
+        if first == empty and second == empty:
+            continue
+        if first != second:
+            raise OSError("cache lock namespace generation commit is incomplete")
+        _decode_lock_namespace_record(lane, first)
+
+
+def _ensure_lock_namespace_ledger(path: Path, stream, anchor_stream) -> None:
+    opened = os.fstat(stream.fileno())
+    size = int(opened.st_size)
+    if size == 1:
+        body = struct.pack(
+            _LOCK_NAMESPACE_HEADER_FORMAT,
+            _LOCK_NAMESPACE_MAGIC,
+            _LOCK_NAMESPACE_LANE_COUNT,
+            _LOCK_NAMESPACE_RECORD_BYTES,
+        ) + bytes(_LOCK_NAMESPACE_LANE_COUNT * _LOCK_NAMESPACE_SLOT_BYTES)
+        stream.seek(1)
+        if stream.write(body) != len(body):
+            raise OSError("cache lock namespace ledger upgrade was incomplete")
+        stream.flush()
+        os.fsync(stream.fileno())
+    elif size != _LOCK_NAMESPACE_BYTES:
+        raise OSError("cache lock namespace ledger size is invalid")
+    _SharedCacheFileLock._assert_carrier_at(
+        path, stream, anchor_stream, (_LOCK_NAMESPACE_BYTES,)
+    )
+    _validate_lock_namespace_ledger(stream)
+
+
+def _bind_lock_lane_generation(namespace_stream, lane_path: Path, lane_stream) -> None:
+    lane = _lock_namespace_lane_index(lane_path)
+    identity = _file_ownership_identity(os.fstat(lane_stream.fileno()))
+    if identity is None:
+        raise OSError("cache lock lane identity is unavailable")
+    offset = (
+        1
+        + _LOCK_NAMESPACE_HEADER_BYTES
+        + lane * _LOCK_NAMESPACE_SLOT_BYTES
+    )
+    slot = _read_lock_namespace_bytes(
+        namespace_stream, offset, _LOCK_NAMESPACE_SLOT_BYTES
+    )
+    empty = bytes(_LOCK_NAMESPACE_RECORD_BYTES)
+    first = slot[:_LOCK_NAMESPACE_RECORD_BYTES]
+    second = slot[_LOCK_NAMESPACE_RECORD_BYTES:]
+    if first == empty and second == empty:
+        record = _lock_namespace_record(lane, identity)
+        namespace_stream.seek(offset)
+        committed = record + record
+        if namespace_stream.write(committed) != len(committed):
+            raise OSError("cache lock lane generation commit was incomplete")
+        namespace_stream.flush()
+        os.fsync(namespace_stream.fileno())
+        slot = _read_lock_namespace_bytes(
+            namespace_stream, offset, _LOCK_NAMESPACE_SLOT_BYTES
+        )
+        first = slot[:_LOCK_NAMESPACE_RECORD_BYTES]
+        second = slot[_LOCK_NAMESPACE_RECORD_BYTES:]
+    if first != second:
+        raise OSError("cache lock lane generation commit is incomplete")
+    recorded = _decode_lock_namespace_record(lane, first)
+    if recorded != identity:
+        raise OSError("cache lock lane generation changed")
 
 
 def _check_cache_rss(reserve: int = 0) -> None:
@@ -334,10 +617,22 @@ class _SharedCacheFileLock:
 
     def _assert_carrier(self, stream) -> None:
         assert self.anchor_stream is not None
-        self._assert_carrier_at(self.path, stream, self.anchor_stream)
+        allowed_sizes = (
+            (1, _LOCK_NAMESPACE_BYTES)
+            if self.namespace_path is None
+            else (1,)
+        )
+        self._assert_carrier_at(
+            self.path, stream, self.anchor_stream, allowed_sizes
+        )
 
     @staticmethod
-    def _assert_carrier_at(path: Path, stream, anchor_stream) -> None:
+    def _assert_carrier_at(
+        path: Path,
+        stream,
+        anchor_stream,
+        allowed_sizes: tuple[int, ...] = (1,),
+    ) -> None:
         anchor_path = _lock_carrier_anchor_path(path)
         carrier = path.lstat()
         anchor = anchor_path.lstat()
@@ -347,7 +642,7 @@ class _SharedCacheFileLock:
         if (
             any(_is_link(value) for value in (carrier, anchor))
             or any(not stat.S_ISREG(value.st_mode) for value in metadata)
-            or any(int(value.st_size) != 1 for value in metadata)
+            or any(int(value.st_size) not in allowed_sizes for value in metadata)
             or any(int(getattr(value, "st_nlink", 0)) != 2 for value in metadata)
             or len({
                 (int(value.st_dev), int(value.st_ino)) for value in metadata
@@ -431,7 +726,8 @@ class _SharedCacheFileLock:
             self._acquire_root_anchor()
             if self.namespace_path is not None and self.namespace_path != self.path:
                 namespace_stream, namespace_anchor_stream = _open_lock_carrier_pair(
-                    self.namespace_path
+                    self.namespace_path,
+                    (1, _LOCK_NAMESPACE_BYTES),
                 )
                 self.namespace_stream = namespace_stream
                 self.namespace_anchor_stream = namespace_anchor_stream
@@ -439,6 +735,7 @@ class _SharedCacheFileLock:
                     self.namespace_path,
                     namespace_stream,
                     namespace_anchor_stream,
+                    (1, _LOCK_NAMESPACE_BYTES),
                 )
                 while not _PublicationGuard._lock(
                     namespace_stream, blocking=False
@@ -448,15 +745,34 @@ class _SharedCacheFileLock:
                         0.01, max(0.0, self.deadline - time.monotonic())
                     ))
                 self._namespace_locked = True
-                self._assert_carrier_at(
+                _ensure_lock_namespace_ledger(
                     self.namespace_path,
                     namespace_stream,
                     namespace_anchor_stream,
                 )
-            stream, anchor_stream = _open_lock_carrier_pair(self.path)
+                self._assert_carrier_at(
+                    self.namespace_path,
+                    namespace_stream,
+                    namespace_anchor_stream,
+                    (_LOCK_NAMESPACE_BYTES,),
+                )
+            carrier_sizes = (
+                (1, _LOCK_NAMESPACE_BYTES)
+                if self.namespace_path is None
+                else (1,)
+            )
+            stream, anchor_stream = _open_lock_carrier_pair(
+                self.path, carrier_sizes
+            )
             self.stream = stream
             self.anchor_stream = anchor_stream
             self._assert_carrier(stream)
+            if self.namespace_stream is not None:
+                _bind_lock_lane_generation(
+                    self.namespace_stream,
+                    self.path,
+                    stream,
+                )
             acquired = _PublicationGuard._lock(stream, blocking=False)
             if self.namespace_stream is not None:
                 assert self.namespace_path is not None
@@ -465,6 +781,7 @@ class _SharedCacheFileLock:
                     self.namespace_path,
                     self.namespace_stream,
                     self.namespace_anchor_stream,
+                    (_LOCK_NAMESPACE_BYTES,),
                 )
             self._assert_root()
             if (
