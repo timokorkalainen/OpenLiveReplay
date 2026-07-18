@@ -1141,15 +1141,27 @@ class CompilerInspectionCache:
                 os.replace(temporary, path)
                 self._assert_root()
             except BaseException as error:
-                try:
-                    if (
-                        temporary_identity is not None
-                        and _file_identity_tuple(_regular_unlinked_file(temporary))
-                        == temporary_identity
-                    ):
-                        temporary.unlink()
-                except (FileNotFoundError, OSError):
-                    pass
+                cleanup_failure: BaseException | None = None
+                if temporary_identity is not None:
+                    try:
+                        current_identity = _file_identity_tuple(
+                            _regular_unlinked_file(temporary)
+                        )
+                        if current_identity != temporary_identity:
+                            cleanup_failure = AuditInfrastructureError(
+                                "compiler inspection publication temporary was replaced"
+                            )
+                        else:
+                            temporary.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError as cleanup_error:
+                        cleanup_failure = cleanup_error
+                if cleanup_failure is not None:
+                    raise AuditInfrastructureError(
+                        "cannot remove compiler inspection publication temporary "
+                        f"after {type(error).__name__}: {error}"
+                    ) from cleanup_failure
                 if isinstance(error, AuditInfrastructureError):
                     raise
                 if not isinstance(error, OSError):
@@ -1192,6 +1204,26 @@ class PreprocessCache:
         if deadline is None:
             return time.monotonic() + _DEFAULT_CACHE_OPERATION_SECONDS
         return deadline
+
+    @staticmethod
+    def _check_publication_budget(
+        deadline: float, cancel_event: object | None
+    ) -> None:
+        if cancel_event is not None:
+            is_set = getattr(cancel_event, "is_set", None)
+            if not callable(is_set):
+                raise AuditInfrastructureError(
+                    "cache publication cancellation event is invalid"
+                )
+            cancelled = is_set()
+            if not isinstance(cancelled, bool):
+                raise AuditInfrastructureError(
+                    "cache publication cancellation event is invalid"
+                )
+            if cancelled:
+                raise AuditInfrastructureError("cache publication cancelled")
+        if time.monotonic() >= deadline:
+            raise AuditInfrastructureError("cache publication deadline exceeded")
 
     def _root_lock(
         self, deadline: float, cancel_event: object | None = None
@@ -1553,9 +1585,24 @@ class PreprocessCache:
             key_lock = self._acquire_key_barrier(
                 key, operation_deadline, cancel_event
             )
+            publication_acquired = False
             try:
-                self._publication_lock.acquire()
+                while True:
+                    self._check_publication_budget(
+                        operation_deadline, cancel_event
+                    )
+                    remaining = max(
+                        0.0, operation_deadline - time.monotonic()
+                    )
+                    if self._publication_lock.acquire(
+                        timeout=min(0.01, remaining)
+                    ):
+                        publication_acquired = True
+                        break
+                self._check_publication_budget(operation_deadline, cancel_event)
             except BaseException:
+                if publication_acquired:
+                    self._publication_lock.release()
                 key_lock.__exit__(None, None, None)
                 raise
             try:

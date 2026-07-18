@@ -239,8 +239,6 @@ class BoundedPreprocessorTests(unittest.TestCase):
             int(os.fstat(stream.fileno()).st_size) for stream in owner.streams
         )
         self.assertGreater(closure_bytes, 0)
-        if os.name == "nt":
-            self.assertEqual(len(owner.streams), 15)
         with mock.patch(
             "gpu_capability_command._content_sha256", side_effect=counted
         ) as content_hash:

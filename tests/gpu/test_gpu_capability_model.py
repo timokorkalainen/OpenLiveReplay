@@ -642,7 +642,7 @@ class ModelTests(unittest.TestCase):
         limits = AuditLimits()
         self.assertEqual((limits.response_depth, limits.response_files), (8, 32))
         self.assertEqual(limits.response_bytes, 4 * 1024 * 1024)
-        self.assertEqual((limits.invocation_seconds, limits.total_seconds), (60.0, 240.0))
+        self.assertEqual((limits.invocation_seconds, limits.total_seconds), (60.0, 180.0))
         self.assertEqual(limits.stdout_bytes, 128 * 1024 * 1024)
         self.assertEqual(limits.stderr_bytes, 1024 * 1024)
         self.assertEqual(limits.retained_token_bytes, 384 * 1024 * 1024)

@@ -251,7 +251,7 @@ class AuditLimits:
     response_files: int = 32
     response_bytes: int = 4 * 1024 * 1024
     invocation_seconds: float = 60.0
-    total_seconds: float = 240.0
+    total_seconds: float = 180.0
     stdout_bytes: int = 128 * 1024 * 1024
     stderr_bytes: int = 1024 * 1024
     retained_token_bytes: int = 384 * 1024 * 1024

@@ -685,7 +685,7 @@ def _run_probe_command(
     validate = getattr(owner, "validate", None)
     if not callable(validate):
         raise AuditInfrastructureError("compiler probe capability owner is invalid")
-    validate(deadline=pipeline_deadline)
+    validate(content=False, deadline=pipeline_deadline)
     command = (str(compiler), *arguments)
     launch_options = {}
     if capability.platform_kind == "linux":
@@ -771,7 +771,7 @@ def _run_probe_command(
         combined = stdout or stderr
     if len(combined) > _VERSION_BYTES:
         raise AuditInfrastructureError("compiler version output limit exceeded")
-    validate()
+    validate(content=False)
     return combined
 
 
@@ -1049,6 +1049,7 @@ class _RuntimeImports:
     rpath: tuple[str, ...] = ()
     runpath: tuple[str, ...] = ()
     format_kind: str = "unknown"
+    optional_names: tuple[str, ...] = ()
 
 
 _LINUX_LDCONFIG_BYTES = 4 * 1024 * 1024
@@ -1270,7 +1271,9 @@ def _bounded_c_string(data, offset: int) -> str:
     return value
 
 
-def _pe_runtime_import_names(data) -> tuple[str, ...]:
+def _pe_runtime_import_details(
+    data,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     length = _binary_length(data)
     if length < 64 or _binary_read(data, 0, 2) != b"MZ":
         raise AuditInfrastructureError("compiler runtime PE image is invalid")
@@ -1283,10 +1286,32 @@ def _pe_runtime_import_names(data) -> tuple[str, ...]:
     if optional + optional_size > length or section_count > 4096:
         raise AuditInfrastructureError("compiler runtime PE headers exceed bounds")
     magic = _binary_unpack(data, "<H", optional)[0]
-    directory_offset = optional + (96 if magic == 0x10B else 112 if magic == 0x20B else -1)
-    if directory_offset < optional or directory_offset + 16 > optional + optional_size:
+    if magic == 0x10B:
+        image_base = _binary_unpack(data, "<I", optional + 28)[0]
+        directory_count_offset = optional + 92
+        directory_offset = optional + 96
+    elif magic == 0x20B:
+        image_base = _binary_unpack(data, "<Q", optional + 24)[0]
+        directory_count_offset = optional + 108
+        directory_offset = optional + 112
+    else:
         raise AuditInfrastructureError("compiler runtime PE optional header is invalid")
-    import_rva, import_size = _binary_unpack(data, "<II", directory_offset + 8)
+    if directory_offset > optional + optional_size:
+        raise AuditInfrastructureError("compiler runtime PE optional header is invalid")
+    directory_count = _binary_unpack(data, "<I", directory_count_offset)[0]
+    available_directories = (optional + optional_size - directory_offset) // 8
+    if directory_count > 4096:
+        raise AuditInfrastructureError("compiler runtime PE directory ceiling exceeded")
+    if directory_count > available_directories:
+        raise AuditInfrastructureError("compiler runtime PE directory table is truncated")
+
+    def directory(index: int) -> tuple[int, int]:
+        if index >= directory_count:
+            return 0, 0
+        return _binary_unpack(data, "<II", directory_offset + index * 8)
+
+    import_rva, import_size = directory(1)
+    delay_rva, delay_size = directory(13)
     section_table = optional + optional_size
     sections = []
     for index in range(section_count):
@@ -1309,19 +1334,94 @@ def _pe_runtime_import_names(data) -> tuple[str, ...]:
             return rva
         raise AuditInfrastructureError("compiler runtime PE import RVA is invalid")
 
-    if import_rva == 0 or import_size == 0:
-        return ()
-    cursor = rva_offset(import_rva)
-    names = []
-    for _index in range(min(4096, import_size // 20 + 1)):
-        if cursor + 20 > length:
-            raise AuditInfrastructureError("compiler runtime PE imports are truncated")
-        descriptor = _binary_unpack(data, "<IIIII", cursor)
-        if descriptor == (0, 0, 0, 0, 0):
-            return tuple(dict.fromkeys(names))
-        names.append(_bounded_c_string(data, rva_offset(descriptor[3])))
-        cursor += 20
-    raise AuditInfrastructureError("compiler runtime PE import ceiling exceeded")
+    metadata_bytes = 0
+    names: list[str] = []
+    optional_names: list[str] = []
+
+    def parse_descriptors(
+        rva: int,
+        size: int,
+        descriptor_format: str,
+        name_index: int,
+        label: str,
+        *,
+        delay: bool = False,
+    ) -> None:
+        nonlocal metadata_bytes
+        if rva == 0 and size == 0:
+            return
+        if rva == 0 or size == 0:
+            raise AuditInfrastructureError(
+                f"compiler runtime PE {label} directory is invalid"
+            )
+        if size > _RUNTIME_CONTEXT_METADATA_BYTES - metadata_bytes:
+            raise AuditInfrastructureError(
+                f"compiler runtime PE {label} metadata ceiling exceeded"
+            )
+        metadata_bytes += size
+        descriptor_size = struct.calcsize(descriptor_format)
+        cursor = rva_offset(rva)
+        directory_end = cursor + size
+        if size < descriptor_size or directory_end > length:
+            raise AuditInfrastructureError(
+                f"compiler runtime PE {label}s are truncated"
+            )
+        descriptor_count = size // descriptor_size
+        if descriptor_count > 4096:
+            raise AuditInfrastructureError(
+                f"compiler runtime PE {label} ceiling exceeded"
+            )
+        for _index in range(descriptor_count):
+            descriptor = _binary_unpack(data, descriptor_format, cursor)
+            if not any(descriptor):
+                return
+            name_rva = descriptor[name_index]
+            if delay:
+                attributes = descriptor[0]
+                if attributes not in (0, 1):
+                    raise AuditInfrastructureError(
+                        "compiler runtime PE delay import attributes are invalid"
+                    )
+                if attributes == 0:
+                    if name_rva < image_base:
+                        raise AuditInfrastructureError(
+                            "compiler runtime PE delay import name VA is invalid"
+                        )
+                    name_rva -= image_base
+            name = _bounded_c_string(data, rva_offset(name_rva))
+            encoded_size = len(name.encode("utf-8")) + 1
+            if encoded_size > _RUNTIME_CONTEXT_METADATA_BYTES - metadata_bytes:
+                raise AuditInfrastructureError(
+                    f"compiler runtime PE {label} metadata ceiling exceeded"
+                )
+            metadata_bytes += encoded_size
+            names.append(name)
+            if delay:
+                optional_names.append(name)
+            cursor += descriptor_size
+        raise AuditInfrastructureError(
+            f"compiler runtime PE {label} directory is unterminated"
+        )
+
+    parse_descriptors(import_rva, import_size, "<IIIII", 3, "import")
+    parse_descriptors(
+        delay_rva, delay_size, "<IIIIIIII", 1, "delay import", delay=True
+    )
+    return (
+        tuple(dict.fromkeys(names)),
+        tuple(dict.fromkeys(optional_names)),
+    )
+
+
+def _pe_runtime_import_names(data) -> tuple[str, ...]:
+    return _pe_runtime_import_details(data)[0]
+
+
+def _pe_runtime_imports(data) -> _RuntimeImports:
+    names, optional_names = _pe_runtime_import_details(data)
+    return _RuntimeImports(
+        names, format_kind="pe", optional_names=optional_names
+    )
 
 
 def _elf_runtime_imports(data) -> _RuntimeImports:
@@ -1346,6 +1446,7 @@ def _elf_runtime_imports(data) -> _RuntimeImports:
         raise AuditInfrastructureError("compiler runtime ELF program headers exceed bounds")
     loads = []
     dynamic = None
+    interpreter_names: list[str] = []
     for index in range(phnum):
         offset = phoff + index * phentsize
         if offset + struct.calcsize(ph_format) > length:
@@ -1359,8 +1460,39 @@ def _elf_runtime_imports(data) -> _RuntimeImports:
             loads.append((virtual, file_size, file_offset))
         elif kind == 2:
             dynamic = (file_offset, file_size)
+        elif kind == 3:
+            if interpreter_names:
+                raise AuditInfrastructureError(
+                    "compiler runtime ELF has multiple PT_INTERP records"
+                )
+            if (
+                file_size < 2
+                or file_size > 32768
+                or file_size > _RUNTIME_CONTEXT_METADATA_BYTES
+                or file_offset + file_size > length
+            ):
+                raise AuditInfrastructureError(
+                    "compiler runtime ELF PT_INTERP metadata exceeds bounds"
+                )
+            payload = _binary_read(data, file_offset, file_size)
+            terminator = payload.find(b"\0")
+            if terminator < 1:
+                raise AuditInfrastructureError(
+                    "compiler runtime ELF PT_INTERP is unterminated or empty"
+                )
+            if any(payload[terminator + 1:]):
+                raise AuditInfrastructureError(
+                    "compiler runtime ELF PT_INTERP contains trailing data"
+                )
+            try:
+                interpreter = payload[:terminator].decode("utf-8")
+            except UnicodeError as error:
+                raise AuditInfrastructureError(
+                    "compiler runtime ELF PT_INTERP is invalid"
+                ) from error
+            interpreter_names.append(interpreter)
     if dynamic is None:
-        return _RuntimeImports((), format_kind="elf")
+        return _RuntimeImports(tuple(interpreter_names), format_kind="elf")
     entry_size = struct.calcsize(dynamic_format)
     needed = []
     rpath = []
@@ -1383,7 +1515,11 @@ def _elf_runtime_imports(data) -> _RuntimeImports:
         if len(needed) > 4096:
             raise AuditInfrastructureError("compiler runtime ELF import ceiling exceeded")
     if string_virtual is None:
-        return _RuntimeImports((), format_kind="elf")
+        if needed or rpath or runpath:
+            raise AuditInfrastructureError(
+                "compiler runtime ELF dynamic string table is absent"
+            )
+        return _RuntimeImports(tuple(interpreter_names), format_kind="elf")
     string_offset = None
     for virtual, file_size, file_offset in loads:
         if virtual <= string_virtual < virtual + file_size:
@@ -1394,7 +1530,12 @@ def _elf_runtime_imports(data) -> _RuntimeImports:
     decode = lambda offsets: tuple(dict.fromkeys(
         _bounded_c_string(data, string_offset + item) for item in offsets
     ))
-    return _RuntimeImports(decode(needed), decode(rpath), decode(runpath), "elf")
+    return _RuntimeImports(
+        tuple(dict.fromkeys((*interpreter_names, *decode(needed)))),
+        decode(rpath),
+        decode(runpath),
+        "elf",
+    )
 
 
 def _elf_runtime_import_names(data) -> tuple[str, ...]:
@@ -1491,9 +1632,7 @@ def _binary_runtime_imports(
     with _RuntimeBinaryReader(path, deadline, cancel_event) as data:
         magic = data.read(0, min(4, data.size))
         if magic.startswith(b"MZ"):
-            return _RuntimeImports(
-                _pe_runtime_import_names(data), format_kind="pe"
-            )
+            return _pe_runtime_imports(data)
         if magic == b"\x7fELF":
             return _elf_runtime_imports(data)
         if magic in {
@@ -1778,6 +1917,7 @@ def _recursive_runtime_paths(
     result = []
     aliases = []
     analyzed_states = set()
+    process_state_counts: dict[tuple[str, int, int | None], int] = {}
     emitted = set()
     reserved = set()
     total_bytes = 0
@@ -1817,13 +1957,17 @@ def _recursive_runtime_paths(
             os.path.normcase(str(path.resolve(strict=True)))
             for path in inherited_rpath
         )
-        loaded_key = tuple(sorted(
-            (
-                name,
-                os.path.normcase(str(path.resolve(strict=True))),
-            )
-            for name, path in loaded_modules.items()
-        ))
+        loaded_key = (
+            ()
+            if platform_kind == "windows"
+            else tuple(sorted(
+                (
+                    name,
+                    os.path.normcase(str(path)),
+                )
+                for name, path in loaded_modules.items()
+            ))
+        )
         state = (
             current_key,
             int(current_metadata.st_dev),
@@ -1851,7 +1995,15 @@ def _recursive_runtime_paths(
             )
         context_metadata_bytes += state_bytes
         analyzed_states.add(state)
-        if len(analyzed_states) > _RUNTIME_CONTEXT_STATES:
+        process_key = (
+            executable_key,
+            int(executable_metadata.st_dev),
+            int(executable_metadata.st_ino) or None,
+        )
+        process_state_counts[process_key] = process_state_counts.get(
+            process_key, 0
+        ) + 1
+        if process_state_counts[process_key] > _RUNTIME_CONTEXT_STATES:
             raise AuditInfrastructureError(
                 "compiler runtime context state ceiling exceeded"
             )
@@ -1867,20 +2019,34 @@ def _recursive_runtime_paths(
         )
         for name in imports.names:
             if imports.format_kind == "pe" and name.casefold().startswith(
-                ("api-ms-win-", "ext-ms-win-")
+                ("api-ms-", "ext-ms-")
             ):
                 # API-set contract names are resolved by the Windows loader's
                 # ApiSet map and do not name replaceable filesystem objects.
                 continue
-            resolved, resolved_aliases, child_inherited = _resolve_runtime_name(
-                name, current, process_executable, platform_kind, imports,
-                inherited_rpath, authority, environment, working_directory,
-                loaded_modules=loaded_modules, known_dlls=known_dlls,
-                deadline=deadline, cancel_event=cancel_event,
-                linux_loader_cache=linux_loader_cache,
+            module_name = Path(name).name.casefold()
+            already_loaded = (
+                imports.format_kind == "pe" and module_name in loaded_modules
             )
+            if already_loaded:
+                continue
+            try:
+                resolved, resolved_aliases, child_inherited = _resolve_runtime_name(
+                    name, current, process_executable, platform_kind, imports,
+                    inherited_rpath, authority, environment, working_directory,
+                    loaded_modules=loaded_modules, known_dlls=known_dlls,
+                    deadline=deadline, cancel_event=cancel_event,
+                    linux_loader_cache=linux_loader_cache,
+                )
+            except AuditInfrastructureError as error:
+                if (
+                    name in imports.optional_names
+                    and str(error) == f"unresolved runtime import: {name}"
+                ):
+                    continue
+                raise
             reserve(resolved)
-            loaded_modules.setdefault(Path(name).name.casefold(), resolved)
+            loaded_modules.setdefault(module_name, resolved)
             for alias in resolved_aliases:
                 if alias not in aliases:
                     aliases.append(alias)
@@ -2197,33 +2363,6 @@ def open_compiler_executable_capability(
                 return memoized
 
     candidates = [canonical]
-    helper_names = frozenset({
-        "as", "as.exe", "clang-cc1", "clang-cc1.exe", "collect2",
-        "collect2.exe", "ld", "ld.exe", "ld.lld", "ld.lld.exe",
-    })
-    siblings = []
-    try:
-        for entry_count, candidate in enumerate(canonical.parent.iterdir(), 1):
-            _check_capability_budget(pipeline_deadline, cancel_event)
-            if entry_count > _RUNTIME_ENUMERATION_ENTRIES:
-                raise AuditInfrastructureError(
-                    "compiler runtime enumeration ceiling exceeded"
-                )
-            name = candidate.name.casefold()
-            if candidate == canonical:
-                continue
-            is_runtime_library = (
-                name.endswith((".dll", ".dylib", ".so")) or ".so." in name
-            )
-            if name.startswith("cc1") or name in helper_names or is_runtime_library:
-                siblings.append(candidate)
-                if len(siblings) + 1 > _RUNTIME_CLOSURE_FILES:
-                    raise AuditInfrastructureError(
-                        "compiler runtime closure file ceiling exceeded"
-                    )
-    except OSError as error:
-        raise AuditInfrastructureError("compiler runtime closure is unreadable") from error
-    candidates.extend(sorted(siblings, key=lambda item: item.name.casefold()))
     candidates.extend(_extra_candidates)
     index = (
         _toolchain_file_index(

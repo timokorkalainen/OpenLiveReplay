@@ -264,6 +264,43 @@ class CompilerIdentificationTests(unittest.TestCase):
         return bytes(image)
 
     @staticmethod
+    def elf_interp_runtime_image(interpreter: str, *, terminated: bool = True) -> bytes:
+        encoded = interpreter.encode("utf-8") + (b"\0" if terminated else b"")
+        image = bytearray(0x100 + len(encoded))
+        ident = b"\x7fELF" + bytes((2, 1, 1)) + b"\0" * 9
+        struct.pack_into(
+            "<16sHHIQQQIHHHHHH", image, 0, ident, 2, 0x3E, 1,
+            0, 64, 0, 0, 64, 56, 1, 0, 0, 0,
+        )
+        struct.pack_into(
+            "<IIQQQQQQ", image, 64, 3, 4, 0x100, 0, 0,
+            len(encoded), len(encoded), 1,
+        )
+        image[0x100:] = encoded
+        return bytes(image)
+
+    @staticmethod
+    def pe_delay_import_runtime_image(name: str, *, valid_name_rva: bool = True) -> bytes:
+        encoded = name.encode("utf-8") + b"\0"
+        image = bytearray(0x300)
+        image[0:2] = b"MZ"
+        struct.pack_into("<I", image, 0x3C, 0x80)
+        image[0x80:0x84] = b"PE\0\0"
+        struct.pack_into("<H", image, 0x86, 1)
+        struct.pack_into("<H", image, 0x94, 240)
+        optional = 0x98
+        struct.pack_into("<H", image, optional, 0x20B)
+        struct.pack_into("<I", image, optional + 108, 16)
+        directories = optional + 112
+        struct.pack_into("<II", image, directories + 13 * 8, 0x1000, 64)
+        section = optional + 240
+        struct.pack_into("<IIII", image, section + 8, 0x100, 0x1000, 0x100, 0x200)
+        name_rva = 0x1050 if valid_name_rva else 0x90000000
+        struct.pack_into("<IIIIIIII", image, 0x200, 1, name_rva, 0, 0, 0, 0, 0, 0)
+        image[0x250:0x250 + len(encoded)] = encoded
+        return bytes(image)
+
+    @staticmethod
     def macho_runtime_image(*, needed: str, rpath: str) -> bytes:
         def command(kind: int, header_bytes: int, value: str) -> bytes:
             encoded = value.encode("utf-8") + b"\0"
@@ -294,6 +331,30 @@ class CompilerIdentificationTests(unittest.TestCase):
         self.assertEqual(imports.names, ("libchild.so",))
         self.assertEqual(imports.rpath, ("$ORIGIN/legacy",))
         self.assertEqual(imports.runpath, ("$ORIGIN/private",))
+
+    def test_elf_pt_interp_and_pe_delay_imports_are_parsed_and_closed(self):
+        elf = self.elf_interp_runtime_image("/toolchain/ld-authoritative.so")
+        pe = self.pe_delay_import_runtime_image("delay-runtime.dll")
+        self.assertEqual(
+            capability_command._elf_runtime_imports(elf).names,
+            ("/toolchain/ld-authoritative.so",),
+        )
+        self.assertEqual(
+            capability_command._pe_runtime_import_names(pe),
+            ("delay-runtime.dll",),
+        )
+
+    def test_elf_pt_interp_and_pe_delay_imports_reject_malformed_names(self):
+        with self.assertRaisesRegex(AuditInfrastructureError, "ELF|unterminated"):
+            capability_command._elf_runtime_imports(
+                self.elf_interp_runtime_image("/toolchain/ld.so", terminated=False)
+            )
+        with self.assertRaisesRegex(AuditInfrastructureError, "PE|RVA"):
+            capability_command._pe_runtime_import_names(
+                self.pe_delay_import_runtime_image(
+                    "delay-runtime.dll", valid_name_rva=False
+                )
+            )
 
     def test_macho_runtime_parser_retains_lc_rpath(self):
         imports = capability_command._macho_runtime_imports(
@@ -628,6 +689,21 @@ class ConfigurationTests(unittest.TestCase):
                 self.dependency_roots,
             )
 
+    def test_implicit_configuration_deadline_uses_global_180_second_limit(self):
+        with mock.patch(
+            "gpu_capability_command.time.monotonic", return_value=1000.0
+        ), mock.patch(
+            "gpu_capability_command.inspect_compiler",
+            side_effect=AuditInfrastructureError("captured implicit deadline"),
+        ) as inspect, self.assertRaisesRegex(
+            AuditInfrastructureError, "captured implicit deadline"
+        ):
+            make_configuration(
+                self.entry(), self.database, 3, self.source_root, self.production,
+                self.environment, AuditLimits(), self.dependency_roots,
+            )
+        self.assertEqual(inspect.call_args.args[6], 1180.0)
+
     def test_make_configuration_normalizes_all_semantic_inputs(self):
         response = self.build / "flags.rsp"
         response.write_text("-DOLR_GPU=1 ../playback/gpu/file.cpp", encoding="utf-8")
@@ -660,9 +736,16 @@ class ConfigurationTests(unittest.TestCase):
     def test_compiler_capability_holds_helper_and_versioned_runtime_siblings(self):
         helper = self.compiler.parent / "cc1plus.exe"
         runtime = self.compiler.parent / "libcompiler-runtime.so.1"
-        helper.write_bytes(b"helper")
-        runtime.write_bytes(b"runtime")
-        configuration = self.make()
+        self.compiler.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=(runtime.name,), runpath=("$ORIGIN",),
+        ))
+        helper.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        runtime.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            return_value=(helper.resolve(),),
+        ):
+            configuration = self.make()
         self.assertEqual(
             tuple(
                 item.role_relative_path.as_posix()
@@ -670,6 +753,30 @@ class ConfigurationTests(unittest.TestCase):
             ),
             ("cc1plus.exe", "g++.exe", "libcompiler-runtime.so.1"),
         )
+
+    def test_unrelated_runtime_sibling_is_excluded_from_the_closure(self):
+        runtime = self.compiler.parent / "unused-runtime.dll"
+        runtime.write_bytes(b"unused runtime")
+        empty = capability_command._RuntimeImports((), format_kind="pe")
+        missing = capability_command._RuntimeImports(
+            ("missing-transitive.dll",), format_kind="pe"
+        )
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports",
+            side_effect=lambda path, **_kwargs: (
+                missing if path.resolve() == runtime.resolve() else empty
+            ),
+        ):
+            capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0,
+            )
+        self.addCleanup(capability.native_owner.close)
+        closure = {
+            item.role_relative_path.as_posix()
+            for item in capability.resolved_runtime_closure
+        }
+        self.assertNotIn("unused-runtime.dll", closure)
 
     def test_version_probe_launches_through_held_compiler_capability(self):
         _clear_compiler_inspection_memo_for_tests()
@@ -684,28 +791,23 @@ class ConfigurationTests(unittest.TestCase):
             )
         self.assertIsInstance(run.call_args.args[0], CompilerExecutableCapability)
 
-    def test_compiler_closure_enumeration_is_bounded_before_materialization(self):
-        original_iterdir = Path.iterdir
-
-        def too_many(path: Path):
-            if path == self.compiler.parent:
-                yield self.compiler
-                for index in range(5000):
-                    yield path / f"unrelated-{index}"
-                raise AssertionError("directory fully materialized")
-            yield from original_iterdir(path)
-
+    def test_unreferenced_sibling_directory_is_not_scanned_into_closure(self):
         _clear_compiler_inspection_memo_for_tests()
-        with mock.patch.object(Path, "iterdir", too_many), self.assertRaisesRegex(
-            AuditInfrastructureError, "enumeration ceiling"
+        with mock.patch.object(
+            Path, "iterdir",
+            side_effect=AssertionError("unreferenced sibling scan"),
         ):
-            open_compiler_executable_capability(
+            capability = open_compiler_executable_capability(
                 self.compiler.resolve(), self.dependency_roots,
                 time.monotonic() + 10.0,
             )
+        self.addCleanup(capability.native_owner.close)
 
     def test_compiler_closure_rejects_oversized_runtime_before_hashing(self):
         runtime = self.compiler.parent / "huge-runtime.dll"
+        self.compiler.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=(runtime.name,), runpath=("$ORIGIN",),
+        ))
         with runtime.open("wb") as stream:
             stream.truncate(257 * 1024 * 1024)
         _clear_compiler_inspection_memo_for_tests()
@@ -892,6 +994,78 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn(nested.resolve(), guarded)
         self.assertIn(runtime_directory.resolve(), guarded)
 
+    def test_pt_interp_and_delay_import_runtime_files_enter_guarded_closure(self):
+        helper_directory = self.compiler.parent / "libexec"
+        helper_directory.mkdir()
+        elf_helper = helper_directory / "cc1"
+        interpreter = self.compiler.parent / "ld-authoritative.so"
+        pe_helper = helper_directory / "cc1plus.exe"
+        delayed = helper_directory / "delay-runtime.dll"
+        interpreter.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        delayed.write_bytes(b"delay runtime payload")
+        elf_helper.write_bytes(
+            CompilerIdentificationTests.elf_interp_runtime_image(
+                str(interpreter.resolve())
+            )
+        )
+        pe_helper.write_bytes(
+            CompilerIdentificationTests.pe_delay_import_runtime_image(delayed.name)
+        )
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            return_value=(elf_helper.resolve(), pe_helper.resolve()),
+        ), mock.patch(
+            "gpu_capability_command._windows_known_dlls", return_value=frozenset()
+        ):
+            capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment=self.environment, working_directory=self.build,
+            )
+        self.addCleanup(capability.native_owner.close)
+        closure = {
+            item.role_relative_path.as_posix()
+            for item in capability.resolved_runtime_closure
+        }
+        self.assertIn("ld-authoritative.so", closure)
+        self.assertIn("libexec/delay-runtime.dll", closure)
+        guarded = set(capability.native_owner.file_paths)
+        self.assertIn(interpreter.resolve(), guarded)
+        self.assertIn(delayed.resolve(), guarded)
+
+    def test_pt_interp_outside_runtime_authority_fails_closed(self):
+        helper = self.compiler.parent / "cc1"
+        outside = self.root / "untrusted" / "ld-untrusted.so"
+        outside.parent.mkdir()
+        outside.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        helper.write_bytes(
+            CompilerIdentificationTests.elf_interp_runtime_image(
+                str(outside.resolve())
+            )
+        )
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            return_value=(helper.resolve(),),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "authority"):
+            open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment=self.environment, working_directory=self.build,
+            )
+
+    def test_delay_import_directory_obeys_context_metadata_ceiling(self):
+        image = CompilerIdentificationTests.pe_delay_import_runtime_image(
+            "delay-runtime.dll"
+        )
+        with mock.patch(
+            "gpu_capability_command._RUNTIME_CONTEXT_METADATA_BYTES", 63
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "PE delay import metadata ceiling"
+        ):
+            capability_command._pe_runtime_import_names(image)
+
     def test_shared_runtime_is_traversed_in_driver_and_helper_loader_contexts(self):
         common = self.compiler.parent / "common"
         driver_only = self.compiler.parent / "driver-only"
@@ -1015,6 +1189,65 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn(driver_transitive.resolve(), paths)
         self.assertIn(helper_transitive.resolve(), paths)
 
+    def test_windows_api_set_delay_contracts_do_not_require_filesystem_paths(self):
+        imports = capability_command._RuntimeImports(
+            ("ext-ms-onecore-appmodel-test-l1-1-0.dll",),
+            format_kind="pe",
+        )
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports", return_value=imports
+        ), mock.patch(
+            "gpu_capability_command._windows_known_dlls", return_value=frozenset()
+        ):
+            paths, _aliases = capability_command._recursive_runtime_paths(
+                (self.compiler.resolve(),), self.compiler.resolve(),
+                self.dependency_roots, "windows", {}, self.build,
+                time.monotonic() + 10.0, None,
+            )
+        self.assertEqual(paths, (self.compiler.resolve(),))
+
+    def test_absent_optional_delay_import_does_not_become_required_at_launch(self):
+        name = "optional-delay-runtime-that-is-absent.dll"
+        imports = capability_command._RuntimeImports(
+            (name,), format_kind="pe", optional_names=(name,)
+        )
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports", return_value=imports
+        ), mock.patch(
+            "gpu_capability_command._windows_known_dlls", return_value=frozenset()
+        ):
+            paths, _aliases = capability_command._recursive_runtime_paths(
+                (self.compiler.resolve(),), self.compiler.resolve(),
+                self.dependency_roots, "windows", {}, self.build,
+                time.monotonic() + 10.0, None,
+            )
+        self.assertEqual(paths, (self.compiler.resolve(),))
+
+    def test_windows_loaded_module_cycle_is_traversed_once_per_process(self):
+        runtime = self.compiler.parent / "cycle-runtime.dll"
+        runtime.write_bytes(b"cycle runtime")
+        imports = {
+            self.compiler.resolve(): capability_command._RuntimeImports(
+                (runtime.name,), format_kind="pe"
+            ),
+            runtime.resolve(): capability_command._RuntimeImports(
+                (self.compiler.name,), format_kind="pe"
+            ),
+        }
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports",
+            side_effect=lambda path, **_kwargs: imports[path.resolve()],
+        ) as parse, mock.patch(
+            "gpu_capability_command._windows_known_dlls", return_value=frozenset()
+        ):
+            paths, _aliases = capability_command._recursive_runtime_paths(
+                (self.compiler.resolve(),), self.compiler.resolve(),
+                self.dependency_roots, "windows", {}, self.build,
+                time.monotonic() + 10.0, None,
+            )
+        self.assertEqual(paths, (self.compiler.resolve(), runtime.resolve()))
+        self.assertEqual(parse.call_count, 2)
+
     def test_runtime_loader_context_state_and_metadata_are_bounded(self):
         empty = capability_command._RuntimeImports((), (), (), "elf")
         for limit_name, message in (
@@ -1033,6 +1266,24 @@ class ConfigurationTests(unittest.TestCase):
                     self.dependency_roots, "linux", {}, self.build,
                     time.monotonic() + 10.0, None,
                 )
+
+    def test_runtime_context_state_ceiling_is_per_launched_executable(self):
+        helper = self.compiler.parent / "cc1.exe"
+        helper.write_bytes(b"helper")
+        empty = capability_command._RuntimeImports((), format_kind="pe")
+        with mock.patch(
+            "gpu_capability_command._RUNTIME_CONTEXT_STATES", 1
+        ), mock.patch(
+            "gpu_capability_command._binary_runtime_imports", return_value=empty
+        ), mock.patch(
+            "gpu_capability_command._windows_known_dlls", return_value=frozenset()
+        ):
+            paths, _aliases = capability_command._recursive_runtime_paths(
+                (self.compiler.resolve(), helper.resolve()),
+                self.compiler.resolve(), self.dependency_roots, "windows", {},
+                self.build, time.monotonic() + 10.0, None,
+            )
+        self.assertEqual(paths, (self.compiler.resolve(), helper.resolve()))
 
     def test_unresolved_loader_import_fails_closed(self):
         nested = self.compiler.parent / "libexec"
@@ -1257,10 +1508,23 @@ class ConfigurationTests(unittest.TestCase):
             with runtime.open("wb") as stream:
                 stream.truncate(220 * 1024 * 1024)
             runtimes.append(runtime)
+        self.compiler.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=tuple(runtime.name for runtime in runtimes),
+            runpath=("$ORIGIN",),
+        ))
         _clear_compiler_inspection_memo_for_tests()
+        original_imports = capability_command._binary_runtime_imports
+
+        def reject_runtime_payload(path, **kwargs):
+            if path.resolve() in {runtime.resolve() for runtime in runtimes}:
+                raise AssertionError(
+                    "runtime payload read before aggregate reservation"
+                )
+            return original_imports(path, **kwargs)
+
         with mock.patch(
             "gpu_capability_command._binary_runtime_imports",
-            side_effect=AssertionError("runtime payload read before aggregate reservation"),
+            side_effect=reject_runtime_payload,
         ), self.assertRaisesRegex(AuditInfrastructureError, "total byte ceiling"):
             open_compiler_executable_capability(
                 self.compiler.resolve(), self.dependency_roots,
@@ -1796,6 +2060,50 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(AuditInfrastructureError, "version probe timeout"):
                 from gpu_capability_command import _probe_compiler_version
                 _probe_compiler_version(capability, CompilerFamily.GCC, self.build, self.environment)
+
+    def test_probe_uses_owned_generation_guards_without_rehashing_full_closure(self):
+        capability = open_compiler_executable_capability(
+            self.compiler, self.dependency_roots, time.monotonic() + 10.0
+        )
+        self.addCleanup(capability.native_owner.close)
+
+        class Containment:
+            requires_handshake = False
+            popen_arguments = {}
+
+            def prepare_command(self, command): return command
+            def attach(self, _process): pass
+            def release(self, _process): pass
+            def close(self): pass
+            def terminate(self): pass
+
+        class Process:
+            returncode = 0
+
+            def __init__(self, *_args, stdout, **_kwargs):
+                stdout.write(b"g++ (GCC) 14.1.0\n")
+                stdout.flush()
+
+            def poll(self): return self.returncode
+            def wait(self, timeout=None): return self.returncode
+            def kill(self): self.returncode = -9
+
+        owner = capability.native_owner
+        with mock.patch.object(
+            owner, "validate", wraps=owner.validate
+        ) as validate, mock.patch(
+            "gpu_capability_command._ProbeContainment", Containment
+        ), mock.patch(
+            "gpu_capability_command.subprocess.Popen", Process
+        ):
+            capability_command._run_probe_command(
+                capability, ("--version",), self.build, self.environment,
+                time.monotonic() + 10.0,
+            )
+        self.assertEqual(
+            [call.kwargs.get("content") for call in validate.call_args_list],
+            [False, False],
+        )
 
     def test_msvc_probe_uses_a_temporary_source_and_leaves_no_artifact(self):
         capability = open_compiler_executable_capability(

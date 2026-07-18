@@ -817,6 +817,48 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             )
         self.assertEqual(list(self.cache.root.glob(".tmp-inspection-*")), [])
 
+    def test_inspection_owned_temporary_cleanup_failure_preserves_original_context(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        key = compiler_inspection_cache_key(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64,
+            executable_capability_digest=self.capability_digest,
+            resolved_runtime_closure_digest=self.closure_digest,
+        )
+        winner = self.cache._path(key)
+        winner_identity = winner.stat().st_ino
+        winner_bytes = winner.read_bytes()
+        different = dataclasses.replace(inspection, driver_fingerprint="a" * 64)
+        real_unlink = Path.unlink
+
+        def reject_owned_temporary(path, *args, **kwargs):
+            if path.name.startswith(".tmp-inspection-"):
+                raise PermissionError("deterministic owned temporary cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            Path, "unlink", autospec=True, side_effect=reject_owned_temporary
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "cannot remove compiler inspection publication temporary.*winner differs",
+        ):
+            CompilerInspectionCache(self.cache.root).publish(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, different, time.monotonic() + 10.0,
+            )
+
+        temporaries = list(self.cache.root.glob(".tmp-inspection-*"))
+        self.assertEqual(len(temporaries), 1)
+        self.assertEqual(winner.stat().st_ino, winner_identity)
+        self.assertEqual(winner.read_bytes(), winner_bytes)
+        temporaries[0].unlink()
+
     def test_live_compiler_mutation_during_cache_decode_remains_fatal(self):
         inspection = self.inspection()
         self.cache.publish(
@@ -1310,6 +1352,85 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             publisher_thread.join(timeout=10.0)
         self.assertFalse(publisher_thread.is_alive())
         self.assertEqual(publication_failures, [])
+
+    def test_different_key_publication_lock_honors_deadline_and_cancellation(self):
+        for mode in ("deadline", "cancel"):
+            with self.subTest(mode=mode):
+                cache = PreprocessCache(self.root / f"publication-lock-{mode}")
+                blocker_view = self.view()
+                contender_configuration = dataclasses.replace(
+                    self.configuration, digest=f"contender-{mode}"
+                )
+                contender_view = self.view(configuration=contender_configuration)
+                blocker_snapshots = cache._snapshot_dependencies(
+                    blocker_view.dependencies, force=True
+                )
+                contender_snapshots = cache._snapshot_dependencies(
+                    contender_view.dependencies, force=True
+                )
+                validation_entered = threading.Event()
+                release_validation = threading.Event()
+                contender_done = threading.Event()
+                blocker_failures: list[BaseException] = []
+                contender_failures: list[BaseException] = []
+                cancelled = threading.Event()
+
+                def final_validation() -> None:
+                    validation_entered.set()
+                    if not release_validation.wait(timeout=5.0):
+                        raise AssertionError("publication lock release timed out")
+
+                def block() -> None:
+                    try:
+                        cache._publish_stabilized(
+                            blocker_view,
+                            blocker_snapshots,
+                            final_validation=final_validation,
+                            deadline=time.monotonic() + 5.0,
+                        )
+                    except BaseException as error:
+                        blocker_failures.append(error)
+
+                def contend() -> None:
+                    try:
+                        cache._publish_stabilized(
+                            contender_view,
+                            contender_snapshots,
+                            deadline=(
+                                time.monotonic() + 0.05
+                                if mode == "deadline"
+                                else time.monotonic() + 5.0
+                            ),
+                            cancel_event=cancelled,
+                        )
+                    except BaseException as error:
+                        contender_failures.append(error)
+                    finally:
+                        contender_done.set()
+
+                blocker_thread = threading.Thread(target=block)
+                contender_thread = threading.Thread(target=contend)
+                blocker_thread.start()
+                self.assertTrue(validation_entered.wait(timeout=5.0))
+                contender_thread.start()
+                if mode == "cancel":
+                    time.sleep(0.05)
+                    cancelled.set()
+                try:
+                    self.assertTrue(
+                        contender_done.wait(timeout=0.3),
+                        "different-key publication ignored deadline/cancellation",
+                    )
+                finally:
+                    release_validation.set()
+                    blocker_thread.join(timeout=5.0)
+                    contender_thread.join(timeout=5.0)
+                self.assertEqual(blocker_failures, [])
+                self.assertEqual(len(contender_failures), 1)
+                self.assertIsInstance(
+                    contender_failures[0], AuditInfrastructureError
+                )
+                self.assertIsNone(cache.load(contender_configuration))
 
     def test_valid_winner_fails_if_losing_temporary_cannot_be_removed(self):
         winner = PreprocessCache(self.cache_root)
