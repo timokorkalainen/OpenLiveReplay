@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import stat
@@ -154,6 +155,8 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             0, False,
         )
         self.environment = {"PATH": str(self.toolchain)}
+        self.capability_digest = "d" * 64
+        self.closure_digest = "f" * 64
 
     def tearDown(self) -> None:
         _PreprocessCacheFixture.tearDown(self)
@@ -173,13 +176,15 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         inspection = self.inspection()
         published = self.cache.publish(
             self.compiler.resolve(), CompilerFamily.GCC, self.environment,
-            self.authority, "e" * 64, inspection, time.monotonic() + 10.0,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
         )
         self.assertEqual(published, inspection)
         self.assertEqual(
             self.cache.load(
                 self.compiler.resolve(), CompilerFamily.GCC, self.environment,
-                self.authority, "e" * 64, time.monotonic() + 10.0,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
             ),
             inspection,
         )
@@ -196,13 +201,33 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         )
         first = compiler_inspection_cache_key(
             self.compiler.resolve(), CompilerFamily.GCC, {}, self.authority,
-            "e" * 64,
+            "e" * 64, executable_capability_digest="d" * 64,
+            resolved_runtime_closure_digest="f" * 64,
         )
         second = compiler_inspection_cache_key(
             other_compiler.resolve(), CompilerFamily.GCC, {}, other_authority,
-            "e" * 64,
+            "e" * 64, executable_capability_digest="d" * 64,
+            resolved_runtime_closure_digest="f" * 64,
         )
         self.assertEqual(first, second)
+
+    def test_inspection_cache_key_binds_capability_and_runtime_closure_digests(self):
+        parameters = inspect.signature(compiler_inspection_cache_key).parameters
+        self.assertIn("executable_capability_digest", parameters)
+        self.assertIn("resolved_runtime_closure_digest", parameters)
+        common = (
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64,
+        )
+        first = compiler_inspection_cache_key(
+            *common, executable_capability_digest="a" * 64,
+            resolved_runtime_closure_digest="b" * 64,
+        )
+        second = compiler_inspection_cache_key(
+            *common, executable_capability_digest="c" * 64,
+            resolved_runtime_closure_digest="d" * 64,
+        )
+        self.assertNotEqual(first, second)
 
     def test_equal_portable_digest_with_different_local_roots_fails_before_access(self):
         other_source = self.root / "second-source"
@@ -221,20 +246,23 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         ), self.assertRaisesRegex(AuditInfrastructureError, "local dependency authority"):
             self.cache.load(
                 self.compiler.resolve(), CompilerFamily.GCC, self.environment,
-                other_authority, "e" * 64, time.monotonic() + 10.0,
+                other_authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
             )
 
     def test_changed_compiler_content_is_a_miss_without_old_manifest_use(self):
         inspection = self.inspection()
         self.cache.publish(
             self.compiler.resolve(), CompilerFamily.GCC, self.environment,
-            self.authority, "e" * 64, inspection, time.monotonic() + 10.0,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
         )
         self.compiler.write_bytes(b"compiler-two")
         self.assertIsNone(
             self.cache.load(
                 self.compiler.resolve(), CompilerFamily.GCC, self.environment,
-                self.authority, "e" * 64, time.monotonic() + 10.0,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
             )
         )
 

@@ -651,7 +651,7 @@ def _after_cleanup_quarantine(_path: Path) -> None:
     """Test seam for deterministic cleanup replacement-race coverage."""
 
 
-_COMPILER_INSPECTION_SCHEMA = "olr-gpu-compiler-inspection-cache-v1"
+_COMPILER_INSPECTION_SCHEMA = "olr-gpu-compiler-inspection-cache-v2"
 _COMPILER_INSPECTION_MAX_BYTES = 512 * 1024
 
 
@@ -708,6 +708,9 @@ def compiler_inspection_cache_key(
     launcher_environment,
     dependency_roots: DependencyRootAuthority,
     expected_audit_engine_fingerprint: str,
+    *,
+    executable_capability_digest: str,
+    resolved_runtime_closure_digest: str,
 ) -> str:
     authority = validate_dependency_root_authority(dependency_roots)
     if not isinstance(compiler_family, CompilerFamily):
@@ -735,6 +738,15 @@ def compiler_inspection_cache_key(
             "compiler inspection executable is outside the local dependency authority"
         )
     _identity, content = _held_compiler_snapshot(canonical)
+    for label, value in (
+        ("compiler executable capability", executable_capability_digest),
+        ("compiler resolved runtime closure", resolved_runtime_closure_digest),
+    ):
+        if (
+            not isinstance(value, str) or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise AuditInfrastructureError(f"{label} digest is invalid")
     digest = hashlib.sha256()
     for value in (
         _COMPILER_INSPECTION_SCHEMA,
@@ -743,6 +755,8 @@ def compiler_inspection_cache_key(
         _inspection_environment_digest(launcher_environment),
         authority.portable_authority_digest,
         expected_audit_engine_fingerprint,
+        executable_capability_digest,
+        resolved_runtime_closure_digest,
     ):
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "little"))
@@ -783,6 +797,8 @@ class CompilerInspectionCache:
         launcher_environment,
         dependency_roots: DependencyRootAuthority,
         expected_audit_engine_fingerprint: str,
+        executable_capability_digest: str,
+        resolved_runtime_closure_digest: str,
         pipeline_deadline: float,
     ) -> CompilerInspection | None:
         authority = validate_dependency_root_authority(dependency_roots)
@@ -791,6 +807,8 @@ class CompilerInspectionCache:
         key = compiler_inspection_cache_key(
             compiler, compiler_family, launcher_environment, authority,
             expected_audit_engine_fingerprint,
+            executable_capability_digest=executable_capability_digest,
+            resolved_runtime_closure_digest=resolved_runtime_closure_digest,
         )
         path = self._path(key)
         try:
@@ -804,13 +822,17 @@ class CompilerInspectionCache:
                 held.verify()
             document = json.loads(payload.decode("ascii"))
             if not isinstance(document, dict) or tuple(document) != (
-                "schema", "key", "dependency_root_authority_digest", "inspection"
+                "schema", "key", "dependency_root_authority_digest",
+                "executable_capability_digest", "resolved_runtime_closure_digest",
+                "inspection"
             ):
                 raise ValueError("compiler inspection manifest schema is invalid")
             if (
                 document["schema"] != _COMPILER_INSPECTION_SCHEMA
                 or document["key"] != key
                 or document["dependency_root_authority_digest"] != authority.portable_authority_digest
+                or document["executable_capability_digest"] != executable_capability_digest
+                or document["resolved_runtime_closure_digest"] != resolved_runtime_closure_digest
                 or not isinstance(document["inspection"], str)
             ):
                 raise ValueError("compiler inspection manifest is invalid")
@@ -838,6 +860,8 @@ class CompilerInspectionCache:
         launcher_environment,
         dependency_roots: DependencyRootAuthority,
         expected_audit_engine_fingerprint: str,
+        executable_capability_digest: str,
+        resolved_runtime_closure_digest: str,
         inspection: CompilerInspection,
         pipeline_deadline: float,
     ) -> CompilerInspection:
@@ -847,6 +871,8 @@ class CompilerInspectionCache:
         key = compiler_inspection_cache_key(
             compiler, compiler_family, launcher_environment, authority,
             expected_audit_engine_fingerprint,
+            executable_capability_digest=executable_capability_digest,
+            resolved_runtime_closure_digest=resolved_runtime_closure_digest,
         )
         identity, content = _held_compiler_snapshot(compiler)
         if (
@@ -860,6 +886,8 @@ class CompilerInspectionCache:
             "schema": _COMPILER_INSPECTION_SCHEMA,
             "key": key,
             "dependency_root_authority_digest": authority.portable_authority_digest,
+            "executable_capability_digest": executable_capability_digest,
+            "resolved_runtime_closure_digest": resolved_runtime_closure_digest,
             "inspection": base64.b64encode(
                 encode_compiler_inspection(inspection)
             ).decode("ascii"),

@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import json
 import os
 import stat
@@ -37,6 +38,7 @@ from gpu_capability_model import (  # noqa: E402
     PreprocessConfiguration,
     SourceLocation,
     _check_casefold_collision,
+    _FilesystemGenerationObserver,
     _validate_native_canonical_text,
     _walk_production_entries,
     build_dependency_root_authority,
@@ -134,22 +136,19 @@ class ModelTests(unittest.TestCase):
         self.assertRegex(authority.portable_authority_digest, r"\A[0-9a-f]{64}\Z")
 
     def test_compiler_inspection_is_exact_frozen_and_strict(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        compiler = Path(temporary.name).resolve() / "g++.exe"
+        compiler.write_bytes(b"compiler")
+        metadata = compiler.stat()
         identity = FileIdentity(
-            canonical=Path("C:/toolchain/g++.exe"),
-            relative=None,
-            device=3,
-            inode=9,
-            line_count=0,
-            production=False,
+            canonical=compiler, relative=None, device=int(metadata.st_dev),
+            inode=int(metadata.st_ino) or None, line_count=0, production=False,
         )
         inspection = CompilerInspection(
-            CompilerFamily.GCC,
-            identity,
-            "a" * 64,
-            "g++ (GCC) 14.1.0",
-            "b" * 64,
-            "c" * 64,
-            "d" * 64,
+            CompilerFamily.GCC, identity,
+            hashlib.sha256(compiler.read_bytes()).hexdigest(),
+            "g++ (GCC) 14.1.0", "b" * 64, "c" * 64, "d" * 64,
         )
         self.assertEqual(
             tuple(inspection.__dataclass_fields__),
@@ -178,14 +177,26 @@ class ModelTests(unittest.TestCase):
         for field, value in replacements.items():
             with self.subTest(field=field), self.assertRaises(AuditInfrastructureError):
                 dataclasses.replace(inspection, **{field: value})
+        directory_identity = dataclasses.replace(identity, canonical=compiler.parent)
+        with self.assertRaisesRegex(AuditInfrastructureError, "regular"):
+            dataclasses.replace(inspection, executable_identity=directory_identity)
+        compiler.write_bytes(b"changed")
+        with self.assertRaisesRegex(AuditInfrastructureError, "changed"):
+            dataclasses.replace(inspection)
 
     def test_compiler_inspection_codec_is_exact_and_rejects_unknown_keys(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        compiler = Path(temporary.name).resolve() / "g++.exe"
+        compiler.write_bytes(b"compiler")
+        metadata = compiler.stat()
         identity = FileIdentity(
-            canonical=Path("C:/toolchain/g++.exe"), relative=None, device=3,
-            inode=9, line_count=0, production=False,
+            canonical=compiler, relative=None, device=int(metadata.st_dev),
+            inode=int(metadata.st_ino) or None, line_count=0, production=False,
         )
         inspection = CompilerInspection(
-            CompilerFamily.GCC, identity, "a" * 64, "g++ (GCC) 14.1.0",
+            CompilerFamily.GCC, identity,
+            hashlib.sha256(compiler.read_bytes()).hexdigest(), "g++ (GCC) 14.1.0",
             "b" * 64, "c" * 64, "d" * 64,
         )
         payload = encode_compiler_inspection(inspection)
@@ -196,6 +207,38 @@ class ModelTests(unittest.TestCase):
             decode_compiler_inspection(
                 json.dumps(document, separators=(",", ":")).encode("ascii")
             )
+
+    def test_windows_generation_observer_closes_partial_handles_on_setup_failure(self):
+        class Callable:
+            def __init__(self, values):
+                self.values = iter(values)
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *_args):
+                return next(self.values)
+
+        create = Callable((101, -1))
+        closed = []
+        close = Callable((True,))
+
+        def close_record(handle):
+            closed.append(handle)
+            return close(handle)
+
+        close_record.argtypes = None
+        close_record.restype = None
+        kernel32 = SimpleNamespace(CreateFileW=create, CloseHandle=close_record)
+        observer = object.__new__(_FilesystemGenerationObserver)
+        observer._handles = []
+        observer._owner = None
+        with mock.patch("ctypes.WinDLL", return_value=kernel32), self.assertRaisesRegex(
+            AuditInfrastructureError, "setup failed"
+        ):
+            observer._arm_windows(
+                ((Path("C:/first"), False), (Path("C:/second"), False))
+            )
+        self.assertEqual(closed, [101])
 
     def test_configuration_audit_result_is_compact_frozen_and_sorted(self):
         dependency = self.dependency()

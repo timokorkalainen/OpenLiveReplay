@@ -74,6 +74,7 @@ class _FilesystemGenerationObserver:
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = (wintypes.HANDLE,)
         close_handle.restype = wintypes.BOOL
+        self._owner = (kernel32, close_handle)
         invalid = ctypes.c_void_p(-1).value
         for path, is_directory in paths:
             access = 0 if is_directory else 0x80000000  # GENERIC_READ
@@ -82,11 +83,20 @@ class _FilesystemGenerationObserver:
             handle = create_file(str(path), access, share, None, 3, flags, None)
             numeric = ctypes.cast(handle, ctypes.c_void_p).value
             if numeric in (None, invalid):
+                errors = []
+                for acquired in reversed(self._handles):
+                    if not close_handle(acquired):
+                        errors.append(acquired)
+                self._handles.clear()
+                self._owner = None
+                if errors:
+                    raise AuditInfrastructureError(
+                        "Windows filesystem generation guard partial cleanup failed"
+                    )
                 raise AuditInfrastructureError(
                     "Windows filesystem generation guard setup failed"
                 )
             self._handles.append(int(numeric))
-        self._owner = (kernel32, close_handle)
 
     def _arm_linux(self, paths: tuple[tuple[Path, bool], ...]) -> None:
         import ctypes
@@ -296,8 +306,10 @@ class CompilerInspection:
     def __post_init__(self) -> None:
         if not isinstance(self.compiler_family, CompilerFamily):
             raise AuditInfrastructureError("compiler inspection family is invalid")
-        _validate_executable_identity(self.executable_identity)
+        _validate_current_executable_identity(self.executable_identity)
         _validate_digest(self.executable_sha256, "compiler executable content")
+        if _current_executable_sha256(self.executable_identity) != self.executable_sha256:
+            raise AuditInfrastructureError("compiler executable content changed")
         if (
             not isinstance(self.normalized_version, str)
             or not self.normalized_version
@@ -1487,6 +1499,51 @@ def _validate_executable_identity(identity: object) -> FileIdentity:
     ):
         raise AuditInfrastructureError("compiler executable identity is invalid")
     return identity
+
+
+def _validate_current_executable_identity(identity: object) -> FileIdentity:
+    identity = _validate_executable_identity(identity)
+    try:
+        before = identity.canonical.lstat()
+        canonical = identity.canonical.resolve(strict=True)
+        current = canonical.stat()
+    except (OSError, RuntimeError) as error:
+        raise AuditInfrastructureError("compiler executable identity changed") from error
+    if (
+        canonical != identity.canonical
+        or not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or (int(current.st_dev), int(current.st_ino) or None)
+        != (identity.device, identity.inode)
+    ):
+        raise AuditInfrastructureError("compiler executable identity is not a current regular file")
+    return identity
+
+
+def _current_executable_sha256(identity: FileIdentity) -> str:
+    _validate_current_executable_identity(identity)
+    digest = hashlib.sha256()
+    try:
+        with identity.canonical.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (int(opened.st_dev), int(opened.st_ino) or None) != (
+                identity.device, identity.inode
+            ):
+                raise OSError("identity changed")
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+        current = identity.canonical.stat()
+    except OSError as error:
+        raise AuditInfrastructureError("compiler executable content changed") from error
+    expected = (identity.device, identity.inode)
+    if (
+        (int(after.st_dev), int(after.st_ino) or None) != expected
+        or (int(current.st_dev), int(current.st_ino) or None) != expected
+    ):
+        raise AuditInfrastructureError("compiler executable content changed")
+    return digest.hexdigest()
 
 
 def encode_compiler_inspection(inspection: CompilerInspection) -> bytes:

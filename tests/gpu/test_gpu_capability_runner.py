@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import subprocess
+import struct
 import sys
 import tempfile
 import threading
@@ -23,6 +24,7 @@ import gpu_capability_command as capability_command  # noqa: E402
 import gpu_capability_model as capability_model  # noqa: E402
 from gpu_capability_command import (  # noqa: E402
     RewrittenCommand,
+    _clear_compiler_inspection_memo_for_tests,
     _environment_digest,
     open_compiler_executable_capability,
 )
@@ -60,7 +62,8 @@ class BoundedPreprocessorTests(unittest.TestCase):
         self.source = self.root / "playback" / "a.cpp"
         self.source.parent.mkdir(parents=True)
         self.source.write_text("lease.nativeHandle();\n", encoding="utf-8")
-        self.outside = self.root / "sdk" / "outside.h"
+        self.external_temporary = tempfile.TemporaryDirectory()
+        self.outside = Path(self.external_temporary.name).resolve() / "sdk" / "outside.h"
         self.outside.parent.mkdir()
         self.outside.write_text("outside\n", encoding="utf-8")
         metadata = self.source.stat()
@@ -74,7 +77,10 @@ class BoundedPreprocessorTests(unittest.TestCase):
         )
         self.production = {self.identity.relative: self.identity}
         self.dependency_roots = build_dependency_root_authority(
-            self.root, {"toolchain": Path(sys.executable).resolve().parent}
+            self.root, {
+                "sdk": self.outside.parent,
+                "toolchain": Path(sys.executable).resolve().parent,
+            }
         )
         self.compiler_capability = open_compiler_executable_capability(
             Path(sys.executable).resolve(), self.dependency_roots, time.monotonic() + 10.0
@@ -83,7 +89,9 @@ class BoundedPreprocessorTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.compiler_capability.native_owner.close()
+        _clear_compiler_inspection_memo_for_tests()
         self.temporary.cleanup()
+        self.external_temporary.cleanup()
 
     def configuration(
         self,
@@ -159,7 +167,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 deadline if deadline is not None else time.monotonic() + 10.0,
             )
 
-    def stabilize_fixture(self, mode: str):
+    def stabilize_fixture(self, mode: str, *extra: str):
         configuration = self.configuration(mode)
 
         def rewrite(_configuration, dependency_output):
@@ -171,6 +179,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
                     mode,
                     "--family",
                     "gcc",
+                    *extra,
                     str(self.source),
                     "-MF",
                     str(dependency_output),
@@ -215,6 +224,49 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 AuditInfrastructureError, message
             ):
                 self.stabilize_fixture(mode)
+
+    def test_dependency_reorder_add_and_remove_are_rejected(self):
+        header = self.root / "playback" / "guarded.h"
+        header.write_text("header\n", encoding="utf-8")
+        metadata = header.stat()
+        header_identity = FileIdentity(
+            header.resolve(), PurePosixPath("playback/guarded.h"),
+            int(metadata.st_dev), int(metadata.st_ino) or None, 1, True,
+        )
+        self.production[header_identity.relative] = header_identity
+        for schedule in ("reorder", "add", "remove"):
+            with self.subTest(schedule=schedule), self.assertRaisesRegex(
+                AuditInfrastructureError, "dependency closure changed"
+            ):
+                self.stabilize_fixture(
+                    "success", "--extra-dependency", str(header),
+                    "--dependency-schedule", schedule,
+                )
+
+    def test_accepted_production_and_external_mutation_restoration_fail_closed(self):
+        for target in (self.source, self.outside):
+            expected = (
+                "guard prevented generation change"
+                if os.name == "nt" else "generation change"
+            )
+            with self.subTest(target=target), self.assertRaisesRegex(
+                AuditInfrastructureError, expected
+            ):
+                self.stabilize_fixture(
+                    "mutate-restore", "--mutate-path", str(target),
+                    "--extra-dependency", str(target),
+                )
+
+    def test_accepted_authority_root_swap_restoration_fails_closed(self):
+        expected = (
+            "guard prevented generation change"
+            if os.name == "nt" else "generation change"
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, expected):
+            self.stabilize_fixture(
+                "swap-root-restore", "--mutate-path", str(self.outside.parent),
+                "--extra-dependency", str(self.outside),
+            )
 
     def test_real_subprocess_accepts_thread_and_spawn_cancellation_events(self):
         events = (threading.Event(), multiprocessing.get_context("spawn").Event())
@@ -901,6 +953,11 @@ class BoundedPreprocessorTests(unittest.TestCase):
 
 class OrchestrationTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.driver_helpers = mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths", return_value=()
+        )
+        self.driver_helpers.start()
+        self.addCleanup(self.driver_helpers.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.build = self.root / "build"
@@ -916,7 +973,10 @@ class OrchestrationTests(unittest.TestCase):
             self.root, {"toolchain": self.compiler.parent}
         )
         self.compiler_capability = open_compiler_executable_capability(
-            self.compiler.resolve(), self.dependency_roots, time.monotonic() + 10.0
+            self.compiler.resolve(),
+            self.dependency_roots,
+            time.monotonic() + 10.0,
+            compiler_family=CompilerFamily.GCC,
         )
 
     def tearDown(self) -> None:
@@ -986,6 +1046,60 @@ class OrchestrationTests(unittest.TestCase):
             ),
         ):
             _FilesystemGenerationObserver(((path, False),))
+
+    def test_linux_generation_observer_fails_on_overflow_and_watch_loss(self):
+        for mask, expected in ((0x00004000, "overflow"), (0x00008000, "watch was lost")):
+            read_fd, write_fd = os.pipe()
+            observer = object.__new__(_FilesystemGenerationObserver)
+            observer._backend = "linux"
+            observer._owner = set()
+            observer._handles = [read_fd]
+            observer._closed = False
+            os.set_blocking(read_fd, False)
+            os.write(write_fd, struct.pack("iIII", 1, mask, 0, 0))
+            os.close(write_fd)
+            try:
+                with self.subTest(mask=mask), self.assertRaisesRegex(
+                    AuditInfrastructureError, expected
+                ):
+                    observer.drain()
+            finally:
+                observer.close()
+
+    def test_local_authority_mismatch_rejects_before_preprocess_cache_or_compiler(self):
+        source = self.write_source("playback/authority.cpp")
+        identity = self.identity(source, "playback/authority.cpp")
+        configuration = self.configuration(identity, "authority-mismatch")
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        other_root = Path(other.name).resolve()
+        other_source = other_root / "source"
+        other_toolchain = other_root / "toolchain"
+        other_source.mkdir()
+        other_toolchain.mkdir()
+        authority = build_dependency_root_authority(
+            other_source, {"toolchain": other_toolchain}
+        )
+        self.assertEqual(
+            authority.portable_authority_digest,
+            self.dependency_roots.portable_authority_digest,
+        )
+        with (
+            mock.patch.object(
+                self.cache, "load", side_effect=AssertionError("cache reached")
+            ),
+            mock.patch(
+                "gpu_capability_runner.stabilize_and_parse_configuration",
+                side_effect=AssertionError("compiler reached"),
+            ),
+            self.assertRaisesRegex(
+                AuditInfrastructureError, "local dependency authority"
+            ),
+        ):
+            load_or_preprocess(
+                configuration, authority, {identity.relative: identity}, self.cache,
+                AuditLimits(rss_bytes=2**63 - 1), time.monotonic() + 10.0,
+            )
 
     @staticmethod
     def identity(path: Path, relative: str) -> FileIdentity:

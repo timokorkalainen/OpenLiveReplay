@@ -351,8 +351,20 @@ def _run_live_fixture_impl(
             "arguments": arguments,
         },)), encoding="utf-8", newline="\n")
         environment = dict(os.environ)
+        toolchain_root = (
+            compiler.parent.parent
+            if family in {
+                CompilerFamily.GCC, CompilerFamily.CLANG, CompilerFamily.CLANG_CL,
+            }
+            else compiler.parents[3]
+        )
+        if root.is_relative_to(toolchain_root) or toolchain_root.is_relative_to(root):
+            # Contract tests substitute the running Python executable while
+            # stubbing collection. Keep those synthetic roots disjoint from
+            # the temporary source tree without weakening real-family roots.
+            toolchain_root = compiler.parent
         dependency_roots = build_dependency_root_authority(
-            root, {"toolchain": compiler.parent}
+            root, {"toolchain": toolchain_root}
         )
         configurations = collect_configurations(
             root, (database,), environment, dependency_roots
@@ -364,6 +376,18 @@ def _run_live_fixture_impl(
         if configurations[0].family is not family:
             raise AuditInfrastructureError(
                 "live compiler family contradicts the selected family"
+            )
+        closure = configurations[0].compiler_capability.resolved_runtime_closure
+        if len(closure) < 2:
+            raise AuditInfrastructureError(
+                "live compiler capability did not resolve its runtime closure"
+            )
+        if family is CompilerFamily.GCC and not any(
+            item.role_relative_path.name.casefold().startswith("cc1")
+            for item in closure
+        ):
+            raise AuditInfrastructureError(
+                "live GCC capability did not resolve the driver-selected cc1 helper"
             )
         production = enumerate_production_identities(root)
         cache = PreprocessCache(root / "gpu-capability-cache")
@@ -726,6 +750,9 @@ FORWARD(lease.safe)();
         configuration = SimpleNamespace(
             family=CompilerFamily.MSVC,
             digest="cfg-live",
+            compiler_capability=SimpleNamespace(
+                resolved_runtime_closure=(object(), object())
+            ),
         )
         view = SimpleNamespace(configuration=configuration)
         coverage = object()
@@ -779,6 +806,9 @@ FORWARD(lease.safe)();
         configuration = SimpleNamespace(
             family=CompilerFamily.MSVC,
             digest="cfg-live",
+            compiler_capability=SimpleNamespace(
+                resolved_runtime_closure=(object(), object())
+            ),
         )
         view = SimpleNamespace(configuration=configuration)
         coverage = object()

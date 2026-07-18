@@ -16,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import gpu_capability_command as capability_command  # noqa: E402
 from gpu_capability_command import (  # noqa: E402
     RewrittenCommand,
     _clear_compiler_inspection_memo_for_tests,
@@ -23,7 +24,9 @@ from gpu_capability_command import (  # noqa: E402
     decode_compile_entry,
     expand_response_files,
     identify_compiler,
+    inspect_compiler,
     make_configuration,
+    open_compiler_executable_capability,
     rewrite_preprocess_command,
     strip_launchers,
 )
@@ -224,6 +227,13 @@ class LauncherTests(unittest.TestCase):
 
 
 class CompilerIdentificationTests(unittest.TestCase):
+    def test_binary_runtime_import_parser_reads_current_executable(self):
+        resolver = getattr(capability_command, "_binary_runtime_import_names", None)
+        self.assertTrue(callable(resolver), "binary runtime import resolver is absent")
+        imports = resolver(Path(sys.executable).resolve())
+        self.assertIsInstance(imports, tuple)
+        self.assertTrue(imports)
+
     def test_identifies_all_supported_families_from_name_and_version(self):
         cases = (
             ("g++.exe", b"g++.exe (Rev2, Built by MSYS2 project) 13.1.0\n", CompilerFamily.GCC),
@@ -432,6 +442,11 @@ class ResponseFileTests(unittest.TestCase):
 
 class ConfigurationTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.driver_helpers = mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths", return_value=()
+        )
+        self.driver_helpers.start()
+        self.addCleanup(self.driver_helpers.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.source_root = self.root / "repo"
@@ -526,6 +541,59 @@ class ConfigurationTests(unittest.TestCase):
             ),
             ("cc1plus.exe", "g++.exe", "libcompiler-runtime.so.1"),
         )
+
+    def test_version_probe_launches_through_held_compiler_capability(self):
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._run_probe_command",
+            return_value=b"g++.exe (GCC) 13.1.0\n",
+        ) as run:
+            inspect_compiler(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.dependency_roots, pipeline_deadline=time.monotonic() + 10.0,
+                working_directory=self.build,
+            )
+        self.assertIsInstance(run.call_args.args[0], CompilerExecutableCapability)
+
+    def test_compiler_closure_enumeration_is_bounded_before_materialization(self):
+        original_iterdir = Path.iterdir
+
+        def too_many(path: Path):
+            if path == self.compiler.parent:
+                yield self.compiler
+                for index in range(5000):
+                    yield path / f"unrelated-{index}"
+                raise AssertionError("directory fully materialized")
+            yield from original_iterdir(path)
+
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch.object(Path, "iterdir", too_many), self.assertRaisesRegex(
+            AuditInfrastructureError, "enumeration ceiling"
+        ):
+            open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0,
+            )
+
+    def test_compiler_closure_rejects_oversized_runtime_before_hashing(self):
+        runtime = self.compiler.parent / "huge-runtime.dll"
+        with runtime.open("wb") as stream:
+            stream.truncate(257 * 1024 * 1024)
+        _clear_compiler_inspection_memo_for_tests()
+        with self.assertRaisesRegex(AuditInfrastructureError, "per-file byte ceiling"):
+            open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0,
+            )
+
+    def test_compiler_closure_honors_cancellation_before_enumeration(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, cancel_event=cancelled,
+            )
 
     def test_compiler_content_metadata_and_version_all_affect_digest(self):
         baseline = self.make()
@@ -884,6 +952,14 @@ class ConfigurationTests(unittest.TestCase):
             self.make(self.entry(arguments=[str(self.compiler), "@source.rsp"]))
 
     def test_compiler_probe_is_bounded_and_fail_closed(self):
+        capability = open_compiler_executable_capability(
+            self.compiler,
+            self.dependency_roots,
+            time.monotonic() + 60.0,
+            compiler_family=CompilerFamily.GCC,
+        )
+        self.addCleanup(capability.native_owner.close)
+
         class FakeProcess:
             def __init__(self, *, stdout, payload=b"", running=False, **_kwargs):
                 stdout.write(payload)
@@ -907,7 +983,7 @@ class ConfigurationTests(unittest.TestCase):
         with mock.patch("gpu_capability_command.subprocess.Popen", side_effect=overflow_process) as popen:
             with self.assertRaisesRegex(AuditInfrastructureError, "version output limit"):
                 from gpu_capability_command import _probe_compiler_version
-                _probe_compiler_version(self.compiler, CompilerFamily.GCC, self.build, self.environment)
+                _probe_compiler_version(capability, CompilerFamily.GCC, self.build, self.environment)
             self.assertFalse(popen.call_args.kwargs["shell"])
 
         with mock.patch(
@@ -920,9 +996,16 @@ class ConfigurationTests(unittest.TestCase):
         ), mock.patch("gpu_capability_command.time.sleep"):
             with self.assertRaisesRegex(AuditInfrastructureError, "version probe timeout"):
                 from gpu_capability_command import _probe_compiler_version
-                _probe_compiler_version(self.compiler, CompilerFamily.GCC, self.build, self.environment)
+                _probe_compiler_version(capability, CompilerFamily.GCC, self.build, self.environment)
 
     def test_msvc_probe_uses_a_temporary_source_and_leaves_no_artifact(self):
+        capability = open_compiler_executable_capability(
+            self.compiler,
+            self.dependency_roots,
+            time.monotonic() + 60.0,
+            compiler_family=CompilerFamily.MSVC,
+        )
+        self.addCleanup(capability.native_owner.close)
         captured: dict[str, object] = {}
 
         class FakeProcess:
@@ -947,7 +1030,7 @@ class ConfigurationTests(unittest.TestCase):
         with mock.patch("gpu_capability_command.subprocess.Popen", FakeProcess):
             from gpu_capability_command import _probe_compiler_version
             output = _probe_compiler_version(
-                self.compiler, CompilerFamily.MSVC, self.build, self.environment
+                capability, CompilerFamily.MSVC, self.build, self.environment
             )
         command = captured["command"]
         self.assertIn("/Bv", command)
@@ -995,6 +1078,13 @@ class ConfigurationTests(unittest.TestCase):
             PYTHONPATH=str(fixture),
         )
         from gpu_capability_command import _run_probe_command, _WindowsProbeJob
+        python_authority = build_dependency_root_authority(
+            fixture, {"python": Path(sys.executable).resolve().parent}
+        )
+        capability = open_compiler_executable_capability(
+            Path(sys.executable), python_authority, time.monotonic() + 60.0
+        )
+        self.addCleanup(capability.native_owner.close)
         if os.name == "nt":
             original_attach = _WindowsProbeJob.attach
 
@@ -1006,11 +1096,11 @@ class ConfigurationTests(unittest.TestCase):
 
             with mock.patch.object(_WindowsProbeJob, "attach", delayed_attach):
                 output = _run_probe_command(
-                    [sys.executable, str(parent)], Path(sys.executable), fixture, environment
+                    capability, (str(parent),), fixture, environment
                 )
         else:
             output = _run_probe_command(
-                [sys.executable, str(parent)], Path(sys.executable), fixture, environment
+                capability, (str(parent),), fixture, environment
             )
         self.assertIn(b"gcc (GCC)", output)
         child_pids = (

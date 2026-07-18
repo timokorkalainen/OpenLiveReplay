@@ -1194,6 +1194,9 @@ def load_or_preprocess(
         dependency_roots,
         expected_digest=configuration.dependency_root_authority_digest,
     )
+    validate_compiler_executable_capability(
+        configuration.compiler_capability, authority
+    )
     cached = cache.load(configuration)
     if cached is not None:
         return cached

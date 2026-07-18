@@ -30,6 +30,7 @@ def _write_dependencies(
     family: str,
     source: Path,
     mode: str,
+    dependencies: tuple[Path, ...] = (),
 ) -> None:
     if path is None or mode == "missing":
         return
@@ -39,11 +40,20 @@ def _write_dependencies(
         return
     if family == "msvc":
         path.write_text(
-            json.dumps({"Data": {"Source": str(source), "Includes": []}}),
+            json.dumps({
+                "Data": {
+                    "Source": str(source),
+                    "Includes": [str(item) for item in dependencies],
+                }
+            }),
             encoding="utf-8",
         )
     else:
-        path.write_text(f"fixture.o: {_make_escape(source)}\n", encoding="utf-8")
+        values = (source, *dependencies)
+        path.write_text(
+            "fixture.o: " + " ".join(_make_escape(item) for item in values) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _source_from_unknown(arguments: list[str]) -> Path:
@@ -82,6 +92,8 @@ def main() -> int:
             "different-second-output",
             "different-second-byte-count",
             "wait-for-cancel",
+            "mutate-restore",
+            "swap-root-restore",
         ),
         required=True,
     )
@@ -93,6 +105,13 @@ def main() -> int:
     parser.add_argument("--child-pid-file", type=Path)
     parser.add_argument("--outside-path", type=Path)
     parser.add_argument("--invocation-counter", type=Path)
+    parser.add_argument("--extra-dependency", type=Path)
+    parser.add_argument(
+        "--dependency-schedule",
+        choices=("stable", "reorder", "add", "remove"),
+        default="stable",
+    )
+    parser.add_argument("--mutate-path", type=Path)
     parser.add_argument(
         "--dependency-mode",
         choices=("valid", "missing", "malformed", "outside"),
@@ -120,12 +139,46 @@ def main() -> int:
     dependency_source = source
     if options.dependency_mode == "outside" and options.outside_path is not None:
         dependency_source = options.outside_path.resolve(strict=False)
+    dependency_extras: tuple[Path, ...] = ()
+    if options.extra_dependency is not None:
+        extra = options.extra_dependency.resolve(strict=False)
+        if options.dependency_schedule == "reorder":
+            dependency_extras = (extra,) if invocation == 1 else ()
+            if invocation > 1:
+                dependency_source, extra = extra, dependency_source
+                dependency_extras = (extra,)
+        elif options.dependency_schedule == "add":
+            dependency_extras = () if invocation == 1 else (extra,)
+        elif options.dependency_schedule == "remove":
+            dependency_extras = (extra,) if invocation == 1 else ()
+        else:
+            dependency_extras = (extra,)
     _write_dependencies(
         dependency_path,
         options.family,
         dependency_source,
         options.dependency_mode,
+        dependency_extras,
     )
+
+    if invocation > 1 and options.fixture_mode in {
+        "mutate-restore", "swap-root-restore"
+    }:
+        if options.mutate_path is None:
+            raise SystemExit("mutation mode requires --mutate-path")
+        target = options.mutate_path.resolve(strict=True)
+        try:
+            if options.fixture_mode == "mutate-restore":
+                original = target.read_bytes()
+                target.write_bytes(original + b"changed")
+                target.write_bytes(original)
+            else:
+                moved = target.with_name(target.name + ".swapped")
+                target.rename(moved)
+                moved.rename(target)
+        except OSError:
+            sys.stderr.write("guard prevented generation change\n")
+            return 91
 
     if options.stderr_bytes:
         prefix = b"BEGIN-OF-STDERR|"

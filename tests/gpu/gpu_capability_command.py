@@ -11,6 +11,7 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -123,6 +124,12 @@ _MSVC_AMBIGUOUS_PREFIX_OPTIONS = (
 )
 _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
+_RUNTIME_ENUMERATION_ENTRIES = 4096
+_RUNTIME_CLOSURE_FILES = 256
+_RUNTIME_FILE_BYTES = 256 * 1024 * 1024
+_RUNTIME_TOTAL_BYTES = 1024 * 1024 * 1024
+_RUNTIME_TREE_ENTRIES = 65536
+_RUNTIME_TREE_DIRECTORIES = 4096
 _compiler_inspection_lock = threading.Lock()
 _compiler_capability_lock = threading.Lock()
 _compiler_capability_memo: dict[tuple[object, ...], CompilerExecutableCapability] = {}
@@ -638,32 +645,51 @@ def expand_response_files(
 
 
 def _probe_compiler_version(
-    compiler: Path,
+    capability: CompilerExecutableCapability,
     family: CompilerFamily,
     cwd: Path,
     environment: Mapping[str, str],
+    pipeline_deadline: float | None = None,
 ) -> bytes:
+    compiler = capability.executable_identity.canonical
     probe_directory: tempfile.TemporaryDirectory[str] | None = None
     if family is CompilerFamily.MSVC:
         probe_directory = tempfile.TemporaryDirectory(prefix="gpu-capability-cl-probe-")
         probe_source = Path(probe_directory.name) / "probe.cpp"
         probe_source.write_bytes(b"\n")
-        command = [str(compiler), "/nologo", "/Bv", "/EP", "/TP", str(probe_source)]
+        arguments = ("/nologo", "/Bv", "/EP", "/TP", str(probe_source))
     else:
-        command = [str(compiler), "--version"]
+        arguments = ("--version",)
     try:
-        return _run_probe_command(command, compiler, cwd, environment)
+        return _run_probe_command(capability, arguments, cwd, environment, pipeline_deadline)
     finally:
         if probe_directory is not None:
             probe_directory.cleanup()
 
 
 def _run_probe_command(
-    command: list[str],
-    compiler: Path,
+    capability: CompilerExecutableCapability,
+    arguments: tuple[str, ...],
     cwd: Path,
     environment: Mapping[str, str],
+    pipeline_deadline: float | None = None,
 ) -> bytes:
+    if not isinstance(capability, CompilerExecutableCapability):
+        raise AuditInfrastructureError("compiler probe capability is invalid")
+    compiler = capability.executable_identity.canonical
+    owner = capability.native_owner
+    validate = getattr(owner, "validate", None)
+    if not callable(validate):
+        raise AuditInfrastructureError("compiler probe capability owner is invalid")
+    validate()
+    command = (str(compiler), *arguments)
+    launch_options = {}
+    if capability.platform_kind == "linux":
+        executable_fd = getattr(owner, "executable_fd", None)
+        if not isinstance(executable_fd, int):
+            raise AuditInfrastructureError("exact compiler probe executable fd is unavailable")
+        command = (f"/proc/self/fd/{executable_fd}", *arguments)
+        launch_options["pass_fds"] = (executable_fd,)
     containment = _ProbeContainment()
     with tempfile.TemporaryFile(mode="w+b") as stdout_stream, tempfile.TemporaryFile(
         mode="w+b"
@@ -679,6 +705,7 @@ def _run_probe_command(
                 stdin=(subprocess.PIPE if containment.requires_handshake else subprocess.DEVNULL),
                 stdout=stdout_stream,
                 stderr=stderr_stream,
+                **launch_options,
                 **containment.popen_arguments,
             )
             containment.attach(process)
@@ -693,7 +720,10 @@ def _run_probe_command(
             containment.close()
             raise
         try:
-            deadline = time.monotonic() + _VERSION_SECONDS
+            deadline = min(
+                time.monotonic() + _VERSION_SECONDS,
+                pipeline_deadline if pipeline_deadline is not None else float("inf"),
+            )
             failure: str | None = None
             while True:
                 observed = os.fstat(stdout_stream.fileno()).st_size + os.fstat(
@@ -737,6 +767,7 @@ def _run_probe_command(
         combined = stdout or stderr
     if len(combined) > _VERSION_BYTES:
         raise AuditInfrastructureError("compiler version output limit exceeded")
+    validate()
     return combined
 
 
@@ -981,10 +1012,351 @@ def _directory_snapshot(path: Path) -> tuple[int, int | None, int]:
     )
 
 
-def _content_sha256(stream) -> str:
+def _check_capability_budget(
+    deadline: float | None, cancel_event: object | None
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise AuditInfrastructureError("compiler capability construction cancelled")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise AuditInfrastructureError("compiler capability deadline exceeded")
+
+
+def _bounded_c_string(data: bytes, offset: int) -> str:
+    if not isinstance(offset, int) or offset < 0 or offset >= len(data):
+        raise AuditInfrastructureError("compiler runtime binary string is invalid")
+    end = data.find(b"\0", offset, min(len(data), offset + 32768))
+    if end < 0:
+        raise AuditInfrastructureError("compiler runtime binary string is unterminated")
+    try:
+        value = data[offset:end].decode("utf-8")
+    except UnicodeError as error:
+        raise AuditInfrastructureError("compiler runtime binary string is invalid") from error
+    if not value:
+        raise AuditInfrastructureError("compiler runtime binary import is empty")
+    return value
+
+
+def _pe_runtime_import_names(data: bytes) -> tuple[str, ...]:
+    if len(data) < 64 or data[:2] != b"MZ":
+        raise AuditInfrastructureError("compiler runtime PE image is invalid")
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_offset + 24 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\0\0":
+        raise AuditInfrastructureError("compiler runtime PE image is invalid")
+    section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    optional = pe_offset + 24
+    if optional + optional_size > len(data) or section_count > 4096:
+        raise AuditInfrastructureError("compiler runtime PE headers exceed bounds")
+    magic = struct.unpack_from("<H", data, optional)[0]
+    directory_offset = optional + (96 if magic == 0x10B else 112 if magic == 0x20B else -1)
+    if directory_offset < optional or directory_offset + 16 > optional + optional_size:
+        raise AuditInfrastructureError("compiler runtime PE optional header is invalid")
+    import_rva, import_size = struct.unpack_from("<II", data, directory_offset + 8)
+    section_table = optional + optional_size
+    sections = []
+    for index in range(section_count):
+        offset = section_table + index * 40
+        if offset + 40 > len(data):
+            raise AuditInfrastructureError("compiler runtime PE section table is invalid")
+        virtual_size, virtual_address, raw_size, raw_offset = struct.unpack_from(
+            "<IIII", data, offset + 8
+        )
+        sections.append((virtual_address, max(virtual_size, raw_size), raw_offset, raw_size))
+
+    def rva_offset(rva: int) -> int:
+        for address, span, raw_offset, raw_size in sections:
+            if address <= rva < address + span:
+                relative = rva - address
+                if relative >= raw_size or raw_offset + relative >= len(data):
+                    break
+                return raw_offset + relative
+        if rva < len(data):
+            return rva
+        raise AuditInfrastructureError("compiler runtime PE import RVA is invalid")
+
+    if import_rva == 0 or import_size == 0:
+        return ()
+    cursor = rva_offset(import_rva)
+    names = []
+    for _index in range(min(4096, import_size // 20 + 1)):
+        if cursor + 20 > len(data):
+            raise AuditInfrastructureError("compiler runtime PE imports are truncated")
+        descriptor = struct.unpack_from("<IIIII", data, cursor)
+        if descriptor == (0, 0, 0, 0, 0):
+            return tuple(dict.fromkeys(names))
+        names.append(_bounded_c_string(data, rva_offset(descriptor[3])))
+        cursor += 20
+    raise AuditInfrastructureError("compiler runtime PE import ceiling exceeded")
+
+
+def _elf_runtime_import_names(data: bytes) -> tuple[str, ...]:
+    if len(data) < 64 or data[:4] != b"\x7fELF":
+        raise AuditInfrastructureError("compiler runtime ELF image is invalid")
+    elf_class, encoding = data[4], data[5]
+    if elf_class not in (1, 2) or encoding not in (1, 2):
+        raise AuditInfrastructureError("compiler runtime ELF format is unsupported")
+    order = "<" if encoding == 1 else ">"
+    if elf_class == 2:
+        phoff = struct.unpack_from(order + "Q", data, 32)[0]
+        phentsize, phnum = struct.unpack_from(order + "HH", data, 54)
+        ph_format = order + "IIQQQQQQ"
+        dynamic_format = order + "qQ"
+    else:
+        phoff = struct.unpack_from(order + "I", data, 28)[0]
+        phentsize, phnum = struct.unpack_from(order + "HH", data, 42)
+        ph_format = order + "IIIIIIII"
+        dynamic_format = order + "iI"
+    if phnum > 4096 or phentsize < struct.calcsize(ph_format):
+        raise AuditInfrastructureError("compiler runtime ELF program headers exceed bounds")
+    loads = []
+    dynamic = None
+    for index in range(phnum):
+        offset = phoff + index * phentsize
+        if offset + struct.calcsize(ph_format) > len(data):
+            raise AuditInfrastructureError("compiler runtime ELF program headers are truncated")
+        values = struct.unpack_from(ph_format, data, offset)
+        if elf_class == 2:
+            kind, file_offset, virtual, file_size = values[0], values[2], values[3], values[5]
+        else:
+            kind, file_offset, virtual, file_size = values[0], values[1], values[2], values[4]
+        if kind == 1:
+            loads.append((virtual, file_size, file_offset))
+        elif kind == 2:
+            dynamic = (file_offset, file_size)
+    if dynamic is None:
+        return ()
+    entry_size = struct.calcsize(dynamic_format)
+    needed = []
+    string_virtual = None
+    for cursor in range(dynamic[0], dynamic[0] + dynamic[1], entry_size):
+        if cursor + entry_size > len(data):
+            raise AuditInfrastructureError("compiler runtime ELF dynamic table is truncated")
+        tag, value = struct.unpack_from(dynamic_format, data, cursor)
+        if tag == 0:
+            break
+        if tag == 1:
+            needed.append(value)
+        elif tag == 5:
+            string_virtual = value
+        if len(needed) > 4096:
+            raise AuditInfrastructureError("compiler runtime ELF import ceiling exceeded")
+    if string_virtual is None:
+        return ()
+    string_offset = None
+    for virtual, file_size, file_offset in loads:
+        if virtual <= string_virtual < virtual + file_size:
+            string_offset = file_offset + string_virtual - virtual
+            break
+    if string_offset is None:
+        raise AuditInfrastructureError("compiler runtime ELF string table is invalid")
+    return tuple(dict.fromkeys(_bounded_c_string(data, string_offset + item) for item in needed))
+
+
+def _macho_runtime_import_names(data: bytes) -> tuple[str, ...]:
+    if len(data) < 28:
+        raise AuditInfrastructureError("compiler runtime Mach-O image is invalid")
+    magic = data[:4]
+    formats = {
+        b"\xfe\xed\xfa\xce": (">", False), b"\xce\xfa\xed\xfe": ("<", False),
+        b"\xfe\xed\xfa\xcf": (">", True), b"\xcf\xfa\xed\xfe": ("<", True),
+    }
+    if magic in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+        order = ">" if magic == b"\xca\xfe\xba\xbe" else "<"
+        count = struct.unpack_from(order + "I", data, 4)[0]
+        if count > 64:
+            raise AuditInfrastructureError("compiler runtime Mach-O fat image exceeds bounds")
+        result = []
+        for index in range(count):
+            entry = 8 + index * 20
+            if entry + 20 > len(data):
+                raise AuditInfrastructureError("compiler runtime Mach-O fat image is truncated")
+            offset, size = struct.unpack_from(order + "II", data, entry + 8)
+            if offset + size > len(data):
+                raise AuditInfrastructureError("compiler runtime Mach-O slice is invalid")
+            result.extend(_macho_runtime_import_names(data[offset:offset + size]))
+        return tuple(dict.fromkeys(result))
+    if magic not in formats:
+        raise AuditInfrastructureError("compiler runtime binary format is unsupported")
+    order, is_64 = formats[magic]
+    command_count, command_bytes = struct.unpack_from(order + "II", data, 16)
+    cursor = 32 if is_64 else 28
+    if command_count > 4096 or cursor + command_bytes > len(data):
+        raise AuditInfrastructureError("compiler runtime Mach-O commands exceed bounds")
+    dylib_commands = {0xC, 0x18, 0x1F, 0x20, 0x23}
+    result = []
+    for _index in range(command_count):
+        if cursor + 8 > len(data):
+            raise AuditInfrastructureError("compiler runtime Mach-O command is truncated")
+        command, size = struct.unpack_from(order + "II", data, cursor)
+        command &= 0x7FFFFFFF
+        if size < 8 or cursor + size > len(data):
+            raise AuditInfrastructureError("compiler runtime Mach-O command is invalid")
+        if command in dylib_commands:
+            if size < 24:
+                raise AuditInfrastructureError("compiler runtime Mach-O dylib command is invalid")
+            name_offset = struct.unpack_from(order + "I", data, cursor + 8)[0]
+            result.append(_bounded_c_string(data, cursor + name_offset))
+        cursor += size
+    return tuple(dict.fromkeys(result))
+
+
+def _binary_runtime_import_names(path: Path) -> tuple[str, ...]:
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _RUNTIME_FILE_BYTES:
+            raise AuditInfrastructureError("compiler runtime per-file byte ceiling exceeded")
+        data = path.read_bytes()
+    except OSError as error:
+        raise AuditInfrastructureError("compiler runtime binary is unreadable") from error
+    if len(data) != metadata.st_size:
+        raise AuditInfrastructureError("compiler runtime binary changed while parsing")
+    if data.startswith(b"MZ"):
+        return _pe_runtime_import_names(data)
+    if data.startswith(b"\x7fELF"):
+        return _elf_runtime_import_names(data)
+    if data[:4] in {
+        b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    }:
+        return _macho_runtime_import_names(data)
+    return ()
+
+
+def _toolchain_file_index(
+    root: Path, deadline: float, cancel_event: object | None
+) -> dict[str, tuple[Path, ...]]:
+    pending = [root]
+    directories = 0
+    entries = 0
+    result: dict[str, list[Path]] = {}
+    while pending:
+        _check_capability_budget(deadline, cancel_event)
+        directory = pending.pop()
+        directories += 1
+        if directories > _RUNTIME_TREE_DIRECTORIES:
+            raise AuditInfrastructureError("compiler runtime directory enumeration ceiling exceeded")
+        try:
+            with os.scandir(directory) as iterator:
+                for entry in iterator:
+                    _check_capability_budget(deadline, cancel_event)
+                    entries += 1
+                    if entries > _RUNTIME_TREE_ENTRIES:
+                        raise AuditInfrastructureError(
+                            "compiler runtime tree enumeration ceiling exceeded"
+                        )
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            result.setdefault(entry.name.casefold(), []).append(
+                                Path(entry.path).resolve(strict=True)
+                            )
+                    except OSError as error:
+                        raise AuditInfrastructureError(
+                            "compiler runtime tree changed during enumeration"
+                        ) from error
+        except OSError as error:
+            raise AuditInfrastructureError("compiler runtime tree is unreadable") from error
+    return {
+        name: tuple(sorted(paths, key=lambda item: os.path.normcase(str(item))))
+        for name, paths in result.items()
+    }
+
+
+def _resolve_runtime_name(
+    name: str,
+    importer: Path,
+    executable: Path,
+    root: Path,
+    index: Mapping[str, tuple[Path, ...]],
+) -> Path | None:
+    expanded = name.replace("@loader_path", str(importer.parent)).replace(
+        "@executable_path", str(executable.parent)
+    )
+    direct = Path(expanded)
+    direct_candidates = []
+    if direct.is_absolute():
+        direct_candidates.append(direct)
+    elif not expanded.startswith("@rpath/"):
+        direct_candidates.extend((
+            importer.parent / direct, executable.parent / direct, root / direct
+        ))
+    basename = Path(expanded.removeprefix("@rpath/")).name.casefold()
+    def valid(candidates):
+        matches = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+                if resolved.is_file() and resolved not in matches:
+                    matches.append(resolved)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return matches
+
+    matches = valid(direct_candidates)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise AuditInfrastructureError(
+            f"compiler runtime import direct resolution is ambiguous: {name}"
+        )
+    matches = valid(index.get(basename, ()))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise AuditInfrastructureError(
+            f"compiler runtime import is ambiguous inside toolchain: {name}"
+        )
+    return matches[0]
+
+
+def _recursive_runtime_paths(
+    seeds: tuple[Path, ...],
+    executable: Path,
+    root: Path,
+    index: Mapping[str, tuple[Path, ...]],
+    deadline: float,
+    cancel_event: object | None,
+) -> tuple[Path, ...]:
+    pending = list(seeds)
+    result = []
+    seen = set()
+    while pending:
+        _check_capability_budget(deadline, cancel_event)
+        current = pending.pop(0).resolve(strict=True)
+        key = os.path.normcase(str(current))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(current)
+        if len(result) > _RUNTIME_CLOSURE_FILES:
+            raise AuditInfrastructureError("compiler runtime closure file ceiling exceeded")
+        for name in _binary_runtime_import_names(current):
+            resolved = _resolve_runtime_name(name, current, executable, root, index)
+            if resolved is not None:
+                pending.append(resolved)
+    return tuple(result)
+
+
+def _content_sha256(
+    stream,
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+    byte_ceiling: int = _RUNTIME_FILE_BYTES,
+) -> str:
     digest = hashlib.sha256()
+    observed = 0
     stream.seek(0)
     while chunk := stream.read(1024 * 1024):
+        _check_capability_budget(deadline, cancel_event)
+        observed += len(chunk)
+        if observed > byte_ceiling:
+            raise AuditInfrastructureError("compiler runtime per-file byte ceiling exceeded")
         digest.update(chunk)
     stream.seek(0)
     return digest.hexdigest()
@@ -1002,6 +1374,7 @@ class _CompilerCapabilityOwner:
         directory_paths: tuple[Path, ...],
         directory_snapshots: tuple[tuple[int, int | None, int], ...],
         observer: _FilesystemGenerationObserver,
+        dependency_root_authority: DependencyRootAuthority,
     ) -> None:
         self.streams = streams
         self.file_paths = file_paths
@@ -1010,6 +1383,7 @@ class _CompilerCapabilityOwner:
         self.directory_paths = directory_paths
         self.directory_snapshots = directory_snapshots
         self.observer = observer
+        self.dependency_root_authority = dependency_root_authority
         self._closed = False
         self._lock = threading.Lock()
 
@@ -1111,25 +1485,82 @@ def _path_chain(sentinel: Path, target: Path) -> tuple[Path, ...]:
     return tuple(result)
 
 
+def _driver_selected_helper_paths(
+    capability: CompilerExecutableCapability,
+    family: CompilerFamily,
+    working_directory: Path,
+    environment: Mapping[str, str],
+    root: Path,
+    index: Mapping[str, tuple[Path, ...]],
+    deadline: float,
+    cancel_event: object | None,
+) -> tuple[Path, ...]:
+    if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
+        names = ("c1.dll", "c1xx.dll", "c2.dll", "mspdbcore.dll")
+        result = []
+        for name in names:
+            candidates = index.get(name, ())
+            if len(candidates) == 1:
+                result.append(candidates[0])
+        return tuple(result)
+    queries = (
+        "cc1", "cc1plus", "collect2", "as", "ld"
+    ) if family is CompilerFamily.GCC else ("clang", "ld.lld", "as", "ld")
+    result = []
+    for program in queries:
+        _check_capability_budget(deadline, cancel_event)
+        output = _run_probe_command(
+            capability,
+            (f"-print-prog-name={program}",),
+            working_directory,
+            environment,
+            deadline,
+        )
+        try:
+            value = output.decode("utf-8").strip()
+        except UnicodeError as error:
+            raise AuditInfrastructureError("compiler helper query output is invalid") from error
+        if not value or "\n" in value or "\0" in value or len(value) > 32768:
+            raise AuditInfrastructureError("compiler helper query output is invalid")
+        resolved = _resolve_runtime_name(
+            value, capability.executable_identity.canonical,
+            capability.executable_identity.canonical, root, index,
+        )
+        if resolved is not None and resolved not in result:
+            result.append(resolved)
+    return tuple(result)
+
+
 def open_compiler_executable_capability(
     compiler: Path,
     dependency_roots: DependencyRootAuthority,
     pipeline_deadline: float,
+    *,
+    cancel_event: object | None = None,
+    compiler_family: CompilerFamily | None = None,
+    launcher_environment: Mapping[str, str] | None = None,
+    working_directory: Path | None = None,
+    _extra_candidates: tuple[Path, ...] = (),
+    _query_driver: bool = True,
 ) -> CompilerExecutableCapability:
     authority = validate_dependency_root_authority(dependency_roots)
     if not isinstance(pipeline_deadline, (int, float)) or isinstance(pipeline_deadline, bool):
         raise AuditInfrastructureError("compiler capability deadline is invalid")
-    if time.monotonic() >= pipeline_deadline:
-        raise AuditInfrastructureError("compiler capability deadline exceeded")
+    _check_capability_budget(pipeline_deadline, cancel_event)
     try:
         canonical = compiler.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise AuditInfrastructureError("compiler executable is unavailable") from error
     binding = _toolchain_binding_for_path(canonical, authority)
+    if compiler_family is not None and not isinstance(compiler_family, CompilerFamily):
+        raise AuditInfrastructureError("compiler capability family is invalid")
+    if launcher_environment is not None and not isinstance(launcher_environment, Mapping):
+        raise AuditInfrastructureError("compiler capability environment is invalid")
     memo_key = (
         os.path.normcase(str(canonical)),
         authority.source_root,
         authority.external_roots,
+        compiler_family,
     )
     with _compiler_capability_lock:
         memoized = _compiler_capability_memo.get(memo_key)
@@ -1149,33 +1580,60 @@ def open_compiler_executable_capability(
         "as", "as.exe", "clang-cc1", "clang-cc1.exe", "collect2",
         "collect2.exe", "ld", "ld.exe", "ld.lld", "ld.lld.exe",
     })
+    siblings = []
     try:
-        siblings = sorted(canonical.parent.iterdir(), key=lambda item: item.name.casefold())
+        for entry_count, candidate in enumerate(canonical.parent.iterdir(), 1):
+            _check_capability_budget(pipeline_deadline, cancel_event)
+            if entry_count > _RUNTIME_ENUMERATION_ENTRIES:
+                raise AuditInfrastructureError(
+                    "compiler runtime enumeration ceiling exceeded"
+                )
+            name = candidate.name.casefold()
+            if candidate == canonical:
+                continue
+            is_runtime_library = (
+                name.endswith((".dll", ".dylib", ".so")) or ".so." in name
+            )
+            if name.startswith("cc1") or name in helper_names or is_runtime_library:
+                siblings.append(candidate)
+                if len(siblings) + 1 > _RUNTIME_CLOSURE_FILES:
+                    raise AuditInfrastructureError(
+                        "compiler runtime closure file ceiling exceeded"
+                    )
     except OSError as error:
         raise AuditInfrastructureError("compiler runtime closure is unreadable") from error
-    for candidate in siblings:
-        name = candidate.name.casefold()
-        if candidate == canonical:
-            continue
-        is_runtime_library = (
-            name.endswith((".dll", ".dylib", ".so")) or ".so." in name
-        )
-        if name.startswith("cc1") or name in helper_names or is_runtime_library:
-            candidates.append(candidate)
-        if len(candidates) > 256:
-            raise AuditInfrastructureError("compiler runtime closure file ceiling exceeded")
+    candidates.extend(sorted(siblings, key=lambda item: item.name.casefold()))
+    candidates.extend(_extra_candidates)
+    index = _toolchain_file_index(
+        binding.resolved_root, pipeline_deadline, cancel_event
+    )
+    candidates = list(_recursive_runtime_paths(
+        tuple(candidates), canonical, binding.resolved_root, index,
+        pipeline_deadline, cancel_event,
+    ))
 
     streams: list[object] = []
     observer: _FilesystemGenerationObserver | None = None
     paths: list[Path] = []
     snapshots: list[tuple[int, int | None, int, int, int, int]] = []
     hashes: list[str] = []
+    total_bytes = 0
     try:
         seen: set[tuple[int, int | None]] = set()
         for candidate in candidates:
+            _check_capability_budget(pipeline_deadline, cancel_event)
             try:
                 resolved = candidate.resolve(strict=True)
                 expected = _regular_file_snapshot(resolved)
+                if expected[2] > _RUNTIME_FILE_BYTES:
+                    raise AuditInfrastructureError(
+                        "compiler runtime per-file byte ceiling exceeded"
+                    )
+                total_bytes += expected[2]
+                if total_bytes > _RUNTIME_TOTAL_BYTES:
+                    raise AuditInfrastructureError(
+                        "compiler runtime total byte ceiling exceeded"
+                    )
                 stream = resolved.open("rb")
             except OSError as error:
                 raise AuditInfrastructureError("compiler runtime closure changed while opening") from error
@@ -1193,7 +1651,9 @@ def open_compiler_executable_capability(
             paths.append(resolved)
             snapshots.append(expected)
             streams.append(stream)
-            hashes.append(_content_sha256(stream))
+            hashes.append(_content_sha256(
+                stream, deadline=pipeline_deadline, cancel_event=cancel_event
+            ))
 
         chain_paths = _path_chain(binding.resolved_root.parent, canonical.parent)
         chain_snapshots = tuple(_directory_snapshot(path) for path in chain_paths)
@@ -1241,6 +1701,7 @@ def open_compiler_executable_capability(
                 tuple((path, True) for path in chain_paths)
                 + tuple((path, False) for path in paths)
             ),
+            authority,
         )
         observer = owner.observer
         capability = CompilerExecutableCapability(
@@ -1259,6 +1720,30 @@ def open_compiler_executable_capability(
             tuple(closure),
         )
         owner.validate()
+        if compiler_family is not None and _query_driver:
+            helpers = _driver_selected_helper_paths(
+                capability,
+                compiler_family,
+                working_directory or canonical.parent,
+                launcher_environment or os.environ,
+                binding.resolved_root,
+                index,
+                pipeline_deadline,
+                cancel_event,
+            )
+            if any(path not in paths for path in helpers):
+                owner.close()
+                return open_compiler_executable_capability(
+                    canonical,
+                    authority,
+                    pipeline_deadline,
+                    cancel_event=cancel_event,
+                    compiler_family=compiler_family,
+                    launcher_environment=launcher_environment,
+                    working_directory=working_directory,
+                    _extra_candidates=helpers,
+                    _query_driver=False,
+                )
         with _compiler_capability_lock:
             existing = _compiler_capability_memo.get(memo_key)
             if existing is not None:
@@ -1290,14 +1775,16 @@ def validate_compiler_executable_capability(
     )
     if not isinstance(capability, CompilerExecutableCapability):
         raise AuditInfrastructureError("compiler executable capability is invalid")
+    owner = capability.native_owner
+    if not isinstance(owner, _CompilerCapabilityOwner):
+        raise AuditInfrastructureError("compiler executable capability owner is invalid")
+    if owner.dependency_root_authority != authority:
+        raise AuditInfrastructureError("compiler capability local dependency authority differs")
     expected_binding = _toolchain_binding_for_path(
         capability.executable_identity.canonical, authority
     )
     if expected_binding != capability.trusted_toolchain_root:
         raise AuditInfrastructureError("compiler executable capability root differs")
-    owner = capability.native_owner
-    if not isinstance(owner, _CompilerCapabilityOwner):
-        raise AuditInfrastructureError("compiler executable capability owner is invalid")
     owner.validate(content=False)
 
 
@@ -1364,7 +1851,14 @@ def inspect_compiler(
     cwd = working_directory or compiler.parent
 
     compiler_snapshot = _compiler_metadata_snapshot(compiler)
-    capability = open_compiler_executable_capability(compiler, authority, deadline)
+    capability = open_compiler_executable_capability(
+        compiler,
+        authority,
+        deadline,
+        compiler_family=compiler_family,
+        launcher_environment=launcher_environment,
+        working_directory=cwd,
+    )
     owner = capability.native_owner
     try:
         validate_compiler_executable_capability(capability, authority)
@@ -1413,6 +1907,8 @@ def inspect_compiler(
                     launcher_environment,
                     authority,
                     expected_audit_engine_fingerprint,
+                    capability.capability_digest,
+                    capability.resolved_runtime_closure_digest,
                     deadline,
                 )
             if cached is not None:
@@ -1430,10 +1926,11 @@ def inspect_compiler(
                 return cached
 
             version_output = _probe_compiler_version(
-                compiler,
+                capability,
                 compiler_family,
                 cwd,
                 launcher_environment,
+                deadline,
             )
             validate_compiler_executable_capability(capability, authority)
             family = identify_compiler(compiler, version_output)
@@ -1471,6 +1968,8 @@ def inspect_compiler(
                     launcher_environment,
                     authority,
                     expected_audit_engine_fingerprint,
+                    capability.capability_digest,
+                    capability.resolved_runtime_closure_digest,
                     inspection,
                     deadline,
                 )
@@ -2369,7 +2868,8 @@ def make_configuration(
     family = inspection.compiler_family
     compiler_fingerprint = inspection.driver_fingerprint
     compiler_capability = open_compiler_executable_capability(
-        compiler, authority, deadline
+        compiler, authority, deadline, compiler_family=family,
+        launcher_environment=environment, working_directory=cwd,
     )
     if compiler_capability.capability_digest != inspection.executable_capability_digest:
         compiler_capability.native_owner.close()

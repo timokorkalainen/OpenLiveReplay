@@ -45,6 +45,31 @@ from gpu_capability_source_audit import (  # noqa: E402
 
 
 class AuditEngineFingerprintTests(unittest.TestCase):
+    def test_preprocess_configuration_constructor_inventory_is_exact(self):
+        self.assertEqual(
+            dict(capability_audit._PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY),
+            {
+                "gpu_capability_command.py": 1,
+                "test_gpu_capability_audit_lanes.py": 1,
+                "test_gpu_capability_cache.py": 1,
+                "test_gpu_capability_command.py": 1,
+                "test_gpu_capability_model.py": 1,
+                "test_gpu_capability_provenance.py": 1,
+                "test_gpu_capability_runner.py": 2,
+            },
+        )
+        source_directory = Path(__file__).resolve().parent
+        observed = {}
+        for path in source_directory.glob("*.py"):
+            count = path.read_text(encoding="utf-8").count(
+                "Preprocess" + "Configuration("
+            )
+            if count:
+                observed[path.name] = count
+        self.assertEqual(observed, dict(
+            capability_audit._PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY
+        ))
+
     def test_slot_descriptor_owner_rebinding_changes_behavior_and_digest(self):
         class ForeignPackedColumn:
             __slots__ = ("_view",)
