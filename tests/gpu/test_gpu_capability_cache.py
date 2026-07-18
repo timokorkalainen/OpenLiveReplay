@@ -1304,6 +1304,45 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
     def test_lock_carrier_fsync_failure_cleans_owned_temporary(self):
         self._assert_failed_initialization_io_cleans_temporary("fsync")
 
+    def test_lock_carrier_first_lstat_failure_cleans_owned_temporary(self):
+        anchor = self.cache.root / ".failed-first-lstat.lock.anchor"
+        temporary = self.cache.root / f".tmp-lock-{'b' * 32}"
+        quarantine = self.cache.root / f".quarantine-lock-{'c' * 32}"
+        real_lstat = Path.lstat
+        failed = False
+
+        def fail_first_temporary_lstat(path, *args, **kwargs):
+            nonlocal failed
+            if Path(path) == temporary and not failed:
+                failed = True
+                raise OSError("deterministic first carrier lstat failure")
+            return real_lstat(path, *args, **kwargs)
+
+        try:
+            with mock.patch(
+                "gpu_capability_cache.uuid.uuid4",
+                side_effect=(
+                    mock.Mock(hex="b" * 32),
+                    mock.Mock(hex="c" * 32),
+                ),
+            ), mock.patch.object(
+                Path,
+                "lstat",
+                autospec=True,
+                side_effect=fail_first_temporary_lstat,
+            ), self.assertRaisesRegex(
+                OSError, "deterministic first carrier lstat failure"
+            ):
+                capability_cache._initialize_lock_carrier_anchor(anchor)
+            self.assertTrue(failed)
+            self.assertFalse(temporary.exists())
+            self.assertFalse(quarantine.exists())
+            self.assertFalse(anchor.exists())
+        finally:
+            temporary.unlink(missing_ok=True)
+            quarantine.unlink(missing_ok=True)
+            anchor.unlink(missing_ok=True)
+
     def test_failed_lock_carrier_cleanup_preserves_replacement(self):
         lock_type = capability_cache._SharedCacheFileLock
         carrier = self.cache.root / ".replaced-initialization.lock"
@@ -1471,6 +1510,60 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             self.assertFalse(temporary.exists())
             self.assertEqual(quarantine.read_bytes(), replacement)
             self.assertEqual(displaced.read_bytes(), b"owned lock carrier temporary")
+        finally:
+            temporary.unlink(missing_ok=True)
+            quarantine.unlink(missing_ok=True)
+            displaced.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_deletes_verified_windows_handle_not_replacement(self):
+        temporary = self.cache.root / ".tmp-lock-windows-handle-delete"
+        quarantine = self.cache.root / f".quarantine-lock-{'5' * 32}"
+        displaced = self.cache.root / ".displaced-owned-windows-quarantine"
+        replacement = b"replacement after verified Windows quarantine open"
+        temporary.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            temporary.stat()
+        )
+        real_unlink = Path.unlink
+        raced = False
+
+        def replace_verified_quarantine(path):
+            nonlocal raced
+            self.assertEqual(Path(path), quarantine)
+            Path(path).rename(displaced)
+            Path(path).write_bytes(replacement)
+            raced = True
+
+        def unlink_with_pre_delete_race(path, *args, **kwargs):
+            if Path(path) == quarantine and not raced:
+                replace_verified_quarantine(path)
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with mock.patch(
+                "gpu_capability_cache.uuid.uuid4",
+                return_value=mock.Mock(hex="5" * 32),
+            ), mock.patch(
+                "gpu_capability_cache._before_windows_lock_carrier_temporary_delete",
+                side_effect=replace_verified_quarantine,
+                create=True,
+            ) as before_delete, mock.patch.object(
+                Path,
+                "unlink",
+                autospec=True,
+                side_effect=unlink_with_pre_delete_race,
+            ):
+                capability_cache._cleanup_owned_lock_carrier_temporary(
+                    temporary,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            self.assertTrue(raced)
+            before_delete.assert_called_once_with(quarantine)
+            self.assertEqual(quarantine.read_bytes(), replacement)
+            self.assertFalse(displaced.exists())
+            self.assertFalse(temporary.exists())
         finally:
             temporary.unlink(missing_ok=True)
             quarantine.unlink(missing_ok=True)

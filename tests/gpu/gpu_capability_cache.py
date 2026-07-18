@@ -85,6 +85,10 @@ def _after_lock_carrier_temporary_quarantine(
     """Test seam after quarantine has detached cleanup from the public name."""
 
 
+def _before_windows_lock_carrier_temporary_delete(_path: Path) -> None:
+    """Test seam after exact Windows quarantine-handle verification."""
+
+
 def _rename_lock_carrier_temporary_to_quarantine(
     source: Path, quarantine: Path
 ) -> None:
@@ -151,6 +155,139 @@ def _rename_lock_carrier_temporary_to_quarantine(
         )
 
 
+def _delete_verified_windows_lock_carrier_temporary(
+    path: Path,
+    expected_identity: tuple[int, int],
+    original_error: BaseException,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileDispositionInformation(ctypes.Structure):
+        _fields_ = (("delete_file", wintypes.BOOLEAN),)
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    delete_access = 0x00010000
+    file_read_attributes = 0x00000080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    file_disposition_info = 4
+    handle = kernel32.CreateFileW(
+        str(path),
+        delete_access | file_read_attributes,
+        file_share_read | file_share_write | file_share_delete,
+        None,
+        open_existing,
+        file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle):
+        error_number = ctypes.get_last_error()
+        raise AuditInfrastructureError(
+            "cache lock carrier quarantine changed"
+        ) from OSError(
+            error_number,
+            "cannot open cache lock carrier quarantine",
+            str(path),
+        )
+
+    try:
+        file_descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
+    except BaseException as descriptor_error:
+        close_succeeded = kernel32.CloseHandle(handle)
+        if not close_succeeded:
+            close_error = OSError(
+                ctypes.get_last_error(),
+                "cannot close cache lock carrier quarantine handle",
+                str(path),
+            )
+            raise AuditInfrastructureError(
+                "cannot close cache lock carrier quarantine handle"
+            ) from close_error
+        raise AuditInfrastructureError(
+            "cannot inspect cache lock carrier quarantine handle"
+        ) from descriptor_error
+
+    try:
+        try:
+            metadata = path.lstat()
+            opened = os.fstat(file_descriptor)
+        except OSError as cleanup_error:
+            raise AuditInfrastructureError(
+                "cache lock carrier quarantine changed"
+            ) from cleanup_error
+        if (
+            _is_link(metadata)
+            or _is_link(opened)
+            or not stat.S_ISREG(metadata.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or int(getattr(metadata, "st_nlink", 1)) != 1
+            or int(getattr(opened, "st_nlink", 1)) != 1
+            or _file_ownership_identity(metadata) != expected_identity
+            or _file_ownership_identity(opened) != expected_identity
+        ):
+            raise AuditInfrastructureError(
+                "cache lock carrier temporary was replaced; replacement preserved "
+                f"at {path}"
+            ) from original_error
+        _before_windows_lock_carrier_temporary_delete(path)
+        disposition = FileDispositionInformation(True)
+        if not kernel32.SetFileInformationByHandle(
+            msvcrt.get_osfhandle(file_descriptor),
+            file_disposition_info,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            error_number = ctypes.get_last_error()
+            raise AuditInfrastructureError(
+                "cannot remove cache lock carrier temporary after "
+                f"{type(original_error).__name__}: {original_error}"
+            ) from OSError(
+                error_number,
+                "cannot mark cache lock carrier quarantine for deletion",
+                str(path),
+            )
+    except BaseException:
+        try:
+            os.close(file_descriptor)
+        except OSError as close_error:
+            raise AuditInfrastructureError(
+                "cannot close cache lock carrier quarantine handle"
+            ) from close_error
+        raise
+    try:
+        os.close(file_descriptor)
+    except OSError as close_error:
+        raise AuditInfrastructureError(
+            "cannot close cache lock carrier quarantine handle"
+        ) from close_error
+
+
 def _cleanup_owned_lock_carrier_temporary(
     path: Path,
     expected_identity: tuple[int, int] | None,
@@ -170,6 +307,11 @@ def _cleanup_owned_lock_carrier_temporary(
             f"{type(original_error).__name__}: {original_error}"
         ) from cleanup_error
     _after_lock_carrier_temporary_quarantine(path, quarantine)
+    if os.name == "nt":
+        _delete_verified_windows_lock_carrier_temporary(
+            quarantine, expected_identity, original_error
+        )
+        return
     try:
         stream = quarantine.open("r+b")
     except OSError as cleanup_error:
@@ -201,30 +343,21 @@ def _cleanup_owned_lock_carrier_temporary(
         # path unlink is scoped to this unexposed 128-bit random private name;
         # an observed replacement is preserved above, but we do not claim to
         # defeat a same-user process that guesses and races that exact name.
-        if os.name != "nt":
-            try:
-                quarantine.unlink()
-                final = os.fstat(stream.fileno())
-            except OSError as cleanup_error:
-                raise AuditInfrastructureError(
-                    "cannot remove cache lock carrier temporary after "
-                    f"{type(original_error).__name__}: {original_error}"
-                ) from cleanup_error
-            if (
-                _file_ownership_identity(final) != expected_identity
-                or int(getattr(final, "st_nlink", 0)) != 0
-            ):
-                raise AuditInfrastructureError(
-                    "cache lock carrier quarantine changed while removing it"
-                ) from original_error
-            return
-    try:
-        quarantine.unlink()
-    except OSError as cleanup_error:
-        raise AuditInfrastructureError(
-            "cannot remove cache lock carrier temporary after "
-            f"{type(original_error).__name__}: {original_error}"
-        ) from cleanup_error
+        try:
+            quarantine.unlink()
+            final = os.fstat(stream.fileno())
+        except OSError as cleanup_error:
+            raise AuditInfrastructureError(
+                "cannot remove cache lock carrier temporary after "
+                f"{type(original_error).__name__}: {original_error}"
+            ) from cleanup_error
+        if (
+            _file_ownership_identity(final) != expected_identity
+            or int(getattr(final, "st_nlink", 0)) != 0
+        ):
+            raise AuditInfrastructureError(
+                "cache lock carrier quarantine changed while removing it"
+            ) from original_error
 
 
 def _initialize_lock_carrier_anchor(anchor: Path) -> None:
@@ -233,8 +366,9 @@ def _initialize_lock_carrier_anchor(anchor: Path) -> None:
     try:
         with temporary.open("x+b") as stream:
             opened = os.fstat(stream.fileno())
-            visible = temporary.lstat()
             opened_identity = _file_ownership_identity(opened)
+            temporary_identity = opened_identity
+            visible = temporary.lstat()
             if (
                 opened_identity is None
                 or _is_link(visible)
@@ -245,7 +379,6 @@ def _initialize_lock_carrier_anchor(anchor: Path) -> None:
                 or _file_ownership_identity(visible) != opened_identity
             ):
                 raise OSError("cache lock carrier temporary ownership is unsafe")
-            temporary_identity = opened_identity
             if stream.write(b"1") != 1:
                 raise OSError("cache lock carrier temporary write was incomplete")
             stream.flush()
