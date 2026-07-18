@@ -9,6 +9,7 @@ import os
 import stat
 import struct
 import sys
+import time
 from array import array
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -255,6 +256,10 @@ class AuditLimits:
     stderr_bytes: int = 1024 * 1024
     retained_token_bytes: int = 384 * 1024 * 1024
     rss_bytes: int = 512 * 1024 * 1024
+    unique_dependency_handles: int = 32_768
+    unique_generation_guard_directories: int = 65_536
+    generation_guard_metadata_bytes: int = 64 * 1024 * 1024
+    dependency_handle_metadata_bytes: int = 32 * 1024 * 1024
     workers: int = field(default_factory=_default_worker_count)
 
 
@@ -293,7 +298,7 @@ class DependencyRootAuthority:
         _validate_authority_structure(self)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class CompilerInspection:
     compiler_family: CompilerFamily
     executable_identity: FileIdentity
@@ -303,12 +308,41 @@ class CompilerInspection:
     inspection_arguments_digest: str
     executable_capability_digest: str
 
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        compiler_family: CompilerFamily,
+        executable_identity: FileIdentity,
+        executable_sha256: str,
+        normalized_version: str,
+        driver_fingerprint: str,
+        inspection_arguments_digest: str,
+        executable_capability_digest: str,
+        *,
+        validation_deadline: float | None = None,
+        cancel_event: object | None = None,
+    ) -> None:
+        for name, value in (
+            ("compiler_family", compiler_family),
+            ("executable_identity", executable_identity),
+            ("executable_sha256", executable_sha256),
+            ("normalized_version", normalized_version),
+            ("driver_fingerprint", driver_fingerprint),
+            ("inspection_arguments_digest", inspection_arguments_digest),
+            ("executable_capability_digest", executable_capability_digest),
+        ):
+            object.__setattr__(self, name, value)
+        self._validate(validation_deadline, cancel_event)
+
+    def _validate(
+        self, validation_deadline: float | None, cancel_event: object | None
+    ) -> None:
         if not isinstance(self.compiler_family, CompilerFamily):
             raise AuditInfrastructureError("compiler inspection family is invalid")
         _validate_current_executable_identity(self.executable_identity)
         _validate_digest(self.executable_sha256, "compiler executable content")
-        if _current_executable_sha256(self.executable_identity) != self.executable_sha256:
+        if _current_executable_sha256(
+            self.executable_identity, validation_deadline, cancel_event
+        ) != self.executable_sha256:
             raise AuditInfrastructureError("compiler executable content changed")
         if (
             not isinstance(self.normalized_version, str)
@@ -1376,15 +1410,23 @@ def validate_dependency_root_authority(
         raise AuditInfrastructureError("dependency root authority digest mismatch")
     for binding in (validated.source_root, *validated.external_roots):
         try:
-            metadata = binding.resolved_root.stat()
+            metadata = binding.resolved_root.lstat()
         except OSError as error:
             raise AuditInfrastructureError("dependency root identity changed") from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or bool(getattr(metadata, "st_file_attributes", 0) & _REPARSE_ATTRIBUTE)
+        ):
+            raise AuditInfrastructureError(
+                "dependency root is not an ordinary directory"
+            )
         current = _identity_from_stat(
             binding.resolved_root,
             metadata,
             production=binding.stable_role == "production",
         )
-        if not stat.S_ISDIR(metadata.st_mode) or current != binding.root_identity:
+        if current != binding.root_identity:
             raise AuditInfrastructureError("dependency root identity changed")
     return validated
 
@@ -1521,7 +1563,18 @@ def _validate_current_executable_identity(identity: object) -> FileIdentity:
     return identity
 
 
-def _current_executable_sha256(identity: FileIdentity) -> str:
+def _current_executable_sha256(
+    identity: FileIdentity,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+) -> str:
+    def check_budget() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise AuditInfrastructureError("compiler inspection hashing cancelled")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise AuditInfrastructureError("compiler inspection hashing deadline exceeded")
+
+    check_budget()
     _validate_current_executable_identity(identity)
     digest = hashlib.sha256()
     try:
@@ -1532,6 +1585,7 @@ def _current_executable_sha256(identity: FileIdentity) -> str:
             ):
                 raise OSError("identity changed")
             while chunk := stream.read(1024 * 1024):
+                check_budget()
                 digest.update(chunk)
             after = os.fstat(stream.fileno())
         current = identity.canonical.stat()
@@ -1561,7 +1615,12 @@ def encode_compiler_inspection(inspection: CompilerInspection) -> bytes:
     return json.dumps(document, ensure_ascii=True, separators=(",", ":")).encode("ascii")
 
 
-def decode_compiler_inspection(payload: bytes) -> CompilerInspection:
+def decode_compiler_inspection(
+    payload: bytes,
+    *,
+    validation_deadline: float | None = None,
+    cancel_event: object | None = None,
+) -> CompilerInspection:
     if not isinstance(payload, bytes) or len(payload) > _LOCAL_INSPECTION_MAX_BYTES:
         raise AuditInfrastructureError("compiler inspection payload is invalid")
     try:
@@ -1582,6 +1641,8 @@ def decode_compiler_inspection(payload: bytes) -> CompilerInspection:
         document["driver_fingerprint"],
         document["inspection_arguments_digest"],
         document["executable_capability_digest"],
+        validation_deadline=validation_deadline,
+        cancel_event=cancel_event,
     )
 
 

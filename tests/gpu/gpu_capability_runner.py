@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -413,7 +414,7 @@ def run_bounded_preprocessor(
     validate_owner = getattr(capability_owner, "validate", None)
     if not callable(validate_owner):
         raise AuditInfrastructureError("compiler executable capability owner is invalid")
-    validate_owner()
+    validate_owner(deadline=effective_deadline, cancel_event=cancel_event)
     if not command.arguments:
         raise AuditInfrastructureError("rewritten preprocess command is empty")
     try:
@@ -492,8 +493,18 @@ def run_bounded_preprocessor(
                     f"/proc/self/fd/{executable_fd}", *command.arguments[1:]
                 )
                 launch_options["pass_fds"] = (executable_fd,)
+            prepared_arguments = containment.prepare_command(launch_arguments)
+            now = time.monotonic()
+            if cancel_event is not None and cancel_event.is_set():
+                raise AuditInfrastructureError(
+                    "coordinator cancelled before launch"
+                )
+            if now >= effective_deadline:
+                raise AuditInfrastructureError(
+                    f"{deadline_reason} before launch"
+                )
             process = subprocess.Popen(
-                containment.prepare_command(launch_arguments),
+                prepared_arguments,
                 cwd=str(configuration.working_directory),
                 env=environment,
                 shell=False,
@@ -919,51 +930,134 @@ def _parse_dependency_output(
     )
 
 
+_GENERATION_GUARD_IDENTITY_METADATA_BYTES = 96
+_GENERATION_GUARD_OWNER_METADATA_BYTES = 128
+_GENERATION_GUARD_INDEX_METADATA_BYTES = 72
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationGuardPreflight:
+    dependencies: tuple[DependencyDigest, ...]
+    directory_paths: tuple[Path, ...]
+    file_paths: tuple[Path, ...]
+    metadata_bytes: int
+    dependency_root_authority: DependencyRootAuthority
+
+
+@dataclass(frozen=True, slots=True)
+class DependencyGenerationGuard:
+    dependency: DependencyDigest
+    held_file_owner: object
+    held_parent_owner: object
+    armed_stat: FileIdentity
+    armed_size: int
+    armed_mtime_ns: int
+    armed_ctime_ns: int
+    platform_watch: object
+    directory_chain_owners: tuple[object, ...]
+    directory_chain_identities: tuple[FileIdentity, ...]
+
+
+def _checked_guard_metadata_add(total: int, amount: int, ceiling: int) -> int:
+    if amount < 0 or total > sys.maxsize - amount:
+        raise AuditInfrastructureError("dependency generation metadata overflow")
+    result = total + amount
+    if result > ceiling:
+        raise AuditInfrastructureError("dependency generation metadata byte ceiling exceeded")
+    return result
+
+
+def preflight_dependency_generation_guards(
+    discovery: PreprocessDiscovery,
+    dependency_roots: DependencyRootAuthority,
+    limits: AuditLimits,
+) -> GenerationGuardPreflight:
+    authority = validate_dependency_root_authority(dependency_roots)
+    if not isinstance(discovery, PreprocessDiscovery) or not isinstance(limits, AuditLimits):
+        raise AuditInfrastructureError("dependency generation preflight is invalid")
+    dependencies_by_path: dict[str, DependencyDigest] = {}
+    directory_paths: dict[str, Path] = {}
+    for dependency in discovery.dependencies:
+        if not isinstance(dependency, DependencyDigest):
+            raise AuditInfrastructureError("dependency generation preflight is invalid")
+        path = dependency.identity.canonical
+        key = os.path.normcase(str(path))
+        previous = dependencies_by_path.get(key)
+        if previous is not None and previous != dependency:
+            raise AuditInfrastructureError("dependency generation path is ambiguous")
+        dependencies_by_path.setdefault(key, dependency)
+        role, _relative = _dependency_binding(path, authority)
+        binding = next(
+            item for item in (authority.source_root, *authority.external_roots)
+            if item.stable_role == role
+        )
+        try:
+            relative_parent = path.parent.relative_to(binding.resolved_root)
+        except ValueError as error:
+            raise AuditInfrastructureError("dependency generation path escaped authority") from error
+        current = binding.resolved_root.parent
+        directory_paths.setdefault(os.path.normcase(str(current)), current)
+        current = binding.resolved_root
+        directory_paths.setdefault(os.path.normcase(str(current)), current)
+        for part in relative_parent.parts:
+            current = current / part
+            directory_paths.setdefault(os.path.normcase(str(current)), current)
+    if not dependencies_by_path:
+        raise AuditInfrastructureError("dependency generation file ceiling exceeded")
+    if len(dependencies_by_path) > limits.unique_dependency_handles:
+        raise AuditInfrastructureError("dependency generation file ceiling exceeded")
+    if len(directory_paths) > limits.unique_generation_guard_directories:
+        raise AuditInfrastructureError("dependency generation directory ceiling exceeded")
+    metadata_bytes = 0
+    fixed = (
+        _GENERATION_GUARD_IDENTITY_METADATA_BYTES
+        + _GENERATION_GUARD_OWNER_METADATA_BYTES
+        + _GENERATION_GUARD_INDEX_METADATA_BYTES
+    )
+    for path in (*directory_paths.values(), *(item.identity.canonical for item in dependencies_by_path.values())):
+        encoded_bytes = len(os.fsencode(str(path)))
+        metadata_bytes = _checked_guard_metadata_add(
+            metadata_bytes, fixed + encoded_bytes,
+            limits.generation_guard_metadata_bytes,
+        )
+    return GenerationGuardPreflight(
+        tuple(dependencies_by_path.values()), tuple(directory_paths.values()),
+        tuple(item.identity.canonical for item in dependencies_by_path.values()),
+        metadata_bytes, authority,
+    )
+
+
 class _DependencyGenerationGuards:
     """OS-observed held-file/path-chain validation between the two runs."""
 
     def __init__(
         self,
-        dependencies: tuple[DependencyDigest, ...],
+        preflight: GenerationGuardPreflight,
         authority: DependencyRootAuthority,
+        deadline: float | None = None,
     ) -> None:
-        if not dependencies or len(dependencies) > 65536:
-            raise AuditInfrastructureError("dependency generation file ceiling exceeded")
+        if not isinstance(preflight, GenerationGuardPreflight):
+            raise AuditInfrastructureError("dependency generation preflight is invalid")
+        if preflight.dependency_root_authority is not authority:
+            raise AuditInfrastructureError("dependency generation authority was replaced")
+        _check_dependency_budget(deadline, None)
         self._authority = authority
-        self._discovery_dependencies = dependencies
+        self._discovery_dependencies = preflight.dependencies
         self._streams: list[object] = []
         self._observer: _FilesystemGenerationObserver | None = None
-        directory_paths: dict[str, Path] = {}
+        self.guards: tuple[DependencyGenerationGuard, ...] = ()
         try:
-            for dependency in dependencies:
-                path = dependency.identity.canonical
-                role, _relative = _dependency_binding(path, authority)
-                binding = next(
-                    item for item in (authority.source_root, *authority.external_roots)
-                    if item.stable_role == role
-                )
-                relative_parent = path.parent.relative_to(binding.resolved_root)
-                current = binding.resolved_root.parent
-                for directory in (current, binding.resolved_root):
-                    directory_paths.setdefault(os.path.normcase(str(directory)), directory)
-                current = binding.resolved_root
-                for part in relative_parent.parts:
-                    current = current / part
-                    directory_paths.setdefault(os.path.normcase(str(current)), current)
-            if len(directory_paths) > 65536:
-                raise AuditInfrastructureError("dependency generation directory ceiling exceeded")
             self._directories = tuple(
                 (path, self._directory_snapshot(path))
-                for path in directory_paths.values()
+                for path in preflight.directory_paths
             )
             self._files = tuple(
                 (dependency.identity.canonical,
                  self._file_snapshot(dependency.identity.canonical.stat()))
-                for dependency in dependencies
+                for dependency in preflight.dependencies
             )
-            if len(self._directories) + len(self._files) > 131072:
-                raise AuditInfrastructureError("dependency generation owner ceiling exceeded")
             for path, snapshot in self._files:
+                _check_dependency_budget(deadline, None)
                 stream = path.open("rb")
                 opened = os.fstat(stream.fileno())
                 if (
@@ -978,6 +1072,21 @@ class _DependencyGenerationGuards:
                 + tuple((path, False) for path, _snapshot in self._files)
             )
             self._observer.drain()
+            directory_identities = tuple(
+                FileIdentity(path, None, snapshot[0], snapshot[1], 0, False)
+                for path, snapshot in self._directories
+            )
+            self.guards = tuple(
+                DependencyGenerationGuard(
+                    dependency, stream, path.parent, dependency.identity,
+                    snapshot[2], snapshot[3], snapshot[4], self,
+                    tuple(path for path, _item in self._directories),
+                    directory_identities,
+                )
+                for dependency, stream, (path, snapshot) in zip(
+                    preflight.dependencies, self._streams, self._files
+                )
+            )
         except BaseException:
             self.close()
             raise
@@ -994,8 +1103,12 @@ class _DependencyGenerationGuards:
 
     @staticmethod
     def _directory_snapshot(path: Path) -> tuple[int, int | None, int]:
-        metadata = path.stat()
-        if not os.path.isdir(path):
+        metadata = path.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+        ):
             raise AuditInfrastructureError("dependency directory guard is invalid")
         return (
             int(metadata.st_dev),
@@ -1080,6 +1193,44 @@ class _DependencyGenerationGuards:
             raise AuditInfrastructureError("dependency generation guard cleanup failed") from errors[0]
 
 
+def arm_dependency_generation_guards(
+    preflight: GenerationGuardPreflight,
+    dependency_roots: DependencyRootAuthority,
+    deadline: float,
+) -> tuple[DependencyGenerationGuard, ...]:
+    authority = validate_dependency_root_authority(dependency_roots)
+    if preflight.dependency_root_authority is not authority:
+        raise AuditInfrastructureError("dependency generation authority was replaced")
+    owner = _DependencyGenerationGuards(preflight, authority, deadline)
+    return owner.guards
+
+
+def _guard_owner(
+    guards: tuple[DependencyGenerationGuard, ...],
+) -> _DependencyGenerationGuards:
+    if not guards or any(
+        not isinstance(guard, DependencyGenerationGuard) for guard in guards
+    ):
+        raise AuditInfrastructureError("dependency generation guards are invalid")
+    owner = guards[0].platform_watch
+    if not isinstance(owner, _DependencyGenerationGuards) or any(
+        guard.platform_watch is not owner for guard in guards
+    ) or owner.guards != guards:
+        raise AuditInfrastructureError("dependency generation guards are invalid")
+    return owner
+
+
+def validate_and_hash_guarded_dependencies(
+    guards: tuple[DependencyGenerationGuard, ...],
+    deadline: float,
+) -> tuple[DependencyDigest, ...]:
+    owner = _guard_owner(guards)
+    try:
+        return owner.validate_and_hash(deadline, None)
+    finally:
+        owner.close()
+
+
 def discover_configuration(
     configuration: PreprocessConfiguration,
     dependency_roots: DependencyRootAuthority,
@@ -1093,7 +1244,8 @@ def discover_configuration(
         expected_digest=configuration.dependency_root_authority_digest,
     )
     validate_compiler_executable_capability(
-        configuration.compiler_capability, authority
+        configuration.compiler_capability, authority,
+        deadline=deadline, cancel_event=cancel_event,
     )
     consumer = _StreamDigestConsumer()
     with tempfile.TemporaryDirectory(
@@ -1131,16 +1283,21 @@ def stabilize_and_parse_configuration(
         expected_digest=configuration.dependency_root_authority_digest,
     )
     validate_compiler_executable_capability(
-        configuration.compiler_capability, authority
+        configuration.compiler_capability, authority,
+        deadline=deadline, cancel_event=cancel_event,
     )
     discovery_started = time.monotonic()
     discovery = discover_configuration(
         configuration, dependency_roots, production, limits, deadline, cancel_event
     )
     discovery_seconds = time.monotonic() - discovery_started
-    guards = _DependencyGenerationGuards(discovery.dependencies, authority).bind(
-        discovery.dependencies
+    preflight = preflight_dependency_generation_guards(
+        discovery, authority, limits
     )
+    guards = arm_dependency_generation_guards(
+        preflight, authority, deadline
+    )
+    guard_owner = _guard_owner(guards)
     accepted_started = time.monotonic()
     try:
         if cancel_event is not None and cancel_event.is_set():
@@ -1158,7 +1315,7 @@ def stabilize_and_parse_configuration(
             rewritten = rewrite_preprocess_command(
                 configuration, Path(temporary) / f"dependencies{suffix}"
             )
-            guards.validate_and_hash(deadline, cancel_event)
+            guard_owner.validate_and_hash(deadline, cancel_event)
             run_bounded_preprocessor(
                 rewritten, configuration, limits, deadline, consumer, cancel_event
             )
@@ -1166,8 +1323,8 @@ def stabilize_and_parse_configuration(
                 rewritten, configuration, authority, production,
                 deadline, cancel_event,
             )
-            accepted_dependencies = guards.validate_and_hash(
-                deadline, cancel_event
+            accepted_dependencies = validate_and_hash_guarded_dependencies(
+                guards, deadline
             )
             if tuple(item.identity for item in accepted_dependencies) != accepted_identities:
                 raise AuditInfrastructureError("dependency closure changed")
@@ -1180,7 +1337,7 @@ def stabilize_and_parse_configuration(
             raise AuditInfrastructureError("dependency closure changed")
         view = builder.finalize(accepted_identities)
     finally:
-        guards.close()
+        guard_owner.close()
     return (
         view,
         discovery,
@@ -1280,7 +1437,8 @@ def load_or_preprocess(
         expected_digest=configuration.dependency_root_authority_digest,
     )
     validate_compiler_executable_capability(
-        configuration.compiler_capability, authority
+        configuration.compiler_capability, authority,
+        deadline=deadline, cancel_event=cancel_event,
     )
     cached = cache.load(configuration)
     if cached is not None:

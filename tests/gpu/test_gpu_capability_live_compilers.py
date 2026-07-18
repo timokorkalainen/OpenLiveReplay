@@ -370,6 +370,11 @@ def _run_live_fixture_impl(
                 "windows-system",
                 Path(os.environ.get("SystemRoot", "C:/Windows")),
             ))
+            runtime_candidates.extend(
+                (f"windows-loader-path-{index:04d}", Path(value))
+                for index, value in enumerate(environment.get("PATH", "").split(os.pathsep))
+                if value
+            )
         elif sys.platform.startswith("linux"):
             runtime_candidates.extend((
                 ("system-lib", Path("/lib")),

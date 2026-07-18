@@ -737,7 +737,6 @@ def compiler_inspection_cache_key(
         raise AuditInfrastructureError(
             "compiler inspection executable is outside the local dependency authority"
         )
-    _identity, content = _held_compiler_snapshot(canonical)
     for label, value in (
         ("compiler executable capability", executable_capability_digest),
         ("compiler resolved runtime closure", resolved_runtime_closure_digest),
@@ -751,7 +750,6 @@ def compiler_inspection_cache_key(
     for value in (
         _COMPILER_INSPECTION_SCHEMA,
         compiler_family.value,
-        content,
         _inspection_environment_digest(launcher_environment),
         authority.portable_authority_digest,
         expected_audit_engine_fingerprint,
@@ -836,14 +834,35 @@ class CompilerInspectionCache:
                 or not isinstance(document["inspection"], str)
             ):
                 raise ValueError("compiler inspection manifest is invalid")
-            inspection = decode_compiler_inspection(
-                base64.b64decode(document["inspection"].encode("ascii"), validate=True)
+            embedded = base64.b64decode(
+                document["inspection"].encode("ascii"), validate=True
             )
-            identity, content = _held_compiler_snapshot(compiler)
+            compiler_before = compiler.stat()
+            compiler_generation = (
+                int(compiler_before.st_dev), int(compiler_before.st_ino) or None,
+                int(compiler_before.st_size), int(compiler_before.st_mtime_ns),
+                int(getattr(compiler_before, "st_ctime_ns", 0)),
+            )
+            try:
+                inspection = decode_compiler_inspection(
+                    embedded, validation_deadline=pipeline_deadline
+                )
+            except AuditInfrastructureError:
+                if time.monotonic() >= pipeline_deadline:
+                    raise
+                try:
+                    compiler_after = compiler.stat()
+                except OSError:
+                    raise
+                if (
+                    int(compiler_after.st_dev), int(compiler_after.st_ino) or None,
+                    int(compiler_after.st_size), int(compiler_after.st_mtime_ns),
+                    int(getattr(compiler_after, "st_ctime_ns", 0)),
+                ) != compiler_generation:
+                    raise
+                return None
             if (
                 inspection.compiler_family is not compiler_family
-                or inspection.executable_identity != identity
-                or inspection.executable_sha256 != content
                 or inspection.executable_capability_digest
                 != executable_capability_digest
             ):
@@ -876,12 +895,9 @@ class CompilerInspectionCache:
             executable_capability_digest=executable_capability_digest,
             resolved_runtime_closure_digest=resolved_runtime_closure_digest,
         )
-        identity, content = _held_compiler_snapshot(compiler)
         if (
             not isinstance(inspection, CompilerInspection)
             or inspection.compiler_family is not compiler_family
-            or inspection.executable_identity != identity
-            or inspection.executable_sha256 != content
             or inspection.executable_capability_digest
             != executable_capability_digest
         ):

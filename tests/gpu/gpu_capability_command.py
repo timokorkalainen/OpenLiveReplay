@@ -6,6 +6,7 @@ import hashlib
 import json
 import locale
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -682,7 +683,7 @@ def _run_probe_command(
     validate = getattr(owner, "validate", None)
     if not callable(validate):
         raise AuditInfrastructureError("compiler probe capability owner is invalid")
-    validate()
+    validate(deadline=pipeline_deadline)
     command = (str(compiler), *arguments)
     launch_options = {}
     if capability.platform_kind == "linux":
@@ -1048,6 +1049,94 @@ class _RuntimeImports:
     format_kind: str = "unknown"
 
 
+_LINUX_LDCONFIG_BYTES = 4 * 1024 * 1024
+_LINUX_LDCONFIG_ENTRIES = 65_536
+
+
+def _parse_linux_ldconfig_cache(payload: bytes) -> dict[str, tuple[Path, ...]]:
+    if not isinstance(payload, bytes) or len(payload) > _LINUX_LDCONFIG_BYTES:
+        raise AuditInfrastructureError("Linux loader cache output exceeds bounds")
+    result: dict[str, list[Path]] = {}
+    entries = 0
+    for raw_line in payload.splitlines():
+        line = raw_line.strip()
+        if b"=>" not in line:
+            continue
+        left, raw_path = line.rsplit(b"=>", 1)
+        name = left.split(None, 1)[0]
+        try:
+            decoded_name = name.decode("ascii")
+            decoded_path = raw_path.strip().decode("utf-8")
+        except UnicodeError as error:
+            raise AuditInfrastructureError("Linux loader cache output is invalid") from error
+        path = Path(decoded_path)
+        if (
+            not decoded_name or len(decoded_name) > 4096
+            or not decoded_path.startswith("/")
+            or len(decoded_path.encode("utf-8")) > 32768
+        ):
+            raise AuditInfrastructureError("Linux loader cache entry is invalid")
+        entries += 1
+        if entries > _LINUX_LDCONFIG_ENTRIES:
+            raise AuditInfrastructureError("Linux loader cache entry ceiling exceeded")
+        paths = result.setdefault(decoded_name, [])
+        if path not in paths:
+            paths.append(path)
+    return {name: tuple(paths) for name, paths in result.items()}
+
+
+def _read_linux_loader_cache(
+    deadline: float | None, cancel_event: object | None
+) -> dict[str, tuple[Path, ...]]:
+    _check_capability_budget(deadline, cancel_event)
+    executable = next(
+        (candidate for candidate in (Path("/sbin/ldconfig"), Path("/usr/sbin/ldconfig"))
+         if candidate.is_file()),
+        None,
+    )
+    if executable is None:
+        located = shutil.which("ldconfig")
+        executable = Path(located) if located else None
+    if executable is None:
+        raise AuditInfrastructureError("Linux loader cache query is unavailable")
+    with tempfile.TemporaryFile(mode="w+b") as output:
+        try:
+            process = subprocess.Popen(
+                (str(executable), "-p"), stdin=subprocess.DEVNULL,
+                stdout=output, stderr=subprocess.DEVNULL,
+                env={"LC_ALL": "C"}, shell=False,
+            )
+        except OSError as error:
+            raise AuditInfrastructureError("Linux loader cache query failed") from error
+        try:
+            while process.poll() is None:
+                _check_capability_budget(deadline, cancel_event)
+                if os.fstat(output.fileno()).st_size > _LINUX_LDCONFIG_BYTES:
+                    raise AuditInfrastructureError("Linux loader cache output exceeds bounds")
+                time.sleep(0.01)
+            if process.returncode != 0:
+                raise AuditInfrastructureError("Linux loader cache query failed")
+            if os.fstat(output.fileno()).st_size > _LINUX_LDCONFIG_BYTES:
+                raise AuditInfrastructureError("Linux loader cache output exceeds bounds")
+            output.seek(0)
+            return _parse_linux_ldconfig_cache(output.read(_LINUX_LDCONFIG_BYTES + 1))
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=1.0)
+            raise
+
+
+def _linux_loader_cache_candidates(
+    name: str,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+) -> tuple[Path, ...]:
+    if not sys.platform.startswith("linux"):
+        return ()
+    return _read_linux_loader_cache(deadline, cancel_event).get(name, ())
+
+
 class _RuntimeBinaryReader:
     """Bounded random-access reader that never materializes a runtime image."""
 
@@ -1319,25 +1408,40 @@ def _macho_runtime_imports(data) -> _RuntimeImports:
         b"\xfe\xed\xfa\xce": (">", False), b"\xce\xfa\xed\xfe": ("<", False),
         b"\xfe\xed\xfa\xcf": (">", True), b"\xcf\xfa\xed\xfe": ("<", True),
     }
-    if magic in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
-        order = ">" if magic == b"\xca\xfe\xba\xbe" else "<"
+    fat_formats = {
+        b"\xca\xfe\xba\xbe": (">", False), b"\xbe\xba\xfe\xca": ("<", False),
+        b"\xca\xfe\xba\xbf": (">", True), b"\xbf\xba\xfe\xca": ("<", True),
+    }
+    if magic in fat_formats:
+        order, fat_64 = fat_formats[magic]
         count = _binary_unpack(data, order + "I", 4)[0]
         if count > 64:
             raise AuditInfrastructureError("compiler runtime Mach-O fat image exceeds bounds")
-        result = []
+        machine = platform.machine().casefold()
+        host_cpu = {
+            "x86_64": 0x01000007, "amd64": 0x01000007,
+            "arm64": 0x0100000C, "aarch64": 0x0100000C,
+            "i386": 7, "i686": 7,
+        }.get(machine)
+        if host_cpu is None:
+            raise AuditInfrastructureError("compiler runtime Mach-O host architecture is unsupported")
+        selected = None
+        entry_size = 32 if fat_64 else 20
         for index in range(count):
-            entry = 8 + index * 20
-            if entry + 20 > length:
+            entry = 8 + index * entry_size
+            if entry + entry_size > length:
                 raise AuditInfrastructureError("compiler runtime Mach-O fat image is truncated")
-            offset, size = _binary_unpack(data, order + "II", entry + 8)
+            cpu = _binary_unpack(data, order + "I", entry)[0]
+            offset, size = _binary_unpack(
+                data, order + ("QQ" if fat_64 else "II"), entry + 8
+            )
             if offset + size > length:
                 raise AuditInfrastructureError("compiler runtime Mach-O slice is invalid")
-            result.append(_macho_runtime_imports(_binary_view(data, offset, size)))
-        return _RuntimeImports(
-            tuple(dict.fromkeys(name for item in result for name in item.names)),
-            tuple(dict.fromkeys(path for item in result for path in item.rpath)),
-            format_kind="macho",
-        )
+            if cpu == host_cpu and selected is None:
+                selected = (offset, size)
+        if selected is None:
+            raise AuditInfrastructureError("compiler runtime Mach-O host slice is absent")
+        return _macho_runtime_imports(_binary_view(data, *selected))
     if magic not in formats:
         raise AuditInfrastructureError("compiler runtime binary format is unsupported")
     order, is_64 = formats[magic]
@@ -1394,6 +1498,7 @@ def _binary_runtime_imports(
             b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
             b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
             b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+            b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
         }:
             return _macho_runtime_imports(data)
         return _RuntimeImports(())
@@ -1521,6 +1626,29 @@ def _loader_default_directories(platform_kind: str) -> tuple[Path, ...]:
     return tuple(result)
 
 
+def _windows_known_dlls() -> frozenset[str]:
+    if os.name != "nt":
+        return frozenset()
+    try:
+        import winreg
+
+        result = set()
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs",
+        ) as key:
+            for index in range(4096):
+                try:
+                    _label, value, _kind = winreg.EnumValue(key, index)
+                except OSError:
+                    break
+                if isinstance(value, str) and value and "\0" not in value:
+                    result.add(Path(value).name.casefold())
+        return frozenset(result)
+    except (ImportError, OSError) as error:
+        raise AuditInfrastructureError("Windows KnownDLL policy is unavailable") from error
+
+
 def _resolve_runtime_name(
     name: str,
     importer: Path,
@@ -1531,6 +1659,12 @@ def _resolve_runtime_name(
     authority: DependencyRootAuthority,
     environment: Mapping[str, str],
     working_directory: Path,
+    *,
+    loaded_modules: Mapping[str, Path] | None = None,
+    known_dlls: frozenset[str] | None = None,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+    linux_loader_cache: Mapping[str, tuple[Path, ...]] | None = None,
 ) -> tuple[Path, tuple[Path, ...], tuple[Path, ...]]:
     candidates = []
     child_inherited = inherited_rpath
@@ -1542,11 +1676,25 @@ def _resolve_runtime_name(
         rpaths = tuple(
             _expand_loader_path(value, importer, executable) for value in imports.rpath
         )
+        library_paths = tuple(
+            Path(value) for value in environment.get("DYLD_LIBRARY_PATH", "").split(os.pathsep)
+            if value
+        )
+        fallback_value = environment.get("DYLD_FALLBACK_LIBRARY_PATH")
+        fallback_paths = tuple(
+            Path(value) for value in fallback_value.split(os.pathsep) if value
+        ) if fallback_value is not None else (
+            Path.home() / "lib", Path("/usr/local/lib"), Path("/usr/lib")
+        )
         if name.startswith("@rpath/"):
             suffix = name[len("@rpath/"):]
             candidates.extend(path / suffix for path in (*rpaths, *inherited_rpath))
-        else:
+        elif name.startswith(("@loader_path/", "@executable_path/")) or raw.is_absolute():
             candidates.append(_expand_loader_path(name, importer, executable))
+        else:
+            leaf = raw.name
+            candidates.extend(path / leaf for path in library_paths)
+            candidates.extend(path / leaf for path in fallback_paths)
         child_inherited = tuple(dict.fromkeys((*rpaths, *inherited_rpath)))
     elif loader_kind == "linux":
         local_rpath = tuple(
@@ -1567,11 +1715,15 @@ def _resolve_runtime_name(
             candidates.append(_expand_loader_path(name, importer, executable))
         else:
             search = (
-                (*inherited_rpath, *local_rpath, *environment_paths)
+                (*local_rpath, *inherited_rpath, *environment_paths)
                 if not local_runpath else
                 (*inherited_rpath, *environment_paths, *local_runpath)
             )
             candidates.extend(path / name for path in search)
+            candidates.extend(
+                _linux_loader_cache_candidates(name, deadline, cancel_event)
+                if linux_loader_cache is None else linux_loader_cache.get(name, ())
+            )
             candidates.extend(path / name for path in _loader_default_directories("linux"))
         if not local_runpath:
             child_inherited = tuple(dict.fromkeys((*inherited_rpath, *local_rpath)))
@@ -1579,19 +1731,23 @@ def _resolve_runtime_name(
         if raw.is_absolute() or "\\" in name or "/" in name:
             candidates.append(raw)
         else:
-            candidates.extend((executable.parent / name, importer.parent / name))
-            candidates.extend(path / name for path in _loader_default_directories("windows"))
-            candidates.append(working_directory / name)
-            candidates.extend(
-                Path(value) / name
-                for value in environment.get("PATH", "").split(os.pathsep)
-                if value
-            )
+            folded = name.casefold()
+            loaded = (loaded_modules or {}).get(folded)
+            if loaded is not None:
+                candidates.append(loaded)
+            elif folded in (known_dlls if known_dlls is not None else _windows_known_dlls()):
+                candidates.append(_loader_default_directories("windows")[0] / name)
+            else:
+                candidates.append(executable.parent / name)
+                candidates.extend(path / name for path in _loader_default_directories("windows"))
+                candidates.append(working_directory / name)
+                candidates.extend(
+                    Path(value) / name
+                    for value in environment.get("PATH", "").split(os.pathsep)
+                    if value
+                )
     for candidate in candidates:
-        try:
-            resolved = _resolve_runtime_candidate(candidate, authority)
-        except AuditInfrastructureError:
-            continue
+        resolved = _resolve_runtime_candidate(candidate, authority)
         if resolved is not None:
             resolved_path, aliases = resolved
             return resolved_path, aliases, child_inherited
@@ -1614,6 +1770,12 @@ def _recursive_runtime_paths(
     seen = set()
     reserved = set()
     total_bytes = 0
+    process_loaded_modules: dict[str, dict[str, Path]] = {}
+    known_dlls = _windows_known_dlls() if platform_kind == "windows" else frozenset()
+    linux_loader_cache = (
+        _read_linux_loader_cache(deadline, cancel_event)
+        if platform_kind == "linux" else None
+    )
 
     def reserve(path: Path) -> None:
         nonlocal total_bytes
@@ -1631,6 +1793,9 @@ def _recursive_runtime_paths(
 
     for seed in seeds:
         reserve(seed)
+        process_loaded_modules.setdefault(
+            os.path.normcase(str(seed.resolve(strict=True))), {}
+        ).setdefault(seed.name.casefold(), seed.resolve(strict=True))
     while pending:
         _check_capability_budget(deadline, cancel_event)
         current, process_executable, inherited_rpath = pending.pop(0)
@@ -1645,6 +1810,9 @@ def _recursive_runtime_paths(
         imports = _binary_runtime_imports(
             current, deadline=deadline, cancel_event=cancel_event
         )
+        loaded_modules = process_loaded_modules[
+            os.path.normcase(str(process_executable.resolve(strict=True)))
+        ]
         for name in imports.names:
             if imports.format_kind == "pe" and name.casefold().startswith(
                 ("api-ms-win-", "ext-ms-win-")
@@ -1655,8 +1823,12 @@ def _recursive_runtime_paths(
             resolved, resolved_aliases, child_inherited = _resolve_runtime_name(
                 name, current, process_executable, platform_kind, imports,
                 inherited_rpath, authority, environment, working_directory,
+                loaded_modules=loaded_modules, known_dlls=known_dlls,
+                deadline=deadline, cancel_event=cancel_event,
+                linux_loader_cache=linux_loader_cache,
             )
             reserve(resolved)
+            loaded_modules.setdefault(Path(name).name.casefold(), resolved)
             for alias in resolved_aliases:
                 if alias not in aliases:
                     aliases.append(alias)
@@ -1719,11 +1891,20 @@ class _CompilerCapabilityOwner:
             raise AuditInfrastructureError("compiler executable capability is closed")
         return self.streams[0].fileno()
 
-    def validate(self, *, content: bool = True) -> None:
+    def validate(
+        self, *, content: bool = True, deadline: float | None = None,
+        cancel_event: object | None = None,
+    ) -> None:
         with self._lock:
-            self._validate_locked(content=content)
+            self._validate_locked(
+                content=content, deadline=deadline, cancel_event=cancel_event
+            )
 
-    def _validate_locked(self, *, content: bool) -> None:
+    def _validate_locked(
+        self, *, content: bool, deadline: float | None,
+        cancel_event: object | None,
+    ) -> None:
+        _check_capability_budget(deadline, cancel_event)
         if self._closed:
             raise AuditInfrastructureError("compiler executable capability is closed")
         self.observer.drain()
@@ -1747,16 +1928,20 @@ class _CompilerCapabilityOwner:
                     "compiler executable changed during compiler version probe: "
                     "capability identity changed"
                 )
-            if content and _content_sha256(stream) != self.file_hashes[
+            if content and _content_sha256(
+                stream, deadline=deadline, cancel_event=cancel_event
+            ) != self.file_hashes[
                 self.streams.index(stream)
             ]:
                 raise AuditInfrastructureError(
                     "compiler executable capability content changed"
                 )
         for path, expected in zip(self.directory_paths, self.directory_snapshots):
+            _check_capability_budget(deadline, cancel_event)
             if _directory_snapshot(path) != expected:
                 raise AuditInfrastructureError("compiler executable path chain changed")
         for path, expected in zip(self.alias_paths, self.alias_snapshots):
+            _check_capability_budget(deadline, cancel_event)
             if _symlink_snapshot(path) != expected:
                 raise AuditInfrastructureError("compiler runtime symlink changed")
         self.observer.drain()
@@ -1923,7 +2108,9 @@ def open_compiler_executable_capability(
         raise AuditInfrastructureError("compiler capability family is invalid")
     if launcher_environment is not None and not isinstance(launcher_environment, Mapping):
         raise AuditInfrastructureError("compiler capability environment is invalid")
-    query_environment = launcher_environment or os.environ
+    query_environment = (
+        os.environ if launcher_environment is None else launcher_environment
+    )
     query_working_directory = working_directory or canonical.parent
     try:
         query_working_directory = query_working_directory.resolve(strict=True)
@@ -1943,7 +2130,10 @@ def open_compiler_executable_capability(
         memoized = _compiler_capability_memo.get(memo_key)
         if memoized is not None:
             try:
-                memoized.native_owner.validate(content=False)
+                memoized.native_owner.validate(
+                    content=False, deadline=pipeline_deadline,
+                    cancel_event=cancel_event,
+                )
             except AuditInfrastructureError:
                 try:
                     memoized.native_owner.close()
@@ -2113,7 +2303,7 @@ def open_compiler_executable_capability(
             closure_digest,
             tuple(closure),
         )
-        owner.validate()
+        owner.validate(deadline=pipeline_deadline, cancel_event=cancel_event)
         if compiler_family is not None and _query_driver:
             helpers = _driver_selected_helper_paths(
                 capability,
@@ -2142,7 +2332,10 @@ def open_compiler_executable_capability(
             existing = _compiler_capability_memo.get(memo_key)
             if existing is not None:
                 owner.close()
-                existing.native_owner.validate(content=False)
+                existing.native_owner.validate(
+                    content=False, deadline=pipeline_deadline,
+                    cancel_event=cancel_event,
+                )
                 return existing
             _compiler_capability_memo[memo_key] = capability
         return capability
@@ -2163,6 +2356,9 @@ def open_compiler_executable_capability(
 def validate_compiler_executable_capability(
     capability: CompilerExecutableCapability,
     dependency_roots: DependencyRootAuthority,
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
 ) -> None:
     authority = validate_dependency_root_authority(
         dependency_roots,
@@ -2172,14 +2368,16 @@ def validate_compiler_executable_capability(
     owner = capability.native_owner
     if not isinstance(owner, _CompilerCapabilityOwner):
         raise AuditInfrastructureError("compiler executable capability owner is invalid")
-    if owner.dependency_root_authority != authority:
+    if owner.dependency_root_authority is not authority:
         raise AuditInfrastructureError("compiler capability local dependency authority differs")
     expected_binding = _toolchain_binding_for_path(
         capability.executable_identity.canonical, authority
     )
     if expected_binding != capability.trusted_toolchain_root:
         raise AuditInfrastructureError("compiler executable capability root differs")
-    owner.validate(content=False)
+    owner.validate(
+        deadline=deadline, cancel_event=cancel_event
+    )
 
 
 def _compiler_fingerprint(
@@ -2255,7 +2453,9 @@ def inspect_compiler(
     )
     owner = capability.native_owner
     try:
-        validate_compiler_executable_capability(capability, authority)
+        validate_compiler_executable_capability(
+            capability, authority, deadline=deadline
+        )
         if _compiler_metadata_snapshot(compiler) != compiler_snapshot:
             raise AuditInfrastructureError(
                 "compiler executable changed during compiler version probe: "
@@ -2287,7 +2487,9 @@ def inspect_compiler(
         with _compiler_inspection_lock:
             memoized = _compiler_inspection_memo.get(memo_key)
             if memoized is not None:
-                validate_compiler_executable_capability(capability, authority)
+                validate_compiler_executable_capability(
+                    capability, authority, deadline=deadline
+                )
                 return memoized
 
             cached = None
@@ -2315,7 +2517,9 @@ def inspect_compiler(
                     or cached.executable_capability_digest != capability.capability_digest
                 ):
                     raise AuditInfrastructureError("compiler inspection cache authority differs")
-                validate_compiler_executable_capability(capability, authority)
+                validate_compiler_executable_capability(
+                    capability, authority, deadline=deadline
+                )
                 _compiler_inspection_memo[memo_key] = cached
                 return cached
 
@@ -2326,7 +2530,9 @@ def inspect_compiler(
                 launcher_environment,
                 deadline,
             )
-            validate_compiler_executable_capability(capability, authority)
+            validate_compiler_executable_capability(
+                capability, authority, deadline=deadline
+            )
             family = identify_compiler(compiler, version_output)
             if family is not compiler_family:
                 raise AuditInfrastructureError("compiler inspection family changed")
@@ -2349,6 +2555,7 @@ def inspect_compiler(
                 driver.hexdigest(),
                 inspection_arguments_digest,
                 capability.capability_digest,
+                validation_deadline=deadline,
             )
             # Force construction of the relocation-stable key before cache publication.
             portable_compiler_inspection_key(inspection)
@@ -2367,7 +2574,9 @@ def inspect_compiler(
                     inspection,
                     deadline,
                 )
-            validate_compiler_executable_capability(capability, authority)
+            validate_compiler_executable_capability(
+                capability, authority, deadline=deadline
+            )
             _compiler_inspection_memo[memo_key] = inspection
             return inspection
     finally:

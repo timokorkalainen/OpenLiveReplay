@@ -40,6 +40,9 @@ _BOOTSTRAP_PSEUDO_FILES = frozenset(
 )
 _DEPENDENCY_DOCUMENT_BYTES = 4 * 1024 * 1024
 _DEPENDENCY_FILE_BYTES = 256 * 1024 * 1024
+_DEPENDENCY_DOCUMENT_ENTRIES = 65_536
+_DEPENDENCY_DOCUMENT_METADATA_BYTES = 32 * 1024 * 1024
+_DEPENDENCY_PATH_METADATA_BYTES = 256
 
 
 def _check_dependency_io_budget(
@@ -245,6 +248,51 @@ def _deduplicate_paths(paths: list[Path]) -> tuple[Path, ...]:
     return tuple(result)
 
 
+def _admit_dependency_document_entry(
+    count: int, metadata_bytes: int, decoded_bytes: int
+) -> tuple[int, int]:
+    count += 1
+    if count > _DEPENDENCY_DOCUMENT_ENTRIES:
+        raise _fail("dependency document entry ceiling exceeded")
+    amount = _DEPENDENCY_PATH_METADATA_BYTES + decoded_bytes
+    if amount < 0 or metadata_bytes > sys.maxsize - amount:
+        raise _fail("dependency document metadata overflow")
+    metadata_bytes += amount
+    if metadata_bytes > _DEPENDENCY_DOCUMENT_METADATA_BYTES:
+        raise _fail("dependency document metadata byte ceiling exceeded")
+    return count, metadata_bytes
+
+
+def _preparse_json_dependency_metadata(payload: bytes) -> None:
+    count = 0
+    metadata_bytes = 0
+    in_string = False
+    escaped = False
+    string_bytes = 0
+    for byte in payload:
+        if not in_string:
+            if byte == 0x22:
+                in_string = True
+                escaped = False
+                string_bytes = 0
+            continue
+        if escaped:
+            escaped = False
+            string_bytes += 1
+        elif byte == 0x5C:
+            escaped = True
+            string_bytes += 1
+        elif byte == 0x22:
+            count, metadata_bytes = _admit_dependency_document_entry(
+                count, metadata_bytes, string_bytes
+            )
+            in_string = False
+        else:
+            string_bytes += 1
+    if in_string:
+        raise _fail("MSVC dependency JSON contains an unterminated string")
+
+
 def parse_gcc_dependencies(
     path: Path,
     *,
@@ -279,6 +327,28 @@ def parse_gcc_dependencies(
     rule_end = data.find(b"\n", colon + 1)
     if rule_end >= 0:
         data = data[:rule_end]
+    admitted_count = 0
+    admitted_metadata = 0
+    admitted_bytes = 0
+    escaped = False
+    for byte in data[colon + 1 :]:
+        if escaped:
+            admitted_bytes += 1
+            escaped = False
+        elif byte == 0x5C:
+            escaped = True
+        elif byte in b" \t\r\n":
+            if admitted_bytes:
+                admitted_count, admitted_metadata = _admit_dependency_document_entry(
+                    admitted_count, admitted_metadata, admitted_bytes
+                )
+                admitted_bytes = 0
+        else:
+            admitted_bytes += 1
+    if admitted_bytes:
+        _admit_dependency_document_entry(
+            admitted_count, admitted_metadata, admitted_bytes
+        )
     fields: list[bytes] = []
     current = bytearray()
     escaped = False
@@ -332,6 +402,7 @@ def parse_msvc_dependencies(
             path, byte_ceiling=_DEPENDENCY_DOCUMENT_BYTES,
             deadline=deadline, cancel_event=cancel_event,
         )
+        _preparse_json_dependency_metadata(payload)
         text = payload.decode("utf-8-sig", errors="strict")
         document = json.loads(text, object_pairs_hook=_json_no_duplicates)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -345,8 +416,16 @@ def parse_msvc_dependencies(
     if not isinstance(source, str) or not isinstance(includes, list):
         raise _fail("MSVC dependency JSON has invalid Source or Includes")
     values = [source, *includes]
+    if len(values) > _DEPENDENCY_DOCUMENT_ENTRIES:
+        raise _fail("dependency document entry ceiling exceeded")
     if any(not isinstance(value, str) or not value for value in values):
         raise _fail("MSVC dependency JSON contains an invalid path")
+    metadata_bytes = 0
+    for value in values:
+        encoded_bytes = len(value.encode("utf-8"))
+        _count, metadata_bytes = _admit_dependency_document_entry(
+            0, metadata_bytes, encoded_bytes
+        )
     return _deduplicate_paths([Path(value) for value in values])
 
 

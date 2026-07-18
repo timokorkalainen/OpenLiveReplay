@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from array import array
 from collections.abc import Sequence
@@ -49,6 +50,7 @@ from gpu_capability_model import (  # noqa: E402
     enumerate_production_identities,
     portable_dependency_key,
     requires_compile_entry,
+    validate_dependency_root_authority,
 )
 
 
@@ -135,6 +137,35 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(authority.external_roots[0].stable_role, "sdk:test")
         self.assertRegex(authority.portable_authority_digest, r"\A[0-9a-f]{64}\Z")
 
+    def test_repeated_authority_validation_rejects_reparse_root_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "source"
+            sdk = root / "sdk"
+            source.mkdir()
+            sdk.mkdir()
+            authority = build_dependency_root_authority(source, {"sdk:test": sdk})
+            original_lstat = Path.lstat
+
+            def reparse_lstat(path: Path):
+                metadata = original_lstat(path)
+                if path == sdk.resolve():
+                    return SimpleNamespace(
+                        st_dev=metadata.st_dev,
+                        st_ino=metadata.st_ino,
+                        st_mode=metadata.st_mode,
+                        st_size=metadata.st_size,
+                        st_mtime_ns=metadata.st_mtime_ns,
+                        st_ctime_ns=metadata.st_ctime_ns,
+                        st_file_attributes=0x400,
+                    )
+                return metadata
+
+            with mock.patch.object(Path, "lstat", reparse_lstat), self.assertRaisesRegex(
+                AuditInfrastructureError, "root identity changed|ordinary directory"
+            ):
+                validate_dependency_root_authority(authority)
+
     def test_compiler_inspection_is_exact_frozen_and_strict(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -206,6 +237,32 @@ class ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(AuditInfrastructureError, "schema"):
             decode_compiler_inspection(
                 json.dumps(document, separators=(",", ":")).encode("ascii")
+            )
+
+    def test_compiler_inspection_hash_validation_obeys_caller_deadline(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        compiler = Path(temporary.name).resolve() / "g++.exe"
+        compiler.write_bytes(b"compiler")
+        metadata = compiler.stat()
+        identity = FileIdentity(
+            compiler, None, int(metadata.st_dev), int(metadata.st_ino) or None,
+            0, False,
+        )
+        arguments = (
+            CompilerFamily.GCC, identity,
+            hashlib.sha256(compiler.read_bytes()).hexdigest(),
+            "g++ (GCC) 14.1.0", "b" * 64, "c" * 64, "d" * 64,
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
+            CompilerInspection(
+                *arguments, validation_deadline=time.monotonic() - 1.0
+            )
+        inspection = CompilerInspection(*arguments)
+        payload = encode_compiler_inspection(inspection)
+        with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
+            decode_compiler_inspection(
+                payload, validation_deadline=time.monotonic() - 1.0
             )
 
     def test_windows_generation_observer_closes_partial_handles_on_setup_failure(self):

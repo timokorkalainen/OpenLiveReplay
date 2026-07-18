@@ -90,6 +90,39 @@ class ProvenanceTests(unittest.TestCase):
                 cancel_event=None,
             )
 
+    def test_gcc_dependency_entry_count_is_bounded_before_path_materialization(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        depfile = Path(temporary.name).resolve() / "many.d"
+        depfile.write_bytes(b"out: " + b"a " * 70_000 + b"\n")
+        with mock.patch(
+            "gpu_capability_provenance.Path",
+            side_effect=AssertionError("dependency Path materialized"),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "entry ceiling"):
+            parse_gcc_dependencies(
+                depfile, deadline=time.monotonic() + 10.0,
+                cancel_event=None,
+            )
+
+    def test_msvc_dependency_entry_count_is_bounded_before_json_materialization(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        document = Path(temporary.name).resolve() / "many.json"
+        document.write_text(
+            json.dumps({
+                "Data": {"Source": "source.cpp", "Includes": ["a"] * 70_000}
+            }, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        with mock.patch(
+            "gpu_capability_provenance.json.loads",
+            side_effect=AssertionError("JSON objects materialized"),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "entry ceiling"):
+            parse_msvc_dependencies(
+                document, deadline=time.monotonic() + 10.0,
+                cancel_event=None,
+            )
+
     def identity(
         self,
         relative: str | None,

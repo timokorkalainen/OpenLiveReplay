@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import locale
 import os
 import subprocess
@@ -302,6 +303,55 @@ class CompilerIdentificationTests(unittest.TestCase):
         )
         self.assertEqual(imports.names, ("@rpath/libchild.dylib",))
         self.assertEqual(imports.rpath, ("@loader_path/../Frameworks",))
+
+    def test_linux_ldconfig_cache_parser_preserves_hwcap_preference(self):
+        parser = getattr(capability_command, "_parse_linux_ldconfig_cache", None)
+        self.assertTrue(callable(parser), "Linux loader cache parser is absent")
+        cache = parser(
+            b"3 libs found in cache `/etc/ld.so.cache'\n"
+            b"\tlibx.so (libc6,x86-64, hwcap: x86-64-v3) => /lib/glibc-hwcaps/x86-64-v3/libx.so\n"
+            b"\tlibx.so (libc6,x86-64) => /lib/libx.so\n"
+        )
+        self.assertEqual(
+            cache["libx.so"],
+            (
+                Path("/lib/glibc-hwcaps/x86-64-v3/libx.so"),
+                Path("/lib/libx.so"),
+            ),
+        )
+
+    def test_macho_fat_image_selects_only_host_slice(self):
+        x86 = self.macho_runtime_image(
+            needed="@rpath/libx86.dylib", rpath="@loader_path/x86"
+        )
+        arm = self.macho_runtime_image(
+            needed="@rpath/libarm.dylib", rpath="@loader_path/arm"
+        )
+        offset_x86 = 0x100
+        offset_arm = offset_x86 + len(x86)
+        image = bytearray(offset_arm + len(arm))
+        struct.pack_into(">II", image, 0, 0xCAFEBABE, 2)
+        struct.pack_into(">IIIII", image, 8, 0x01000007, 3, offset_x86, len(x86), 0)
+        struct.pack_into(">IIIII", image, 28, 0x0100000C, 0, offset_arm, len(arm), 0)
+        image[offset_x86:offset_x86 + len(x86)] = x86
+        image[offset_arm:offset_arm + len(arm)] = arm
+        with mock.patch("platform.machine", return_value="x86_64"):
+            imports = capability_command._macho_runtime_imports(bytes(image))
+        self.assertEqual(imports.names, ("@rpath/libx86.dylib",))
+        self.assertEqual(imports.rpath, ("@loader_path/x86",))
+
+    def test_macho_fat64_image_selects_host_slice(self):
+        thin = self.macho_runtime_image(
+            needed="@rpath/libhost.dylib", rpath="@loader_path/host"
+        )
+        offset = 0x100
+        image = bytearray(offset + len(thin))
+        struct.pack_into(">II", image, 0, 0xCAFEBABF, 1)
+        struct.pack_into(">IIQQII", image, 8, 0x01000007, 3, offset, len(thin), 0, 0)
+        image[offset:] = thin
+        with mock.patch("platform.machine", return_value="x86_64"):
+            imports = capability_command._macho_runtime_imports(bytes(image))
+        self.assertEqual(imports.names, ("@rpath/libhost.dylib",))
 
     def test_binary_runtime_import_parser_reads_current_executable(self):
         resolver = getattr(capability_command, "_binary_runtime_import_names", None)
@@ -714,6 +764,61 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("helper-c.exe", closures[2])
         self.assertEqual(query.call_count, 3)
 
+    def test_explicit_empty_environment_is_not_replaced_by_ambient_environment(self):
+        observed = []
+
+        def selected(_capability, _family, _cwd, environment, *_rest):
+            observed.append(dict(environment))
+            return ()
+
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            side_effect=selected,
+        ), mock.patch.dict(os.environ, {"AMBIENT_ONLY": "present"}, clear=True):
+            open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment={}, working_directory=self.build,
+            )
+        self.assertEqual(observed, [{}])
+
+    def test_capability_requires_identical_in_process_authority_object(self):
+        capability = open_compiler_executable_capability(
+            self.compiler.resolve(), self.dependency_roots,
+            time.monotonic() + 10.0,
+        )
+        replacement = dataclasses.replace(self.dependency_roots)
+        self.assertEqual(replacement, self.dependency_roots)
+        self.assertIsNot(replacement, self.dependency_roots)
+        with self.assertRaisesRegex(AuditInfrastructureError, "local dependency authority"):
+            capability_command.validate_compiler_executable_capability(
+                capability, replacement
+            )
+
+    def test_capability_validation_hashing_obeys_deadline_and_cancellation(self):
+        capability = open_compiler_executable_capability(
+            self.compiler.resolve(), self.dependency_roots,
+            time.monotonic() + 10.0,
+        )
+        parameters = inspect.signature(
+            capability_command.validate_compiler_executable_capability
+        ).parameters
+        self.assertIn("deadline", parameters)
+        self.assertIn("cancel_event", parameters)
+        with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
+            capability_command.validate_compiler_executable_capability(
+                capability, self.dependency_roots,
+                deadline=time.monotonic() - 1.0,
+            )
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            capability_command.validate_compiler_executable_capability(
+                capability, self.dependency_roots,
+                deadline=time.monotonic() + 10.0, cancel_event=cancelled,
+            )
+
     def test_nested_helper_runpath_runtime_and_every_ancestor_are_guarded(self):
         nested = self.compiler.parent / "libexec" / "nested"
         runtime_directory = self.compiler.parent / "runtime"
@@ -767,6 +872,140 @@ class ConfigurationTests(unittest.TestCase):
                 time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
                 launcher_environment=self.environment, working_directory=self.build,
             )
+
+    def test_loader_rejects_first_existing_candidate_outside_authority(self):
+        outside = self.root / "outside-runtime"
+        authorized = self.compiler.parent / "authorized-runtime"
+        outside.mkdir()
+        authorized.mkdir()
+        name = "libfirst-effective.so"
+        (outside / name).write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        (authorized / name).write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        imports = capability_command._RuntimeImports((name,), format_kind="elf")
+        with mock.patch(
+            "gpu_capability_command._loader_default_directories",
+            return_value=(authorized,),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "authority"):
+            capability_command._resolve_runtime_name(
+                name,
+                self.compiler.resolve(),
+                self.compiler.resolve(),
+                "linux",
+                imports,
+                (),
+                self.dependency_roots,
+                {"LD_LIBRARY_PATH": str(outside)},
+                self.build,
+            )
+
+    def test_linux_loader_uses_cache_before_configured_default(self):
+        cache_directory = self.compiler.parent / "cache-runtime"
+        default_directory = self.compiler.parent / "default-runtime"
+        cache_directory.mkdir()
+        default_directory.mkdir()
+        name = "libcached-first.so"
+        cached = cache_directory / name
+        default = default_directory / name
+        cached.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        default.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        imports = capability_command._RuntimeImports((name,), format_kind="elf")
+        with mock.patch(
+            "gpu_capability_command._linux_loader_cache_candidates",
+            return_value=(cached,), create=True,
+        ), mock.patch(
+            "gpu_capability_command._loader_default_directories",
+            return_value=(default_directory,),
+        ):
+            resolved, _aliases, _inherited = capability_command._resolve_runtime_name(
+                name, self.compiler.resolve(), self.compiler.resolve(), "linux",
+                imports, (), self.dependency_roots, {}, self.build,
+            )
+        self.assertEqual(resolved, cached.resolve())
+
+    def test_windows_loader_reuses_loaded_module_before_application_copy(self):
+        loaded_directory = self.compiler.parent / "loaded-runtime"
+        loaded_directory.mkdir()
+        name = "already-loaded.dll"
+        loaded = loaded_directory / name
+        application_copy = self.compiler.parent / name
+        loaded.write_bytes(b"loaded")
+        application_copy.write_bytes(b"application")
+        imports = capability_command._RuntimeImports((name,), format_kind="pe")
+        parameters = inspect.signature(
+            capability_command._resolve_runtime_name
+        ).parameters
+        self.assertIn("loaded_modules", parameters)
+        resolved, _aliases, _inherited = capability_command._resolve_runtime_name(
+            name, self.compiler.resolve(), self.compiler.resolve(), "windows",
+            imports, (), self.dependency_roots, {}, self.build,
+            loaded_modules={name.casefold(): loaded.resolve()}, known_dlls=frozenset(),
+        )
+        self.assertEqual(resolved, loaded.resolve())
+
+    def test_windows_loader_uses_known_dll_before_application_copy(self):
+        windows = self.root / "windows"
+        system32 = windows / "System32"
+        system = windows / "System"
+        system32.mkdir(parents=True)
+        system.mkdir()
+        name = "known-runtime.dll"
+        known = system32 / name
+        application_copy = self.compiler.parent / name
+        known.write_bytes(b"known")
+        application_copy.write_bytes(b"application")
+        authority = build_dependency_root_authority(
+            self.source_root,
+            {"toolchain": self.compiler.parent, "windows-system": windows},
+        )
+        imports = capability_command._RuntimeImports((name,), format_kind="pe")
+        with mock.patch(
+            "gpu_capability_command._loader_default_directories",
+            return_value=(system32, system, windows),
+        ):
+            resolved, _aliases, _inherited = capability_command._resolve_runtime_name(
+                name, self.compiler.resolve(), self.compiler.resolve(), "windows",
+                imports, (), authority, {}, self.build,
+                loaded_modules={}, known_dlls=frozenset({name.casefold()}),
+            )
+        self.assertEqual(resolved, known.resolve())
+
+    def test_windows_loader_does_not_search_dependent_importer_directory(self):
+        importer_directory = self.compiler.parent / "nested"
+        path_directory = self.compiler.parent / "path-runtime"
+        importer_directory.mkdir()
+        path_directory.mkdir()
+        importer = importer_directory / "dependent.dll"
+        importer.write_bytes(b"dependent")
+        name = "ordinary-runtime.dll"
+        (importer_directory / name).write_bytes(b"importer-decoy")
+        selected = path_directory / name
+        selected.write_bytes(b"path-selected")
+        imports = capability_command._RuntimeImports((name,), format_kind="pe")
+        with mock.patch(
+            "gpu_capability_command._loader_default_directories",
+            return_value=(),
+        ):
+            resolved, _aliases, _inherited = capability_command._resolve_runtime_name(
+                name, importer.resolve(), self.compiler.resolve(), "windows",
+                imports, (), self.dependency_roots,
+                {"PATH": str(path_directory)}, self.build,
+                loaded_modules={}, known_dlls=frozenset(),
+            )
+        self.assertEqual(resolved, selected.resolve())
+
+    def test_macho_loader_uses_explicit_fallback_path_for_bare_name(self):
+        fallback = self.compiler.parent / "fallback-runtime"
+        fallback.mkdir()
+        name = "libfallback.dylib"
+        runtime = fallback / name
+        runtime.write_bytes(b"runtime")
+        imports = capability_command._RuntimeImports((name,), format_kind="macho")
+        resolved, _aliases, _inherited = capability_command._resolve_runtime_name(
+            name, self.compiler.resolve(), self.compiler.resolve(), "macos",
+            imports, (), self.dependency_roots,
+            {"DYLD_FALLBACK_LIBRARY_PATH": str(fallback)}, self.build,
+        )
+        self.assertEqual(resolved, runtime.resolve())
 
     def test_runtime_closure_spans_distinct_authority_roots(self):
         helper_directory = self.compiler.parent / "libexec"

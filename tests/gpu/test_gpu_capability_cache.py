@@ -314,6 +314,82 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             )
         )
 
+    def test_cache_key_load_and_publish_do_not_rehash_held_compiler(self):
+        inspection = self.inspection()
+        with mock.patch(
+            "gpu_capability_cache._held_compiler_snapshot",
+            wraps=sys.modules["gpu_capability_cache"]._held_compiler_snapshot,
+        ) as snapshot:
+            self.cache.publish(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, inspection, time.monotonic() + 10.0,
+            )
+            self.assertEqual(
+                self.cache.load(
+                    self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                    self.authority, "e" * 64, self.capability_digest,
+                    self.closure_digest, time.monotonic() + 10.0,
+                ),
+                inspection,
+            )
+        self.assertEqual(snapshot.call_count, 0)
+
+    def test_corrupt_authentic_inspection_payload_is_a_cache_miss(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        key = compiler_inspection_cache_key(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64,
+            executable_capability_digest=self.capability_digest,
+            resolved_runtime_closure_digest=self.closure_digest,
+        )
+        path = self.cache._path(key)
+        document = json.loads(path.read_text(encoding="ascii"))
+        embedded = json.loads(base64.b64decode(document["inspection"]).decode("ascii"))
+        embedded["compiler_family"] = "not-a-family"
+        document["inspection"] = base64.b64encode(
+            json.dumps(embedded, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        ).decode("ascii")
+        path.write_text(
+            json.dumps(document, ensure_ascii=True, separators=(",", ":")),
+            encoding="ascii",
+        )
+        self.assertIsNone(
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
+            )
+        )
+
+    def test_live_compiler_mutation_during_cache_decode_remains_fatal(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        original_decode = sys.modules["gpu_capability_cache"].decode_compiler_inspection
+
+        def mutate_then_decode(payload, **kwargs):
+            self.compiler.write_bytes(b"compiler-mutated-during-load")
+            return original_decode(payload, **kwargs)
+
+        with mock.patch(
+            "gpu_capability_cache.decode_compiler_inspection",
+            side_effect=mutate_then_decode,
+        ), self.assertRaisesRegex(AuditInfrastructureError, "content changed"):
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
+            )
+
 class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
     def setUp(self) -> None:
         _PreprocessCacheFixture.setUp(self)

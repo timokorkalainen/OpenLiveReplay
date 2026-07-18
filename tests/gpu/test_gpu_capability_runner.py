@@ -45,7 +45,6 @@ from gpu_capability_model import (  # noqa: E402
 from gpu_capability_provenance import PreprocessedStreamBuilder  # noqa: E402
 from gpu_capability_runner import (  # noqa: E402
     ExecutionResult,
-    _DependencyGenerationGuards,
     _WindowsJob,
     collect_configurations,
     discover_configuration,
@@ -606,6 +605,29 @@ class BoundedPreprocessorTests(unittest.TestCase):
             )
         popen.assert_not_called()
 
+    def test_cancellation_is_rechecked_immediately_before_popen(self):
+        cancellation = threading.Event()
+
+        def prepare(_containment, command):
+            cancellation.set()
+            return command
+
+        with mock.patch.object(
+            capability_runner._ProcessContainment,
+            "prepare_command",
+            prepare,
+        ), mock.patch(
+            "gpu_capability_runner.subprocess.Popen",
+            side_effect=OSError("Popen was reached"),
+        ) as popen, self.assertRaisesRegex(
+            AuditInfrastructureError, "cancelled before launch"
+        ):
+            self.run_direct(
+                "success", deadline=time.monotonic() + 10.0,
+                cancel_event=cancellation,
+            )
+        popen.assert_not_called()
+
     def test_exact_environment_snapshot_is_passed_to_popen(self):
         snapshot = {"GPU_RUNNER_SENTINEL": "one"}
         configuration = dataclasses.replace(
@@ -1035,23 +1057,38 @@ class OrchestrationTests(unittest.TestCase):
             identity,
             hashlib.sha256(path.read_bytes()).hexdigest(),
         )
-        guards = _DependencyGenerationGuards(
-            (dependency,), self.dependency_roots
-        ).bind((dependency,))
+        discovery = capability_runner.PreprocessDiscovery(
+            capability_runner.StreamDigest("a" * 64, 1),
+            (dependency,), (identity,),
+        )
+        preflight = capability_runner.preflight_dependency_generation_guards(
+            discovery, self.dependency_roots, AuditLimits()
+        )
+        guards = capability_runner.arm_dependency_generation_guards(
+            preflight, self.dependency_roots, time.monotonic() + 10.0
+        )
+        owner = guards[0].platform_watch
         try:
             if os.name == "nt":
                 with self.assertRaises(OSError):
                     path.write_text("changed\n", encoding="utf-8")
-                self.assertEqual(guards.validate_and_hash(), (dependency,))
+                self.assertEqual(
+                    capability_runner.validate_and_hash_guarded_dependencies(
+                        guards, time.monotonic() + 10.0
+                    ),
+                    (dependency,),
+                )
             else:
                 path.write_text("changed\n", encoding="utf-8")
                 path.write_text("original\n", encoding="utf-8")
                 with self.assertRaisesRegex(
                     AuditInfrastructureError, "generation change"
                 ):
-                    guards.validate_and_hash()
+                    capability_runner.validate_and_hash_guarded_dependencies(
+                        guards, time.monotonic() + 10.0
+                    )
         finally:
-            guards.close()
+            owner.close()
 
     def test_dependency_guard_cleanup_failure_is_fatal(self):
         path = self.write_source("playback/cleanup.h", "original\n")
@@ -1062,14 +1099,24 @@ class OrchestrationTests(unittest.TestCase):
             identity,
             hashlib.sha256(path.read_bytes()).hexdigest(),
         )
-        guards = _DependencyGenerationGuards((dependency,), self.dependency_roots)
-        observer = guards._observer
+        discovery = capability_runner.PreprocessDiscovery(
+            capability_runner.StreamDigest("a" * 64, 1),
+            (dependency,), (identity,),
+        )
+        preflight = capability_runner.preflight_dependency_generation_guards(
+            discovery, self.dependency_roots, AuditLimits()
+        )
+        guards = capability_runner.arm_dependency_generation_guards(
+            preflight, self.dependency_roots, time.monotonic() + 10.0
+        )
+        owner = guards[0].platform_watch
+        observer = owner._observer
         with mock.patch.object(
             observer, "close", side_effect=AuditInfrastructureError("cleanup")
         ), self.assertRaisesRegex(
             AuditInfrastructureError, "guard cleanup failed"
         ):
-            guards.close()
+            owner.close()
         observer._close_no_raise()
 
     def test_dependency_guard_rejects_unsupported_platform_backend(self):
@@ -1229,6 +1276,64 @@ class OrchestrationTests(unittest.TestCase):
             capability_runner._dependency_digests(
                 (identity,), self.dependency_roots,
                 time.monotonic() - 1.0, None,
+            )
+
+    def test_dependency_generation_guards_use_locked_three_phase_interface(self):
+        for name in (
+            "preflight_dependency_generation_guards",
+            "arm_dependency_generation_guards",
+            "validate_and_hash_guarded_dependencies",
+        ):
+            self.assertTrue(callable(getattr(capability_runner, name, None)), name)
+        source = self.write_source("playback/three-phase.h")
+        identity = self.identity(source, "playback/three-phase.h")
+        dependencies = capability_runner._dependency_digests(
+            (identity,), self.dependency_roots,
+            time.monotonic() + 10.0, None,
+        )
+        discovery = capability_runner.PreprocessDiscovery(
+            capability_runner.StreamDigest("a" * 64, 1),
+            dependencies, (identity,),
+        )
+        preflight = capability_runner.preflight_dependency_generation_guards(
+            discovery, self.dependency_roots, AuditLimits()
+        )
+        guards = capability_runner.arm_dependency_generation_guards(
+            preflight, self.dependency_roots, time.monotonic() + 10.0
+        )
+        self.assertEqual(
+            capability_runner.validate_and_hash_guarded_dependencies(
+                guards, time.monotonic() + 10.0
+            ),
+            dependencies,
+        )
+
+    def test_guard_metadata_admission_fails_before_first_open_or_watch(self):
+        fields = AuditLimits.__dataclass_fields__
+        self.assertIn("unique_dependency_handles", fields)
+        self.assertIn("unique_generation_guard_directories", fields)
+        self.assertIn("generation_guard_metadata_bytes", fields)
+        source = self.write_source("playback/metadata-admission.h")
+        identity = self.identity(source, "playback/metadata-admission.h")
+        dependencies = capability_runner._dependency_digests(
+            (identity,), self.dependency_roots,
+            time.monotonic() + 10.0, None,
+        )
+        discovery = capability_runner.PreprocessDiscovery(
+            capability_runner.StreamDigest("a" * 64, 1),
+            dependencies, (identity,),
+        )
+        limits = dataclasses.replace(
+            AuditLimits(), generation_guard_metadata_bytes=1
+        )
+        with mock.patch.object(
+            Path, "open", side_effect=AssertionError("file owner opened")
+        ), mock.patch(
+            "gpu_capability_runner._FilesystemGenerationObserver",
+            side_effect=AssertionError("watch armed"),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "metadata"):
+            capability_runner.preflight_dependency_generation_guards(
+                discovery, self.dependency_roots, limits
             )
 
     @staticmethod
