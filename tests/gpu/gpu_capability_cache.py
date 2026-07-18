@@ -53,6 +53,124 @@ class _UnsafeCacheNamespaceError(OSError):
     """A cache pathname is linked, replaced, or otherwise not uniquely owned."""
 
 
+def _lock_carrier_anchor_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.anchor")
+
+
+def _before_lock_carrier_temporary_cleanup(_path: Path) -> None:
+    """Test seam for deterministic lock-carrier cleanup race coverage."""
+
+
+def _cleanup_owned_lock_carrier_temporary(
+    path: Path,
+    expected_identity: tuple[int, int] | None,
+    original_error: BaseException,
+) -> None:
+    if expected_identity is None:
+        return
+    _before_lock_carrier_temporary_cleanup(path)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as cleanup_error:
+        raise AuditInfrastructureError(
+            "cache lock carrier temporary was replaced"
+        ) from cleanup_error
+    if (
+        _is_link(metadata)
+        or not stat.S_ISREG(metadata.st_mode)
+        or _file_ownership_identity(metadata) != expected_identity
+    ):
+        raise AuditInfrastructureError(
+            "cache lock carrier temporary was replaced"
+        ) from original_error
+    try:
+        path.unlink()
+    except OSError as cleanup_error:
+        raise AuditInfrastructureError(
+            "cannot remove cache lock carrier temporary after "
+            f"{type(original_error).__name__}: {original_error}"
+        ) from cleanup_error
+
+
+def _initialize_lock_carrier_anchor(anchor: Path) -> None:
+    temporary = anchor.with_name(f".tmp-lock-{uuid.uuid4().hex}")
+    temporary_identity: tuple[int, int] | None = None
+    try:
+        with temporary.open("x+b") as stream:
+            stream.write(b"1")
+            stream.flush()
+            os.fsync(stream.fileno())
+            temporary_identity = _file_ownership_identity(os.fstat(stream.fileno()))
+        try:
+            if os.name == "nt":
+                os.rename(temporary, anchor)
+            else:
+                os.link(temporary, anchor)
+                temporary.unlink()
+        except FileExistsError as error:
+            _cleanup_owned_lock_carrier_temporary(
+                temporary, temporary_identity, error
+            )
+    except BaseException as error:
+        _cleanup_owned_lock_carrier_temporary(
+            temporary, temporary_identity, error
+        )
+        raise
+
+
+def _open_lock_carrier_pair(path: Path):
+    anchor = _lock_carrier_anchor_path(path)
+    try:
+        anchor.lstat()
+    except FileNotFoundError:
+        try:
+            existing = _regular_unlinked_file(path)
+        except FileNotFoundError:
+            _initialize_lock_carrier_anchor(anchor)
+        else:
+            if int(existing.st_size) != 1:
+                raise OSError("cache lock carrier is uninitialized")
+            try:
+                os.link(path, anchor)
+            except FileExistsError:
+                pass
+    anchor_metadata = anchor.lstat()
+    if (
+        _is_link(anchor_metadata)
+        or not stat.S_ISREG(anchor_metadata.st_mode)
+        or int(anchor_metadata.st_size) != 1
+        or int(getattr(anchor_metadata, "st_nlink", 0)) not in (1, 2)
+    ):
+        raise OSError("cache lock carrier anchor is unsafe")
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        if int(getattr(anchor_metadata, "st_nlink", 0)) != 1:
+            raise OSError("cache lock carrier anchor has an unexpected alias")
+        try:
+            os.link(anchor, path, follow_symlinks=False)
+        except FileExistsError:
+            pass
+
+    anchor_stream = None
+    stream = None
+    try:
+        anchor_stream = anchor.open("r+b")
+        stream = path.open("r+b")
+        _SharedCacheFileLock._assert_carrier_at(
+            path, stream, anchor_stream
+        )
+        return stream, anchor_stream
+    except BaseException:
+        if stream is not None:
+            stream.close()
+        if anchor_stream is not None:
+            anchor_stream.close()
+        raise
+
+
 def _check_cache_rss(reserve: int = 0) -> None:
     limit = AuditLimits().rss_bytes
     rss = _current_process_rss_bytes()
@@ -172,7 +290,7 @@ class _PublicationGuard:
 
 
 class _SharedCacheFileLock:
-    """Deadline-bounded cross-process lock over one ordinary carrier file."""
+    """Deadline-bounded lock over a carrier with a persistent hard-link anchor."""
 
     def __init__(
         self,
@@ -190,7 +308,9 @@ class _SharedCacheFileLock:
         self.cancel_event = cancel_event
         self.namespace_path = namespace_path
         self.stream = None
+        self.anchor_stream = None
         self.namespace_stream = None
+        self.namespace_anchor_stream = None
         self._namespace_locked = False
         self._root_fd: int | None = None
 
@@ -213,17 +333,25 @@ class _SharedCacheFileLock:
             raise AuditInfrastructureError("cache root was replaced")
 
     def _assert_carrier(self, stream) -> None:
-        self._assert_carrier_at(self.path, stream)
+        assert self.anchor_stream is not None
+        self._assert_carrier_at(self.path, stream, self.anchor_stream)
 
     @staticmethod
-    def _assert_carrier_at(path: Path, stream) -> None:
-        carrier = _regular_unlinked_file(path)
+    def _assert_carrier_at(path: Path, stream, anchor_stream) -> None:
+        anchor_path = _lock_carrier_anchor_path(path)
+        carrier = path.lstat()
+        anchor = anchor_path.lstat()
         opened = os.fstat(stream.fileno())
+        opened_anchor = os.fstat(anchor_stream.fileno())
+        metadata = (carrier, anchor, opened, opened_anchor)
         if (
-            int(opened.st_dev) != int(carrier.st_dev)
-            or int(opened.st_ino) != int(carrier.st_ino)
-            or int(getattr(opened, "st_nlink", 1)) != 1
-            or int(opened.st_size) != 1
+            any(_is_link(value) for value in (carrier, anchor))
+            or any(not stat.S_ISREG(value.st_mode) for value in metadata)
+            or any(int(value.st_size) != 1 for value in metadata)
+            or any(int(getattr(value, "st_nlink", 0)) != 2 for value in metadata)
+            or len({
+                (int(value.st_dev), int(value.st_ino)) for value in metadata
+            }) != 1
         ):
             raise OSError("cache lock carrier changed while opening")
 
@@ -275,6 +403,9 @@ class _SharedCacheFileLock:
 
     def _release_namespace(self) -> None:
         if self.namespace_stream is None:
+            if self.namespace_anchor_stream is not None:
+                self.namespace_anchor_stream.close()
+                self.namespace_anchor_stream = None
             return
         stream = self.namespace_stream
         self.namespace_stream = None
@@ -284,6 +415,9 @@ class _SharedCacheFileLock:
         finally:
             self._namespace_locked = False
             stream.close()
+            if self.namespace_anchor_stream is not None:
+                self.namespace_anchor_stream.close()
+                self.namespace_anchor_stream = None
 
     def __enter__(self) -> "_SharedCacheFileLock":
         if (
@@ -296,15 +430,16 @@ class _SharedCacheFileLock:
             self._assert_root()
             self._acquire_root_anchor()
             if self.namespace_path is not None and self.namespace_path != self.path:
-                try:
-                    namespace_stream = self.namespace_path.open("x+b")
-                    namespace_stream.write(b"1")
-                    namespace_stream.flush()
-                    os.fsync(namespace_stream.fileno())
-                except FileExistsError:
-                    namespace_stream = self.namespace_path.open("r+b")
+                namespace_stream, namespace_anchor_stream = _open_lock_carrier_pair(
+                    self.namespace_path
+                )
                 self.namespace_stream = namespace_stream
-                self._assert_carrier_at(self.namespace_path, namespace_stream)
+                self.namespace_anchor_stream = namespace_anchor_stream
+                self._assert_carrier_at(
+                    self.namespace_path,
+                    namespace_stream,
+                    namespace_anchor_stream,
+                )
                 while not _PublicationGuard._lock(
                     namespace_stream, blocking=False
                 ):
@@ -313,19 +448,37 @@ class _SharedCacheFileLock:
                         0.01, max(0.0, self.deadline - time.monotonic())
                     ))
                 self._namespace_locked = True
-                self._assert_carrier_at(self.namespace_path, namespace_stream)
-            try:
-                stream = self.path.open("x+b")
-                stream.write(b"1")
-                stream.flush()
-                os.fsync(stream.fileno())
-            except FileExistsError:
-                stream = self.path.open("r+b")
+                self._assert_carrier_at(
+                    self.namespace_path,
+                    namespace_stream,
+                    namespace_anchor_stream,
+                )
+            stream, anchor_stream = _open_lock_carrier_pair(self.path)
             self.stream = stream
+            self.anchor_stream = anchor_stream
             self._assert_carrier(stream)
-            while not _PublicationGuard._lock(stream, blocking=False):
+            acquired = _PublicationGuard._lock(stream, blocking=False)
+            if self.namespace_stream is not None:
+                assert self.namespace_path is not None
+                assert self.namespace_anchor_stream is not None
+                self._assert_carrier_at(
+                    self.namespace_path,
+                    self.namespace_stream,
+                    self.namespace_anchor_stream,
+                )
+            self._assert_root()
+            if (
+                self._root_fd is not None
+                and _directory_identity(os.fstat(self._root_fd))
+                != self.root_identity
+            ):
+                raise AuditInfrastructureError("cache root was replaced")
+            self._release_namespace()
+            self._release_root_anchor()
+            while not acquired:
                 self._check_budget()
                 time.sleep(min(0.01, max(0.0, self.deadline - time.monotonic())))
+                acquired = _PublicationGuard._lock(stream, blocking=False)
             self._assert_carrier(stream)
             self._check_budget()
             self._assert_root()
@@ -336,6 +489,9 @@ class _SharedCacheFileLock:
                 if self.stream is not None:
                     self.stream.close()
                     self.stream = None
+                if self.anchor_stream is not None:
+                    self.anchor_stream.close()
+                    self.anchor_stream = None
             finally:
                 try:
                     self._release_namespace()
@@ -355,6 +511,9 @@ class _SharedCacheFileLock:
             try:
                 self.stream.close()
                 self.stream = None
+                if self.anchor_stream is not None:
+                    self.anchor_stream.close()
+                    self.anchor_stream = None
             finally:
                 try:
                     self._release_namespace()

@@ -88,6 +88,25 @@ def _publish_equal_inspection_in_spawned_process(
         result_queue.put(("error", type(error).__name__, str(error)))
 
 
+def _acquire_shared_lock_in_spawned_process(
+    cache_root: str,
+    carrier_name: str,
+    result_queue,
+) -> None:
+    try:
+        root = Path(cache_root)
+        identity = _directory_identity(capability_cache._ordinary_directory(root))
+        with capability_cache._SharedCacheFileLock(
+            root / carrier_name,
+            root,
+            identity,
+            time.monotonic() + 5.0,
+        ):
+            result_queue.put(("ok",))
+    except BaseException as error:
+        result_queue.put(("error", type(error).__name__, str(error)))
+
+
 def _spawned_preprocess_fixture(
     fixture_root: str,
 ) -> tuple[PreprocessConfiguration, FileIdentity, FileIdentity]:
@@ -820,91 +839,332 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 cancelled,
             )
 
-    @unittest.skipIf(os.name == "nt", "POSIX flock semantics only")
-    def test_shared_lock_serializes_waiter_across_carrier_replacement(self):
-        lock_type = capability_cache._SharedCacheFileLock
-        carrier = self.cache.root / ".compiler-inspection-root.lock"
-        first = lock_type(
-            carrier,
-            self.cache.root,
-            self.cache._root_identity,
-            time.monotonic() + 10.0,
-        )
-        first.__enter__()
-        attempted = threading.Event()
-        outcomes = []
-        def acquire_second():
-            second = lock_type(
-                carrier,
-                self.cache.root,
-                self.cache._root_identity,
-                time.monotonic() + 5.0,
+    def test_distinct_lock_lanes_enter_concurrently(self):
+        locks_by_path = {}
+        for index in range(64):
+            candidate = self.cache._key_lock(
+                f"distinct-{index}", time.monotonic() + 10.0
             )
+            locks_by_path.setdefault(candidate.path, candidate)
+            if len(locks_by_path) == 2:
+                break
+        self.assertEqual(len(locks_by_path), 2)
+        first, second = locks_by_path.values()
+        entered = threading.Event()
+        failures: list[BaseException] = []
+
+        def acquire_distinct_lane() -> None:
             try:
-                attempted.set()
                 with second:
-                    outcomes.append("acquired")
+                    entered.set()
             except BaseException as error:
-                outcomes.append(error)
+                failures.append(error)
 
+        first.__enter__()
+        waiter = threading.Thread(target=acquire_distinct_lane)
+        waiter.start()
         try:
-            waiter = threading.Thread(target=acquire_second)
-            waiter.start()
-            self.assertTrue(attempted.wait(timeout=2.0))
-            displaced = carrier.with_name(f"{carrier.name}.displaced")
-            carrier.rename(displaced)
-            carrier.write_bytes(b"1")
-            time.sleep(0.05)
-            self.assertTrue(waiter.is_alive())
-            first.__exit__(None, None, None)
-            waiter.join(timeout=2.0)
-            self.assertFalse(waiter.is_alive())
+            entered_while_first_held = entered.wait(timeout=0.5)
         finally:
-            if first.stream is not None:
-                first.__exit__(None, None, None)
+            first.__exit__(None, None, None)
+            waiter.join(timeout=5.0)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(failures, [])
+        self.assertTrue(
+            entered_while_first_held,
+            "distinct lock lane was serialized behind the active lane",
+        )
 
-        self.assertEqual(len(outcomes), 1)
-        self.assertEqual(outcomes[0], "acquired")
+    def test_same_lock_lane_remains_serialized(self):
+        first = self.cache._key_lock("same-lane", time.monotonic() + 10.0)
+        second = self.cache._key_lock("same-lane", time.monotonic() + 5.0)
+        self.assertEqual(first.path, second.path)
+        attempted = threading.Event()
+        entered = threading.Event()
+        failures: list[BaseException] = []
 
-    @unittest.skipIf(os.name == "nt", "POSIX flock semantics only")
-    def test_post_replacement_opener_cannot_split_lock_namespace(self):
+        def acquire_same_lane() -> None:
+            attempted.set()
+            try:
+                with second:
+                    entered.set()
+            except BaseException as error:
+                failures.append(error)
+
+        first.__enter__()
+        waiter = threading.Thread(target=acquire_same_lane)
+        waiter.start()
+        self.assertTrue(attempted.wait(timeout=2.0))
+        try:
+            self.assertFalse(entered.wait(timeout=0.15))
+        finally:
+            first.__exit__(None, None, None)
+            waiter.join(timeout=5.0)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(failures, [])
+        self.assertTrue(entered.is_set())
+
+    def test_post_replacement_opener_rejects_split_lock_namespace(self):
         lock_type = capability_cache._SharedCacheFileLock
         carrier = self.cache.root / ".compiler-inspection-root.lock"
-        first = lock_type(
+        with lock_type(
             carrier,
             self.cache.root,
             self.cache._root_identity,
             time.monotonic() + 10.0,
-        )
-        first.__enter__()
+        ):
+            pass
         displaced = carrier.with_name(f"{carrier.name}.displaced")
         carrier.rename(displaced)
         carrier.write_bytes(b"1")
-        outcomes = []
+        try:
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "lock namespace"
+            ):
+                with lock_type(
+                    carrier,
+                    self.cache.root,
+                    self.cache._root_identity,
+                    time.monotonic() + 1.0,
+                ):
+                    self.fail("replacement carrier entered a split namespace")
+        finally:
+            carrier.unlink(missing_ok=True)
+            displaced.rename(carrier)
 
-        def acquire_replacement_carrier():
+    def test_spawned_post_replacement_opener_is_fatal(self):
+        lock_type = capability_cache._SharedCacheFileLock
+        carrier = self.cache.root / ".spawned-replacement-root.lock"
+        with lock_type(
+            carrier,
+            self.cache.root,
+            self.cache._root_identity,
+            time.monotonic() + 10.0,
+        ):
+            pass
+        displaced = carrier.with_name(f"{carrier.name}.displaced")
+        carrier.rename(displaced)
+        carrier.write_bytes(b"1")
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        process = context.Process(
+            target=_acquire_shared_lock_in_spawned_process,
+            args=(str(self.cache.root), carrier.name, results),
+        )
+        try:
+            process.start()
+            process.join(timeout=10.0)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+            observed = results.get(timeout=2.0)
+            self.assertEqual(observed[0:2], ("error", "AuditInfrastructureError"))
+            self.assertRegex(observed[2], "lock namespace")
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5.0)
+            results.close()
+            results.join_thread()
+            process.close()
+            carrier.unlink(missing_ok=True)
+            displaced.rename(carrier)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permits replacement of an open carrier")
+    def test_namespace_replacement_during_lane_acquisition_is_fatal(self):
+        lock_type = capability_cache._SharedCacheFileLock
+        namespace = self.cache.root / ".during-acquisition-root.lock"
+        lane = self.cache.root / ".during-acquisition-lane.lock"
+        displaced = namespace.with_name(f"{namespace.name}.displaced")
+        real_open_pair = capability_cache._open_lock_carrier_pair
+
+        def replace_namespace_while_lane_opens(path):
+            pair = real_open_pair(path)
+            if Path(path) == lane:
+                namespace.rename(displaced)
+                namespace.write_bytes(b"1")
+            return pair
+
+        try:
+            with mock.patch(
+                "gpu_capability_cache._open_lock_carrier_pair",
+                side_effect=replace_namespace_while_lane_opens,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "lock namespace"
+            ):
+                with lock_type(
+                    lane,
+                    self.cache.root,
+                    self.cache._root_identity,
+                    time.monotonic() + 5.0,
+                    namespace_path=namespace,
+                ):
+                    self.fail("replaced namespace carrier entered the lane")
+        finally:
+            namespace.unlink(missing_ok=True)
+            if displaced.exists():
+                displaced.rename(namespace)
+
+    @unittest.skipUnless(os.name == "nt", "Windows first-use publication race")
+    def test_concurrent_first_use_never_exposes_uninitialized_carrier(self):
+        lock_type = capability_cache._SharedCacheFileLock
+        carrier = self.cache.root / ".first-use-root.lock"
+        first_create_opened = threading.Event()
+        release_first_create = threading.Event()
+        delay_lock = threading.Lock()
+        delayed = False
+        real_open = Path.open
+        outcomes: list[str] = []
+        failures: list[BaseException] = []
+
+        def delay_first_create(path, *args, **kwargs):
+            nonlocal delayed
+            stream = real_open(path, *args, **kwargs)
+            mode = args[0] if args else kwargs.get("mode", "r")
+            with delay_lock:
+                should_delay = mode == "x+b" and not delayed
+                if should_delay:
+                    delayed = True
+            if should_delay:
+                first_create_opened.set()
+                if not release_first_create.wait(timeout=5.0):
+                    stream.close()
+                    raise AssertionError("first carrier creation release timed out")
+            return stream
+
+        def acquire() -> None:
             try:
                 with lock_type(
                     carrier,
                     self.cache.root,
                     self.cache._root_identity,
-                    time.monotonic() + 0.15,
+                    time.monotonic() + 5.0,
                 ):
-                    outcomes.append("acquired-concurrently")
+                    outcomes.append("acquired")
             except BaseException as error:
-                outcomes.append(error)
+                failures.append(error)
 
-        waiter = threading.Thread(target=acquire_replacement_carrier)
+        with mock.patch.object(Path, "open", autospec=True, side_effect=delay_first_create):
+            first = threading.Thread(target=acquire)
+            second = threading.Thread(target=acquire)
+            first.start()
+            self.assertTrue(first_create_opened.wait(timeout=2.0))
+            public_size = carrier.stat().st_size if carrier.exists() else None
+            second.start()
+            time.sleep(0.1)
+            release_first_create.set()
+            first.join(timeout=5.0)
+            second.join(timeout=5.0)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertNotEqual(public_size, 0)
+        self.assertEqual(failures, [])
+        self.assertEqual(outcomes, ["acquired", "acquired"])
+
+    def test_failed_lock_carrier_initialization_cleans_owned_temporary(self):
+        lock_type = capability_cache._SharedCacheFileLock
+        carrier = self.cache.root / ".failed-initialization.lock"
+        anchor = capability_cache._lock_carrier_anchor_path(carrier)
+        temporary = self.cache.root / f".tmp-lock-{'f' * 32}"
+        operation = "rename" if os.name == "nt" else "link"
+        real_operation = getattr(os, operation)
+
+        def reject_anchor_publication(source, destination, *args, **kwargs):
+            if Path(source) == temporary and Path(destination) == anchor:
+                raise OSError("deterministic carrier publication failure")
+            return real_operation(source, destination, *args, **kwargs)
+
+        with mock.patch(
+            "gpu_capability_cache.uuid.uuid4",
+            return_value=mock.Mock(hex="f" * 32),
+        ), mock.patch(
+            f"gpu_capability_cache.os.{operation}",
+            side_effect=reject_anchor_publication,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "lock namespace"
+        ):
+            with lock_type(
+                carrier,
+                self.cache.root,
+                self.cache._root_identity,
+                time.monotonic() + 5.0,
+            ):
+                self.fail("failed carrier initialization entered the lock")
+        self.assertFalse(temporary.exists())
+        self.assertFalse(anchor.exists())
+        self.assertFalse(carrier.exists())
+
+    def test_failed_lock_carrier_cleanup_preserves_replacement(self):
+        lock_type = capability_cache._SharedCacheFileLock
+        carrier = self.cache.root / ".replaced-initialization.lock"
+        anchor = capability_cache._lock_carrier_anchor_path(carrier)
+        temporary = self.cache.root / f".tmp-lock-{'e' * 32}"
+        displaced = self.cache.root / ".owned-lock-carrier-temporary"
+        replacement = b"replacement lock carrier temporary"
+        operation = "rename" if os.name == "nt" else "link"
+        real_operation = getattr(os, operation)
+        real_rename = os.rename
+
+        def reject_anchor_publication(source, destination, *args, **kwargs):
+            if Path(source) == temporary and Path(destination) == anchor:
+                raise OSError("deterministic carrier publication failure")
+            return real_operation(source, destination, *args, **kwargs)
+
+        def replace_before_cleanup(path):
+            self.assertEqual(Path(path), temporary)
+            real_rename(temporary, displaced)
+            temporary.write_bytes(replacement)
+
         try:
-            waiter.start()
-            waiter.join(timeout=2.0)
-            self.assertFalse(waiter.is_alive())
-            self.assertEqual(len(outcomes), 1)
-            self.assertIsInstance(outcomes[0], AuditInfrastructureError)
-            self.assertRegex(str(outcomes[0]), "deadline|namespace")
+            with mock.patch(
+                "gpu_capability_cache.uuid.uuid4",
+                return_value=mock.Mock(hex="e" * 32),
+            ), mock.patch(
+                f"gpu_capability_cache.os.{operation}",
+                side_effect=reject_anchor_publication,
+            ), mock.patch(
+                "gpu_capability_cache._before_lock_carrier_temporary_cleanup",
+                side_effect=replace_before_cleanup,
+            ) as cleanup, self.assertRaisesRegex(
+                AuditInfrastructureError, "lock carrier temporary was replaced"
+            ):
+                with lock_type(
+                    carrier,
+                    self.cache.root,
+                    self.cache._root_identity,
+                    time.monotonic() + 5.0,
+                ):
+                    self.fail("replaced carrier initialization entered the lock")
+            cleanup.assert_called_once_with(temporary)
+            self.assertEqual(temporary.read_bytes(), replacement)
+            self.assertFalse(anchor.exists())
+            self.assertFalse(carrier.exists())
         finally:
-            first.__exit__(None, None, None)
-            waiter.join(timeout=2.0)
+            temporary.unlink(missing_ok=True)
+            displaced.unlink(missing_ok=True)
+
+    def test_unsafe_lock_anchor_is_rejected_without_public_link_creation(self):
+        lock_type = capability_cache._SharedCacheFileLock
+        carrier = self.cache.root / ".unsafe-anchor.lock"
+        anchor = capability_cache._lock_carrier_anchor_path(carrier)
+        seed = self.root / "unsafe-anchor-seed"
+        seed.write_bytes(b"1")
+        try:
+            os.link(seed, anchor)
+        except OSError as error:
+            self.skipTest(f"hardlinks unavailable: {error}")
+        before_links = int(seed.stat().st_nlink)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "lock namespace"
+        ):
+            with lock_type(
+                carrier,
+                self.cache.root,
+                self.cache._root_identity,
+                time.monotonic() + 5.0,
+            ):
+                self.fail("unsafe carrier anchor entered the lock")
+        self.assertFalse(carrier.exists())
+        self.assertEqual(int(seed.stat().st_nlink), before_links)
 
     def test_inspection_publication_rejects_unsafe_shared_lock_carrier(self):
         inspection = self.inspection()
