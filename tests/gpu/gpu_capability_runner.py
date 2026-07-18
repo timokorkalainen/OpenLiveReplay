@@ -17,6 +17,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 
 from gpu_capability_cache import PreprocessCache
 from gpu_capability_command import (
@@ -959,6 +960,7 @@ _GENERATION_GUARD_INDEX_METADATA_BYTES = 72
 @dataclass(frozen=True, slots=True)
 class GenerationGuardPreflight:
     dependencies: tuple[DependencyDigest, ...]
+    dependencies_by_path: Mapping[str, DependencyDigest]
     directory_paths: tuple[Path, ...]
     file_paths: tuple[Path, ...]
     metadata_bytes: int
@@ -1003,10 +1005,9 @@ def preflight_dependency_generation_guards(
             raise AuditInfrastructureError("dependency generation preflight is invalid")
         path = dependency.identity.canonical
         key = os.path.normcase(str(path))
-        previous = dependencies_by_path.get(key)
-        if previous is not None and previous != dependency:
-            raise AuditInfrastructureError("dependency generation path is ambiguous")
-        dependencies_by_path.setdefault(key, dependency)
+        if key in dependencies_by_path:
+            raise AuditInfrastructureError("dependency generation path is duplicate or ambiguous")
+        dependencies_by_path[key] = dependency
         role, _relative = _dependency_binding(path, authority)
         binding = next(
             item for item in (authority.source_root, *authority.external_roots)
@@ -1042,7 +1043,9 @@ def preflight_dependency_generation_guards(
             limits.generation_guard_metadata_bytes,
         )
     return GenerationGuardPreflight(
-        tuple(dependencies_by_path.values()), tuple(directory_paths.values()),
+        tuple(dependencies_by_path.values()),
+        MappingProxyType(dependencies_by_path),
+        tuple(directory_paths.values()),
         tuple(item.identity.canonical for item in dependencies_by_path.values()),
         metadata_bytes, authority,
     )
@@ -1064,6 +1067,7 @@ class _DependencyGenerationGuards:
         _check_dependency_budget(deadline, None)
         self._authority = authority
         self._discovery_dependencies = preflight.dependencies
+        self._dependencies_by_path = preflight.dependencies_by_path
         self._streams: list[object] = []
         self._observer: _FilesystemGenerationObserver | None = None
         self.guards: tuple[DependencyGenerationGuard, ...] = ()
@@ -1097,11 +1101,12 @@ class _DependencyGenerationGuards:
                 FileIdentity(path, None, snapshot[0], snapshot[1], 0, False)
                 for path, snapshot in self._directories
             )
+            directory_paths = preflight.directory_paths
             self.guards = tuple(
                 DependencyGenerationGuard(
                     dependency, stream, path.parent, dependency.identity,
                     snapshot[2], snapshot[3], snapshot[4], self,
-                    tuple(path for path, _item in self._directories),
+                    directory_paths,
                     directory_identities,
                 )
                 for dependency, stream, (path, snapshot) in zip(
@@ -1164,11 +1169,13 @@ class _DependencyGenerationGuards:
                 or self._file_snapshot(path.stat()) != expected
             ):
                 raise AuditInfrastructureError("dependency generation changed")
-            dependency = next(
-                dependency
-                for dependency in self._discovery_dependencies
-                if dependency.identity.canonical == path
+            dependency = self._dependencies_by_path.get(
+                os.path.normcase(str(path))
             )
+            if dependency is None or dependency.identity.canonical != path:
+                raise AuditInfrastructureError(
+                    "dependency generation lookup changed"
+                )
             digest = hashlib.sha256()
             stream.seek(0)
             while chunk := stream.read(1024 * 1024):

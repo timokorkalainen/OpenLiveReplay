@@ -49,6 +49,10 @@ _hash_cache: dict[tuple[object, ...], str] = {}
 _hash_lock = threading.Lock()
 
 
+class _UnsafeCacheNamespaceError(OSError):
+    """A cache pathname is linked, replaced, or otherwise not uniquely owned."""
+
+
 def _check_cache_rss(reserve: int = 0) -> None:
     limit = AuditLimits().rss_bytes
     rss = _current_process_rss_bytes()
@@ -277,16 +281,22 @@ def _path_key(path: Path) -> str:
 def _regular_unlinked_file(path: Path) -> os.stat_result:
     metadata = path.lstat()
     if _is_link(metadata) or not stat.S_ISREG(metadata.st_mode):
-        raise OSError(f"cache path is not an ordinary file: {path}")
+        raise _UnsafeCacheNamespaceError(
+            f"cache path is not an ordinary file: {path}"
+        )
     if int(getattr(metadata, "st_nlink", 1)) != 1:
-        raise OSError(f"cache path has filesystem aliases: {path}")
+        raise _UnsafeCacheNamespaceError(
+            f"cache path has filesystem aliases: {path}"
+        )
     return metadata
 
 
 def _ordinary_directory(path: Path) -> os.stat_result:
     metadata = path.lstat()
     if _is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
-        raise OSError(f"cache path is not an ordinary directory: {path}")
+        raise _UnsafeCacheNamespaceError(
+            f"cache path is not an ordinary directory: {path}"
+        )
     return metadata
 
 
@@ -305,12 +315,14 @@ def _dependency_digest(identity: FileIdentity, *, force: bool = False) -> str:
         raise OSError("dependency path is not absolute")
     metadata = path.lstat()
     if _is_link(metadata) or not stat.S_ISREG(metadata.st_mode):
-        raise OSError("dependency is not an ordinary file")
+        raise _UnsafeCacheNamespaceError("dependency is not an ordinary file")
     if int(getattr(metadata, "st_nlink", 1)) != 1:
-        raise OSError("dependency has filesystem aliases")
+        raise _UnsafeCacheNamespaceError("dependency has filesystem aliases")
     canonical = path.resolve(strict=True)
     if _path_key(canonical) != _path_key(path):
-        raise OSError("dependency resolves through a canonical alias")
+        raise _UnsafeCacheNamespaceError(
+            "dependency resolves through a canonical alias"
+        )
     device = int(metadata.st_dev)
     inode = int(metadata.st_ino) if int(metadata.st_ino) != 0 else None
     if identity.device is not None and device != identity.device:
@@ -593,7 +605,9 @@ class _HeldCacheFile:
             or _file_identity_tuple(opened) != _file_identity_tuple(before)
         ):
             stream.close()
-            raise OSError("cache file changed while opening")
+            raise _UnsafeCacheNamespaceError(
+                "cache file changed while opening"
+            )
         self.stream = stream
         self.identity = _file_identity_tuple(opened)
         return self
@@ -601,12 +615,17 @@ class _HeldCacheFile:
     def verify(self) -> None:
         assert self.stream is not None and self.identity is not None
         opened = os.fstat(self.stream.fileno())
-        current = _regular_unlinked_file(self.path)
+        try:
+            current = _regular_unlinked_file(self.path)
+        except FileNotFoundError as error:
+            raise _UnsafeCacheNamespaceError(
+                "cache file was removed while held"
+            ) from error
         if (
             _file_identity_tuple(opened) != self.identity
             or _file_identity_tuple(current) != self.identity
         ):
-            raise OSError("cache file changed while held")
+            raise _UnsafeCacheNamespaceError("cache file changed while held")
 
     def __exit__(self, _type, _value, _traceback) -> None:
         assert self.stream is not None
@@ -1475,8 +1494,8 @@ class PreprocessCache:
         key: str,
     ) -> PreprocessedTranslationUnitView | None:
         entry = self.root / key
+        self._assert_root_identity()
         try:
-            self._assert_root_identity()
             document = self._load_manifest(entry, key)
             dependencies = self._validated_dependencies(document)
             payload = entry / "payload.bin"
@@ -1502,6 +1521,10 @@ class PreprocessCache:
                     expected_digest,
                 )
                 held.verify()
+        except _UnsafeCacheNamespaceError as error:
+            raise AuditInfrastructureError(
+                "cache namespace is unsafe"
+            ) from error
         except (
             AuditInfrastructureError,
             FileNotFoundError,
@@ -1584,12 +1607,27 @@ class PreprocessCache:
         return winner
 
     @staticmethod
-    def _discard_losing_temporary(temporary: Path) -> None:
-        if not _remove_held_flat_directory(temporary):
+    def _discard_losing_temporary(
+        temporary: Path,
+        expected_identity: tuple[int, int | None],
+    ) -> None:
+        if not _remove_held_flat_directory(
+            temporary, expected_identity=expected_identity
+        ):
             try:
-                temporary.lstat()
+                current_identity = _directory_identity(
+                    _ordinary_directory(temporary)
+                )
             except FileNotFoundError:
                 return
+            except OSError as error:
+                raise AuditInfrastructureError(
+                    "losing cache publication temporary was replaced"
+                ) from error
+            if current_identity != expected_identity:
+                raise AuditInfrastructureError(
+                    "losing cache publication temporary was replaced"
+                )
             raise AuditInfrastructureError(
                 "cannot remove losing cache publication temporary"
             )
@@ -1680,7 +1718,9 @@ class PreprocessCache:
                         winner = self._load_unlocked(view.configuration, key)
                         if winner is not None:
                             winner = self._accept_winner(view, winner)
-                            self._discard_losing_temporary(temporary)
+                            self._discard_losing_temporary(
+                                temporary, temporary_identity
+                            )
                             if final_validation is not None:
                                 final_validation()
                             return winner
@@ -1703,7 +1743,9 @@ class PreprocessCache:
                             if winner is None:
                                 raise
                             winner = self._accept_winner(view, winner)
-                            self._discard_losing_temporary(temporary)
+                            self._discard_losing_temporary(
+                                temporary, temporary_identity
+                            )
                             if final_validation is not None:
                                 final_validation()
                             return winner
@@ -1725,7 +1767,9 @@ class PreprocessCache:
                             if winner is None:
                                 raise
                             winner = self._accept_winner(view, winner)
-                            self._discard_losing_temporary(temporary)
+                            self._discard_losing_temporary(
+                                temporary, temporary_identity
+                            )
                             if final_validation is not None:
                                 final_validation()
                             return winner

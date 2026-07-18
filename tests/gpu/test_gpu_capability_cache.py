@@ -20,6 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import gpu_capability_cache as capability_cache  # noqa: E402
 from gpu_capability_cache import (  # noqa: E402
     CompilerInspectionCache,
     PreprocessCache,
@@ -931,7 +932,7 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
     def test_hit_requires_every_dependency_content_hash(self):
         self._assert_hit_requires_every_dependency_content_hash()
 
-    def test_missing_replaced_and_hardlinked_dependency_are_misses(self):
+    def test_missing_and_regularly_replaced_dependencies_are_misses(self):
         cache = PreprocessCache(self.cache_root)
         cache.publish(self.view())
         self.header_path.unlink()
@@ -940,12 +941,19 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         self.assertIsNone(cache.load(self.configuration))
 
         cache.publish(self.view(dependencies=(self.main, self.identity(self.header_path, "playback/a.h"))))
+
+    def test_hardlinked_dependency_is_a_fatal_namespace_violation(self):
+        cache = PreprocessCache(self.cache_root)
+        cache.publish(self.view())
         alias = self.root / "alias.h"
         try:
             os.link(self.header_path, alias)
         except OSError as error:
             self.skipTest(f"hardlinks unavailable: {error}")
-        self.assertIsNone(cache.load(self.configuration))
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "namespace|alias|ordinary"
+        ):
+            cache.load(self.configuration)
 
     def test_unreadable_dependency_is_a_miss(self):
         cache = PreprocessCache(self.cache_root)
@@ -974,21 +982,18 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         (entry / "payload.bin").write_bytes(b"corrupt")
         self.assertIsNone(cache.load(self.configuration))
 
-    def test_payload_replacement_between_hash_and_deserialize_is_a_miss(self):
+    def test_payload_namespace_violation_during_decode_is_fatal(self):
         cache = PreprocessCache(self.cache_root)
         cache.publish(self.view())
-        payload = self.entry(cache) / "payload.bin"
-
-        def replace_after_hash(_path: Path) -> None:
-            replacement = payload.with_name("replacement.bin")
-            replacement.write_bytes(payload.read_bytes().replace(b"lease", b"zease", 1))
-            os.replace(replacement, payload)
-
         with mock.patch(
-            "gpu_capability_cache._before_payload_parse",
-            side_effect=replace_after_hash,
+            "gpu_capability_cache._HeldCacheFile.verify",
+            side_effect=capability_cache._UnsafeCacheNamespaceError(
+                "payload was replaced"
+            ),
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "namespace|replaced|changed"
         ):
-            self.assertIsNone(cache.load(self.configuration))
+            cache.load(self.configuration)
 
     def test_in_place_payload_mutation_with_restored_mtime_is_a_miss(self):
         cache = PreprocessCache(self.cache_root)
@@ -1522,6 +1527,48 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             ):
                 loser.publish(self.view())
 
+    def test_losing_temporary_replacement_is_never_deleted(self):
+        winner = PreprocessCache(self.cache_root)
+        winner.publish(self.view())
+        loser = PreprocessCache(self.cache_root)
+        real_remove = _remove_held_flat_directory
+        replacement = None
+        displaced = None
+        received_identities = []
+
+        def replace_before_remove(path, *, expected_identity=None, **kwargs):
+            nonlocal replacement, displaced
+            if path.name.startswith(".tmp-") and replacement is None:
+                received_identities.append(expected_identity)
+                displaced = path.with_name(f"{path.name}.displaced")
+                path.rename(displaced)
+                path.mkdir()
+                (path / "manifest.json").write_bytes(b"replacement manifest")
+                (path / "payload.bin").write_bytes(b"replacement payload")
+                replacement = path
+            return real_remove(
+                path, expected_identity=expected_identity, **kwargs
+            )
+
+        try:
+            with mock.patch(
+                "gpu_capability_cache._remove_held_flat_directory",
+                side_effect=replace_before_remove,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "temporary.*replaced|cannot remove.*temporary"
+            ):
+                loser.publish(self.view())
+            self.assertIsNotNone(replacement)
+            self.assertTrue(replacement.exists())
+            self.assertEqual(len(received_identities), 1)
+            self.assertIsNotNone(received_identities[0])
+            self.assertIsNotNone(winner.load(self.configuration))
+        finally:
+            if replacement is not None and replacement.exists():
+                real_remove(replacement)
+            if displaced is not None and displaced.exists():
+                real_remove(displaced)
+
     def test_publish_failure_never_creates_a_complete_entry(self):
         cache = PreprocessCache(self.cache_root)
         with mock.patch("gpu_capability_cache._write_payload", side_effect=OSError("disk full")):
@@ -1780,7 +1827,10 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             os.link(manifest, alias)
         except OSError as error:
             self.skipTest(f"hardlinks unavailable: {error}")
-        self.assertIsNone(cache.load(self.configuration))
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "namespace|alias|ordinary"
+        ):
+            cache.load(self.configuration)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ import time
 import unittest
 from array import array
 from pathlib import Path, PurePosixPath
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest import mock
 
 
@@ -1343,6 +1343,137 @@ class OrchestrationTests(unittest.TestCase):
                     )
         finally:
             owner.close()
+
+    def test_generation_guard_preflight_charges_one_shared_directory_table(self):
+        dependencies = []
+        for index in range(2):
+            relative = f"playback/shared-{index}/guarded.h"
+            path = self.write_source(relative, f"guarded {index}\n")
+            identity = self.identity(path, relative)
+            dependencies.append(DependencyDigest(
+                self.dependency_roots.source_root.stable_role,
+                PurePosixPath(relative),
+                identity,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            ))
+        discovery = capability_runner.PreprocessDiscovery(
+            capability_runner.StreamDigest("a" * 64, 1),
+            tuple(dependencies),
+            tuple(item.identity for item in dependencies),
+        )
+        preflight = capability_runner.preflight_dependency_generation_guards(
+            discovery, self.dependency_roots, AuditLimits()
+        )
+        self.assertIsInstance(preflight.dependencies_by_path, MappingProxyType)
+        guards = capability_runner.arm_dependency_generation_guards(
+            preflight, self.dependency_roots, time.monotonic() + 10.0
+        )
+        owner = guards[0].platform_watch
+        try:
+            self.assertIs(
+                guards[0].directory_chain_owners,
+                preflight.directory_paths,
+            )
+            self.assertIs(
+                guards[0].directory_chain_owners,
+                guards[1].directory_chain_owners,
+            )
+            self.assertIs(
+                guards[0].directory_chain_identities,
+                guards[1].directory_chain_identities,
+            )
+        finally:
+            owner.close()
+
+    def test_generation_guard_preflight_accepts_exact_32768_before_any_open(self):
+        role = self.dependency_roots.source_root.stable_role
+        dependencies = tuple(
+            DependencyDigest(
+                role,
+                PurePosixPath(f"playback/ceiling-{index}.h"),
+                FileIdentity(
+                    self.root / "playback" / f"ceiling-{index}.h",
+                    PurePosixPath(f"playback/ceiling-{index}.h"),
+                    1,
+                    index + 1,
+                    0,
+                    True,
+                ),
+                "a" * 64,
+            )
+            for index in range(32_768)
+        )
+        discovery = capability_runner.PreprocessDiscovery(
+            capability_runner.StreamDigest("a" * 64, 1),
+            dependencies,
+            tuple(item.identity for item in dependencies),
+        )
+        with mock.patch.object(
+            Path, "open", side_effect=AssertionError("file owner opened")
+        ), mock.patch(
+            "gpu_capability_runner._FilesystemGenerationObserver",
+            side_effect=AssertionError("watch armed"),
+        ):
+            preflight = capability_runner.preflight_dependency_generation_guards(
+                discovery, self.dependency_roots, AuditLimits()
+            )
+        self.assertEqual(len(preflight.dependencies), 32_768)
+        self.assertEqual(len(preflight.dependencies_by_path), 32_768)
+
+    def test_guarded_dependency_lookup_is_linear_and_rejects_duplicate_paths(self):
+        dependencies = []
+        for index in range(64):
+            relative = f"playback/lookup-{index}.h"
+            path = self.write_source(relative, f"lookup {index}\n")
+            identity = self.identity(path, relative)
+            dependencies.append(DependencyDigest(
+                self.dependency_roots.source_root.stable_role,
+                PurePosixPath(relative),
+                identity,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            ))
+        discovery = capability_runner.PreprocessDiscovery(
+            capability_runner.StreamDigest("a" * 64, 1),
+            tuple(dependencies),
+            tuple(item.identity for item in dependencies),
+        )
+        preflight = capability_runner.preflight_dependency_generation_guards(
+            discovery, self.dependency_roots, AuditLimits()
+        )
+        guards = capability_runner.arm_dependency_generation_guards(
+            preflight, self.dependency_roots, time.monotonic() + 10.0
+        )
+        owner = guards[0].platform_watch
+
+        class CountingDependencies(tuple):
+            visits = 0
+
+            def __iter__(self):
+                for item in super().__iter__():
+                    self.visits += 1
+                    yield item
+
+        counted = CountingDependencies(owner._discovery_dependencies)
+        owner._discovery_dependencies = counted
+        self.assertEqual(
+            capability_runner.validate_and_hash_guarded_dependencies(
+                guards, time.monotonic() + 10.0
+            ),
+            tuple(dependencies),
+        )
+        self.assertLessEqual(counted.visits, len(dependencies))
+
+        duplicate_discovery = capability_runner.PreprocessDiscovery(
+            capability_runner.StreamDigest("a" * 64, 1),
+            (dependencies[0], dependencies[0]),
+            (dependencies[0].identity, dependencies[0].identity),
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "duplicate|ambiguous"
+        ):
+            capability_runner.preflight_dependency_generation_guards(
+                duplicate_discovery, self.dependency_roots, AuditLimits()
+            )
 
     def test_dependency_guard_cleanup_failure_is_fatal(self):
         path = self.write_source("playback/cleanup.h", "original\n")
