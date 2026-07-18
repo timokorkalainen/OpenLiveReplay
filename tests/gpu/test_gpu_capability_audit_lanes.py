@@ -10,7 +10,7 @@ import tracemalloc
 import unittest
 from array import array
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType
+from types import FunctionType, MappingProxyType
 from unittest import mock
 
 
@@ -42,6 +42,73 @@ from gpu_capability_source_audit import (  # noqa: E402
 
 
 class AuditEngineFingerprintTests(unittest.TestCase):
+    def test_enum_lookup_and_iteration_state_are_attested(self):
+        baseline = capability_audit.audit_engine_fingerprint()
+        compiler_family = capability_model.CompilerFamily
+
+        lookup = dict(compiler_family._value2member_map_)
+        lookup["gcc"] = compiler_family.CLANG
+        with mock.patch.object(compiler_family, "_value2member_map_", lookup):
+            self.assertIs(compiler_family("gcc"), compiler_family.CLANG)
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+        reordered_lookup = dict(reversed(tuple(compiler_family._value2member_map_.items())))
+        with mock.patch.object(
+            compiler_family, "_value2member_map_", reordered_lookup
+        ):
+            self.assertEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+        reversed_names = list(reversed(compiler_family._member_names_))
+        with mock.patch.object(compiler_family, "_member_names_", reversed_names):
+            self.assertEqual(
+                tuple(compiler_family),
+                tuple(reversed(tuple(compiler_family.__members__.values()))),
+            )
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+    def test_enum_live_state_rejects_unsupported_values(self):
+        compiler_family = capability_model.CompilerFamily
+        unsupported_lookup = dict(compiler_family._value2member_map_)
+        unsupported_lookup["gcc"] = []
+        with mock.patch.object(
+            compiler_family, "_value2member_map_", unsupported_lookup
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "Enum member mapping is invalid"
+            ):
+                capability_audit.audit_engine_fingerprint()
+
+    def test_nested_code_globals_are_followed_recursively(self):
+        def fixture_outer():
+            def inner():
+                return nested_runtime_policy
+
+            return inner
+
+        outer = FunctionType(
+            fixture_outer.__code__,
+            capability_audit.__dict__,
+            "nested_policy_outer",
+        )
+        outer.__module__ = capability_audit.__name__
+        outer.__qualname__ = "nested_policy_outer"
+        with (
+            mock.patch.object(
+                capability_audit, "nested_runtime_policy", "first", create=True
+            ),
+            mock.patch.object(
+                capability_audit, "nested_policy_outer", outer, create=True
+            ),
+        ):
+            baseline = capability_audit.audit_engine_fingerprint()
+            with mock.patch.object(
+                capability_audit, "nested_runtime_policy", "second"
+            ):
+                self.assertEqual(outer()(), "second")
+                self.assertNotEqual(
+                    capability_audit.audit_engine_fingerprint(), baseline
+                )
+
     def test_worker_default_mutation_changes_digest_without_hashing_host_count(self):
         baseline = capability_audit.audit_engine_fingerprint()
         defaults = capability_model.AuditLimits.__init__.__defaults__

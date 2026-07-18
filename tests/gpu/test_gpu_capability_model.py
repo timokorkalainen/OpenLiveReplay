@@ -402,6 +402,11 @@ class ModelTests(unittest.TestCase):
             ):
                 decode_local_dependency_digest(payload)
 
+    def test_local_dependency_codec_wraps_deep_json_recursion(self):
+        payload = b"[" * 5000 + b"0" + b"]" * 5000
+        with self.assertRaises(AuditInfrastructureError):
+            decode_local_dependency_digest(payload)
+
     def test_private_owned_packed_construction_avoids_copy_reserve_and_stays_read_only(self):
         configuration = self.configuration()
         limits = dataclasses.replace(AuditLimits(), rss_bytes=100_000)

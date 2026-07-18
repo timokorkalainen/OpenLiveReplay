@@ -7030,7 +7030,7 @@ _DATACLASS_GENERATED_MEMBER_EXCLUSIONS = frozenset({
     "__dataclass_fields__",
     "__dataclass_params__",
 })
-_ENUM_GENERATED_MEMBER_EXCLUSIONS = frozenset({
+_ENUM_LIVE_STATE_MEMBERS = frozenset({
     "_hashable_values_",
     "_member_map_",
     "_member_names_",
@@ -7373,7 +7373,7 @@ class _LiveSemanticEncoder:
             pieces.append(self._frame(b"closure", closure_values))
         global_pieces: list[bytes] = []
         exclusions = _AUDIT_RUNTIME_STATE_EXCLUSIONS.get(function.__module__, frozenset())
-        for name in sorted(set(function.__code__.co_names)):
+        for name in _global_names_from_code(function.__code__):
             if name not in function.__globals__:
                 continue
             if name in exclusions:
@@ -7390,6 +7390,104 @@ class _LiveSemanticEncoder:
             global_pieces.append(self._frame(b"global", (name.encode("utf-8"), encoded)))
         pieces.append(self._frame(b"globals", global_pieces))
         return self._frame(b"function", pieces)
+
+    def _encode_enum_live_sequence(self, name: str, value: object) -> bytes:
+        if not isinstance(value, list):
+            raise AuditInfrastructureError(
+                f"audit engine Enum live sequence is invalid: {name}"
+            )
+        cycle = self._cycle_or_mark(value)
+        if cycle is not None:
+            return cycle
+        return self._frame(
+            b"enum-live-sequence",
+            (name.encode("ascii"), *(self.encode(item) for item in value)),
+        )
+
+    def _encode_enum_live_mapping(
+        self,
+        name: str,
+        value: object,
+        *,
+        preserve_order: bool,
+    ) -> bytes:
+        if not isinstance(value, dict):
+            raise AuditInfrastructureError(
+                f"audit engine Enum live mapping is invalid: {name}"
+            )
+        cycle = self._cycle_or_mark(value)
+        if cycle is not None:
+            return cycle
+        if preserve_order:
+            ordered_items = tuple(value.items())
+        else:
+            encoded_items = sorted(
+                (
+                    (
+                        _LiveSemanticEncoder().encode(key),
+                        key,
+                        item,
+                    )
+                    for key, item in value.items()
+                ),
+                key=lambda encoded_item: encoded_item[0],
+            )
+            key_encodings = tuple(item[0] for item in encoded_items)
+            if len(set(key_encodings)) != len(key_encodings):
+                raise AuditInfrastructureError(
+                    "audit engine Enum live mapping has duplicate semantic keys"
+                )
+            ordered_items = tuple(
+                (key, item) for _key_encoding, key, item in encoded_items
+            )
+        return self._frame(
+            b"enum-live-mapping",
+            (
+                name.encode("ascii"),
+                *(
+                    self._frame(b"item", (self.encode(key), self.encode(item)))
+                    for key, item in ordered_items
+                ),
+            ),
+        )
+
+    def _encode_enum_live_state(
+        self,
+        class_object: enum.EnumMeta,
+        name: str,
+        value: object,
+    ) -> bytes:
+        if name == "_member_names_":
+            if not isinstance(value, list) or any(
+                not isinstance(member_name, str)
+                or member_name not in class_object._member_map_
+                for member_name in value
+            ):
+                raise AuditInfrastructureError(
+                    "audit engine Enum member names are invalid"
+                )
+            return self._encode_enum_live_sequence(name, value)
+        if name in {"_hashable_values_", "_unhashable_values_"}:
+            return self._encode_enum_live_sequence(name, value)
+        if name in {"_member_map_", "_value2member_map_"}:
+            if not isinstance(value, dict) or any(
+                not isinstance(member, class_object) for member in value.values()
+            ):
+                raise AuditInfrastructureError(
+                    f"audit engine Enum member mapping is invalid: {name}"
+                )
+            if name == "_member_map_" and any(
+                not isinstance(member_name, str) for member_name in value
+            ):
+                raise AuditInfrastructureError(
+                    "audit engine Enum member-name mapping is invalid"
+                )
+            return self._encode_enum_live_mapping(
+                name,
+                value,
+                preserve_order=name == "_member_map_",
+            )
+        return self._encode_enum_live_mapping(name, value, preserve_order=False)
 
     def _encode_class(self, class_object: type) -> bytes:
         cycle = self._cycle_or_mark(class_object)
@@ -7500,9 +7598,9 @@ class _LiveSemanticEncoder:
                 continue
             elif (
                 isinstance(class_object, enum.EnumMeta)
-                and name in _ENUM_GENERATED_MEMBER_EXCLUSIONS
+                and name in _ENUM_LIVE_STATE_MEMBERS
             ):
-                continue
+                encoded = self._encode_enum_live_state(class_object, name, member)
             elif name == "__annotations__":
                 if not isinstance(member, dict) or any(
                     not isinstance(key, str) for key in member
@@ -7524,6 +7622,27 @@ class _LiveSemanticEncoder:
                 encoded = self.encode(member)
             pieces.append(self._frame(b"class-member", (name.encode("utf-8"), encoded)))
         return self._frame(b"class", pieces)
+
+
+def _global_names_from_code(code: types.CodeType) -> tuple[str, ...]:
+    if not isinstance(code, types.CodeType):
+        raise AuditInfrastructureError("audit engine code object is invalid")
+    pending = [code]
+    seen: set[int] = set()
+    names: set[str] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        names.update(current.co_names)
+        pending.extend(
+            constant
+            for constant in current.co_consts
+            if isinstance(constant, types.CodeType)
+        )
+    return tuple(sorted(names))
 
 
 def _marshal_live_semantic_object(loaded_object: object) -> bytes:

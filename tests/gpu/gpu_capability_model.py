@@ -878,6 +878,7 @@ _LOCAL_DEPENDENCY_FIELDS = (
     "production",
     "sha256",
 )
+_LOCAL_DEPENDENCY_MAX_BYTES = 64 * 1024
 
 
 def _validate_digest(value: object, label: str) -> str:
@@ -1138,13 +1139,21 @@ def decode_local_dependency_digest(
 ) -> DependencyDigest:
     if not isinstance(payload, bytes):
         raise AuditInfrastructureError("local dependency payload is invalid")
+    if len(payload) > _LOCAL_DEPENDENCY_MAX_BYTES:
+        raise AuditInfrastructureError("local dependency payload is too large")
     try:
         pairs = json.loads(
             payload.decode("ascii"),
             object_pairs_hook=lambda items: items,
             parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
         )
-    except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+    except (
+        UnicodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        json.JSONDecodeError,
+    ) as error:
         raise AuditInfrastructureError("local dependency payload is invalid") from error
     if not isinstance(pairs, list) or any(
         not isinstance(pair, tuple)
