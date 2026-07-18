@@ -5,6 +5,7 @@ import base64
 import hashlib
 import inspect
 import json
+import multiprocessing
 import os
 import stat
 import sys
@@ -40,6 +41,48 @@ from gpu_capability_model import (  # noqa: E402
     build_dependency_root_authority,
     encode_compiler_inspection,
 )
+
+
+def _publish_equal_inspection_in_spawned_process(
+    cache_root: str,
+    source_root: str,
+    toolchain_root: str,
+    compiler_path: str,
+    start_event,
+    result_queue,
+) -> None:
+    try:
+        source = Path(source_root)
+        toolchain = Path(toolchain_root)
+        compiler = Path(compiler_path)
+        authority = build_dependency_root_authority(
+            source, {"toolchain": toolchain}
+        )
+        metadata = compiler.stat()
+        identity = FileIdentity(
+            compiler.resolve(), None, int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+            0, False,
+        )
+        inspection = CompilerInspection(
+            CompilerFamily.GCC,
+            identity,
+            hashlib.sha256(compiler.read_bytes()).hexdigest(),
+            "g++ (GCC) 14.1.0",
+            "b" * 64,
+            "c" * 64,
+            "d" * 64,
+        )
+        if not start_event.wait(timeout=5.0):
+            raise RuntimeError("spawned inspection publisher start timed out")
+        published = CompilerInspectionCache(Path(cache_root)).publish(
+            compiler.resolve(), CompilerFamily.GCC, {"PATH": str(toolchain)},
+            authority, "e" * 64, "d" * 64, "f" * 64, inspection,
+            time.monotonic() + 10.0,
+        )
+        result_queue.put(("ok", published.driver_fingerprint))
+    except BaseException as error:
+        result_queue.put(("error", type(error).__name__, str(error)))
 
 
 class _PreprocessCacheFixture:
@@ -482,6 +525,175 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             (int(after.st_dev), int(after.st_ino)),
             (int(before.st_dev), int(before.st_ino)),
         )
+
+    def test_distinct_instances_accept_one_equal_concurrent_inspection_winner(self):
+        inspection = self.inspection()
+        caches = (self.cache, CompilerInspectionCache(self.cache.root))
+        key = compiler_inspection_cache_key(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64,
+            executable_capability_digest=self.capability_digest,
+            resolved_runtime_closure_digest=self.closure_digest,
+        )
+        destination = self.cache._path(key)
+        collision = threading.Barrier(2)
+        winner_ready = threading.Event()
+        replace_lock = threading.Lock()
+        replace_calls: list[Path] = []
+        real_replace = os.replace
+        results: list[CompilerInspection] = []
+        failures: list[BaseException] = []
+
+        def collide_replace(source, target):
+            if (
+                Path(source).name.startswith(".tmp-inspection-")
+                and Path(target) == destination
+            ):
+                with replace_lock:
+                    index = len(replace_calls)
+                    replace_calls.append(Path(source))
+                try:
+                    collision.wait(timeout=1.0)
+                except threading.BrokenBarrierError:
+                    pass
+                if index == 0:
+                    real_replace(source, target)
+                    winner_ready.set()
+                    return
+                winner_ready.wait(timeout=1.0)
+                raise FileExistsError("deterministic concurrent winner")
+            real_replace(source, target)
+
+        def publish(cache):
+            try:
+                results.append(cache.publish(
+                    self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                    self.authority, "e" * 64, self.capability_digest,
+                    self.closure_digest, inspection, time.monotonic() + 10.0,
+                ))
+            except BaseException as error:
+                failures.append(error)
+
+        with mock.patch("gpu_capability_cache.os.replace", side_effect=collide_replace):
+            threads = [threading.Thread(target=publish, args=(cache,)) for cache in caches]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10.0)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(failures, [])
+        self.assertEqual(results, [inspection, inspection])
+        self.assertEqual(len(replace_calls), 1)
+        self.assertEqual(
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
+            ),
+            inspection,
+        )
+
+    def test_spawned_processes_accept_one_equal_inspection_winner(self):
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        results = context.Queue()
+        arguments = (
+            str(self.cache.root),
+            str(self.source),
+            str(self.toolchain),
+            str(self.compiler),
+            start,
+            results,
+        )
+        processes = [
+            context.Process(
+                target=_publish_equal_inspection_in_spawned_process,
+                args=arguments,
+            )
+            for _index in range(2)
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(timeout=15.0)
+        self.assertFalse(any(process.is_alive() for process in processes))
+        self.assertEqual([process.exitcode for process in processes], [0, 0])
+        observed = [results.get(timeout=2.0) for _process in processes]
+        self.assertEqual(observed, [("ok", "b" * 64), ("ok", "b" * 64)])
+        self.assertEqual(
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
+            ),
+            self.inspection(),
+        )
+        results.close()
+        results.join_thread()
+
+    def test_inspection_publication_lock_honors_deadline_and_cancellation(self):
+        inspection = self.inspection()
+        lock_type = sys.modules["gpu_capability_cache"]._SharedCacheFileLock
+        root_lock = lock_type(
+            self.cache.root / ".compiler-inspection-root.lock",
+            self.cache.root,
+            self.cache._root_identity,
+            time.monotonic() + 10.0,
+        )
+        with root_lock, self.assertRaisesRegex(
+            AuditInfrastructureError, "lock deadline"
+        ):
+            self.cache.publish(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, inspection, time.monotonic() + 0.05,
+            )
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            self.cache.publish(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, inspection, time.monotonic() + 10.0,
+                cancelled,
+            )
+
+    def test_inspection_publication_rejects_unsafe_shared_lock_carrier(self):
+        inspection = self.inspection()
+        seed = self.root / "inspection-lock-seed"
+        seed.write_bytes(b"1")
+        carrier = self.cache.root / ".compiler-inspection-root.lock"
+        try:
+            os.link(seed, carrier)
+        except OSError as error:
+            self.skipTest(f"hardlinks unavailable: {error}")
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "lock namespace"
+        ):
+            self.cache.publish(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, inspection, time.monotonic() + 10.0,
+            )
+        self.assertTrue(os.path.samefile(seed, carrier))
+
+    def test_different_concurrent_inspection_winner_remains_fatal(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        different = dataclasses.replace(inspection, driver_fingerprint="a" * 64)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "winner differs"
+        ):
+            CompilerInspectionCache(self.cache.root).publish(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, different, time.monotonic() + 10.0,
+            )
 
     def test_live_compiler_mutation_during_cache_decode_remains_fatal(self):
         inspection = self.inspection()

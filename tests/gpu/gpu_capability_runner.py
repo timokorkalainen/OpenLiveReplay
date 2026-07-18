@@ -1300,6 +1300,11 @@ def stabilize_and_parse_configuration(
     limits: AuditLimits,
     deadline: float,
     cancel_event: object | None = None,
+    publication: Callable[[
+        PreprocessedTranslationUnitView,
+        PreprocessDiscovery,
+        Callable[[], None],
+    ], PreprocessedTranslationUnitView] | None = None,
 ) -> tuple[PreprocessedTranslationUnitView, PreprocessDiscovery, PreprocessStageTimings]:
     authority = validate_dependency_root_authority(
         dependency_roots,
@@ -1322,6 +1327,14 @@ def stabilize_and_parse_configuration(
     )
     guard_owner = _guard_owner(guards)
     accepted_started = time.monotonic()
+
+    def validate_accepted_generation() -> None:
+        _check_dependency_budget(deadline, cancel_event)
+        dependencies = guard_owner.validate_and_hash(deadline, cancel_event)
+        _check_dependency_budget(deadline, cancel_event)
+        if dependencies != discovery.dependencies:
+            raise AuditInfrastructureError("dependency closure changed")
+
     try:
         if cancel_event is not None and cancel_event.is_set():
             raise AuditInfrastructureError("preprocessing cancelled before accepted launch")
@@ -1346,9 +1359,11 @@ def stabilize_and_parse_configuration(
                 rewritten, configuration, authority, production,
                 deadline, cancel_event,
             )
-            accepted_dependencies = validate_and_hash_guarded_dependencies(
-                guards, deadline, cancel_event
+            _check_dependency_budget(deadline, cancel_event)
+            accepted_dependencies = guard_owner.validate_and_hash(
+                deadline, cancel_event
             )
+            _check_dependency_budget(deadline, cancel_event)
             if tuple(item.identity for item in accepted_dependencies) != accepted_identities:
                 raise AuditInfrastructureError("dependency closure changed")
         accepted_stream = consumer.finish()
@@ -1359,6 +1374,10 @@ def stabilize_and_parse_configuration(
         if accepted_dependencies != discovery.dependencies:
             raise AuditInfrastructureError("dependency closure changed")
         view = builder.finalize(accepted_identities)
+        if publication is None:
+            validate_accepted_generation()
+        else:
+            view = publication(view, discovery, validate_accepted_generation)
     finally:
         guard_owner.close()
     return (
@@ -1470,35 +1489,45 @@ def load_or_preprocess(
         raise AuditInfrastructureError(
             f"configuration {configuration.digest} cancelled before preprocessing"
         )
-    accepted, discovery, _stages = stabilize_and_parse_configuration(
+    def publish_accepted(
+        accepted: PreprocessedTranslationUnitView,
+        discovery: PreprocessDiscovery,
+        validate_generation: Callable[[], None],
+    ) -> PreprocessedTranslationUnitView:
+        try:
+            snapshots = cache._snapshot_dependencies(
+                discovery.dependency_identities, force=True
+            )
+        except OSError as error:
+            raise AuditInfrastructureError(
+                "dependency changed during preprocessing"
+            ) from error
+        if len(snapshots) != len(discovery.dependencies) or any(
+            snapshot.identity != dependency.identity
+            or snapshot.sha256 != dependency.sha256
+            for snapshot, dependency in zip(snapshots, discovery.dependencies)
+        ):
+            raise AuditInfrastructureError(
+                "dependency content changed during preprocessing"
+            )
+        if accepted.configuration != configuration:
+            raise AuditInfrastructureError(
+                "preprocessor returned a mismatched accepted configuration"
+            )
+        return cache._publish_stabilized(
+            accepted, snapshots, final_validation=validate_generation
+        )
+
+    accepted, _discovery, _stages = stabilize_and_parse_configuration(
         configuration,
         authority,
         production,
         limits,
         deadline,
         cancel_event,
+        publication=publish_accepted,
     )
-    try:
-        snapshots = cache._snapshot_dependencies(
-            discovery.dependency_identities, force=True
-        )
-    except OSError as error:
-        raise AuditInfrastructureError(
-            "dependency changed during preprocessing"
-        ) from error
-    if len(snapshots) != len(discovery.dependencies) or any(
-        snapshot.identity != dependency.identity
-        or snapshot.sha256 != dependency.sha256
-        for snapshot, dependency in zip(snapshots, discovery.dependencies)
-    ):
-        raise AuditInfrastructureError(
-            "dependency content changed during preprocessing"
-        )
-    if accepted.configuration != configuration:
-        raise AuditInfrastructureError(
-            "preprocessor returned a mismatched accepted configuration"
-        )
-    return cache._publish_stabilized(accepted, snapshots)
+    return accepted
 
 
 def _json_object_without_duplicates(

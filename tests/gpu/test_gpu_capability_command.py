@@ -892,6 +892,148 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn(nested.resolve(), guarded)
         self.assertIn(runtime_directory.resolve(), guarded)
 
+    def test_shared_runtime_is_traversed_in_driver_and_helper_loader_contexts(self):
+        common = self.compiler.parent / "common"
+        driver_only = self.compiler.parent / "driver-only"
+        helper_directory = self.compiler.parent / "libexec"
+        helper_only = helper_directory / "helper-only"
+        for directory in (common, driver_only, helper_directory, helper_only):
+            directory.mkdir(exist_ok=True)
+        helper = helper_directory / "cc1.exe"
+        shared = common / "libshared.so"
+        driver_transitive = driver_only / "libcontext.so"
+        helper_transitive = helper_only / "libcontext.so"
+        self.compiler.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=(shared.name,),
+            rpath=("$ORIGIN/common:$ORIGIN/driver-only",),
+        ))
+        helper.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=(shared.name,),
+            rpath=("$ORIGIN/../common:$ORIGIN/helper-only",),
+        ))
+        shared.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=(driver_transitive.name,),
+        ))
+        driver_transitive.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        helper_transitive.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            return_value=(helper.resolve(),),
+        ):
+            capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment=self.environment, working_directory=self.build,
+            )
+        closure_paths = {
+            item.role_relative_path.as_posix()
+            for item in capability.resolved_runtime_closure
+        }
+        self.assertIn("driver-only/libcontext.so", closure_paths)
+        self.assertIn("libexec/helper-only/libcontext.so", closure_paths)
+
+    def test_macho_shared_runtime_uses_each_inherited_rpath_context(self):
+        helper_directory = self.compiler.parent / "libexec"
+        common = self.compiler.parent / "common"
+        driver_only = self.compiler.parent / "driver-only"
+        helper_only = helper_directory / "helper-only"
+        for directory in (helper_directory, common, driver_only, helper_only):
+            directory.mkdir(exist_ok=True)
+        helper = helper_directory / "cc1"
+        shared = common / "libshared.dylib"
+        driver_transitive = driver_only / "libcontext.dylib"
+        helper_transitive = helper_only / "libcontext.dylib"
+        for path in (helper, shared, driver_transitive, helper_transitive):
+            path.write_bytes(b"runtime")
+        imports = {
+            self.compiler.resolve(): capability_command._RuntimeImports(
+                (str(shared.resolve()),), ("@loader_path/driver-only",), (), "macho"
+            ),
+            helper.resolve(): capability_command._RuntimeImports(
+                (str(shared.resolve()),), ("@loader_path/helper-only",), (), "macho"
+            ),
+            shared.resolve(): capability_command._RuntimeImports(
+                ("@rpath/libcontext.dylib",), (), (), "macho"
+            ),
+            driver_transitive.resolve(): capability_command._RuntimeImports(
+                (), (), (), "macho"
+            ),
+            helper_transitive.resolve(): capability_command._RuntimeImports(
+                (), (), (), "macho"
+            ),
+        }
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports",
+            side_effect=lambda path, **_kwargs: imports[path.resolve()],
+        ):
+            paths, _aliases = capability_command._recursive_runtime_paths(
+                (self.compiler.resolve(), helper.resolve()),
+                self.compiler.resolve(), self.dependency_roots, "macos", {},
+                self.build, time.monotonic() + 10.0, None,
+            )
+        self.assertIn(driver_transitive.resolve(), paths)
+        self.assertIn(helper_transitive.resolve(), paths)
+
+    def test_windows_shared_runtime_uses_each_executable_loader_context(self):
+        helper_directory = self.compiler.parent / "libexec"
+        helper_directory.mkdir()
+        helper = helper_directory / "cc1.exe"
+        shared = self.compiler.parent / "shared.dll"
+        driver_transitive = self.compiler.parent / "context.dll"
+        helper_transitive = helper_directory / "context.dll"
+        for path in (helper, shared, driver_transitive, helper_transitive):
+            path.write_bytes(b"runtime")
+        imports = {
+            self.compiler.resolve(): capability_command._RuntimeImports(
+                (str(shared.resolve()),), (), (), "pe"
+            ),
+            helper.resolve(): capability_command._RuntimeImports(
+                (str(shared.resolve()),), (), (), "pe"
+            ),
+            shared.resolve(): capability_command._RuntimeImports(
+                ("context.dll",), (), (), "pe"
+            ),
+            driver_transitive.resolve(): capability_command._RuntimeImports(
+                (), (), (), "pe"
+            ),
+            helper_transitive.resolve(): capability_command._RuntimeImports(
+                (), (), (), "pe"
+            ),
+        }
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports",
+            side_effect=lambda path, **_kwargs: imports[path.resolve()],
+        ), mock.patch(
+            "gpu_capability_command._windows_known_dlls", return_value=frozenset()
+        ):
+            paths, _aliases = capability_command._recursive_runtime_paths(
+                (self.compiler.resolve(), helper.resolve()),
+                self.compiler.resolve(), self.dependency_roots, "windows", {},
+                self.build, time.monotonic() + 10.0, None,
+            )
+        self.assertIn(driver_transitive.resolve(), paths)
+        self.assertIn(helper_transitive.resolve(), paths)
+
+    def test_runtime_loader_context_state_and_metadata_are_bounded(self):
+        empty = capability_command._RuntimeImports((), (), (), "elf")
+        for limit_name, message in (
+            ("_RUNTIME_CONTEXT_STATES", "context state ceiling"),
+            ("_RUNTIME_CONTEXT_METADATA_BYTES", "context metadata ceiling"),
+        ):
+            with self.subTest(limit=limit_name), mock.patch(
+                f"gpu_capability_command.{limit_name}", 0
+            ), mock.patch(
+                "gpu_capability_command._binary_runtime_imports", return_value=empty
+            ), mock.patch(
+                "gpu_capability_command._read_linux_loader_cache", return_value={}
+            ), self.assertRaisesRegex(AuditInfrastructureError, message):
+                capability_command._recursive_runtime_paths(
+                    (self.compiler.resolve(),), self.compiler.resolve(),
+                    self.dependency_roots, "linux", {}, self.build,
+                    time.monotonic() + 10.0, None,
+                )
+
     def test_unresolved_loader_import_fails_closed(self):
         nested = self.compiler.parent / "libexec"
         nested.mkdir()

@@ -128,6 +128,8 @@ _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
 _RUNTIME_ENUMERATION_ENTRIES = 4096
 _RUNTIME_CLOSURE_FILES = 256
+_RUNTIME_CONTEXT_STATES = 1024
+_RUNTIME_CONTEXT_METADATA_BYTES = 8 * 1024 * 1024
 _RUNTIME_FILE_BYTES = 256 * 1024 * 1024
 _RUNTIME_TOTAL_BYTES = 1024 * 1024 * 1024
 _RUNTIME_TREE_ENTRIES = 65536
@@ -1764,13 +1766,22 @@ def _recursive_runtime_paths(
     deadline: float,
     cancel_event: object | None,
 ) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
-    pending = [(seed, seed, ()) for seed in seeds]
+    pending = [
+        (
+            seed,
+            seed,
+            (),
+            {seed.name.casefold(): seed.resolve(strict=True)},
+        )
+        for seed in seeds
+    ]
     result = []
     aliases = []
-    seen = set()
+    analyzed_states = set()
+    emitted = set()
     reserved = set()
     total_bytes = 0
-    process_loaded_modules: dict[str, dict[str, Path]] = {}
+    context_metadata_bytes = 0
     known_dlls = _windows_known_dlls() if platform_kind == "windows" else frozenset()
     linux_loader_cache = (
         _read_linux_loader_cache(deadline, cancel_event)
@@ -1793,26 +1804,67 @@ def _recursive_runtime_paths(
 
     for seed in seeds:
         reserve(seed)
-        process_loaded_modules.setdefault(
-            os.path.normcase(str(seed.resolve(strict=True))), {}
-        ).setdefault(seed.name.casefold(), seed.resolve(strict=True))
     while pending:
         _check_capability_budget(deadline, cancel_event)
-        current, process_executable, inherited_rpath = pending.pop(0)
+        current, process_executable, inherited_rpath, loaded_modules = pending.pop(0)
         current = current.resolve(strict=True)
-        key = os.path.normcase(str(current))
-        if key in seen:
+        process_executable = process_executable.resolve(strict=True)
+        current_metadata = current.stat()
+        executable_metadata = process_executable.stat()
+        current_key = os.path.normcase(str(current))
+        executable_key = os.path.normcase(str(process_executable))
+        inherited_key = tuple(
+            os.path.normcase(str(path.resolve(strict=True)))
+            for path in inherited_rpath
+        )
+        loaded_key = tuple(sorted(
+            (
+                name,
+                os.path.normcase(str(path.resolve(strict=True))),
+            )
+            for name, path in loaded_modules.items()
+        ))
+        state = (
+            current_key,
+            int(current_metadata.st_dev),
+            int(current_metadata.st_ino) or None,
+            executable_key,
+            int(executable_metadata.st_dev),
+            int(executable_metadata.st_ino) or None,
+            inherited_key,
+            loaded_key,
+        )
+        if state in analyzed_states:
             continue
-        seen.add(key)
-        result.append(current)
-        if len(result) > _RUNTIME_CLOSURE_FILES:
-            raise AuditInfrastructureError("compiler runtime closure file ceiling exceeded")
+        state_bytes = 256 + sum(
+            len(os.fsencode(value))
+            for value in (
+                current_key,
+                executable_key,
+                *inherited_key,
+                *(part for item in loaded_key for part in item),
+            )
+        )
+        if state_bytes > _RUNTIME_CONTEXT_METADATA_BYTES - context_metadata_bytes:
+            raise AuditInfrastructureError(
+                "compiler runtime context metadata ceiling exceeded"
+            )
+        context_metadata_bytes += state_bytes
+        analyzed_states.add(state)
+        if len(analyzed_states) > _RUNTIME_CONTEXT_STATES:
+            raise AuditInfrastructureError(
+                "compiler runtime context state ceiling exceeded"
+            )
+        if current_key not in emitted:
+            emitted.add(current_key)
+            result.append(current)
+            if len(result) > _RUNTIME_CLOSURE_FILES:
+                raise AuditInfrastructureError(
+                    "compiler runtime closure file ceiling exceeded"
+                )
         imports = _binary_runtime_imports(
             current, deadline=deadline, cancel_event=cancel_event
         )
-        loaded_modules = process_loaded_modules[
-            os.path.normcase(str(process_executable.resolve(strict=True)))
-        ]
         for name in imports.names:
             if imports.format_kind == "pe" and name.casefold().startswith(
                 ("api-ms-win-", "ext-ms-win-")
@@ -1832,7 +1884,12 @@ def _recursive_runtime_paths(
             for alias in resolved_aliases:
                 if alias not in aliases:
                     aliases.append(alias)
-            pending.append((resolved, process_executable, child_inherited))
+            pending.append((
+                resolved,
+                process_executable,
+                child_inherited,
+                loaded_modules,
+            ))
     return tuple(result), tuple(aliases)
 
 

@@ -917,19 +917,20 @@ class BoundedPreprocessorTests(unittest.TestCase):
         configuration = self.configuration("success")
         cache = PreprocessCache(self.root / "cache")
         expected = self.preprocess_fixture("success")
+        discovery = SimpleNamespace(
+            dependency_identities=expected.dependencies,
+            dependencies=capability_runner._dependency_digests(
+                expected.dependencies, self.dependency_roots,
+                time.monotonic() + 10.0, None,
+            ),
+        )
+
+        def stabilized(*_arguments, publication, **_kwargs):
+            return publication(expected, discovery, lambda: None), discovery, None
+
         with mock.patch(
             "gpu_capability_runner.stabilize_and_parse_configuration",
-            return_value=(
-                expected,
-                SimpleNamespace(
-                    dependency_identities=expected.dependencies,
-                    dependencies=capability_runner._dependency_digests(
-                        expected.dependencies, self.dependency_roots,
-                        time.monotonic() + 10.0, None,
-                    ),
-                ),
-                None,
-            ),
+            side_effect=stabilized,
         ) as preprocess:
             self.assertIs(
                 load_or_preprocess(
@@ -968,7 +969,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
 
         calls = 0
 
-        def preprocess(*_arguments):
+        def preprocess(*_arguments, **_kwargs):
             nonlocal calls
             calls += 1
             self.source.write_text("changed after compiler read\n", encoding="utf-8")
@@ -996,8 +997,8 @@ class BoundedPreprocessorTests(unittest.TestCase):
         cache = PreprocessCache(self.root / "cache")
         before = self.source.stat()
 
-        def mutate_after_accepted(*_arguments, **_kwargs):
-            result = self.stabilize_fixture("success")
+        def mutate_after_accepted(*_arguments, publication, **_kwargs):
+            view, discovery, stages = self.stabilize_fixture("success")
             self.source.write_text("other.nativeHandle();\n", encoding="utf-8")
             after = self.source.stat()
             self.assertEqual(int(after.st_ino), int(before.st_ino))
@@ -1005,7 +1006,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 self.source.read_text(encoding="utf-8").count("\n"),
                 self.identity.line_count,
             )
-            return result
+            return publication(view, discovery, lambda: None), discovery, stages
 
         with mock.patch(
             "gpu_capability_runner.stabilize_and_parse_configuration",
@@ -1020,6 +1021,92 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 cache,
                 AuditLimits(rss_bytes=2**63 - 1),
                 time.monotonic() + 10.0,
+            )
+        self.assertIsNone(cache.load(configuration))
+
+    def test_mutation_after_cache_stability_check_prevents_publish_and_return(self):
+        configuration = self.configuration("success")
+        cache = PreprocessCache(self.root / "cache")
+        before = self.source.stat()
+        real_validate = cache._validate_stable_dependencies
+
+        def rewrite(_configuration, dependency_output):
+            return RewrittenCommand(
+                arguments=(
+                    sys.executable,
+                    str(self.fixture),
+                    "--fixture-mode",
+                    "success",
+                    "--family",
+                    "gcc",
+                    str(self.source),
+                    "-MF",
+                    str(dependency_output),
+                ),
+                dependency_output=dependency_output,
+                dependency_format="gcc-depfile",
+            )
+
+        def mutate_after_validation(dependencies, snapshots):
+            real_validate(dependencies, snapshots)
+            self.source.write_text("other.nativeHandle();\n", encoding="utf-8")
+            after = self.source.stat()
+            self.assertEqual(int(after.st_ino), int(before.st_ino))
+            self.assertEqual(
+                self.source.read_text(encoding="utf-8").count("\n"),
+                self.identity.line_count,
+            )
+
+        with mock.patch(
+            "gpu_capability_runner.rewrite_preprocess_command",
+            side_effect=rewrite,
+        ), mock.patch.object(
+            cache,
+            "_validate_stable_dependencies",
+            side_effect=mutate_after_validation,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "dependency.*changed|cannot publish"
+        ):
+            load_or_preprocess(
+                configuration,
+                self.dependency_roots,
+                self.production,
+                cache,
+                AuditLimits(rss_bytes=2**63 - 1),
+                time.monotonic() + 10.0,
+            )
+        self.assertIsNone(cache.load(configuration))
+
+    def test_failed_mutation_attempt_after_atomic_rename_removes_publication(self):
+        configuration = self.configuration("success")
+        cache = PreprocessCache(self.root / "cache")
+        entry = cache.root / cache._configuration_key(configuration)
+        real_rename = os.rename
+
+        def rewrite(_configuration, dependency_output):
+            return RewrittenCommand(
+                arguments=(
+                    sys.executable, str(self.fixture), "--fixture-mode", "success",
+                    "--family", "gcc", str(self.source), "-MF",
+                    str(dependency_output),
+                ),
+                dependency_output=dependency_output,
+                dependency_format="gcc-depfile",
+            )
+
+        def rename_then_mutate(source, destination):
+            real_rename(source, destination)
+            if Path(destination) == entry and Path(source).name.startswith(".tmp-"):
+                self.source.write_text("other.nativeHandle();\n", encoding="utf-8")
+
+        with mock.patch(
+            "gpu_capability_runner.rewrite_preprocess_command", side_effect=rewrite
+        ), mock.patch(
+            "gpu_capability_cache.os.rename", side_effect=rename_then_mutate
+        ), self.assertRaises(AuditInfrastructureError):
+            load_or_preprocess(
+                configuration, self.dependency_roots, self.production, cache,
+                AuditLimits(rss_bytes=2**63 - 1), time.monotonic() + 10.0,
             )
         self.assertIsNone(cache.load(configuration))
 
@@ -1087,15 +1174,16 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 barrier.wait(timeout=5.0)
             real_rename(source, destination)
 
-        def preprocess(*_arguments):
+        def preprocess(*_arguments, publication, **_kwargs):
             view = views[threading.current_thread().name]
-            return view, SimpleNamespace(
+            discovery = SimpleNamespace(
                 dependency_identities=view.dependencies,
                 dependencies=capability_runner._dependency_digests(
                     view.dependencies, self.dependency_roots,
                     time.monotonic() + 10.0, None,
                 ),
-            ), None
+            )
+            return publication(view, discovery, lambda: None), discovery, None
 
         def run(cache: PreprocessCache) -> None:
             try:
