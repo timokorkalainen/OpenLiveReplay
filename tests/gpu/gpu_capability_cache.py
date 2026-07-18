@@ -252,6 +252,7 @@ def _delete_verified_windows_lock_carrier_temporary(
             str(path),
         )
 
+    primary_error: BaseException | None = None
     try:
         information = FileInformation()
         if not kernel32.GetFileInformationByHandle(
@@ -270,9 +271,12 @@ def _delete_verified_windows_lock_carrier_temporary(
         opened_inode = (
             int(information.index_high) << 32
         ) | int(information.index_low)
-        # CPython 3.12+ exposes the 128-bit Windows file ID through st_ino;
-        # 3.11 uses the legacy 64-bit file index from FileInformation.
-        if sys.version_info >= (3, 12):
+        # CPython 3.12+ exposes the 128-bit Windows file ID through st_ino.
+        # A successful zero ID retains the legacy index but uses the FileIdInfo
+        # volume; 3.12.0 treats query failure as fatal, while 3.12.1+ falls
+        # back to the legacy pair.  Python 3.11 never issues the query.
+        python_version = tuple(sys.version_info[:3])
+        if python_version >= (3, 12):
             identity = FileIdInformation()
             if kernel32.GetFileInformationByHandleEx(
                 handle,
@@ -281,8 +285,19 @@ def _delete_verified_windows_lock_carrier_temporary(
                 ctypes.sizeof(identity),
             ):
                 opened_device = int(identity.volume)
-                opened_inode = int.from_bytes(
+                file_id = int.from_bytes(
                     bytes(identity.file_id.identifier), "little"
+                )
+                if file_id != 0:
+                    opened_inode = file_id
+            elif python_version == (3, 12, 0):
+                error_number = ctypes.get_last_error()
+                raise AuditInfrastructureError(
+                    "cannot inspect cache lock carrier quarantine file ID"
+                ) from OSError(
+                    error_number,
+                    "cannot query cache lock carrier quarantine file ID",
+                    str(path),
                 )
 
         try:
@@ -322,6 +337,9 @@ def _delete_verified_windows_lock_carrier_temporary(
                 "cannot mark cache lock carrier quarantine for deletion",
                 str(path),
             )
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         if not kernel32.CloseHandle(handle):
             close_error = OSError(
@@ -329,9 +347,18 @@ def _delete_verified_windows_lock_carrier_temporary(
                 "cannot close cache lock carrier quarantine handle",
                 str(path),
             )
-            raise AuditInfrastructureError(
+            close_failure = AuditInfrastructureError(
                 "cannot close cache lock carrier quarantine handle"
-            ) from close_error
+            )
+            close_failure.__cause__ = close_error
+            close_failure.__suppress_context__ = True
+            if primary_error is None:
+                raise close_failure
+            primary_error.secondary_close_error = close_failure
+            primary_error.add_note(
+                "Secondary CloseHandle failure: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
 
 
 def _cleanup_owned_lock_carrier_temporary(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import base64
+import contextlib
 import hashlib
 import inspect
 import json
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from array import array
 from pathlib import Path, PurePosixPath
@@ -1613,6 +1615,462 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         finally:
             quarantine.unlink(missing_ok=True)
 
+    @staticmethod
+    def _assert_windows_native_handle_is_invalid(handle) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = (
+                ("attributes", wintypes.DWORD),
+                ("creation", wintypes.FILETIME),
+                ("access", wintypes.FILETIME),
+                ("write", wintypes.FILETIME),
+                ("volume", wintypes.DWORD),
+                ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD),
+                ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD),
+                ("index_low", wintypes.DWORD),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetFileInformationByHandle.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(FileInformation),
+        )
+        kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        information = FileInformation()
+        result = kernel32.GetFileInformationByHandle(
+            handle, ctypes.byref(information)
+        )
+        error_number = ctypes.get_last_error()
+        if result:
+            kernel32.CloseHandle(handle)
+        if result or error_number != 6:
+            raise AssertionError(
+                "closed native handle remained queryable "
+                f"(result={result!r}, error={error_number})"
+            )
+
+    def _exercise_windows_file_id_mapping(
+        self,
+        *,
+        name: str,
+        version: tuple[int, int, int],
+        file_id_query_succeeds: bool,
+        file_id_value: int,
+        expected_device: int,
+        expected_inode: int,
+    ) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = (
+                ("attributes", wintypes.DWORD),
+                ("creation", wintypes.FILETIME),
+                ("access", wintypes.FILETIME),
+                ("write", wintypes.FILETIME),
+                ("volume", wintypes.DWORD),
+                ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD),
+                ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD),
+                ("index_low", wintypes.DWORD),
+            )
+
+        class FileId128(ctypes.Structure):
+            _fields_ = (("identifier", ctypes.c_ubyte * 16),)
+
+        class FileIdInformation(ctypes.Structure):
+            _fields_ = (
+                ("volume", ctypes.c_ulonglong),
+                ("file_id", FileId128),
+            )
+
+        class Metadata:
+            st_mode = stat.S_IFREG | stat.S_IREAD | stat.S_IWRITE
+            st_nlink = 1
+            st_dev = expected_device
+            st_ino = expected_inode
+            st_file_attributes = 0
+
+        legacy_device = 0x12345678
+        legacy_inode = 0x123456789ABCDEF0
+        file_id_device = 0x8877665544332211
+        quarantine = self.cache.root / f".quarantine-lock-file-id-{name}"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        file_id_queries = 0
+
+        def base_query(_handle, pointer):
+            information = ctypes.cast(
+                pointer, ctypes.POINTER(FileInformation)
+            ).contents
+            information.attributes = 0
+            information.volume = legacy_device
+            information.links = 1
+            information.index_high = legacy_inode >> 32
+            information.index_low = legacy_inode & 0xFFFFFFFF
+            return True
+
+        def file_id_query(_handle, information_class, pointer, _size):
+            nonlocal file_id_queries
+            file_id_queries += 1
+            self.assertEqual(information_class, 18)
+            if not file_id_query_succeeds:
+                ctypes.set_last_error(50)
+                return False
+            information = ctypes.cast(
+                pointer, ctypes.POINTER(FileIdInformation)
+            ).contents
+            information.volume = file_id_device
+            encoded = file_id_value.to_bytes(16, "little")
+            for index, value in enumerate(encoded):
+                information.file_id.identifier[index] = value
+            return True
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch.object(
+                kernel32,
+                "GetFileInformationByHandle",
+                side_effect=base_query,
+            ), mock.patch.object(
+                kernel32,
+                "GetFileInformationByHandleEx",
+                side_effect=file_id_query,
+            ), mock.patch.object(
+                Path, "lstat", autospec=True, return_value=Metadata()
+            ), mock.patch(
+                "gpu_capability_cache.sys.version_info", version
+            ):
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    (expected_device, expected_inode),
+                    OSError("deterministic initialization failure"),
+                )
+            self.assertEqual(file_id_queries, 0 if version < (3, 12) else 1)
+            self.assertFalse(quarantine.exists())
+        finally:
+            quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows FileIdInfo identity mapping")
+    def test_lock_carrier_cleanup_matches_cpython_file_id_mapping(self):
+        legacy_device = 0x12345678
+        legacy_inode = 0x123456789ABCDEF0
+        file_id_device = 0x8877665544332211
+        file_id_value = 0x102030405060708090A0B0C0D0E0F001
+        cases = (
+            (
+                "legacy-311",
+                (3, 11, 9),
+                False,
+                0,
+                legacy_device,
+                legacy_inode,
+            ),
+            (
+                "zero-312",
+                (3, 12, 0),
+                True,
+                0,
+                file_id_device,
+                legacy_inode,
+            ),
+            (
+                "little-endian-312",
+                (3, 12, 0),
+                True,
+                file_id_value,
+                file_id_device,
+                file_id_value,
+            ),
+            (
+                "fallback-3121",
+                (3, 12, 1),
+                False,
+                0,
+                legacy_device,
+                legacy_inode,
+            ),
+            (
+                "fallback-313",
+                (3, 13, 0),
+                False,
+                0,
+                legacy_device,
+                legacy_inode,
+            ),
+        )
+        for case in cases:
+            with self.subTest(case=case[0]):
+                self._exercise_windows_file_id_mapping(
+                    name=case[0],
+                    version=case[1],
+                    file_id_query_succeeds=case[2],
+                    file_id_value=case[3],
+                    expected_device=case[4],
+                    expected_inode=case[5],
+                )
+
+    @unittest.skipUnless(os.name == "nt", "Windows FileIdInfo identity mapping")
+    def test_lock_carrier_cleanup_surfaces_cpython_3120_file_id_query_failure(self):
+        import ctypes
+
+        quarantine = self.cache.root / ".quarantine-lock-file-id-query-3120"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        def fail_query(*_args):
+            ctypes.set_last_error(50)
+            return False
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch.object(
+                kernel32,
+                "GetFileInformationByHandleEx",
+                side_effect=fail_query,
+            ), mock.patch(
+                "gpu_capability_cache.sys.version_info", (3, 12, 0)
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "cannot inspect cache lock carrier quarantine file ID",
+            ) as raised:
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertTrue(quarantine.exists())
+        finally:
+            quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_closes_each_post_create_failure_exactly_once(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = (
+                ("attributes", wintypes.DWORD),
+                ("creation", wintypes.FILETIME),
+                ("access", wintypes.FILETIME),
+                ("write", wintypes.FILETIME),
+                ("volume", wintypes.DWORD),
+                ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD),
+                ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD),
+                ("index_low", wintypes.DWORD),
+            )
+
+        cases = (
+            ("query", "cannot inspect cache lock carrier quarantine handle"),
+            ("file-id-query", "cannot inspect cache lock carrier quarantine file ID"),
+            ("lstat", "cache lock carrier quarantine changed"),
+            ("validation", "lock carrier temporary was replaced"),
+            ("seam", "deterministic delete seam failure"),
+            ("disposition", "cannot remove cache lock carrier temporary"),
+        )
+        for point, expected_message in cases:
+            with self.subTest(point=point):
+                quarantine = self.cache.root / f".quarantine-lock-close-{point}"
+                quarantine.write_bytes(b"owned lock carrier temporary")
+                expected_identity = capability_cache._file_ownership_identity(
+                    quarantine.stat()
+                )
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                real_close = kernel32.CloseHandle
+                real_lstat = Path.lstat
+                real_query = kernel32.GetFileInformationByHandle
+                closed_handles = []
+
+                def close_real_handle(handle):
+                    closed_handles.append(handle)
+                    return real_close(handle)
+
+                def fail_native_call(*_args):
+                    ctypes.set_last_error(6)
+                    return False
+
+                def fail_quarantine_lstat(path, *args, **kwargs):
+                    if Path(path) == quarantine:
+                        raise OSError("deterministic quarantine lstat failure")
+                    return real_lstat(path, *args, **kwargs)
+
+                def invalidate_link_count(handle, pointer):
+                    result = real_query(handle, pointer)
+                    information = ctypes.cast(
+                        pointer, ctypes.POINTER(FileInformation)
+                    ).contents
+                    information.links = 2
+                    return result
+
+                try:
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(
+                            mock.patch("ctypes.WinDLL", return_value=kernel32)
+                        )
+                        close_handle = stack.enter_context(
+                            mock.patch.object(
+                                kernel32,
+                                "CloseHandle",
+                                side_effect=close_real_handle,
+                            )
+                        )
+                        if point == "query":
+                            stack.enter_context(
+                                mock.patch.object(
+                                    kernel32,
+                                    "GetFileInformationByHandle",
+                                    side_effect=fail_native_call,
+                                )
+                            )
+                        elif point == "file-id-query":
+                            stack.enter_context(
+                                mock.patch.object(
+                                    kernel32,
+                                    "GetFileInformationByHandleEx",
+                                    side_effect=fail_native_call,
+                                )
+                            )
+                            stack.enter_context(
+                                mock.patch(
+                                    "gpu_capability_cache.sys.version_info",
+                                    (3, 12, 0),
+                                )
+                            )
+                        elif point == "lstat":
+                            stack.enter_context(
+                                mock.patch.object(
+                                    Path,
+                                    "lstat",
+                                    autospec=True,
+                                    side_effect=fail_quarantine_lstat,
+                                )
+                            )
+                        elif point == "validation":
+                            stack.enter_context(
+                                mock.patch.object(
+                                    kernel32,
+                                    "GetFileInformationByHandle",
+                                    side_effect=invalidate_link_count,
+                                )
+                            )
+                        elif point == "seam":
+                            stack.enter_context(
+                                mock.patch(
+                                    "gpu_capability_cache._before_windows_lock_carrier_temporary_delete",
+                                    side_effect=RuntimeError(
+                                        "deterministic delete seam failure"
+                                    ),
+                                )
+                            )
+                        else:
+                            stack.enter_context(
+                                mock.patch.object(
+                                    kernel32,
+                                    "SetFileInformationByHandle",
+                                    side_effect=fail_native_call,
+                                )
+                            )
+                        with self.assertRaisesRegex(
+                            BaseException, expected_message
+                        ):
+                            capability_cache._delete_verified_windows_lock_carrier_temporary(
+                                quarantine,
+                                expected_identity,
+                                OSError("deterministic initialization failure"),
+                            )
+                    close_handle.assert_called_once()
+                    self.assertEqual(len(closed_handles), 1)
+                    self._assert_windows_native_handle_is_invalid(
+                        closed_handles[0]
+                    )
+                finally:
+                    quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_preserves_primary_when_close_also_fails(self):
+        import ctypes
+
+        cases = (
+            ("query", "cannot inspect cache lock carrier quarantine handle"),
+            ("disposition", "cannot remove cache lock carrier temporary"),
+        )
+        for point, primary_message in cases:
+            with self.subTest(point=point):
+                quarantine = self.cache.root / f".quarantine-lock-combined-{point}"
+                quarantine.write_bytes(b"owned lock carrier temporary")
+                expected_identity = capability_cache._file_ownership_identity(
+                    quarantine.stat()
+                )
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                real_close = kernel32.CloseHandle
+                closed_handles = []
+
+                def fail_primary(*_args):
+                    ctypes.set_last_error(5)
+                    return False
+
+                def close_then_report_failure(handle):
+                    closed_handles.append(handle)
+                    self.assertTrue(real_close(handle))
+                    ctypes.set_last_error(6)
+                    return False
+
+                target = (
+                    "GetFileInformationByHandle"
+                    if point == "query"
+                    else "SetFileInformationByHandle"
+                )
+                try:
+                    with mock.patch(
+                        "ctypes.WinDLL", return_value=kernel32
+                    ), mock.patch.object(
+                        kernel32, target, side_effect=fail_primary
+                    ), mock.patch.object(
+                        kernel32,
+                        "CloseHandle",
+                        side_effect=close_then_report_failure,
+                    ) as close_handle, self.assertRaisesRegex(
+                        AuditInfrastructureError, primary_message
+                    ) as raised:
+                        capability_cache._delete_verified_windows_lock_carrier_temporary(
+                            quarantine,
+                            expected_identity,
+                            OSError("deterministic initialization failure"),
+                        )
+                    close_handle.assert_called_once()
+                    self.assertEqual(len(closed_handles), 1)
+                    self._assert_windows_native_handle_is_invalid(
+                        closed_handles[0]
+                    )
+                    secondary = raised.exception.secondary_close_error
+                    self.assertIsInstance(secondary, AuditInfrastructureError)
+                    self.assertIsInstance(secondary.__cause__, OSError)
+                    self.assertIn(
+                        "cannot close cache lock carrier quarantine handle",
+                        str(secondary),
+                    )
+                    rendered = "".join(
+                        traceback.format_exception(raised.exception)
+                    )
+                    self.assertIn("Secondary CloseHandle failure", rendered)
+                    self.assertIn(primary_message, rendered)
+                finally:
+                    quarantine.unlink(missing_ok=True)
+
     @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
     def test_lock_carrier_cleanup_reports_windows_information_query_failure(self):
         import ctypes
@@ -1887,10 +2345,11 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         )
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         real_close = kernel32.CloseHandle
-        retained_handles = []
+        closed_handles = []
 
         def fail_close(handle):
-            retained_handles.append(handle)
+            closed_handles.append(handle)
+            self.assertTrue(real_close(handle))
             ctypes.set_last_error(6)
             return False
 
@@ -1909,10 +2368,10 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                     OSError("deterministic initialization failure"),
                 )
             close_handle.assert_called_once()
+            self.assertEqual(len(closed_handles), 1)
+            self._assert_windows_native_handle_is_invalid(closed_handles[0])
             self.assertIsInstance(raised.exception.__cause__, OSError)
         finally:
-            for handle in retained_handles:
-                real_close(handle)
             quarantine.unlink(missing_ok=True)
 
     @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
