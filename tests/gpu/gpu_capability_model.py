@@ -11,7 +11,7 @@ import struct
 import sys
 from array import array
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, overload
 
@@ -34,6 +34,10 @@ class CompilerFamily(enum.Enum):
     CLANG_CL = "clang-cl"
 
 
+def _default_worker_count() -> int:
+    return min(8, os.cpu_count() or 1)
+
+
 @dataclass(frozen=True)
 class AuditLimits:
     response_depth: int = 8
@@ -45,7 +49,7 @@ class AuditLimits:
     stderr_bytes: int = 1024 * 1024
     retained_token_bytes: int = 384 * 1024 * 1024
     rss_bytes: int = 512 * 1024 * 1024
-    workers: int = min(8, os.cpu_count() or 1)
+    workers: int = field(default_factory=_default_worker_count)
 
 
 @dataclass(frozen=True)
@@ -1045,6 +1049,14 @@ def portable_dependency_key(dependency: DependencyDigest) -> bytes:
     return bytes(payload)
 
 
+def _dependency_sort_key(dependency: DependencyDigest) -> tuple[str, str, str]:
+    return (
+        dependency.stable_role,
+        dependency.role_relative_path.as_posix(),
+        dependency.sha256,
+    )
+
+
 def _audit_finding_key(finding: AuditResultFinding) -> tuple[str, int, str, str]:
     return (
         finding.path.as_posix(),
@@ -1069,7 +1081,7 @@ class ConfigurationAuditResult:
             not isinstance(item, DependencyDigest) for item in self.dependencies
         ):
             raise AuditInfrastructureError("audit result dependencies are invalid")
-        dependency_keys = tuple(portable_dependency_key(item) for item in self.dependencies)
+        dependency_keys = tuple(_dependency_sort_key(item) for item in self.dependencies)
         if dependency_keys != tuple(sorted(dependency_keys)) or len(set(dependency_keys)) != len(dependency_keys):
             raise AuditInfrastructureError("audit result dependencies are not unique and sorted")
         if not isinstance(self.reached_production, tuple):
@@ -1134,10 +1146,14 @@ def decode_local_dependency_digest(
         )
     except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
         raise AuditInfrastructureError("local dependency payload is invalid") from error
-    if (
-        not isinstance(pairs, list)
-        or tuple(key for key, _value in pairs) != _LOCAL_DEPENDENCY_FIELDS
+    if not isinstance(pairs, list) or any(
+        not isinstance(pair, tuple)
+        or len(pair) != 2
+        or not isinstance(pair[0], str)
+        for pair in pairs
     ):
+        raise AuditInfrastructureError("local dependency schema is invalid")
+    if tuple(pair[0] for pair in pairs) != _LOCAL_DEPENDENCY_FIELDS:
         raise AuditInfrastructureError("local dependency schema is invalid")
     values = dict(pairs)
     stable_role = values["stable_role"]

@@ -7016,8 +7016,31 @@ _AUDIT_ENGINE_TARGET_MODULES = (
     sys.modules[__name__],
 )
 _AUDIT_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
-    "gpu_capability_source_audit": frozenset({"_RUNTIME_OBSERVER_LOCK"}),
+    "gpu_capability_source_audit": frozenset(),
     "gpu_capability_model": frozenset(),
+})
+_CLASS_STRUCTURAL_MEMBER_EXCLUSIONS = frozenset({
+    "__dict__",
+    "__doc__",
+    "__module__",
+    "__qualname__",
+    "__weakref__",
+})
+_DATACLASS_GENERATED_MEMBER_EXCLUSIONS = frozenset({
+    "__dataclass_fields__",
+    "__dataclass_params__",
+})
+_ENUM_GENERATED_MEMBER_EXCLUSIONS = frozenset({
+    "_hashable_values_",
+    "_member_map_",
+    "_member_names_",
+    "_unhashable_values_",
+    "_unhashable_values_map_",
+    "_value2member_map_",
+})
+_CLASS_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
+    "gpu_capability_model.CompactTokenSequence": frozenset({"_abc_impl"}),
+    "gpu_capability_model._ReadOnlyPackedColumn": frozenset({"_abc_impl"}),
 })
 
 
@@ -7183,6 +7206,8 @@ class _LiveSemanticEncoder:
                     self.encode(value.value),
                 ),
             )
+        if value is dataclasses._HAS_DEFAULT_FACTORY:
+            return b"dataclass-default-factory"
         if isinstance(value, types.CodeType):
             return self._encode_code(value)
         if isinstance(value, types.FunctionType):
@@ -7197,6 +7222,11 @@ class _LiveSemanticEncoder:
             return self._frame(b"imported-class", (_semantic_origin_role(value).encode("utf-8"),))
         if isinstance(value, types.ModuleType):
             return self._frame(b"imported-module", (value.__name__.encode("utf-8"),))
+        if isinstance(value, types.GenericAlias):
+            return self._frame(
+                b"generic-alias",
+                (self.encode(value.__origin__), self.encode(value.__args__)),
+            )
         if isinstance(value, tuple):
             cycle = self._cycle_or_mark(value)
             if cycle is not None:
@@ -7300,16 +7330,10 @@ class _LiveSemanticEncoder:
         cycle = self._cycle_or_mark(function)
         if cycle is not None:
             return cycle
-        defaults = function.__defaults__
-        if (
-            function is _gpu_capability_model.AuditLimits.__init__
-            and defaults
-        ):
-            defaults = (*defaults[:-1], "host-cpu-derived-worker-default")
         pieces = [
             _semantic_origin_role(function).encode("utf-8"),
             self._encode_code(function.__code__),
-            self.encode(defaults),
+            self.encode(function.__defaults__),
         ]
         keyword_defaults = function.__kwdefaults__ or {}
         pieces.append(self._frame(
@@ -7414,8 +7438,6 @@ class _LiveSemanticEncoder:
             field_pieces: list[bytes] = []
             for field in dataclasses.fields(class_object):
                 default = field.default
-                if class_object is _gpu_capability_model.AuditLimits and field.name == "workers":
-                    default = "host-cpu-derived-worker-default"
                 default_bytes = (
                     b"missing"
                     if default is dataclasses.MISSING
@@ -7437,8 +7459,25 @@ class _LiveSemanticEncoder:
                     ),
                 ))
             pieces.append(self._frame(b"dataclass-fields", field_pieces))
+        class_role = f"{class_object.__module__}.{class_object.__qualname__}"
+        runtime_exclusions = _CLASS_RUNTIME_STATE_EXCLUSIONS.get(
+            class_role, frozenset()
+        )
+        missing_runtime_exclusions = runtime_exclusions - set(class_object.__dict__)
+        if missing_runtime_exclusions:
+            raise AuditInfrastructureError(
+                "audit engine class runtime-state exclusion does not exist: "
+                + ", ".join(sorted(missing_runtime_exclusions))
+            )
         for name, member in sorted(class_object.__dict__.items()):
-            if name in ("__dict__", "__weakref__", "__module__", "__doc__"):
+            if name in _CLASS_STRUCTURAL_MEMBER_EXCLUSIONS:
+                continue
+            if (
+                dataclasses.is_dataclass(class_object)
+                and name in _DATACLASS_GENERATED_MEMBER_EXCLUSIONS
+            ):
+                continue
+            if name in runtime_exclusions:
                 continue
             encoded: bytes | None = None
             if isinstance(member, staticmethod):
@@ -7459,10 +7498,31 @@ class _LiveSemanticEncoder:
                 encoded = self._frame(b"descriptor", (name.encode("utf-8"),))
             elif isinstance(class_object, enum.EnumMeta) and isinstance(member, class_object):
                 continue
-            elif name.isupper():
+            elif (
+                isinstance(class_object, enum.EnumMeta)
+                and name in _ENUM_GENERATED_MEMBER_EXCLUSIONS
+            ):
+                continue
+            elif name == "__annotations__":
+                if not isinstance(member, dict) or any(
+                    not isinstance(key, str) for key in member
+                ):
+                    raise AuditInfrastructureError(
+                        "audit engine class annotations are invalid"
+                    )
+                encoded = self._frame(
+                    b"class-annotations",
+                    tuple(
+                        self._frame(
+                            b"annotation",
+                            (key.encode("utf-8"), self.encode(value)),
+                        )
+                        for key, value in sorted(member.items())
+                    ),
+                )
+            else:
                 encoded = self.encode(member)
-            if encoded is not None:
-                pieces.append(self._frame(b"class-member", (name.encode("utf-8"), encoded)))
+            pieces.append(self._frame(b"class-member", (name.encode("utf-8"), encoded)))
         return self._frame(b"class", pieces)
 
 
@@ -7484,9 +7544,37 @@ def _walk_live_semantic_graph_cycle_safe(
     target_modules: tuple[types.ModuleType, ...],
     runtime_state_exclusions: Mapping[str, frozenset[str]],
 ) -> tuple[tuple[str, object], ...]:
+    module_names = tuple(module.__name__ for module in target_modules)
+    if set(runtime_state_exclusions) != set(module_names):
+        raise AuditInfrastructureError(
+            "audit engine runtime-state exclusion modules are not exact"
+        )
     roots: dict[str, object] = {}
     for module in target_modules:
-        excluded = runtime_state_exclusions.get(module.__name__, frozenset())
+        excluded = runtime_state_exclusions[module.__name__]
+        if not isinstance(excluded, frozenset) or any(
+            not isinstance(name, str) or not name for name in excluded
+        ):
+            raise AuditInfrastructureError(
+                "audit engine runtime-state exclusion manifest is invalid"
+            )
+        missing = excluded - set(vars(module))
+        if missing:
+            raise AuditInfrastructureError(
+                "audit engine runtime-state exclusion does not exist: "
+                + ", ".join(sorted(missing))
+            )
+        for name in excluded:
+            value = vars(module)[name]
+            owned = (
+                isinstance(value, (types.FunctionType, type))
+                and getattr(value, "__module__", None) == module.__name__
+            )
+            if owned or _is_semantic_constant_name(name):
+                raise AuditInfrastructureError(
+                    "audit engine runtime-state exclusion names a semantic symbol: "
+                    f"{module.__name__}.{name}"
+                )
         for name, value in vars(module).items():
             if name in excluded:
                 continue

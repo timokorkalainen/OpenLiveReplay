@@ -42,6 +42,73 @@ from gpu_capability_source_audit import (  # noqa: E402
 
 
 class AuditEngineFingerprintTests(unittest.TestCase):
+    def test_worker_default_mutation_changes_digest_without_hashing_host_count(self):
+        baseline = capability_audit.audit_engine_fingerprint()
+        defaults = capability_model.AuditLimits.__init__.__defaults__
+        self.assertIsNotNone(defaults)
+        with mock.patch.object(
+            capability_model.AuditLimits.__init__,
+            "__defaults__",
+            (*defaults[:-1], 999),
+        ):
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+        source_directory = Path(__file__).resolve().parent
+        script = (
+            "import os,sys; os.cpu_count=lambda: int(sys.argv[2]); "
+            "sys.path.insert(0,sys.argv[1]); "
+            "import gpu_capability_source_audit as audit; "
+            "print(audit.audit_engine_fingerprint())"
+        )
+
+        def fingerprint_for_cpu_count(cpu_count: int) -> str:
+            completed = subprocess.run(
+                (sys.executable, "-c", script, str(source_directory), str(cpu_count)),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return completed.stdout.strip()
+
+        self.assertEqual(fingerprint_for_cpu_count(1), fingerprint_for_cpu_count(999))
+
+    def test_worker_default_computation_is_a_loaded_semantic_component(self):
+        baseline = capability_audit.audit_engine_fingerprint()
+
+        def mutated_worker_default():
+            return 999
+
+        with mock.patch.object(
+            capability_model, "_default_worker_count", mutated_worker_default
+        ):
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+    def test_owned_class_data_members_are_exhaustive_and_fail_closed(self):
+        baseline = capability_audit.audit_engine_fingerprint()
+        packed_column = capability_model._ReadOnlyPackedColumn
+        for name, replacement in (
+            ("itemsize", 999),
+            ("format", "mutated"),
+            ("readonly", False),
+        ):
+            with self.subTest(name=name), mock.patch.object(
+                packed_column, name, replacement
+            ):
+                self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+        with mock.patch.object(
+            packed_column, "arbitrary_owned_semantic", 7, create=True
+        ):
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+        with mock.patch.object(
+            packed_column, "unsupported_owned_semantic", [], create=True
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "unsupported loaded semantic object"
+            ):
+                capability_audit.audit_engine_fingerprint()
+
     def test_dataclass_generated_init_and_repr_are_attested(self):
         baseline = capability_audit.audit_engine_fingerprint()
 
@@ -232,14 +299,103 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             ):
                 capability_audit.audit_engine_fingerprint()
 
+    def test_runtime_state_exclusions_are_exact_existing_and_nonsemantic(self):
+        target_modules = {
+            module.__name__: module
+            for module in capability_audit._AUDIT_ENGINE_TARGET_MODULES
+        }
+        exclusions = capability_audit._AUDIT_RUNTIME_STATE_EXCLUSIONS
+        self.assertEqual(set(exclusions), set(target_modules))
+        for module_name, excluded_names in exclusions.items():
+            module = target_modules[module_name]
+            for name in excluded_names:
+                with self.subTest(module=module_name, name=name):
+                    self.assertTrue(hasattr(module, name))
+                    value = getattr(module, name)
+                    self.assertFalse(
+                        isinstance(value, (type, type(lambda: None)))
+                        and getattr(value, "__module__", None) == module_name
+                    )
+                    self.assertFalse(capability_audit._is_semantic_constant_name(name))
+
+        invalid_exclusions = MappingProxyType({
+            "gpu_capability_model": frozenset(),
+            "gpu_capability_source_audit": frozenset({"_RUNTIME_OBSERVER_LOCK"}),
+        })
+        with self.assertRaisesRegex(AuditInfrastructureError, "runtime-state exclusion"):
+            capability_audit._walk_live_semantic_graph_cycle_safe(
+                target_modules=capability_audit._AUDIT_ENGINE_TARGET_MODULES,
+                runtime_state_exclusions=invalid_exclusions,
+            )
+
+        semantic_exclusions = MappingProxyType({
+            "gpu_capability_model": frozenset(),
+            "gpu_capability_source_audit": frozenset({"cpp_tokens"}),
+        })
+        with self.assertRaisesRegex(AuditInfrastructureError, "semantic symbol"):
+            capability_audit._walk_live_semantic_graph_cycle_safe(
+                target_modules=capability_audit._AUDIT_ENGINE_TARGET_MODULES,
+                runtime_state_exclusions=semantic_exclusions,
+            )
+
     def test_recomputation_does_not_read_the_filesystem(self):
-        baseline = capability_audit.audit_engine_fingerprint()
-        with (
-            mock.patch("builtins.open", side_effect=AssertionError("filesystem read")),
-            mock.patch.object(Path, "read_bytes", side_effect=AssertionError("filesystem read")),
-            mock.patch.object(Path, "read_text", side_effect=AssertionError("filesystem read")),
-        ):
-            self.assertEqual(capability_audit.audit_engine_fingerprint(), baseline)
+        source_directory = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as temporary:
+            imported_root = Path(temporary) / "gpu"
+            imported_root.mkdir()
+            for name in ("gpu_capability_model.py", "gpu_capability_source_audit.py"):
+                shutil.copyfile(source_directory / name, imported_root / name)
+
+            script = r'''
+import builtins
+import io
+import os
+import sys
+from pathlib import Path
+from unittest import mock
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+import gpu_capability_source_audit as audit
+
+baseline = audit.audit_engine_fingerprint()
+captured = audit._IMPORTED_MODULE_IDENTITIES
+for name in ("gpu_capability_model.py", "gpu_capability_source_audit.py"):
+    original = root / name
+    os.replace(original, original.with_suffix(".loaded"))
+    original.write_bytes(b"replacement module bytes")
+
+denied = AssertionError("fingerprint recomputation read the filesystem")
+with (
+    mock.patch.object(builtins, "open", side_effect=denied),
+    mock.patch.object(io, "open", side_effect=denied),
+    mock.patch.object(os, "open", side_effect=denied),
+    mock.patch.object(os, "stat", side_effect=denied),
+    mock.patch.object(os, "lstat", side_effect=denied),
+    mock.patch.object(os, "scandir", side_effect=denied),
+    mock.patch.object(Path, "open", side_effect=denied),
+    mock.patch.object(Path, "read_bytes", side_effect=denied),
+    mock.patch.object(Path, "read_text", side_effect=denied),
+    mock.patch.object(Path, "resolve", side_effect=denied),
+    mock.patch.object(Path, "stat", side_effect=denied),
+    mock.patch.object(Path, "lstat", side_effect=denied),
+):
+    recomputed = audit.audit_engine_fingerprint()
+
+if recomputed != baseline:
+    raise AssertionError("path replacement changed loaded semantics")
+if audit._IMPORTED_MODULE_IDENTITIES != captured:
+    raise AssertionError("captured loaded identities changed")
+print(recomputed)
+'''
+            completed = subprocess.run(
+                (sys.executable, "-c", script, str(imported_root)),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertRegex(completed.stdout.strip(), r"\A[0-9a-f]{64}\Z")
 
     def test_audit_fingerprint_is_portable_across_absolute_import_roots(self):
         source_directory = Path(__file__).resolve().parent

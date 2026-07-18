@@ -365,6 +365,43 @@ class ModelTests(unittest.TestCase):
                 findings=(),
             )
 
+    def test_dependency_order_uses_role_path_and_digest_tuple_not_framed_bytes(self):
+        z_dependency = DependencyDigest(
+            stable_role="production",
+            role_relative_path=PurePosixPath("playback/z.h"),
+            identity=self.identity("playback/z.h"),
+            sha256="a" * 64,
+        )
+        aa_dependency = DependencyDigest(
+            stable_role="production",
+            role_relative_path=PurePosixPath("playback/aa.h"),
+            identity=self.identity("playback/aa.h"),
+            sha256="a" * 64,
+        )
+        self.assertLess(portable_dependency_key(z_dependency), portable_dependency_key(aa_dependency))
+        with self.assertRaisesRegex(AuditInfrastructureError, "unique and sorted"):
+            ConfigurationAuditResult(
+                configuration_digest="c" * 64,
+                audit_engine_fingerprint="a" * 64,
+                dependencies=(z_dependency, aa_dependency),
+                reached_production=(),
+                findings=(),
+            )
+
+    def test_local_dependency_codec_wraps_every_malformed_pair_shape(self):
+        malformed_payloads = (
+            b"[1]",
+            b"[[]]",
+            b'[["stable_role"]]',
+            b'[["stable_role","production","extra"]]',
+            b'{"stable_role":"production"}',
+        )
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload), self.assertRaises(
+                AuditInfrastructureError
+            ):
+                decode_local_dependency_digest(payload)
+
     def test_private_owned_packed_construction_avoids_copy_reserve_and_stays_read_only(self):
         configuration = self.configuration()
         limits = dataclasses.replace(AuditLimits(), rss_bytes=100_000)
