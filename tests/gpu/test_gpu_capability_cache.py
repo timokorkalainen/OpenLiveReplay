@@ -1516,6 +1516,406 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             displaced.unlink(missing_ok=True)
 
     @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_does_not_leak_adopted_crt_descriptor(self):
+        import msvcrt
+
+        quarantine = self.cache.root / ".quarantine-lock-crt-descriptor-leak"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        real_open_osfhandle = msvcrt.open_osfhandle
+        real_close = os.close
+        adopted_descriptors: list[int] = []
+        cleanup_error: BaseException | None = None
+
+        def record_adopted_descriptor(handle, flags):
+            descriptor = real_open_osfhandle(handle, flags)
+            adopted_descriptors.append(descriptor)
+            return descriptor
+
+        try:
+            with mock.patch(
+                "msvcrt.open_osfhandle",
+                side_effect=record_adopted_descriptor,
+            ), mock.patch(
+                "gpu_capability_cache.os.close",
+                side_effect=OSError("deterministic CRT descriptor close failure"),
+            ):
+                try:
+                    capability_cache._delete_verified_windows_lock_carrier_temporary(
+                        quarantine,
+                        expected_identity,
+                        OSError("deterministic initialization failure"),
+                    )
+                except BaseException as error:
+                    cleanup_error = error
+
+            leaked_descriptors = []
+            for descriptor in adopted_descriptors:
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    continue
+                leaked_descriptors.append(descriptor)
+            self.assertEqual(
+                leaked_descriptors,
+                [],
+                "cleanup leaked an adopted CRT descriptor and its native handle",
+            )
+            self.assertEqual(adopted_descriptors, [])
+            self.assertIsNone(cleanup_error)
+            self.assertFalse(quarantine.exists())
+        finally:
+            for descriptor in adopted_descriptors:
+                try:
+                    real_close(descriptor)
+                except OSError:
+                    pass
+            quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_reports_windows_create_failure(self):
+        import ctypes
+
+        quarantine = self.cache.root / ".quarantine-lock-create-failure"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        invalid_handle = ctypes.c_void_p(-1).value
+
+        def fail_create(*_args):
+            ctypes.set_last_error(5)
+            return invalid_handle
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch.object(
+                kernel32, "CreateFileW", side_effect=fail_create
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "cache lock carrier quarantine changed",
+            ) as raised:
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertIn(
+                "cannot open cache lock carrier quarantine",
+                str(raised.exception.__cause__),
+            )
+            self.assertTrue(quarantine.exists())
+        finally:
+            quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_reports_windows_information_query_failure(self):
+        import ctypes
+
+        quarantine = self.cache.root / ".quarantine-lock-query-failure"
+        renamed = self.cache.root / ".renamed-query-failure"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        def fail_query(*_args):
+            ctypes.set_last_error(6)
+            return False
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch.object(
+                kernel32,
+                "GetFileInformationByHandle",
+                side_effect=fail_query,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "cannot inspect cache lock carrier quarantine handle",
+            ) as raised:
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            quarantine.rename(renamed)
+            renamed.rename(quarantine)
+        finally:
+            quarantine.unlink(missing_ok=True)
+            renamed.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_reports_windows_path_validation_failure(self):
+        quarantine = self.cache.root / ".quarantine-lock-path-query-failure"
+        renamed = self.cache.root / ".renamed-path-query-failure"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        real_lstat = Path.lstat
+
+        def fail_quarantine_lstat(path, *args, **kwargs):
+            if Path(path) == quarantine:
+                raise OSError("deterministic quarantine path validation failure")
+            return real_lstat(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                Path,
+                "lstat",
+                autospec=True,
+                side_effect=fail_quarantine_lstat,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "cache lock carrier quarantine changed",
+            ) as raised:
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertIn(
+                "deterministic quarantine path validation failure",
+                str(raised.exception.__cause__),
+            )
+            quarantine.rename(renamed)
+            renamed.rename(quarantine)
+        finally:
+            quarantine.unlink(missing_ok=True)
+            renamed.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_rejects_mutated_windows_handle_metadata(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = (
+                ("attributes", wintypes.DWORD),
+                ("creation", wintypes.FILETIME),
+                ("access", wintypes.FILETIME),
+                ("write", wintypes.FILETIME),
+                ("volume", wintypes.DWORD),
+                ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD),
+                ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD),
+                ("index_low", wintypes.DWORD),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        real_query = kernel32.GetFileInformationByHandle
+
+        for field in ("links", "attributes"):
+            with self.subTest(field=field):
+                quarantine = self.cache.root / f".quarantine-lock-mutated-{field}"
+                quarantine.write_bytes(b"owned lock carrier temporary")
+                expected_identity = capability_cache._file_ownership_identity(
+                    quarantine.stat()
+                )
+
+                def mutate_query(handle, pointer):
+                    result = real_query(handle, pointer)
+                    information = ctypes.cast(
+                        pointer, ctypes.POINTER(FileInformation)
+                    ).contents
+                    if field == "links":
+                        information.links = 2
+                    else:
+                        information.attributes |= 0x00000400
+                    return result
+
+                try:
+                    with mock.patch(
+                        "ctypes.WinDLL", return_value=kernel32
+                    ), mock.patch.object(
+                        kernel32,
+                        "GetFileInformationByHandle",
+                        side_effect=mutate_query,
+                    ), self.assertRaisesRegex(
+                        AuditInfrastructureError,
+                        "lock carrier temporary was replaced; replacement preserved",
+                    ):
+                        capability_cache._delete_verified_windows_lock_carrier_temporary(
+                            quarantine,
+                            expected_identity,
+                            OSError("deterministic initialization failure"),
+                        )
+                    self.assertTrue(quarantine.exists())
+                finally:
+                    quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(
+        os.name == "nt" and sys.version_info >= (3, 12),
+        "Windows FileIdInfo identity mapping",
+    )
+    def test_lock_carrier_cleanup_rejects_mutated_windows_file_id(self):
+        import ctypes
+
+        class FileId128(ctypes.Structure):
+            _fields_ = (("identifier", ctypes.c_ubyte * 16),)
+
+        class FileIdInformation(ctypes.Structure):
+            _fields_ = (
+                ("volume", ctypes.c_ulonglong),
+                ("file_id", FileId128),
+            )
+
+        quarantine = self.cache.root / ".quarantine-lock-mutated-file-id"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        real_query = kernel32.GetFileInformationByHandleEx
+
+        def mutate_file_id(handle, information_class, pointer, size):
+            result = real_query(handle, information_class, pointer, size)
+            if result and information_class == 18:
+                identity = ctypes.cast(
+                    pointer, ctypes.POINTER(FileIdInformation)
+                ).contents
+                identity.file_id.identifier[0] ^= 1
+            return result
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch.object(
+                kernel32,
+                "GetFileInformationByHandleEx",
+                side_effect=mutate_file_id,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "lock carrier temporary was replaced; replacement preserved",
+            ):
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            self.assertTrue(quarantine.exists())
+        finally:
+            quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_closes_handle_when_test_seam_fails(self):
+        quarantine = self.cache.root / ".quarantine-lock-seam-failure"
+        renamed = self.cache.root / ".renamed-seam-failure"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        try:
+            with mock.patch(
+                "gpu_capability_cache._before_windows_lock_carrier_temporary_delete",
+                side_effect=RuntimeError("deterministic delete seam failure"),
+            ), self.assertRaisesRegex(
+                RuntimeError, "deterministic delete seam failure"
+            ):
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            quarantine.rename(renamed)
+            renamed.rename(quarantine)
+        finally:
+            quarantine.unlink(missing_ok=True)
+            renamed.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_reports_windows_disposition_failure(self):
+        import ctypes
+
+        quarantine = self.cache.root / ".quarantine-lock-disposition-failure"
+        renamed = self.cache.root / ".renamed-disposition-failure"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        def fail_disposition(*_args):
+            ctypes.set_last_error(5)
+            return False
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch.object(
+                kernel32,
+                "SetFileInformationByHandle",
+                side_effect=fail_disposition,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "cannot remove cache lock carrier temporary",
+            ) as raised:
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertIn(
+                "cannot mark cache lock carrier quarantine for deletion",
+                str(raised.exception.__cause__),
+            )
+            quarantine.rename(renamed)
+            renamed.rename(quarantine)
+        finally:
+            quarantine.unlink(missing_ok=True)
+            renamed.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_reports_one_windows_close_failure(self):
+        import ctypes
+
+        quarantine = self.cache.root / ".quarantine-lock-close-failure"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        real_close = kernel32.CloseHandle
+        retained_handles = []
+
+        def fail_close(handle):
+            retained_handles.append(handle)
+            ctypes.set_last_error(6)
+            return False
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch.object(
+                kernel32, "CloseHandle", side_effect=fail_close
+            ) as close_handle, self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "cannot close cache lock carrier quarantine handle",
+            ) as raised:
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            close_handle.assert_called_once()
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+        finally:
+            for handle in retained_handles:
+                real_close(handle)
+            quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
     def test_lock_carrier_cleanup_deletes_verified_windows_handle_not_replacement(self):
         temporary = self.cache.root / ".tmp-lock-windows-handle-delete"
         quarantine = self.cache.root / f".quarantine-lock-{'5' * 32}"

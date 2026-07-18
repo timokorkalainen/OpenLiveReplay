@@ -161,8 +161,30 @@ def _delete_verified_windows_lock_carrier_temporary(
     original_error: BaseException,
 ) -> None:
     import ctypes
-    import msvcrt
     from ctypes import wintypes
+
+    class FileInformation(ctypes.Structure):
+        _fields_ = (
+            ("attributes", wintypes.DWORD),
+            ("creation", wintypes.FILETIME),
+            ("access", wintypes.FILETIME),
+            ("write", wintypes.FILETIME),
+            ("volume", wintypes.DWORD),
+            ("size_high", wintypes.DWORD),
+            ("size_low", wintypes.DWORD),
+            ("links", wintypes.DWORD),
+            ("index_high", wintypes.DWORD),
+            ("index_low", wintypes.DWORD),
+        )
+
+    class FileId128(ctypes.Structure):
+        _fields_ = (("identifier", ctypes.c_ubyte * 16),)
+
+    class FileIdInformation(ctypes.Structure):
+        _fields_ = (
+            ("volume", ctypes.c_ulonglong),
+            ("file_id", FileId128),
+        )
 
     class FileDispositionInformation(ctypes.Structure):
         _fields_ = (("delete_file", wintypes.BOOLEAN),)
@@ -178,6 +200,18 @@ def _delete_verified_windows_lock_carrier_temporary(
         wintypes.HANDLE,
     )
     kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(FileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
     kernel32.SetFileInformationByHandle.argtypes = (
         wintypes.HANDLE,
         ctypes.c_int,
@@ -195,7 +229,9 @@ def _delete_verified_windows_lock_carrier_temporary(
     file_share_delete = 0x00000004
     open_existing = 3
     file_flag_open_reparse_point = 0x00200000
+    file_attribute_directory = 0x00000010
     file_disposition_info = 4
+    file_id_info = 18
     handle = kernel32.CreateFileW(
         str(path),
         delete_access | file_read_attributes,
@@ -217,39 +253,53 @@ def _delete_verified_windows_lock_carrier_temporary(
         )
 
     try:
-        file_descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
-    except BaseException as descriptor_error:
-        close_succeeded = kernel32.CloseHandle(handle)
-        if not close_succeeded:
-            close_error = OSError(
-                ctypes.get_last_error(),
-                "cannot close cache lock carrier quarantine handle",
+        information = FileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            handle, ctypes.byref(information)
+        ):
+            error_number = ctypes.get_last_error()
+            raise AuditInfrastructureError(
+                "cannot inspect cache lock carrier quarantine handle"
+            ) from OSError(
+                error_number,
+                "cannot query cache lock carrier quarantine handle",
                 str(path),
             )
-            raise AuditInfrastructureError(
-                "cannot close cache lock carrier quarantine handle"
-            ) from close_error
-        raise AuditInfrastructureError(
-            "cannot inspect cache lock carrier quarantine handle"
-        ) from descriptor_error
 
-    try:
+        opened_device = int(information.volume)
+        opened_inode = (
+            int(information.index_high) << 32
+        ) | int(information.index_low)
+        # CPython 3.12+ exposes the 128-bit Windows file ID through st_ino;
+        # 3.11 uses the legacy 64-bit file index from FileInformation.
+        if sys.version_info >= (3, 12):
+            identity = FileIdInformation()
+            if kernel32.GetFileInformationByHandleEx(
+                handle,
+                file_id_info,
+                ctypes.byref(identity),
+                ctypes.sizeof(identity),
+            ):
+                opened_device = int(identity.volume)
+                opened_inode = int.from_bytes(
+                    bytes(identity.file_id.identifier), "little"
+                )
+
         try:
             metadata = path.lstat()
-            opened = os.fstat(file_descriptor)
         except OSError as cleanup_error:
             raise AuditInfrastructureError(
                 "cache lock carrier quarantine changed"
             ) from cleanup_error
         if (
             _is_link(metadata)
-            or _is_link(opened)
             or not stat.S_ISREG(metadata.st_mode)
-            or not stat.S_ISREG(opened.st_mode)
+            or bool(information.attributes & _REPARSE_ATTRIBUTE)
+            or bool(information.attributes & file_attribute_directory)
             or int(getattr(metadata, "st_nlink", 1)) != 1
-            or int(getattr(opened, "st_nlink", 1)) != 1
+            or int(information.links) != 1
             or _file_ownership_identity(metadata) != expected_identity
-            or _file_ownership_identity(opened) != expected_identity
+            or (opened_device, opened_inode) != expected_identity
         ):
             raise AuditInfrastructureError(
                 "cache lock carrier temporary was replaced; replacement preserved "
@@ -258,7 +308,7 @@ def _delete_verified_windows_lock_carrier_temporary(
         _before_windows_lock_carrier_temporary_delete(path)
         disposition = FileDispositionInformation(True)
         if not kernel32.SetFileInformationByHandle(
-            msvcrt.get_osfhandle(file_descriptor),
+            handle,
             file_disposition_info,
             ctypes.byref(disposition),
             ctypes.sizeof(disposition),
@@ -272,20 +322,16 @@ def _delete_verified_windows_lock_carrier_temporary(
                 "cannot mark cache lock carrier quarantine for deletion",
                 str(path),
             )
-    except BaseException:
-        try:
-            os.close(file_descriptor)
-        except OSError as close_error:
+    finally:
+        if not kernel32.CloseHandle(handle):
+            close_error = OSError(
+                ctypes.get_last_error(),
+                "cannot close cache lock carrier quarantine handle",
+                str(path),
+            )
             raise AuditInfrastructureError(
                 "cannot close cache lock carrier quarantine handle"
             ) from close_error
-        raise
-    try:
-        os.close(file_descriptor)
-    except OSError as close_error:
-        raise AuditInfrastructureError(
-            "cannot close cache lock carrier quarantine handle"
-        ) from close_error
 
 
 def _cleanup_owned_lock_carrier_temporary(
