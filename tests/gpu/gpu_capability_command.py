@@ -17,16 +17,24 @@ import tempfile
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Iterator, Mapping
 
 from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
+    CompilerExecutableCapability,
     CompilerFamily,
+    CompilerInspection,
+    _FilesystemGenerationObserver,
+    DependencyDigest,
+    DependencyRootAuthority,
+    DependencyRootBinding,
     FileIdentity,
     PreprocessConfiguration,
+    portable_compiler_inspection_key,
+    validate_dependency_root_authority,
 )
 
 
@@ -115,16 +123,25 @@ _MSVC_AMBIGUOUS_PREFIX_OPTIONS = (
 )
 _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
-_COMPILER_INSPECTION_LOCK = threading.Lock()
-_COMPILER_INSPECTION_MEMO: dict[
-    tuple[Path, tuple[int, int, int, int, int], str, CompilerFamily],
-    tuple[CompilerFamily, str],
+_compiler_inspection_lock = threading.Lock()
+_compiler_capability_lock = threading.Lock()
+_compiler_capability_memo: dict[tuple[object, ...], CompilerExecutableCapability] = {}
+_compiler_inspection_memo: dict[
+    tuple[object, ...],
+    CompilerInspection,
 ] = {}
 
 
 def _clear_compiler_inspection_memo_for_tests() -> None:
-    with _COMPILER_INSPECTION_LOCK:
-        _COMPILER_INSPECTION_MEMO.clear()
+    with _compiler_inspection_lock:
+        _compiler_inspection_memo.clear()
+    with _compiler_capability_lock:
+        for capability in _compiler_capability_memo.values():
+            try:
+                capability.native_owner.close()
+            except AuditInfrastructureError:
+                pass
+        _compiler_capability_memo.clear()
 
 
 @dataclass(frozen=True)
@@ -939,6 +956,351 @@ def _compiler_metadata_snapshot(compiler: Path) -> tuple[int, int, int, int, int
     )
 
 
+def _regular_file_snapshot(path: Path) -> tuple[int, int | None, int, int, int, int]:
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise AuditInfrastructureError(f"compiler capability path is not regular: {path}")
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(getattr(metadata, "st_ctime_ns", 0)),
+        int(metadata.st_mode),
+    )
+
+
+def _directory_snapshot(path: Path) -> tuple[int, int | None, int]:
+    metadata = path.stat()
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise AuditInfrastructureError(f"compiler capability directory is invalid: {path}")
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+        int(metadata.st_mode),
+    )
+
+
+def _content_sha256(stream) -> str:
+    digest = hashlib.sha256()
+    stream.seek(0)
+    while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
+    stream.seek(0)
+    return digest.hexdigest()
+
+
+class _CompilerCapabilityOwner:
+    """Held executable/closure files plus exact path-chain snapshots."""
+
+    def __init__(
+        self,
+        streams: tuple[object, ...],
+        file_paths: tuple[Path, ...],
+        file_snapshots: tuple[tuple[int, int | None, int, int, int, int], ...],
+        file_hashes: tuple[str, ...],
+        directory_paths: tuple[Path, ...],
+        directory_snapshots: tuple[tuple[int, int | None, int], ...],
+        observer: _FilesystemGenerationObserver,
+    ) -> None:
+        self.streams = streams
+        self.file_paths = file_paths
+        self.file_snapshots = file_snapshots
+        self.file_hashes = file_hashes
+        self.directory_paths = directory_paths
+        self.directory_snapshots = directory_snapshots
+        self.observer = observer
+        self._closed = False
+        self._lock = threading.Lock()
+
+    @property
+    def executable_fd(self) -> int:
+        if self._closed or not self.streams:
+            raise AuditInfrastructureError("compiler executable capability is closed")
+        return self.streams[0].fileno()
+
+    def validate(self, *, content: bool = True) -> None:
+        with self._lock:
+            self._validate_locked(content=content)
+
+    def _validate_locked(self, *, content: bool) -> None:
+        if self._closed:
+            raise AuditInfrastructureError("compiler executable capability is closed")
+        self.observer.drain()
+        for stream, path, expected in zip(
+            self.streams, self.file_paths, self.file_snapshots
+        ):
+            opened = os.fstat(stream.fileno())
+            opened_snapshot = (
+                int(opened.st_dev),
+                int(opened.st_ino) if int(opened.st_ino) != 0 else None,
+                int(opened.st_size),
+                int(opened.st_mtime_ns),
+                int(getattr(opened, "st_ctime_ns", 0)),
+                int(opened.st_mode),
+            )
+            if (
+                opened_snapshot[:4] != expected[:4]
+                or _regular_file_snapshot(path) != expected
+            ):
+                raise AuditInfrastructureError(
+                    "compiler executable changed during compiler version probe: "
+                    "capability identity changed"
+                )
+            if content and _content_sha256(stream) != self.file_hashes[
+                self.streams.index(stream)
+            ]:
+                raise AuditInfrastructureError(
+                    "compiler executable capability content changed"
+                )
+        for path, expected in zip(self.directory_paths, self.directory_snapshots):
+            if _directory_snapshot(path) != expected:
+                raise AuditInfrastructureError("compiler executable path chain changed")
+        self.observer.drain()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            errors: list[BaseException] = []
+            try:
+                self.observer.close()
+            except BaseException as error:
+                errors.append(error)
+            for stream in reversed(self.streams):
+                try:
+                    stream.close()
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                raise AuditInfrastructureError("compiler capability owner cleanup failed") from errors[0]
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _toolchain_binding_for_path(
+    path: Path, dependency_roots: DependencyRootAuthority
+) -> DependencyRootBinding:
+    matches: list[DependencyRootBinding] = []
+    for binding in dependency_roots.external_roots:
+        try:
+            path.relative_to(binding.resolved_root)
+        except ValueError:
+            continue
+        matches.append(binding)
+    if len(matches) != 1:
+        raise AuditInfrastructureError("compiler is not mapped by exactly one trusted toolchain root")
+    return matches[0]
+
+
+def _path_chain(sentinel: Path, target: Path) -> tuple[Path, ...]:
+    try:
+        relative = target.relative_to(sentinel)
+    except ValueError as error:
+        raise AuditInfrastructureError("compiler path escapes trusted toolchain root") from error
+    result = [sentinel]
+    current = sentinel
+    for part in relative.parts:
+        current = current / part
+        result.append(current)
+    return tuple(result)
+
+
+def open_compiler_executable_capability(
+    compiler: Path,
+    dependency_roots: DependencyRootAuthority,
+    pipeline_deadline: float,
+) -> CompilerExecutableCapability:
+    authority = validate_dependency_root_authority(dependency_roots)
+    if not isinstance(pipeline_deadline, (int, float)) or isinstance(pipeline_deadline, bool):
+        raise AuditInfrastructureError("compiler capability deadline is invalid")
+    if time.monotonic() >= pipeline_deadline:
+        raise AuditInfrastructureError("compiler capability deadline exceeded")
+    try:
+        canonical = compiler.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise AuditInfrastructureError("compiler executable is unavailable") from error
+    binding = _toolchain_binding_for_path(canonical, authority)
+    memo_key = (
+        os.path.normcase(str(canonical)),
+        authority.source_root,
+        authority.external_roots,
+    )
+    with _compiler_capability_lock:
+        memoized = _compiler_capability_memo.get(memo_key)
+        if memoized is not None:
+            try:
+                memoized.native_owner.validate(content=False)
+            except AuditInfrastructureError:
+                try:
+                    memoized.native_owner.close()
+                finally:
+                    _compiler_capability_memo.pop(memo_key, None)
+            else:
+                return memoized
+
+    candidates = [canonical]
+    helper_names = frozenset({
+        "as", "as.exe", "clang-cc1", "clang-cc1.exe", "collect2",
+        "collect2.exe", "ld", "ld.exe", "ld.lld", "ld.lld.exe",
+    })
+    try:
+        siblings = sorted(canonical.parent.iterdir(), key=lambda item: item.name.casefold())
+    except OSError as error:
+        raise AuditInfrastructureError("compiler runtime closure is unreadable") from error
+    for candidate in siblings:
+        name = candidate.name.casefold()
+        if candidate == canonical:
+            continue
+        is_runtime_library = (
+            name.endswith((".dll", ".dylib", ".so")) or ".so." in name
+        )
+        if name.startswith("cc1") or name in helper_names or is_runtime_library:
+            candidates.append(candidate)
+        if len(candidates) > 256:
+            raise AuditInfrastructureError("compiler runtime closure file ceiling exceeded")
+
+    streams: list[object] = []
+    observer: _FilesystemGenerationObserver | None = None
+    paths: list[Path] = []
+    snapshots: list[tuple[int, int | None, int, int, int, int]] = []
+    hashes: list[str] = []
+    try:
+        seen: set[tuple[int, int | None]] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve(strict=True)
+                expected = _regular_file_snapshot(resolved)
+                stream = resolved.open("rb")
+            except OSError as error:
+                raise AuditInfrastructureError("compiler runtime closure changed while opening") from error
+            opened = os.fstat(stream.fileno())
+            opened_key = (
+                int(opened.st_dev),
+                int(opened.st_ino) if int(opened.st_ino) != 0 else None,
+            )
+            if opened_key != expected[:2] or opened_key in seen:
+                stream.close()
+                if opened_key in seen:
+                    continue
+                raise AuditInfrastructureError("compiler runtime closure identity changed")
+            seen.add(opened_key)
+            paths.append(resolved)
+            snapshots.append(expected)
+            streams.append(stream)
+            hashes.append(_content_sha256(stream))
+
+        chain_paths = _path_chain(binding.resolved_root.parent, canonical.parent)
+        chain_snapshots = tuple(_directory_snapshot(path) for path in chain_paths)
+        closure: list[DependencyDigest] = []
+        for path, snapshot, content in zip(paths, snapshots, hashes):
+            relative = PurePosixPath(path.relative_to(binding.resolved_root).as_posix())
+            closure.append(
+                DependencyDigest(
+                    binding.stable_role,
+                    relative,
+                    FileIdentity(path, None, snapshot[0], snapshot[1], 0, False),
+                    content,
+                )
+            )
+        closure.sort(key=lambda item: (item.stable_role, item.role_relative_path.as_posix(), item.sha256))
+        closure_digest = hashlib.sha256(
+            b"".join(
+                len(portable_compiler_inspection_key_value).to_bytes(8, "little")
+                + portable_compiler_inspection_key_value
+                for item in closure
+                for portable_compiler_inspection_key_value in (
+                    item.stable_role.encode("ascii")
+                    + b"\0"
+                    + item.role_relative_path.as_posix().encode("utf-8")
+                    + b"\0"
+                    + item.sha256.encode("ascii"),
+                )
+            )
+        ).hexdigest()
+        platform_kind = "windows" if os.name == "nt" else ("macos" if sys.platform == "darwin" else "linux")
+        capability_digest_hasher = hashlib.sha256()
+        for value in (
+            platform_kind,
+            binding.stable_role,
+            canonical.relative_to(binding.resolved_root).as_posix(),
+            hashes[0],
+            closure_digest,
+            authority.portable_authority_digest,
+        ):
+            _hash_field(capability_digest_hasher, value.encode("utf-8"))
+        owner = _CompilerCapabilityOwner(
+            tuple(streams), tuple(paths), tuple(snapshots), tuple(hashes),
+            chain_paths, chain_snapshots,
+            _FilesystemGenerationObserver(
+                tuple((path, True) for path in chain_paths)
+                + tuple((path, False) for path in paths)
+            ),
+        )
+        observer = owner.observer
+        capability = CompilerExecutableCapability(
+            platform_kind,
+            FileIdentity(canonical, None, snapshots[0][0], snapshots[0][1], 0, False),
+            hashes[0],
+            capability_digest_hasher.hexdigest(),
+            owner,
+            binding,
+            tuple(chain_paths),
+            tuple(
+                FileIdentity(path, None, snapshot[0], snapshot[1], 0, False)
+                for path, snapshot in zip(chain_paths, chain_snapshots)
+            ),
+            closure_digest,
+            tuple(closure),
+        )
+        owner.validate()
+        with _compiler_capability_lock:
+            existing = _compiler_capability_memo.get(memo_key)
+            if existing is not None:
+                owner.close()
+                existing.native_owner.validate(content=False)
+                return existing
+            _compiler_capability_memo[memo_key] = capability
+        return capability
+    except BaseException:
+        if observer is not None:
+            try:
+                observer.close()
+            except Exception:
+                pass
+        for stream in reversed(streams):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        raise
+
+
+def validate_compiler_executable_capability(
+    capability: CompilerExecutableCapability,
+    dependency_roots: DependencyRootAuthority,
+) -> None:
+    authority = validate_dependency_root_authority(
+        dependency_roots,
+    )
+    if not isinstance(capability, CompilerExecutableCapability):
+        raise AuditInfrastructureError("compiler executable capability is invalid")
+    expected_binding = _toolchain_binding_for_path(
+        capability.executable_identity.canonical, authority
+    )
+    if expected_binding != capability.trusted_toolchain_root:
+        raise AuditInfrastructureError("compiler executable capability root differs")
+    owner = capability.native_owner
+    if not isinstance(owner, _CompilerCapabilityOwner):
+        raise AuditInfrastructureError("compiler executable capability owner is invalid")
+    owner.validate(content=False)
+
+
 def _compiler_fingerprint(
     compiler: Path,
     normalized_version: bytes,
@@ -968,46 +1330,177 @@ def _compiler_fingerprint(
     return hasher.hexdigest()
 
 
+def inspect_compiler(
+    compiler: Path,
+    compiler_family: CompilerFamily,
+    launcher_environment: Mapping[str, str],
+    dependency_roots: DependencyRootAuthority,
+    inspection_cache=None,
+    expected_audit_engine_fingerprint: str = "",
+    pipeline_deadline: float | None = None,
+    limits: AuditLimits | None = None,
+    launch_accountant=None,
+    *,
+    working_directory: Path | None = None,
+) -> CompilerInspection:
+    """Inspect a held compiler capability and return portable exact evidence."""
+
+    del limits, launch_accountant
+    if not isinstance(compiler_family, CompilerFamily):
+        raise AuditInfrastructureError("compiler inspection family is invalid")
+    if not isinstance(launcher_environment, Mapping):
+        raise AuditInfrastructureError("compiler inspection environment is invalid")
+    authority = validate_dependency_root_authority(dependency_roots)
+    deadline = (
+        time.monotonic() + _VERSION_SECONDS
+        if pipeline_deadline is None
+        else pipeline_deadline
+    )
+    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+        raise AuditInfrastructureError("compiler inspection deadline is invalid")
+    if time.monotonic() >= deadline:
+        raise AuditInfrastructureError("compiler inspection deadline exceeded")
+    environment_digest = _environment_digest(launcher_environment)
+    cwd = working_directory or compiler.parent
+
+    compiler_snapshot = _compiler_metadata_snapshot(compiler)
+    capability = open_compiler_executable_capability(compiler, authority, deadline)
+    owner = capability.native_owner
+    try:
+        validate_compiler_executable_capability(capability, authority)
+        if _compiler_metadata_snapshot(compiler) != compiler_snapshot:
+            raise AuditInfrastructureError(
+                "compiler executable changed during compiler version probe: "
+                f"{compiler}"
+            )
+        arguments = (
+            "/nologo", "/Bv", "/EP", "/TP"
+        ) if compiler_family is CompilerFamily.MSVC else ("--version",)
+        arguments_digest = hashlib.sha256()
+        for value in (
+            compiler_family.value,
+            *arguments,
+            environment_digest,
+            authority.portable_authority_digest,
+        ):
+            _hash_field(arguments_digest, value.encode("utf-8"))
+        inspection_arguments_digest = arguments_digest.hexdigest()
+        memo_key = (
+            capability.executable_sha256,
+            capability.capability_digest,
+            environment_digest,
+            compiler_family,
+            authority.portable_authority_digest,
+            capability.executable_identity.canonical,
+            capability.executable_identity.device,
+            capability.executable_identity.inode,
+        )
+
+        with _compiler_inspection_lock:
+            memoized = _compiler_inspection_memo.get(memo_key)
+            if memoized is not None:
+                validate_compiler_executable_capability(capability, authority)
+                return memoized
+
+            cached = None
+            if inspection_cache is not None:
+                load = getattr(inspection_cache, "load", None)
+                if not callable(load):
+                    raise AuditInfrastructureError("compiler inspection cache is invalid")
+                cached = load(
+                    compiler,
+                    compiler_family,
+                    launcher_environment,
+                    authority,
+                    expected_audit_engine_fingerprint,
+                    deadline,
+                )
+            if cached is not None:
+                if (
+                    not isinstance(cached, CompilerInspection)
+                    or cached.compiler_family is not compiler_family
+                    or cached.executable_identity != capability.executable_identity
+                    or cached.executable_sha256 != capability.executable_sha256
+                    or cached.inspection_arguments_digest != inspection_arguments_digest
+                    or cached.executable_capability_digest != capability.capability_digest
+                ):
+                    raise AuditInfrastructureError("compiler inspection cache authority differs")
+                validate_compiler_executable_capability(capability, authority)
+                _compiler_inspection_memo[memo_key] = cached
+                return cached
+
+            version_output = _probe_compiler_version(
+                compiler,
+                compiler_family,
+                cwd,
+                launcher_environment,
+            )
+            validate_compiler_executable_capability(capability, authority)
+            family = identify_compiler(compiler, version_output)
+            if family is not compiler_family:
+                raise AuditInfrastructureError("compiler inspection family changed")
+            normalized_version_bytes = _normalize_version_output(version_output)
+            normalized_version = normalized_version_bytes.decode("utf-8")
+            driver = hashlib.sha256()
+            for value in (
+                family.value.encode("ascii"),
+                capability.executable_sha256.encode("ascii"),
+                normalized_version_bytes,
+                capability.capability_digest.encode("ascii"),
+                authority.portable_authority_digest.encode("ascii"),
+            ):
+                _hash_field(driver, value)
+            inspection = CompilerInspection(
+                family,
+                capability.executable_identity,
+                capability.executable_sha256,
+                normalized_version,
+                driver.hexdigest(),
+                inspection_arguments_digest,
+                capability.capability_digest,
+            )
+            # Force construction of the relocation-stable key before cache publication.
+            portable_compiler_inspection_key(inspection)
+            if inspection_cache is not None:
+                publish = getattr(inspection_cache, "publish", None)
+                if not callable(publish):
+                    raise AuditInfrastructureError("compiler inspection cache is invalid")
+                inspection = publish(
+                    compiler,
+                    compiler_family,
+                    launcher_environment,
+                    authority,
+                    expected_audit_engine_fingerprint,
+                    inspection,
+                    deadline,
+                )
+            validate_compiler_executable_capability(capability, authority)
+            _compiler_inspection_memo[memo_key] = inspection
+            return inspection
+    finally:
+        # The process-local capability memo owns the held closure. Configuration
+        # objects borrow the same validated capability without reopening it.
+        pass
+
+
 def _inspect_compiler(
     compiler: Path,
     family_hint: CompilerFamily,
     working_directory: Path,
     environment: Mapping[str, str],
     environment_digest: str,
-) -> tuple[CompilerFamily, str]:
-    """Inspect one stable compiler/environment pair once per audit process."""
-
-    with _COMPILER_INSPECTION_LOCK:
-        compiler_snapshot = _compiler_metadata_snapshot(compiler)
-        key = (compiler, compiler_snapshot, environment_digest, family_hint)
-        cached = _COMPILER_INSPECTION_MEMO.get(key)
-        if cached is not None:
-            if _compiler_metadata_snapshot(compiler) != compiler_snapshot:
-                raise AuditInfrastructureError(
-                    "compiler executable changed during compiler version probe: "
-                    f"{compiler}"
-                )
-            return cached
-        version_output = _probe_compiler_version(
-            compiler,
-            family_hint,
-            working_directory,
-            environment,
-        )
-        if _compiler_metadata_snapshot(compiler) != compiler_snapshot:
-            raise AuditInfrastructureError(
-                "compiler executable changed during compiler version probe: "
-                f"{compiler}"
-            )
-        family = identify_compiler(compiler, version_output)
-        fingerprint = _compiler_fingerprint(
-            compiler,
-            _normalize_version_output(version_output),
-            compiler_snapshot,
-        )
-        result = (family, fingerprint)
-        _COMPILER_INSPECTION_MEMO[key] = result
-        return result
+    dependency_roots: DependencyRootAuthority,
+) -> CompilerInspection:
+    if environment_digest != _environment_digest(environment):
+        raise AuditInfrastructureError("compiler environment digest mismatch")
+    return inspect_compiler(
+        compiler,
+        family_hint,
+        environment,
+        dependency_roots,
+        pipeline_deadline=time.monotonic() + _VERSION_SECONDS,
+        working_directory=working_directory,
+    )
 
 
 def _canonical_argument_path(value: str, cwd: Path) -> Path:
@@ -1351,11 +1844,13 @@ class _ForwardedSpan:
     stop: int
 
 
-@dataclass(slots=True)
 class _CommaSpanCursor:
-    text: str
-    position: int
-    stop: int
+    __slots__ = ("text", "position", "stop")
+
+    def __init__(self, text: str, position: int, stop: int) -> None:
+        self.text = text
+        self.position = position
+        self.stop = stop
 
     def next_span(self) -> _ForwardedSpan | None:
         if self.position > self.stop:
@@ -1828,9 +2323,16 @@ def make_configuration(
     production: Mapping[PurePosixPath, FileIdentity],
     environment: Mapping[str, str],
     limits: AuditLimits,
+    dependency_roots: DependencyRootAuthority,
+    inspection_cache=None,
+    expected_audit_engine_fingerprint: str = "",
+    pipeline_deadline: float | None = None,
 ) -> PreprocessConfiguration:
     """Build one stable semantic configuration from a compile database entry."""
 
+    authority = validate_dependency_root_authority(dependency_roots)
+    if authority.source_root.resolved_root != source_root.resolve(strict=False):
+        raise AuditInfrastructureError("compile source root differs from dependency authority")
     if not isinstance(entry_index, int) or isinstance(entry_index, bool) or entry_index < 0:
         raise AuditInfrastructureError("compile database entry index is invalid")
     cwd, decoded = decode_compile_entry(entry, database, windows=os.name == "nt")
@@ -1852,13 +2354,26 @@ def make_configuration(
     family_hint = _family_from_name(compiler_argument)
     compiler = _resolve_compiler(compiler_argument, cwd, environment)
     environment_digest = _environment_digest(environment)
-    family, compiler_fingerprint = _inspect_compiler(
+    deadline = pipeline_deadline or (time.monotonic() + limits.total_seconds)
+    inspection = inspect_compiler(
         compiler,
         family_hint,
-        cwd,
         environment,
-        environment_digest,
+        authority,
+        inspection_cache,
+        expected_audit_engine_fingerprint,
+        deadline,
+        limits,
+        working_directory=cwd,
     )
+    family = inspection.compiler_family
+    compiler_fingerprint = inspection.driver_fingerprint
+    compiler_capability = open_compiler_executable_capability(
+        compiler, authority, deadline
+    )
+    if compiler_capability.capability_digest != inspection.executable_capability_digest:
+        compiler_capability.native_owner.close()
+        raise AuditInfrastructureError("compiler capability changed after inspection")
     if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
         _reject_msvc_environment_arguments(environment)
     expanded_arguments = expand_response_files(
@@ -1907,19 +2422,25 @@ def make_configuration(
         "family": family.value,
         "compiler": str(compiler),
         "compiler_fingerprint": compiler_fingerprint,
+        "compiler_metadata": _compiler_metadata_snapshot(compiler),
         "working_directory": str(cwd),
         "source": str(source.canonical),
         "arguments": expanded_arguments,
         "environment_digest": environment_digest,
     }
-    digest = hashlib.sha256(
-        json.dumps(
-            semantic,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    semantic_bytes = json.dumps(
+        semantic,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest_builder = hashlib.sha256()
+    _hash_field(digest_builder, semantic_bytes)
+    _hash_field(
+        digest_builder, authority.portable_authority_digest.encode("ascii")
+    )
+    _hash_field(digest_builder, compiler_capability.capability_digest.encode("ascii"))
+    digest = digest_builder.hexdigest()
     return PreprocessConfiguration(
         entry_id=f"{database.resolve()}:{entry_index}",
         family=family,
@@ -1929,4 +2450,7 @@ def make_configuration(
         arguments=expanded_arguments,
         environment_digest=environment_digest,
         digest=digest,
+        dependency_root_authority_digest=authority.portable_authority_digest,
+        compiler_capability_digest=compiler_capability.capability_digest,
+        compiler_capability=compiler_capability,
     )

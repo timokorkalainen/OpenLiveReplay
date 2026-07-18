@@ -21,7 +21,9 @@ from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
     CompactTokenSequence,
+    CompilerExecutableCapability,
     CompilerFamily,
+    DependencyRootBinding,
     CoverageReport,
     FileIdentity,
     PreprocessedTranslationUnitView,
@@ -397,6 +399,20 @@ class AuditEngineFingerprintTests(unittest.TestCase):
                 capability_audit.audit_engine_fingerprint()
 
     def test_runtime_state_exclusions_are_exact_existing_and_nonsemantic(self):
+        self.assertEqual(
+            tuple(
+                module.__name__
+                for module in capability_audit._AUDIT_ENGINE_TARGET_MODULES
+            ),
+            (
+                "gpu_capability_model",
+                "gpu_capability_source_audit",
+                "gpu_capability_command",
+                "gpu_capability_cache",
+                "gpu_capability_provenance",
+                "gpu_capability_runner",
+            ),
+        )
         target_modules = {
             module.__name__: module
             for module in capability_audit._AUDIT_ENGINE_TARGET_MODULES
@@ -416,7 +432,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
                     self.assertFalse(capability_audit._is_semantic_constant_name(name))
 
         invalid_exclusions = MappingProxyType({
-            "gpu_capability_model": frozenset(),
+            **exclusions,
             "gpu_capability_source_audit": frozenset({"_RUNTIME_OBSERVER_LOCK"}),
         })
         with self.assertRaisesRegex(AuditInfrastructureError, "runtime-state exclusion"):
@@ -426,7 +442,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             )
 
         semantic_exclusions = MappingProxyType({
-            "gpu_capability_model": frozenset(),
+            **exclusions,
             "gpu_capability_source_audit": frozenset({"cpp_tokens"}),
         })
         with self.assertRaisesRegex(AuditInfrastructureError, "semantic symbol"):
@@ -440,7 +456,15 @@ class AuditEngineFingerprintTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             imported_root = Path(temporary) / "gpu"
             imported_root.mkdir()
-            for name in ("gpu_capability_model.py", "gpu_capability_source_audit.py"):
+            module_files = (
+                "gpu_capability_model.py",
+                "gpu_capability_source_audit.py",
+                "gpu_capability_command.py",
+                "gpu_capability_cache.py",
+                "gpu_capability_provenance.py",
+                "gpu_capability_runner.py",
+            )
+            for name in module_files:
                 shutil.copyfile(source_directory / name, imported_root / name)
 
             script = r'''
@@ -457,7 +481,7 @@ import gpu_capability_source_audit as audit
 
 baseline = audit.audit_engine_fingerprint()
 captured = audit._IMPORTED_MODULE_IDENTITIES
-for name in ("gpu_capability_model.py", "gpu_capability_source_audit.py"):
+for name in {module_files!r}:
     original = root / name
     os.replace(original, original.with_suffix(".loaded"))
     original.write_bytes(b"replacement module bytes")
@@ -484,7 +508,7 @@ if recomputed != baseline:
 if audit._IMPORTED_MODULE_IDENTITIES != captured:
     raise AssertionError("captured loaded identities changed")
 print(recomputed)
-'''
+'''.format(module_files=module_files)
             completed = subprocess.run(
                 (sys.executable, "-c", script, str(imported_root)),
                 check=True,
@@ -502,7 +526,15 @@ print(recomputed)
             second = root / "second" / "gpu"
             first.mkdir(parents=True)
             second.mkdir(parents=True)
-            for name in ("gpu_capability_model.py", "gpu_capability_source_audit.py"):
+            module_files = (
+                "gpu_capability_model.py",
+                "gpu_capability_source_audit.py",
+                "gpu_capability_command.py",
+                "gpu_capability_cache.py",
+                "gpu_capability_provenance.py",
+                "gpu_capability_runner.py",
+            )
+            for name in module_files:
                 shutil.copyfile(source_directory / name, first / name)
                 shutil.copyfile(source_directory / name, second / name)
 
@@ -524,18 +556,39 @@ print(recomputed)
             self.assertEqual(fingerprint(first), fingerprint(second))
             mutated = (second / "gpu_capability_source_audit.py").read_text(encoding="utf-8")
             self.assertIn(
-                'AUDIT_ENGINE_STAGE_BYTES = b"task-1-model-and-source-audit"',
+                'AUDIT_ENGINE_STAGE_BYTES = b"task-2-capability-stabilization"',
                 mutated,
             )
             (second / "gpu_capability_source_audit.py").write_text(
                 mutated.replace(
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-1-model-and-source-audit"',
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-1-model-and-source-audit-mutated"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-2-capability-stabilization"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-2-capability-stabilization-mutated"',
                     1,
                 ),
                 encoding="utf-8",
             )
             self.assertNotEqual(fingerprint(first), fingerprint(second))
+
+    def test_task1_fingerprint_no_longer_attests_after_staged_evolution(self):
+        current = capability_audit.audit_engine_fingerprint()
+        with (
+            mock.patch.object(
+                capability_audit,
+                "AUDIT_ENGINE_GRAPH_SCHEMA_BYTES",
+                b"olr-gpu-capability-live-graph-v1",
+            ),
+            mock.patch.object(
+                capability_audit,
+                "AUDIT_ENGINE_STAGE_BYTES",
+                b"task-1-model-and-source-audit",
+            ),
+        ):
+            task1 = capability_audit.audit_engine_fingerprint()
+        self.assertNotEqual(task1, current)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "loaded audit engine attestation"
+        ):
+            capability_audit._attest_loaded_audit_engine(task1)
 
     def test_windows_relative_forward_slash_import_attests_loaded_engine(self):
         source_directory = Path(__file__).resolve().parent
@@ -601,6 +654,17 @@ class CompilerAuditLaneTests(unittest.TestCase):
         )
 
     def configuration(self, source: FileIdentity, digest: str = "cfg-a"):
+        executable = FileIdentity(
+            Path("C:/toolchain/g++.exe"), None, 3, 9001, 0, False
+        )
+        root = DependencyRootBinding(
+            "toolchain", Path("C:/toolchain"),
+            FileIdentity(Path("C:/toolchain"), None, 3, 9002, 0, False),
+        )
+        capability = CompilerExecutableCapability(
+            "windows", executable, "1" * 64, "2" * 64, object(), root,
+            (), (), "3" * 64, (),
+        )
         return PreprocessConfiguration(
             entry_id="compile_commands.json:0",
             family=CompilerFamily.GCC,
@@ -610,6 +674,9 @@ class CompilerAuditLaneTests(unittest.TestCase):
             arguments=(str(source.canonical),),
             environment_digest="environment-a",
             digest=digest,
+            dependency_root_authority_digest="a" * 64,
+            compiler_capability_digest=capability.capability_digest,
+            compiler_capability=capability,
         )
 
     @staticmethod

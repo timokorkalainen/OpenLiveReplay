@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 import stat
@@ -20,11 +21,17 @@ from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
     CompactTokenSequence,
+    CompilerFamily,
+    CompilerInspection,
+    DependencyRootAuthority,
     FileIdentity,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
     _current_process_rss_bytes,
     _preprocessed_view_semantic_digest,
+    decode_compiler_inspection,
+    encode_compiler_inspection,
+    validate_dependency_root_authority,
 )
 
 
@@ -36,8 +43,8 @@ _IO_BLOCK_BYTES = 64 * 1024
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _MAX_RECORD_BYTES = 16 * 1024 * 1024
 _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-_HASH_CACHE: dict[tuple[object, ...], str] = {}
-_HASH_LOCK = threading.Lock()
+_hash_cache: dict[tuple[object, ...], str] = {}
+_hash_lock = threading.Lock()
 
 
 def _check_cache_rss(reserve: int = 0) -> None:
@@ -197,8 +204,8 @@ def _dependency_digest(identity: FileIdentity, *, force: bool = False) -> str:
             int(getattr(opened, "st_ctime_ns", 0)),
         )
         if not force:
-            with _HASH_LOCK:
-                cached = _HASH_CACHE.get(signature)
+            with _hash_lock:
+                cached = _hash_cache.get(signature)
             if cached is not None:
                 return cached
         while True:
@@ -215,11 +222,11 @@ def _dependency_digest(identity: FileIdentity, *, force: bool = False) -> str:
         ):
             raise OSError("dependency changed while hashing")
     result = digest.hexdigest()
-    with _HASH_LOCK:
+    with _hash_lock:
         if force:
-            _HASH_CACHE[signature] = result
+            _hash_cache[signature] = result
             return result
-        return _HASH_CACHE.setdefault(signature, result)
+        return _hash_cache.setdefault(signature, result)
 
 
 @dataclass(frozen=True)
@@ -644,6 +651,245 @@ def _after_cleanup_quarantine(_path: Path) -> None:
     """Test seam for deterministic cleanup replacement-race coverage."""
 
 
+_COMPILER_INSPECTION_SCHEMA = "olr-gpu-compiler-inspection-cache-v1"
+_COMPILER_INSPECTION_MAX_BYTES = 512 * 1024
+
+
+def _inspection_environment_digest(environment) -> str:
+    if not isinstance(environment, dict) and not hasattr(environment, "items"):
+        raise AuditInfrastructureError("compiler inspection environment is invalid")
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, value in environment.items():
+        if not isinstance(name, str) or not isinstance(value, str) or "\0" in name or "\0" in value:
+            raise AuditInfrastructureError("compiler inspection environment is invalid")
+        normalized = name.casefold() if os.name == "nt" else name
+        if normalized in seen:
+            raise AuditInfrastructureError("compiler inspection environment is ambiguous")
+        seen.add(normalized)
+        entries.append((normalized, value))
+    digest = hashlib.sha256()
+    for name, value in sorted(entries):
+        for item in (name.encode("utf-8"), value.encode("utf-8")):
+            digest.update(len(item).to_bytes(8, "big"))
+            digest.update(item)
+    return digest.hexdigest()
+
+
+def _held_compiler_snapshot(compiler: Path) -> tuple[FileIdentity, str]:
+    if not isinstance(compiler, Path) or not compiler.is_absolute():
+        raise AuditInfrastructureError("compiler inspection executable is invalid")
+    try:
+        canonical = compiler.resolve(strict=True)
+        before = _regular_unlinked_file(canonical)
+        digest = hashlib.sha256()
+        with canonical.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if _file_identity_tuple(opened) != _file_identity_tuple(before):
+                raise OSError("compiler changed while opening")
+            while chunk := stream.read(_IO_BLOCK_BYTES):
+                digest.update(chunk)
+            after_open = os.fstat(stream.fileno())
+        after = _regular_unlinked_file(canonical)
+    except OSError as error:
+        raise AuditInfrastructureError("compiler inspection executable changed") from error
+    if _file_identity_tuple(after_open) != _file_identity_tuple(before) or _file_identity_tuple(after) != _file_identity_tuple(before):
+        raise AuditInfrastructureError("compiler inspection executable changed")
+    inode = int(before.st_ino) if int(before.st_ino) != 0 else None
+    return (
+        FileIdentity(canonical, None, int(before.st_dev), inode, 0, False),
+        digest.hexdigest(),
+    )
+
+
+def compiler_inspection_cache_key(
+    compiler: Path,
+    compiler_family: CompilerFamily,
+    launcher_environment,
+    dependency_roots: DependencyRootAuthority,
+    expected_audit_engine_fingerprint: str,
+) -> str:
+    authority = validate_dependency_root_authority(dependency_roots)
+    if not isinstance(compiler_family, CompilerFamily):
+        raise AuditInfrastructureError("compiler inspection family is invalid")
+    if expected_audit_engine_fingerprint:
+        if (
+            not isinstance(expected_audit_engine_fingerprint, str)
+            or len(expected_audit_engine_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in expected_audit_engine_fingerprint)
+        ):
+            raise AuditInfrastructureError("audit engine fingerprint is invalid")
+    try:
+        canonical = compiler.resolve(strict=True)
+    except OSError as error:
+        raise AuditInfrastructureError("compiler inspection executable is invalid") from error
+    matches = []
+    for binding in authority.external_roots:
+        try:
+            canonical.relative_to(binding.resolved_root)
+        except ValueError:
+            continue
+        matches.append(binding)
+    if len(matches) != 1:
+        raise AuditInfrastructureError(
+            "compiler inspection executable is outside the local dependency authority"
+        )
+    _identity, content = _held_compiler_snapshot(canonical)
+    digest = hashlib.sha256()
+    for value in (
+        _COMPILER_INSPECTION_SCHEMA,
+        compiler_family.value,
+        content,
+        _inspection_environment_digest(launcher_environment),
+        authority.portable_authority_digest,
+        expected_audit_engine_fingerprint,
+    ):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+class CompilerInspectionCache:
+    """Exact atomic compiler-inspection records under a local bound root."""
+
+    def __init__(self, root: Path) -> None:
+        if not isinstance(root, Path) or not root.is_absolute():
+            raise AuditInfrastructureError("compiler inspection cache root is invalid")
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            metadata = _ordinary_directory(root)
+        except OSError as error:
+            raise AuditInfrastructureError("compiler inspection cache root is unavailable") from error
+        self.root = root
+        self._root_identity = _directory_identity(metadata)
+        self._lock = threading.Lock()
+
+    def _assert_root(self) -> None:
+        try:
+            current = _ordinary_directory(self.root)
+        except OSError as error:
+            raise AuditInfrastructureError("compiler inspection cache root was replaced") from error
+        if _directory_identity(current) != self._root_identity:
+            raise AuditInfrastructureError("compiler inspection cache root was replaced")
+
+    def _path(self, key: str) -> Path:
+        return self.root / f".compiler-inspection-{key}.json"
+
+    def load(
+        self,
+        compiler: Path,
+        compiler_family: CompilerFamily,
+        launcher_environment,
+        dependency_roots: DependencyRootAuthority,
+        expected_audit_engine_fingerprint: str,
+        pipeline_deadline: float,
+    ) -> CompilerInspection | None:
+        authority = validate_dependency_root_authority(dependency_roots)
+        if time.monotonic() >= pipeline_deadline:
+            raise AuditInfrastructureError("compiler inspection cache deadline exceeded")
+        key = compiler_inspection_cache_key(
+            compiler, compiler_family, launcher_environment, authority,
+            expected_audit_engine_fingerprint,
+        )
+        path = self._path(key)
+        try:
+            self._assert_root()
+            metadata = _regular_unlinked_file(path)
+            if metadata.st_size > _COMPILER_INSPECTION_MAX_BYTES:
+                raise ValueError("compiler inspection manifest is too large")
+            with _HeldCacheFile(path) as held:
+                assert held.stream is not None
+                payload = held.stream.read(_COMPILER_INSPECTION_MAX_BYTES + 1)
+                held.verify()
+            document = json.loads(payload.decode("ascii"))
+            if not isinstance(document, dict) or tuple(document) != (
+                "schema", "key", "dependency_root_authority_digest", "inspection"
+            ):
+                raise ValueError("compiler inspection manifest schema is invalid")
+            if (
+                document["schema"] != _COMPILER_INSPECTION_SCHEMA
+                or document["key"] != key
+                or document["dependency_root_authority_digest"] != authority.portable_authority_digest
+                or not isinstance(document["inspection"], str)
+            ):
+                raise ValueError("compiler inspection manifest is invalid")
+            inspection = decode_compiler_inspection(
+                base64.b64decode(document["inspection"].encode("ascii"), validate=True)
+            )
+            identity, content = _held_compiler_snapshot(compiler)
+            if (
+                inspection.compiler_family is not compiler_family
+                or inspection.executable_identity != identity
+                or inspection.executable_sha256 != content
+            ):
+                raise ValueError("compiler inspection executable differs")
+            return inspection
+        except (
+            FileNotFoundError, OSError, UnicodeError, ValueError, TypeError,
+            json.JSONDecodeError,
+        ):
+            return None
+
+    def publish(
+        self,
+        compiler: Path,
+        compiler_family: CompilerFamily,
+        launcher_environment,
+        dependency_roots: DependencyRootAuthority,
+        expected_audit_engine_fingerprint: str,
+        inspection: CompilerInspection,
+        pipeline_deadline: float,
+    ) -> CompilerInspection:
+        authority = validate_dependency_root_authority(dependency_roots)
+        if time.monotonic() >= pipeline_deadline:
+            raise AuditInfrastructureError("compiler inspection cache deadline exceeded")
+        key = compiler_inspection_cache_key(
+            compiler, compiler_family, launcher_environment, authority,
+            expected_audit_engine_fingerprint,
+        )
+        identity, content = _held_compiler_snapshot(compiler)
+        if (
+            not isinstance(inspection, CompilerInspection)
+            or inspection.compiler_family is not compiler_family
+            or inspection.executable_identity != identity
+            or inspection.executable_sha256 != content
+        ):
+            raise AuditInfrastructureError("compiler inspection publication differs")
+        document = {
+            "schema": _COMPILER_INSPECTION_SCHEMA,
+            "key": key,
+            "dependency_root_authority_digest": authority.portable_authority_digest,
+            "inspection": base64.b64encode(
+                encode_compiler_inspection(inspection)
+            ).decode("ascii"),
+        }
+        encoded = json.dumps(
+            document, ensure_ascii=True, separators=(",", ":")
+        ).encode("ascii")
+        if len(encoded) > _COMPILER_INSPECTION_MAX_BYTES:
+            raise AuditInfrastructureError("compiler inspection manifest is too large")
+        temporary = self.root / f".tmp-inspection-{uuid.uuid4().hex}"
+        path = self._path(key)
+        with self._lock:
+            try:
+                self._assert_root()
+                with temporary.open("xb") as stream:
+                    stream.write(encoded)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                self._assert_root()
+                os.replace(temporary, path)
+                self._assert_root()
+            except OSError as error:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+                raise AuditInfrastructureError("cannot publish compiler inspection") from error
+        return inspection
+
+
 class PreprocessCache:
     def __init__(
         self,
@@ -681,7 +927,10 @@ class PreprocessCache:
         if _directory_identity(metadata) != self._root_identity:
             raise AuditInfrastructureError("cache root identity was replaced")
 
-    def _configuration_key(self, configuration: PreprocessConfiguration) -> str:
+    def _configuration_key(
+        self,
+        configuration: PreprocessConfiguration,
+    ) -> str:
         if not isinstance(configuration, PreprocessConfiguration):
             raise AuditInfrastructureError("preprocess configuration is invalid")
         semantic = {
@@ -693,6 +942,8 @@ class PreprocessCache:
             "source": str(configuration.source.canonical),
             "arguments": configuration.arguments,
             "environment_digest": configuration.environment_digest,
+            "dependency_root_authority_digest": configuration.dependency_root_authority_digest,
+            "compiler_capability_digest": configuration.compiler_capability_digest,
         }
         return hashlib.sha256(
             json.dumps(
@@ -795,7 +1046,8 @@ class PreprocessCache:
         return tuple(result)
 
     def load(
-        self, configuration: PreprocessConfiguration
+        self,
+        configuration: PreprocessConfiguration,
     ) -> PreprocessedTranslationUnitView | None:
         key = self._configuration_key(configuration)
         entry = self.root / key
@@ -882,7 +1134,10 @@ class PreprocessCache:
                 "dependency content changed during preprocessing"
             )
 
-    def publish(self, view: PreprocessedTranslationUnitView) -> None:
+    def publish(
+        self,
+        view: PreprocessedTranslationUnitView,
+    ) -> None:
         try:
             snapshots = self._snapshot_dependencies(view.dependencies, force=True)
         except OSError as error:

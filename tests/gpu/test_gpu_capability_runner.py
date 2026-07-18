@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -11,31 +13,43 @@ import time
 import unittest
 from array import array
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_capability_command as capability_command  # noqa: E402
-from gpu_capability_command import RewrittenCommand, _environment_digest  # noqa: E402
+import gpu_capability_model as capability_model  # noqa: E402
+from gpu_capability_command import (  # noqa: E402
+    RewrittenCommand,
+    _environment_digest,
+    open_compiler_executable_capability,
+)
 from gpu_capability_cache import PreprocessCache  # noqa: E402
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
     CompactTokenSequence,
     CompilerFamily,
+    DependencyDigest,
     FileIdentity,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
+    build_dependency_root_authority,
+    _FilesystemGenerationObserver,
 )
+from gpu_capability_provenance import PreprocessedStreamBuilder  # noqa: E402
 from gpu_capability_runner import (  # noqa: E402
     ExecutionResult,
+    _DependencyGenerationGuards,
     _WindowsJob,
     collect_configurations,
     load_or_preprocess,
     preprocess_all,
     preprocess_configuration,
     run_bounded_preprocessor,
+    stabilize_and_parse_configuration,
 )
 
 
@@ -59,9 +73,16 @@ class BoundedPreprocessorTests(unittest.TestCase):
             production=True,
         )
         self.production = {self.identity.relative: self.identity}
+        self.dependency_roots = build_dependency_root_authority(
+            self.root, {"toolchain": Path(sys.executable).resolve().parent}
+        )
+        self.compiler_capability = open_compiler_executable_capability(
+            Path(sys.executable).resolve(), self.dependency_roots, time.monotonic() + 10.0
+        )
         self.fixture = Path(__file__).parent / "fixtures" / "fake_preprocessor.py"
 
     def tearDown(self) -> None:
+        self.compiler_capability.native_owner.close()
         self.temporary.cleanup()
 
     def configuration(
@@ -81,6 +102,11 @@ class BoundedPreprocessorTests(unittest.TestCase):
             arguments=(str(self.source),),
             environment_digest=_environment_digest(dict(os.environ)),
             digest=f"cfg-{family.value}-{mode}",
+            dependency_root_authority_digest=(
+                self.dependency_roots.portable_authority_digest
+            ),
+            compiler_capability_digest=self.compiler_capability.capability_digest,
+            compiler_capability=self.compiler_capability,
         )
 
     def preprocess_fixture(
@@ -132,6 +158,76 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 limits or AuditLimits(rss_bytes=2**63 - 1),
                 deadline if deadline is not None else time.monotonic() + 10.0,
             )
+
+    def stabilize_fixture(self, mode: str):
+        configuration = self.configuration(mode)
+
+        def rewrite(_configuration, dependency_output):
+            return RewrittenCommand(
+                arguments=(
+                    sys.executable,
+                    str(self.fixture),
+                    "--fixture-mode",
+                    mode,
+                    "--family",
+                    "gcc",
+                    str(self.source),
+                    "-MF",
+                    str(dependency_output),
+                ),
+                dependency_output=dependency_output,
+                dependency_format="gcc-depfile",
+            )
+
+        with mock.patch(
+            "gpu_capability_runner.rewrite_preprocess_command", side_effect=rewrite
+        ):
+            return stabilize_and_parse_configuration(
+                configuration,
+                self.dependency_roots,
+                self.production,
+                AuditLimits(rss_bytes=2**63 - 1),
+                time.monotonic() + 10.0,
+            )
+
+    def test_cold_stabilization_invokes_twice_but_builds_once(self):
+        with mock.patch(
+            "gpu_capability_runner.PreprocessedStreamBuilder",
+            wraps=PreprocessedStreamBuilder,
+        ) as builder, mock.patch(
+            "gpu_capability_runner.run_bounded_preprocessor",
+            wraps=run_bounded_preprocessor,
+        ) as execute:
+            view, discovery, stages = self.stabilize_fixture("success")
+        self.assertEqual(builder.call_count, 1)
+        self.assertEqual(execute.call_count, 2)
+        self.assertGreater(discovery.stream.byte_count, 0)
+        self.assertGreater(stages.discovery_seconds, 0.0)
+        self.assertGreater(stages.accepted_parse_seconds, 0.0)
+        self.assertEqual(view.configuration.digest, "cfg-gcc-success")
+
+    def test_raw_output_and_byte_count_mismatches_publish_nothing(self):
+        for mode, message in (
+            ("different-second-output", "raw preprocessed output changed"),
+            ("different-second-byte-count", "raw preprocessed byte count changed"),
+        ):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                AuditInfrastructureError, message
+            ):
+                self.stabilize_fixture(mode)
+
+    def test_real_subprocess_accepts_thread_and_spawn_cancellation_events(self):
+        events = (threading.Event(), multiprocessing.get_context("spawn").Event())
+        for event in events:
+            event.set()
+            with self.subTest(event=type(event).__name__), self.assertRaisesRegex(
+                AuditInfrastructureError, "cancelled"
+            ):
+                self.run_direct(
+                    "wait-for-cancel",
+                    cancel_event=event,
+                    extra=("--sleep-seconds", "30"),
+                )
 
     @staticmethod
     def altered_view(
@@ -644,6 +740,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
         ):
             actual = load_or_preprocess(
                 configuration,
+                self.dependency_roots,
                 self.production,
                 cache,
                 AuditLimits(rss_bytes=2**63 - 1),
@@ -657,11 +754,17 @@ class BoundedPreprocessorTests(unittest.TestCase):
         cache = PreprocessCache(self.root / "cache")
         expected = self.preprocess_fixture("success")
         with mock.patch(
-            "gpu_capability_runner.preprocess_configuration", return_value=expected
+            "gpu_capability_runner.stabilize_and_parse_configuration",
+            return_value=(
+                expected,
+                SimpleNamespace(dependency_identities=expected.dependencies),
+                None,
+            ),
         ) as preprocess:
             self.assertIs(
                 load_or_preprocess(
                     configuration,
+                    self.dependency_roots,
                     self.production,
                     cache,
                     AuditLimits(rss_bytes=2**63 - 1),
@@ -669,17 +772,18 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 ),
                 expected,
             )
-        self.assertEqual(preprocess.call_count, 2)
+        self.assertEqual(preprocess.call_count, 1)
         self.assertIsNotNone(cache.load(configuration))
 
         failed_configuration = dataclasses.replace(configuration, digest="failed")
         with mock.patch(
-            "gpu_capability_runner.preprocess_configuration",
+            "gpu_capability_runner.stabilize_and_parse_configuration",
             side_effect=AuditInfrastructureError("compiler failed"),
         ):
             with self.assertRaisesRegex(AuditInfrastructureError, "compiler failed"):
                 load_or_preprocess(
                     failed_configuration,
+                    self.dependency_roots,
                     self.production,
                     cache,
                     AuditLimits(rss_bytes=2**63 - 1),
@@ -697,55 +801,43 @@ class BoundedPreprocessorTests(unittest.TestCase):
         def preprocess(*_arguments):
             nonlocal calls
             calls += 1
-            if calls == 2:
-                self.source.write_text("changed after compiler read\n", encoding="utf-8")
-            return old_view
+            self.source.write_text("changed after compiler read\n", encoding="utf-8")
+            raise AuditInfrastructureError("dependency changed during preprocessing")
 
         with mock.patch(
-            "gpu_capability_runner.preprocess_configuration", side_effect=preprocess
+            "gpu_capability_runner.stabilize_and_parse_configuration", side_effect=preprocess
         ):
             with self.assertRaisesRegex(
                 AuditInfrastructureError, "changed during preprocessing"
             ):
                 load_or_preprocess(
                     configuration,
+                    self.dependency_roots,
                     self.production,
                     cache,
                     AuditLimits(rss_bytes=2**63 - 1),
                     time.monotonic() + 10.0,
                 )
-        self.assertEqual(calls, 2)
+        self.assertEqual(calls, 1)
         self.assertIsNone(cache.load(configuration))
 
     def test_load_or_preprocess_rejects_transient_output_even_when_content_is_restored(self):
         configuration = self.configuration("success")
         cache = PreprocessCache(self.root / "cache")
-        discovery = self.preprocess_fixture("success")
-        accepted = self.altered_view(discovery)
-        original = self.source.read_bytes()
-        calls = 0
-
-        def preprocess(*_arguments):
-            nonlocal calls
-            if calls == 0:
-                calls += 1
-                return discovery
-            self.source.write_text("transient B\n", encoding="utf-8")
-            self.source.write_bytes(original)
-            return accepted
-
         with mock.patch(
-            "gpu_capability_runner.preprocess_configuration", side_effect=preprocess
+            "gpu_capability_runner.stabilize_and_parse_configuration",
+            side_effect=AuditInfrastructureError("raw preprocessed output changed"),
         ), mock.patch.object(
             CompactTokenSequence,
             "__iter__",
             side_effect=AssertionError("token iteration"),
         ):
             with self.assertRaisesRegex(
-                AuditInfrastructureError, "nondeterministic preprocessed output"
+                AuditInfrastructureError, "raw preprocessed output changed"
             ):
                 load_or_preprocess(
                     configuration,
+                    self.dependency_roots,
                     self.production,
                     cache,
                     AuditLimits(rss_bytes=2**63 - 1),
@@ -772,13 +864,15 @@ class BoundedPreprocessorTests(unittest.TestCase):
             real_rename(source, destination)
 
         def preprocess(*_arguments):
-            return views[threading.current_thread().name]
+            view = views[threading.current_thread().name]
+            return view, SimpleNamespace(dependency_identities=view.dependencies), None
 
         def run(cache: PreprocessCache) -> None:
             try:
                 successes.append(
                     load_or_preprocess(
                         configuration,
+                        self.dependency_roots,
                         self.production,
                         cache,
                         AuditLimits(rss_bytes=2**63 - 1),
@@ -789,7 +883,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 failures.append(error)
 
         with mock.patch(
-            "gpu_capability_runner.preprocess_configuration", side_effect=preprocess
+            "gpu_capability_runner.stabilize_and_parse_configuration", side_effect=preprocess
         ), mock.patch("gpu_capability_cache.os.rename", side_effect=rename):
             threads = [
                 threading.Thread(target=run, args=(cache,), name=name)
@@ -813,20 +907,85 @@ class OrchestrationTests(unittest.TestCase):
         self.build.mkdir()
         (self.root / "playback").mkdir()
         (self.root / "recorder_engine").mkdir()
-        self.compiler = self.root / "toolchain" / "g++.exe"
-        self.compiler.parent.mkdir()
+        self.toolchain_temporary = tempfile.TemporaryDirectory()
+        self.compiler = Path(self.toolchain_temporary.name).resolve() / "g++.exe"
         self.compiler.write_bytes(b"compiler-a")
         self.environment = {"PATH": str(self.compiler.parent), "GPU_MODE": "on"}
         self.cache = PreprocessCache((self.root / "cache").resolve())
+        self.dependency_roots = build_dependency_root_authority(
+            self.root, {"toolchain": self.compiler.parent}
+        )
+        self.compiler_capability = open_compiler_executable_capability(
+            self.compiler.resolve(), self.dependency_roots, time.monotonic() + 10.0
+        )
 
     def tearDown(self) -> None:
+        self.compiler_capability.native_owner.close()
         self.temporary.cleanup()
+        self.toolchain_temporary.cleanup()
 
     def write_source(self, relative: str, text: str = "int value;\n") -> Path:
         path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
         return path.resolve()
+
+    def test_dependency_guard_prevents_or_observes_write_then_restore(self):
+        path = self.write_source("playback/guarded.h", "original\n")
+        identity = self.identity(path, "playback/guarded.h")
+        dependency = DependencyDigest(
+            self.dependency_roots.source_root.stable_role,
+            PurePosixPath("playback/guarded.h"),
+            identity,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        guards = _DependencyGenerationGuards(
+            (dependency,), self.dependency_roots
+        ).bind((dependency,))
+        try:
+            if os.name == "nt":
+                with self.assertRaises(OSError):
+                    path.write_text("changed\n", encoding="utf-8")
+                self.assertEqual(guards.validate_and_hash(), (dependency,))
+            else:
+                path.write_text("changed\n", encoding="utf-8")
+                path.write_text("original\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "generation change"
+                ):
+                    guards.validate_and_hash()
+        finally:
+            guards.close()
+
+    def test_dependency_guard_cleanup_failure_is_fatal(self):
+        path = self.write_source("playback/cleanup.h", "original\n")
+        identity = self.identity(path, "playback/cleanup.h")
+        dependency = DependencyDigest(
+            self.dependency_roots.source_root.stable_role,
+            PurePosixPath("playback/cleanup.h"),
+            identity,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        guards = _DependencyGenerationGuards((dependency,), self.dependency_roots)
+        observer = guards._observer
+        with mock.patch.object(
+            observer, "close", side_effect=AuditInfrastructureError("cleanup")
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "guard cleanup failed"
+        ):
+            guards.close()
+        observer._close_no_raise()
+
+    def test_dependency_guard_rejects_unsupported_platform_backend(self):
+        path = self.write_source("playback/unsupported.h", "original\n")
+        with (
+            mock.patch.object(capability_model.os, "name", "posix"),
+            mock.patch.object(capability_model.sys, "platform", "aix"),
+            self.assertRaisesRegex(
+                AuditInfrastructureError, "observation is unsupported"
+            ),
+        ):
+            _FilesystemGenerationObserver(((path, False),))
 
     @staticmethod
     def identity(path: Path, relative: str) -> FileIdentity:
@@ -874,7 +1033,9 @@ class OrchestrationTests(unittest.TestCase):
             "gpu_capability_command._probe_compiler_version",
             return_value=b"g++.exe (GCC) 13.1.0\n",
         ):
-            return collect_configurations(self.root, databases, self.environment)
+            return collect_configurations(
+                self.root, databases, self.environment, self.dependency_roots
+            )
 
     def configuration(
         self,
@@ -893,6 +1054,11 @@ class OrchestrationTests(unittest.TestCase):
             arguments=(*arguments, str(identity.canonical)),
             environment_digest=_environment_digest(dict(os.environ)),
             digest=digest,
+            dependency_root_authority_digest=(
+                self.dependency_roots.portable_authority_digest
+            ),
+            compiler_capability_digest=self.compiler_capability.capability_digest,
+            compiler_capability=self.compiler_capability,
         )
 
     @staticmethod
@@ -961,20 +1127,17 @@ class OrchestrationTests(unittest.TestCase):
         with mock.patch(
             "gpu_capability_command._probe_compiler_version",
             side_effect=version_probe,
-        ) as probe, mock.patch(
-            "gpu_capability_command._compiler_fingerprint",
-            wraps=capability_command._compiler_fingerprint,
-        ) as fingerprint:
+        ) as probe:
             configurations = collect_configurations(
                 self.root,
                 (database,),
                 self.environment,
+                self.dependency_roots,
             )
         elapsed = time.monotonic() - started
 
         self.assertEqual(len(configurations), 251)
         self.assertEqual(probe.call_count, 1)
-        self.assertEqual(fingerprint.call_count, 1)
         self.assertLess(elapsed, 2.0)
 
     def test_collection_sorts_databases_and_entries_deterministically(self):
@@ -1103,6 +1266,7 @@ class OrchestrationTests(unittest.TestCase):
         ):
             preprocess_all(
                 (configuration,),
+                self.dependency_roots,
                 {a.relative: a, missing.relative: missing},
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
@@ -1142,6 +1306,7 @@ class OrchestrationTests(unittest.TestCase):
             ):
                 preprocess_all(
                     configurations,
+                    self.dependency_roots,
                     production,
                     self.cache,
                     AuditLimits(workers=1, rss_bytes=2**63 - 1),
@@ -1170,6 +1335,7 @@ class OrchestrationTests(unittest.TestCase):
         with mock.patch("gpu_capability_runner.load_or_preprocess", return_value=result):
             views, coverage = preprocess_all(
                 (configuration,),
+                self.dependency_roots,
                 production,
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
@@ -1209,6 +1375,7 @@ class OrchestrationTests(unittest.TestCase):
             ):
                 views, coverage = preprocess_all(
                     (first, second),
+                    self.dependency_roots,
                     {source.relative: source},
                     self.cache,
                     AuditLimits(workers=workers, rss_bytes=2**63 - 1),
@@ -1231,6 +1398,7 @@ class OrchestrationTests(unittest.TestCase):
         ):
             preprocess_all(
                 (configuration,),
+                self.dependency_roots,
                 {source.relative: source},
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
@@ -1269,6 +1437,7 @@ class OrchestrationTests(unittest.TestCase):
         ):
             preprocess_all(
                 (first_configuration, second_configuration),
+                self.dependency_roots,
                 {first.relative: first, second.relative: second},
                 self.cache,
                 AuditLimits(workers=2, rss_bytes=2**63 - 1),
@@ -1291,6 +1460,7 @@ class OrchestrationTests(unittest.TestCase):
         ):
             _views, coverage = preprocess_all(
                 (configuration,),
+                self.dependency_roots,
                 {source.relative: source, header.relative: header},
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
@@ -1316,6 +1486,7 @@ class OrchestrationTests(unittest.TestCase):
         ):
             _views, coverage = preprocess_all(
                 (configuration,),
+                self.dependency_roots,
                 {source.relative: source, header.relative: header},
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
@@ -1362,6 +1533,7 @@ class OrchestrationTests(unittest.TestCase):
         ):
             preprocess_all(
                 tuple(configurations),
+                self.dependency_roots,
                 production,
                 self.cache,
                 AuditLimits(workers=2, rss_bytes=2**63 - 1),
@@ -1394,6 +1566,7 @@ class OrchestrationTests(unittest.TestCase):
         ) as raised:
             preprocess_all(
                 tuple(configurations),
+                self.dependency_roots,
                 production,
                 self.cache,
                 AuditLimits(workers=2, rss_bytes=2**63 - 1),

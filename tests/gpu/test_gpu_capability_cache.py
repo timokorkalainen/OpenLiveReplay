@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import stat
@@ -17,24 +18,31 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gpu_capability_cache import (  # noqa: E402
+    CompilerInspectionCache,
     PreprocessCache,
-    _HASH_CACHE,
-    _HASH_LOCK,
+    _hash_cache,
+    _hash_lock,
     _PublicationGuard,
+    compiler_inspection_cache_key,
 )
 from gpu_capability_model import (  # noqa: E402
+    AuditInfrastructureError,
     CompactTokenSequence,
+    CompilerExecutableCapability,
     CompilerFamily,
+    CompilerInspection,
+    DependencyRootBinding,
     FileIdentity,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
+    build_dependency_root_authority,
 )
 
 
-class PreprocessCacheTests(unittest.TestCase):
+class _PreprocessCacheFixture:
     def setUp(self) -> None:
-        with _HASH_LOCK:
-            _HASH_CACHE.clear()
+        with _hash_lock:
+            _hash_cache.clear()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.cache_root = self.root / "cache"
@@ -48,6 +56,17 @@ class PreprocessCacheTests(unittest.TestCase):
         self.compiler.write_bytes(b"compiler-fingerprint-one")
         self.main = self.identity(self.main_path, "playback/a.cpp")
         self.header = self.identity(self.header_path, "playback/a.h")
+        self.dependency_roots = build_dependency_root_authority(self.root, {})
+        executable = self.identity(self.compiler)
+        binding = DependencyRootBinding(
+            "toolchain", self.compiler.parent.resolve(),
+            FileIdentity(self.compiler.parent.resolve(), None, executable.device,
+                         executable.inode, 0, False),
+        )
+        capability = CompilerExecutableCapability(
+            "windows", dataclasses.replace(executable, line_count=0),
+            "1" * 64, "2" * 64, object(), binding, (), (), "3" * 64, (),
+        )
         self.configuration = PreprocessConfiguration(
             entry_id="compile_commands.json:0",
             family=CompilerFamily.GCC,
@@ -57,6 +76,11 @@ class PreprocessCacheTests(unittest.TestCase):
             arguments=("-std=c++17", str(self.main_path)),
             environment_digest="environment-one",
             digest="compiler-fingerprint-one",
+            dependency_root_authority_digest=(
+                self.dependency_roots.portable_authority_digest
+            ),
+            compiler_capability_digest=capability.capability_digest,
+            compiler_capability=capability,
         )
 
     def tearDown(self) -> None:
@@ -101,12 +125,128 @@ class PreprocessCacheTests(unittest.TestCase):
         cache = cache or PreprocessCache(self.cache_root)
         return self.cache_root / cache._configuration_key(self.configuration)
 
-    def test_hit_requires_every_dependency_content_hash(self):
+    def _assert_hit_requires_every_dependency_content_hash(self):
         cache = PreprocessCache(self.cache_root)
         cache.publish(self.view())
         self.assertIsNotNone(cache.load(self.configuration))
         self.header_path.write_text("changed\n", encoding="utf-8")
         self.assertIsNone(cache.load(self.configuration))
+
+
+class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
+    def setUp(self) -> None:
+        _PreprocessCacheFixture.setUp(self)
+        self.source = self.root / "inspection-source"
+        self.toolchain = self.root / "inspection-toolchain"
+        inspection_cache_root = self.root / "inspection-cache"
+        self.source.mkdir()
+        self.toolchain.mkdir()
+        self.compiler = self.toolchain / "g++.exe"
+        self.compiler.write_bytes(b"compiler-one")
+        self.authority = build_dependency_root_authority(
+            self.source, {"toolchain": self.toolchain}
+        )
+        self.cache = CompilerInspectionCache(inspection_cache_root)
+        metadata = self.compiler.stat()
+        self.compiler_identity = FileIdentity(
+            self.compiler.resolve(), None, int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+            0, False,
+        )
+        self.environment = {"PATH": str(self.toolchain)}
+
+    def tearDown(self) -> None:
+        _PreprocessCacheFixture.tearDown(self)
+
+    def inspection(self) -> CompilerInspection:
+        return CompilerInspection(
+            CompilerFamily.GCC,
+            self.compiler_identity,
+            hashlib.sha256(self.compiler.read_bytes()).hexdigest(),
+            "g++ (GCC) 14.1.0",
+            "b" * 64,
+            "c" * 64,
+            "d" * 64,
+        )
+
+    def test_exact_inspection_manifest_round_trips_under_local_authority(self):
+        inspection = self.inspection()
+        published = self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, inspection, time.monotonic() + 10.0,
+        )
+        self.assertEqual(published, inspection)
+        self.assertEqual(
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, time.monotonic() + 10.0,
+            ),
+            inspection,
+        )
+
+    def test_portable_inspection_key_excludes_path_and_native_identity(self):
+        other_source = self.root / "other-source"
+        other_toolchain = self.root / "other-toolchain"
+        other_source.mkdir()
+        other_toolchain.mkdir()
+        other_compiler = other_toolchain / "g++.exe"
+        other_compiler.write_bytes(self.compiler.read_bytes())
+        other_authority = build_dependency_root_authority(
+            other_source, {"toolchain": other_toolchain}
+        )
+        first = compiler_inspection_cache_key(
+            self.compiler.resolve(), CompilerFamily.GCC, {}, self.authority,
+            "e" * 64,
+        )
+        second = compiler_inspection_cache_key(
+            other_compiler.resolve(), CompilerFamily.GCC, {}, other_authority,
+            "e" * 64,
+        )
+        self.assertEqual(first, second)
+
+    def test_equal_portable_digest_with_different_local_roots_fails_before_access(self):
+        other_source = self.root / "second-source"
+        other_toolchain = self.root / "second-toolchain"
+        other_source.mkdir()
+        other_toolchain.mkdir()
+        other_authority = build_dependency_root_authority(
+            other_source, {"toolchain": other_toolchain}
+        )
+        self.assertEqual(
+            other_authority.portable_authority_digest,
+            self.authority.portable_authority_digest,
+        )
+        with mock.patch.object(
+            self.cache, "_path", side_effect=AssertionError("cache accessed")
+        ), self.assertRaisesRegex(AuditInfrastructureError, "local dependency authority"):
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                other_authority, "e" * 64, time.monotonic() + 10.0,
+            )
+
+    def test_changed_compiler_content_is_a_miss_without_old_manifest_use(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, inspection, time.monotonic() + 10.0,
+        )
+        self.compiler.write_bytes(b"compiler-two")
+        self.assertIsNone(
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, time.monotonic() + 10.0,
+            )
+        )
+
+class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
+    def setUp(self) -> None:
+        _PreprocessCacheFixture.setUp(self)
+
+    def tearDown(self) -> None:
+        _PreprocessCacheFixture.tearDown(self)
+
+    def test_hit_requires_every_dependency_content_hash(self):
+        self._assert_hit_requires_every_dependency_content_hash()
 
     def test_missing_replaced_and_hardlinked_dependency_are_misses(self):
         cache = PreprocessCache(self.cache_root)
@@ -407,13 +547,13 @@ class PreprocessCacheTests(unittest.TestCase):
     def test_dependency_digests_are_shared_across_configurations(self):
         cache = PreprocessCache(self.cache_root)
         cache.publish(self.view())
-        self.assertEqual(len(_HASH_CACHE), 2)
+        self.assertEqual(len(_hash_cache), 2)
         cache.publish(
             self.view(
                 configuration=dataclasses.replace(self.configuration, digest="second")
             )
         )
-        self.assertEqual(len(_HASH_CACHE), 2)
+        self.assertEqual(len(_hash_cache), 2)
 
     def test_cleanup_removes_complete_entries_unused_for_fourteen_days(self):
         cache = PreprocessCache(self.cache_root)

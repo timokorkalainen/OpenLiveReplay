@@ -24,6 +24,10 @@ from types import MappingProxyType
 from typing import Callable, Iterable
 
 import gpu_capability_model as _gpu_capability_model
+import gpu_capability_command as _gpu_capability_command
+import gpu_capability_cache as _gpu_capability_cache
+import gpu_capability_provenance as _gpu_capability_provenance
+import gpu_capability_runner as _gpu_capability_runner
 from gpu_capability_model import (
     AUDIT_RESULT_SCHEMA_BYTES,
     AuditInfrastructureError,
@@ -7009,15 +7013,28 @@ def run_live_only(
         printer(f"PASS: live compiler capability parity: {family.value}={canonical}")
 
 
-AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v1"
-AUDIT_ENGINE_STAGE_BYTES = b"task-1-model-and-source-audit"
+AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v2"
+AUDIT_ENGINE_STAGE_BYTES = b"task-2-capability-stabilization"
 _AUDIT_ENGINE_TARGET_MODULES = (
     _gpu_capability_model,
     sys.modules[__name__],
+    _gpu_capability_command,
+    _gpu_capability_cache,
+    _gpu_capability_provenance,
+    _gpu_capability_runner,
 )
 _AUDIT_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
     "gpu_capability_source_audit": frozenset(),
     "gpu_capability_model": frozenset(),
+    "gpu_capability_command": frozenset({
+        "_compiler_capability_lock",
+        "_compiler_capability_memo",
+        "_compiler_inspection_lock",
+        "_compiler_inspection_memo",
+    }),
+    "gpu_capability_cache": frozenset({"_hash_cache", "_hash_lock"}),
+    "gpu_capability_provenance": frozenset(),
+    "gpu_capability_runner": frozenset(),
 })
 _CLASS_STRUCTURAL_MEMBER_EXCLUSIONS = frozenset({
     "__dict__",

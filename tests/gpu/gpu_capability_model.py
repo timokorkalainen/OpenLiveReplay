@@ -10,7 +10,7 @@ import stat
 import struct
 import sys
 from array import array
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, overload
@@ -25,6 +25,202 @@ _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 class AuditInfrastructureError(RuntimeError):
     pass
+
+
+class _FilesystemGenerationObserver:
+    """Own OS guards that make any watched file/path generation change fatal."""
+
+    def __init__(self, paths: tuple[tuple[Path, bool], ...]) -> None:
+        if not isinstance(paths, tuple) or not paths or len(paths) > 131072:
+            raise AuditInfrastructureError("filesystem generation watch ceiling exceeded")
+        if len({os.path.normcase(str(path)) for path, _is_directory in paths}) != len(paths):
+            raise AuditInfrastructureError("filesystem generation watches are not unique")
+        self._backend = (
+            "windows" if os.name == "nt"
+            else "macos" if sys.platform == "darwin"
+            else "linux" if sys.platform.startswith("linux")
+            else "unsupported"
+        )
+        self._owner: object | None = None
+        self._handles: list[int] = []
+        self._closed = False
+        try:
+            if self._backend == "windows":
+                self._arm_windows(paths)
+            elif self._backend == "linux":
+                self._arm_linux(paths)
+            elif self._backend == "macos":
+                self._arm_macos(paths)
+            elif self._backend == "unsupported":
+                raise AuditInfrastructureError(
+                    "filesystem generation observation is unsupported"
+                )
+            self.drain()
+        except BaseException:
+            self._close_no_raise()
+            raise
+
+    def _arm_windows(self, paths: tuple[tuple[Path, bool], ...]) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        invalid = ctypes.c_void_p(-1).value
+        for path, is_directory in paths:
+            access = 0 if is_directory else 0x80000000  # GENERIC_READ
+            share = 0x1 | (0x2 if is_directory else 0)  # never FILE_SHARE_DELETE
+            flags = 0x02000000 if is_directory else 0x00000080
+            handle = create_file(str(path), access, share, None, 3, flags, None)
+            numeric = ctypes.cast(handle, ctypes.c_void_p).value
+            if numeric in (None, invalid):
+                raise AuditInfrastructureError(
+                    "Windows filesystem generation guard setup failed"
+                )
+            self._handles.append(int(numeric))
+        self._owner = (kernel32, close_handle)
+
+    def _arm_linux(self, paths: tuple[tuple[Path, bool], ...]) -> None:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        initialize = getattr(libc, "inotify_init1", None)
+        add_watch = getattr(libc, "inotify_add_watch", None)
+        if initialize is None or add_watch is None:
+            raise AuditInfrastructureError("Linux inotify generation guards are unsupported")
+        initialize.argtypes = (ctypes.c_int,)
+        initialize.restype = ctypes.c_int
+        add_watch.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+        add_watch.restype = ctypes.c_int
+        descriptor = int(initialize(os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)))
+        if descriptor < 0:
+            raise AuditInfrastructureError("Linux inotify generation guard setup failed")
+        self._handles.append(descriptor)
+        mask = 0x00000002 | 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080
+        mask |= 0x00000200 | 0x00000400 | 0x00000800
+        watches: set[int] = set()
+        for path, _is_directory in paths:
+            watch = int(add_watch(descriptor, os.fsencode(path), mask))
+            if watch < 0 or watch in watches:
+                raise AuditInfrastructureError("Linux inotify generation guard setup failed")
+            watches.add(watch)
+        self._owner = watches
+
+    def _arm_macos(self, paths: tuple[tuple[Path, bool], ...]) -> None:
+        import select
+
+        if not hasattr(select, "kqueue") or not hasattr(select, "KQ_FILTER_VNODE"):
+            raise AuditInfrastructureError("macOS vnode generation guards are unsupported")
+        queue = select.kqueue()
+        descriptors: list[int] = []
+        flags = (
+            select.KQ_NOTE_WRITE | select.KQ_NOTE_RENAME | select.KQ_NOTE_DELETE
+            | select.KQ_NOTE_ATTRIB
+        )
+        try:
+            for path, _is_directory in paths:
+                descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+                descriptors.append(descriptor)
+                event = select.kevent(
+                    descriptor, filter=select.KQ_FILTER_VNODE,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=flags,
+                )
+                if queue.control((event,), 0, 0):
+                    raise AuditInfrastructureError("macOS vnode generation guard setup failed")
+        except BaseException:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+            queue.close()
+            raise
+        self._handles.extend(descriptors)
+        self._owner = queue
+
+    def drain(self) -> None:
+        if self._closed:
+            raise AuditInfrastructureError("filesystem generation observer is closed")
+        if self._backend == "windows":
+            return
+        if self._backend == "macos":
+            events = self._owner.control(None, 131072, 0)
+            if events:
+                raise AuditInfrastructureError("macOS vnode generation change observed")
+            return
+        descriptor = self._handles[0]
+        while True:
+            try:
+                payload = os.read(descriptor, 1024 * 1024)
+            except BlockingIOError:
+                return
+            except OSError as error:
+                raise AuditInfrastructureError("Linux inotify generation guard failed") from error
+            if not payload:
+                raise AuditInfrastructureError("Linux inotify generation watch was lost")
+            offset = 0
+            while offset < len(payload):
+                if len(payload) - offset < 16:
+                    raise AuditInfrastructureError("Linux inotify event stream is invalid")
+                _watch, mask, _cookie, name_length = struct.unpack_from("iIII", payload, offset)
+                offset += 16 + name_length
+                if offset > len(payload):
+                    raise AuditInfrastructureError("Linux inotify event stream is invalid")
+                if mask & 0x00004000:
+                    raise AuditInfrastructureError("Linux inotify generation event overflow")
+                if mask & (0x00002000 | 0x00008000):
+                    raise AuditInfrastructureError("Linux inotify generation watch was lost")
+                raise AuditInfrastructureError("Linux inotify generation change observed")
+
+    def _close_no_raise(self) -> list[BaseException]:
+        if self._closed:
+            return []
+        self._closed = True
+        errors: list[BaseException] = []
+        if self._backend == "windows":
+            close_handle = self._owner[1] if self._owner is not None else None
+            if close_handle is not None:
+                for handle in reversed(self._handles):
+                    if not close_handle(handle):
+                        errors.append(OSError("CloseHandle failed"))
+        elif self._backend == "macos":
+            queue = self._owner
+            for descriptor in reversed(self._handles):
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    errors.append(error)
+            if queue is not None:
+                try:
+                    queue.close()
+                except OSError as error:
+                    errors.append(error)
+        else:
+            for descriptor in reversed(self._handles):
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    errors.append(error)
+        self._handles.clear()
+        return errors
+
+    def close(self) -> None:
+        errors = self._close_no_raise()
+        if errors:
+            raise AuditInfrastructureError(
+                "filesystem generation observer cleanup failed"
+            ) from errors[0]
+
+    def __del__(self) -> None:
+        try:
+            self._close_no_raise()
+        except Exception:
+            pass
 
 
 class CompilerFamily(enum.Enum):
@@ -62,7 +258,100 @@ class FileIdentity:
     production: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class DependencyRootBinding:
+    stable_role: str
+    resolved_root: Path
+    root_identity: FileIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stable_role, str):
+            raise AuditInfrastructureError("dependency root role is invalid")
+        if not isinstance(self.resolved_root, Path):
+            raise AuditInfrastructureError("dependency root path is invalid")
+        if not isinstance(self.root_identity, FileIdentity):
+            raise AuditInfrastructureError("dependency root identity is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class DependencyRootAuthority:
+    source_root: DependencyRootBinding
+    external_roots: tuple[DependencyRootBinding, ...]
+    portable_authority_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_authority_structure(self)
+
+
+@dataclass(frozen=True, slots=True)
+class CompilerInspection:
+    compiler_family: CompilerFamily
+    executable_identity: FileIdentity
+    executable_sha256: str
+    normalized_version: str
+    driver_fingerprint: str
+    inspection_arguments_digest: str
+    executable_capability_digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.compiler_family, CompilerFamily):
+            raise AuditInfrastructureError("compiler inspection family is invalid")
+        _validate_executable_identity(self.executable_identity)
+        _validate_digest(self.executable_sha256, "compiler executable content")
+        if (
+            not isinstance(self.normalized_version, str)
+            or not self.normalized_version
+            or "\0" in self.normalized_version
+            or "\r" in self.normalized_version
+            or self.normalized_version != self.normalized_version.strip()
+            or any(line != line.rstrip() for line in self.normalized_version.split("\n"))
+        ):
+            raise AuditInfrastructureError("compiler normalized version is invalid")
+        _validate_digest(self.driver_fingerprint, "compiler driver fingerprint")
+        _validate_digest(
+            self.inspection_arguments_digest, "compiler inspection arguments"
+        )
+        _validate_digest(
+            self.executable_capability_digest, "compiler executable capability"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CompilerExecutableCapability:
+    platform_kind: str
+    executable_identity: FileIdentity
+    executable_sha256: str
+    capability_digest: str
+    native_owner: object = field(compare=False, repr=False)
+    trusted_toolchain_root: DependencyRootBinding
+    directory_chain_owners: tuple[object, ...] = field(compare=False, repr=False)
+    directory_chain_identities: tuple[FileIdentity, ...]
+    resolved_runtime_closure_digest: str
+    resolved_runtime_closure: tuple["DependencyDigest", ...]
+
+    def __post_init__(self) -> None:
+        if self.platform_kind not in {"windows", "linux", "macos"}:
+            raise AuditInfrastructureError("compiler capability platform is invalid")
+        _validate_executable_identity(self.executable_identity)
+        _validate_digest(self.executable_sha256, "compiler executable content")
+        _validate_digest(self.capability_digest, "compiler executable capability")
+        if not isinstance(self.trusted_toolchain_root, DependencyRootBinding):
+            raise AuditInfrastructureError("compiler trusted toolchain root is invalid")
+        if not isinstance(self.directory_chain_owners, tuple) or not isinstance(
+            self.directory_chain_identities, tuple
+        ):
+            raise AuditInfrastructureError("compiler directory chain is invalid")
+        _validate_digest(
+            self.resolved_runtime_closure_digest, "compiler runtime closure"
+        )
+        if not isinstance(self.resolved_runtime_closure, tuple) or any(
+            not isinstance(item, DependencyDigest)
+            for item in self.resolved_runtime_closure
+        ):
+            raise AuditInfrastructureError("compiler runtime closure is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class PreprocessConfiguration:
     entry_id: str
     family: CompilerFamily
@@ -72,6 +361,19 @@ class PreprocessConfiguration:
     arguments: tuple[str, ...]
     environment_digest: str
     digest: str
+    dependency_root_authority_digest: str
+    compiler_capability_digest: str
+    compiler_capability: CompilerExecutableCapability = field(compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        _validate_digest(
+            self.dependency_root_authority_digest, "dependency root authority"
+        )
+        _validate_digest(self.compiler_capability_digest, "compiler capability")
+        if not isinstance(self.compiler_capability, CompilerExecutableCapability):
+            raise AuditInfrastructureError("compiler executable capability is invalid")
+        if self.compiler_capability.capability_digest != self.compiler_capability_digest:
+            raise AuditInfrastructureError("compiler capability digest disagrees")
 
 
 @dataclass(frozen=True, slots=True)
@@ -887,6 +1189,363 @@ def _validate_digest(value: object, label: str) -> str:
     return value
 
 
+_DEPENDENCY_ROOT_AUTHORITY_SCHEMA = "olr-gpu-dependency-root-authority-v1"
+_DEPENDENCY_ROOT_AUTHORITY_FIELDS = (
+    "schema",
+    "source_root",
+    "external_roots",
+    "portable_authority_digest",
+)
+_COMPILER_INSPECTION_FIELDS = (
+    "compiler_family",
+    "executable_identity",
+    "executable_sha256",
+    "normalized_version",
+    "driver_fingerprint",
+    "inspection_arguments_digest",
+    "executable_capability_digest",
+)
+_LOCAL_AUTHORITY_MAX_BYTES = 256 * 1024
+_LOCAL_INSPECTION_MAX_BYTES = 256 * 1024
+
+
+def _identity_from_stat(path: Path, metadata: os.stat_result, *, production: bool) -> FileIdentity:
+    inode = int(metadata.st_ino) if int(metadata.st_ino) != 0 else None
+    return FileIdentity(
+        canonical=path,
+        relative=None,
+        device=int(metadata.st_dev),
+        inode=inode,
+        line_count=0,
+        production=production,
+    )
+
+
+def _identity_native_key(identity: FileIdentity) -> tuple[int | None, int | None]:
+    return identity.device, identity.inode
+
+
+def _validate_root_binding(binding: object, *, source: bool) -> DependencyRootBinding:
+    if not isinstance(binding, DependencyRootBinding):
+        raise AuditInfrastructureError("dependency root binding is invalid")
+    if source:
+        if binding.stable_role != "production":
+            raise AuditInfrastructureError("source root role must be production")
+    elif (
+        binding.stable_role == "production"
+        or _STABLE_DEPENDENCY_ROLE.fullmatch(binding.stable_role) is None
+    ):
+        raise AuditInfrastructureError("external dependency root role is invalid")
+    _validate_native_canonical_path(binding.resolved_root)
+    identity = binding.root_identity
+    if (
+        not isinstance(identity, FileIdentity)
+        or identity.canonical != binding.resolved_root
+        or identity.relative is not None
+        or identity.production is not source
+        or identity.line_count != 0
+        or any(
+            value is not None
+            and (not isinstance(value, int) or isinstance(value, bool) or value < 0)
+            for value in (identity.device, identity.inode)
+        )
+    ):
+        raise AuditInfrastructureError("dependency root identity is invalid")
+    return binding
+
+
+def _portable_authority_digest(roles: tuple[str, ...]) -> str:
+    digest = hashlib.sha256()
+    for value in (_DEPENDENCY_ROOT_AUTHORITY_SCHEMA, *roles):
+        encoded = value.encode("ascii")
+        digest.update(struct.pack("<Q", len(encoded)))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _validate_authority_structure(authority: object) -> DependencyRootAuthority:
+    if not isinstance(authority, DependencyRootAuthority):
+        raise AuditInfrastructureError("dependency root authority is invalid")
+    source = _validate_root_binding(authority.source_root, source=True)
+    if not isinstance(authority.external_roots, tuple):
+        raise AuditInfrastructureError("external dependency roots are invalid")
+    external = tuple(
+        _validate_root_binding(binding, source=False)
+        for binding in authority.external_roots
+    )
+    roles = tuple(binding.stable_role for binding in external)
+    if roles != tuple(sorted(roles)) or len(set(roles)) != len(roles):
+        raise AuditInfrastructureError("external dependency root roles are not unique and sorted")
+    paths = (source.resolved_root, *(binding.resolved_root for binding in external))
+    keys = tuple(os.path.normcase(str(path)) for path in paths)
+    if len(set(keys)) != len(keys):
+        raise AuditInfrastructureError("dependency roots overlap")
+    for index, first in enumerate(paths):
+        for second in paths[index + 1 :]:
+            try:
+                first.relative_to(second)
+            except ValueError:
+                pass
+            else:
+                raise AuditInfrastructureError("dependency roots overlap")
+            try:
+                second.relative_to(first)
+            except ValueError:
+                pass
+            else:
+                raise AuditInfrastructureError("dependency roots overlap")
+    expected = _portable_authority_digest(("production", *roles))
+    if authority.portable_authority_digest != expected:
+        raise AuditInfrastructureError("dependency root authority digest disagrees")
+    return authority
+
+
+def build_dependency_root_authority(
+    source_root: Path,
+    external_roots: Mapping[str, Path],
+) -> DependencyRootAuthority:
+    if not isinstance(source_root, Path) or not isinstance(external_roots, Mapping):
+        raise AuditInfrastructureError("dependency root inputs are invalid")
+
+    def binding(role: str, value: Path, *, source: bool) -> DependencyRootBinding:
+        if not isinstance(value, Path):
+            raise AuditInfrastructureError("dependency root path is invalid")
+        try:
+            requested = value.absolute()
+            before = requested.lstat()
+            resolved = requested.resolve(strict=True)
+            after = resolved.stat()
+        except (OSError, RuntimeError) as error:
+            raise AuditInfrastructureError(f"dependency root is unavailable: {value}") from error
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or bool(getattr(before, "st_file_attributes", 0) & _REPARSE_ATTRIBUTE)
+            or not stat.S_ISDIR(after.st_mode)
+        ):
+            raise AuditInfrastructureError(f"dependency root is not an ordinary directory: {value}")
+        before_key = (int(before.st_dev), int(before.st_ino) or None)
+        after_key = (int(after.st_dev), int(after.st_ino) or None)
+        if before_key != after_key:
+            raise AuditInfrastructureError(f"dependency root changed while binding: {value}")
+        return DependencyRootBinding(
+            role,
+            resolved,
+            _identity_from_stat(resolved, after, production=source),
+        )
+
+    source_binding = binding("production", source_root, source=True)
+    externals: list[DependencyRootBinding] = []
+    for role, root in external_roots.items():
+        if not isinstance(role, str):
+            raise AuditInfrastructureError("external dependency root role is invalid")
+        externals.append(binding(role, root, source=False))
+    externals.sort(key=lambda item: item.stable_role)
+    authority = DependencyRootAuthority(
+        source_binding,
+        tuple(externals),
+        _portable_authority_digest(
+            ("production", *(item.stable_role for item in externals))
+        ),
+    )
+    return _validate_authority_structure(authority)
+
+
+def validate_dependency_root_authority(
+    authority: object,
+    *,
+    expected_digest: str | None = None,
+) -> DependencyRootAuthority:
+    validated = _validate_authority_structure(authority)
+    if expected_digest is not None and (
+        _validate_digest(expected_digest, "dependency root authority")
+        != validated.portable_authority_digest
+    ):
+        raise AuditInfrastructureError("dependency root authority digest mismatch")
+    for binding in (validated.source_root, *validated.external_roots):
+        try:
+            metadata = binding.resolved_root.stat()
+        except OSError as error:
+            raise AuditInfrastructureError("dependency root identity changed") from error
+        current = _identity_from_stat(
+            binding.resolved_root,
+            metadata,
+            production=binding.stable_role == "production",
+        )
+        if not stat.S_ISDIR(metadata.st_mode) or current != binding.root_identity:
+            raise AuditInfrastructureError("dependency root identity changed")
+    return validated
+
+
+def _identity_document(identity: FileIdentity) -> dict[str, object]:
+    return {
+        "canonical": str(identity.canonical),
+        "relative": identity.relative.as_posix() if identity.relative is not None else None,
+        "device": identity.device,
+        "inode": identity.inode,
+        "line_count": identity.line_count,
+        "production": identity.production,
+    }
+
+
+def _identity_from_exact_document(value: object) -> FileIdentity:
+    fields = ("canonical", "relative", "device", "inode", "line_count", "production")
+    if not isinstance(value, dict) or tuple(value) != fields:
+        raise AuditInfrastructureError("local identity schema is invalid")
+    canonical = value["canonical"]
+    relative = value["relative"]
+    if not isinstance(canonical, str):
+        raise AuditInfrastructureError("local identity is invalid")
+    return FileIdentity(
+        Path(_validate_native_canonical_text(canonical)),
+        PurePosixPath(relative) if isinstance(relative, str) else None,
+        value["device"],
+        value["inode"],
+        value["line_count"],
+        value["production"],
+    )
+
+
+def encode_dependency_root_authority(authority: DependencyRootAuthority) -> bytes:
+    validated = _validate_authority_structure(authority)
+
+    def record(binding: DependencyRootBinding) -> dict[str, object]:
+        return {
+            "stable_role": binding.stable_role,
+            "resolved_root": str(binding.resolved_root),
+            "root_identity": _identity_document(binding.root_identity),
+        }
+
+    document = {
+        "schema": _DEPENDENCY_ROOT_AUTHORITY_SCHEMA,
+        "source_root": record(validated.source_root),
+        "external_roots": [record(item) for item in validated.external_roots],
+        "portable_authority_digest": validated.portable_authority_digest,
+    }
+    return json.dumps(document, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def decode_dependency_root_authority(
+    payload: bytes,
+    *,
+    expected: DependencyRootAuthority | None = None,
+) -> DependencyRootAuthority:
+    if not isinstance(payload, bytes) or len(payload) > _LOCAL_AUTHORITY_MAX_BYTES:
+        raise AuditInfrastructureError("local dependency root authority payload is invalid")
+    try:
+        document = json.loads(payload.decode("ascii"))
+    except (UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError) as error:
+        raise AuditInfrastructureError("local dependency root authority payload is invalid") from error
+    if not isinstance(document, dict) or tuple(document) != _DEPENDENCY_ROOT_AUTHORITY_FIELDS:
+        raise AuditInfrastructureError("local dependency root authority schema is invalid")
+    if document["schema"] != _DEPENDENCY_ROOT_AUTHORITY_SCHEMA:
+        raise AuditInfrastructureError("local dependency root authority schema is invalid")
+
+    def binding(value: object) -> DependencyRootBinding:
+        if not isinstance(value, dict) or tuple(value) != (
+            "stable_role", "resolved_root", "root_identity"
+        ):
+            raise AuditInfrastructureError("local dependency root binding schema is invalid")
+        role = value["stable_role"]
+        root = value["resolved_root"]
+        if not isinstance(role, str) or not isinstance(root, str):
+            raise AuditInfrastructureError("local dependency root binding is invalid")
+        return DependencyRootBinding(
+            role,
+            Path(_validate_native_canonical_text(root)),
+            _identity_from_exact_document(value["root_identity"]),
+        )
+
+    external_values = document["external_roots"]
+    if not isinstance(external_values, list):
+        raise AuditInfrastructureError("local external dependency roots are invalid")
+    decoded = _validate_authority_structure(
+        DependencyRootAuthority(
+            binding(document["source_root"]),
+            tuple(binding(value) for value in external_values),
+            document["portable_authority_digest"],
+        )
+    )
+    if expected is not None and decoded != expected:
+        raise AuditInfrastructureError("local dependency root authority differs")
+    return decoded
+
+
+def _validate_executable_identity(identity: object) -> FileIdentity:
+    if not isinstance(identity, FileIdentity):
+        raise AuditInfrastructureError("compiler executable identity is invalid")
+    _validate_native_canonical_path(identity.canonical)
+    if (
+        identity.relative is not None
+        or identity.production is not False
+        or identity.line_count != 0
+        or any(
+            value is not None
+            and (not isinstance(value, int) or isinstance(value, bool) or value < 0)
+            for value in (identity.device, identity.inode)
+        )
+    ):
+        raise AuditInfrastructureError("compiler executable identity is invalid")
+    return identity
+
+
+def encode_compiler_inspection(inspection: CompilerInspection) -> bytes:
+    if not isinstance(inspection, CompilerInspection):
+        raise AuditInfrastructureError("compiler inspection is invalid")
+    document = {
+        "compiler_family": inspection.compiler_family.value,
+        "executable_identity": _identity_document(inspection.executable_identity),
+        "executable_sha256": inspection.executable_sha256,
+        "normalized_version": inspection.normalized_version,
+        "driver_fingerprint": inspection.driver_fingerprint,
+        "inspection_arguments_digest": inspection.inspection_arguments_digest,
+        "executable_capability_digest": inspection.executable_capability_digest,
+    }
+    return json.dumps(document, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def decode_compiler_inspection(payload: bytes) -> CompilerInspection:
+    if not isinstance(payload, bytes) or len(payload) > _LOCAL_INSPECTION_MAX_BYTES:
+        raise AuditInfrastructureError("compiler inspection payload is invalid")
+    try:
+        document = json.loads(payload.decode("ascii"))
+    except (UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError) as error:
+        raise AuditInfrastructureError("compiler inspection payload is invalid") from error
+    if not isinstance(document, dict) or tuple(document) != _COMPILER_INSPECTION_FIELDS:
+        raise AuditInfrastructureError("compiler inspection schema is invalid")
+    try:
+        family = CompilerFamily(document["compiler_family"])
+    except (ValueError, TypeError) as error:
+        raise AuditInfrastructureError("compiler inspection family is invalid") from error
+    return CompilerInspection(
+        family,
+        _identity_from_exact_document(document["executable_identity"]),
+        document["executable_sha256"],
+        document["normalized_version"],
+        document["driver_fingerprint"],
+        document["inspection_arguments_digest"],
+        document["executable_capability_digest"],
+    )
+
+
+def portable_compiler_inspection_key(inspection: CompilerInspection) -> bytes:
+    if not isinstance(inspection, CompilerInspection):
+        raise AuditInfrastructureError("compiler inspection is invalid")
+    payload = bytearray()
+    for value in (
+        inspection.compiler_family.value,
+        inspection.executable_sha256,
+        inspection.normalized_version,
+        inspection.driver_fingerprint,
+        inspection.inspection_arguments_digest,
+        inspection.executable_capability_digest,
+    ):
+        encoded = value.encode("utf-8")
+        payload.extend(struct.pack("<Q", len(encoded)))
+        payload.extend(encoded)
+    return bytes(payload)
+
+
 def _validate_role_relative_path(
     stable_role: object,
     role_relative_path: object,
@@ -905,7 +1564,10 @@ def _validate_role_relative_path(
         or role_relative_path.is_absolute()
         or "\\" in path_text
         or any(part in ("", ".", "..") for part in role_relative_path.parts)
-        or role_relative_path.suffix.casefold() not in _SOURCE_SUFFIXES
+        or (
+            stable_role == "production"
+            and role_relative_path.suffix.casefold() not in _SOURCE_SUFFIXES
+        )
     ):
         raise AuditInfrastructureError("dependency role-relative path is invalid")
     if stable_role == "production" and (

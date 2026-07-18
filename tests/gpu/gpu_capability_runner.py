@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import queue
@@ -23,19 +24,24 @@ from gpu_capability_command import (
     decode_compile_entry,
     make_configuration,
     rewrite_preprocess_command,
+    validate_compiler_executable_capability,
 )
 from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
     CompilerFamily,
     CoverageReport,
+    DependencyDigest,
+    DependencyRootAuthority,
     FileIdentity,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
+    _FilesystemGenerationObserver,
     _current_process_rss_bytes,
     _preprocessed_view_semantic_digest,
     enumerate_production_identities,
     requires_compile_entry,
+    validate_dependency_root_authority,
 )
 from gpu_capability_provenance import (
     PreprocessedStreamBuilder,
@@ -308,13 +314,13 @@ def run_bounded_preprocessor(
     limits: AuditLimits,
     deadline: float,
     consume_stdout: Callable[[bytes], None],
-    cancel_event: threading.Event | None = None,
+    cancel_event: object | None = None,
 ) -> ExecutionResult:
     """Execute one rewritten command without retaining its stdout stream."""
 
     _validate_execution_inputs(command, configuration, limits, deadline, consume_stdout)
     started = time.monotonic()
-    if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+    if cancel_event is not None and not callable(getattr(cancel_event, "is_set", None)):
         raise AuditInfrastructureError("preprocess cancellation event is invalid")
     if cancel_event is not None and cancel_event.is_set():
         raise _diagnostic(
@@ -378,6 +384,31 @@ def run_bounded_preprocessor(
             observed_stdout_bytes=0,
             stderr_tail=b"",
         )
+    capability = configuration.compiler_capability
+    if capability.capability_digest != configuration.compiler_capability_digest:
+        raise _diagnostic(
+            configuration,
+            "compiler executable capability digest mismatch",
+            exit_status="not-started",
+            elapsed_seconds=time.monotonic() - started,
+            observed_stdout_bytes=0,
+            stderr_tail=b"",
+        )
+    capability_owner = capability.native_owner
+    validate_owner = getattr(capability_owner, "validate", None)
+    if not callable(validate_owner):
+        raise AuditInfrastructureError("compiler executable capability owner is invalid")
+    validate_owner()
+    if not command.arguments:
+        raise AuditInfrastructureError("rewritten preprocess command is empty")
+    try:
+        requested_executable = Path(command.arguments[0]).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise AuditInfrastructureError("compiler executable launch path is unavailable") from error
+    if os.path.normcase(str(requested_executable)) != os.path.normcase(
+        str(capability.executable_identity.canonical)
+    ):
+        raise AuditInfrastructureError("compiler launch does not consume the held capability")
     containment = _ProcessContainment()
     process: subprocess.Popen[bytes] | None = None
     stdout_events: queue.Queue[bytes | BaseException | None] = queue.Queue(maxsize=2)
@@ -436,14 +467,25 @@ def run_bounded_preprocessor(
     failure: tuple[str, int | str, float] | None = None
     try:
         try:
+            launch_arguments = command.arguments
+            launch_options: dict[str, object] = {}
+            if capability.platform_kind == "linux":
+                executable_fd = getattr(capability_owner, "executable_fd", None)
+                if not isinstance(executable_fd, int):
+                    raise AuditInfrastructureError("exact compiler executable fd is unavailable")
+                launch_arguments = (
+                    f"/proc/self/fd/{executable_fd}", *command.arguments[1:]
+                )
+                launch_options["pass_fds"] = (executable_fd,)
             process = subprocess.Popen(
-                containment.prepare_command(command.arguments),
+                containment.prepare_command(launch_arguments),
                 cwd=str(configuration.working_directory),
                 env=environment,
                 shell=False,
                 stdin=(subprocess.PIPE if containment.requires_handshake else subprocess.DEVNULL),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                **launch_options,
                 **containment.popen_arguments,
             )
             containment.attach(process)
@@ -627,6 +669,7 @@ def run_bounded_preprocessor(
                 observed_stdout_bytes=observed_stdout_bytes,
                 stderr_tail=complete_stderr_tail,
             )
+        validate_owner()
         with stderr_lock:
             complete_stderr_tail = bytes(stderr_tail)
         return ExecutionResult(
@@ -696,6 +739,369 @@ def _absolute_dependencies(
     return tuple(
         path if path.is_absolute() else (working_directory / path).resolve(strict=False)
         for path in paths
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StreamDigest:
+    sha256: str
+    byte_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PreprocessDiscovery:
+    stream: StreamDigest
+    dependencies: tuple[DependencyDigest, ...]
+    dependency_identities: tuple[FileIdentity, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreprocessStageTimings:
+    discovery_seconds: float
+    accepted_parse_seconds: float
+
+
+class _StreamDigestConsumer:
+    def __init__(self, downstream: Callable[[bytes], None] | None = None) -> None:
+        self._digest = hashlib.sha256()
+        self._count = 0
+        self._downstream = downstream
+
+    def __call__(self, chunk: bytes) -> None:
+        self._digest.update(chunk)
+        self._count += len(chunk)
+        if self._downstream is not None:
+            self._downstream(chunk)
+
+    def finish(self) -> StreamDigest:
+        return StreamDigest(self._digest.hexdigest(), self._count)
+
+
+def _dependency_binding(
+    path: Path, authority: DependencyRootAuthority
+) -> tuple[str, PurePosixPath]:
+    matches: list[tuple[str, PurePosixPath]] = []
+    for binding in (authority.source_root, *authority.external_roots):
+        try:
+            relative = path.relative_to(binding.resolved_root)
+        except ValueError:
+            continue
+        matches.append(
+            (binding.stable_role, PurePosixPath(relative.as_posix()))
+        )
+    if len(matches) != 1:
+        raise AuditInfrastructureError(
+            "dependency is not mapped by exactly one dependency-root authority"
+        )
+    return matches[0]
+
+
+def _hash_dependency_identity(
+    identity: FileIdentity,
+    authority: DependencyRootAuthority,
+) -> DependencyDigest:
+    path = identity.canonical
+    stable_role, relative = _dependency_binding(path, authority)
+    digest = hashlib.sha256()
+    try:
+        before = path.stat()
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+            after_open = os.fstat(stream.fileno())
+        after = path.stat()
+    except OSError as error:
+        raise AuditInfrastructureError("dependency changed while hashing") from error
+    snapshot = lambda item: (
+        int(item.st_dev),
+        int(item.st_ino) if int(item.st_ino) != 0 else None,
+        int(item.st_size),
+        int(item.st_mtime_ns),
+        int(getattr(item, "st_ctime_ns", 0)),
+    )
+    expected = snapshot(before)
+    if (
+        snapshot(opened)[:4] != expected[:4]
+        or snapshot(after_open)[:4] != expected[:4]
+        or snapshot(after) != expected
+    ):
+        raise AuditInfrastructureError("dependency changed while hashing")
+    if (identity.device, identity.inode) != expected[:2]:
+        raise AuditInfrastructureError("dependency identity changed while hashing")
+    return DependencyDigest(stable_role, relative, identity, digest.hexdigest())
+
+
+def _dependency_digests(
+    identities: tuple[FileIdentity, ...], authority: DependencyRootAuthority
+) -> tuple[DependencyDigest, ...]:
+    return tuple(_hash_dependency_identity(identity, authority) for identity in identities)
+
+
+def _parse_dependency_output(
+    rewritten: RewrittenCommand,
+    configuration: PreprocessConfiguration,
+    authority: DependencyRootAuthority,
+    production: Mapping[PurePosixPath, FileIdentity],
+) -> tuple[FileIdentity, ...]:
+    if rewritten.dependency_format == "gcc-depfile":
+        paths = parse_gcc_dependencies(rewritten.dependency_output)
+    elif rewritten.dependency_format == "msvc-json":
+        paths = parse_msvc_dependencies(rewritten.dependency_output)
+    else:
+        raise AuditInfrastructureError(
+            f"unsupported dependency format: {rewritten.dependency_format}"
+        )
+    return validate_dependency_identities(
+        _absolute_dependencies(paths, configuration.working_directory),
+        authority.source_root.resolved_root,
+        production,
+    )
+
+
+class _DependencyGenerationGuards:
+    """OS-observed held-file/path-chain validation between the two runs."""
+
+    def __init__(
+        self,
+        dependencies: tuple[DependencyDigest, ...],
+        authority: DependencyRootAuthority,
+    ) -> None:
+        if not dependencies or len(dependencies) > 65536:
+            raise AuditInfrastructureError("dependency generation file ceiling exceeded")
+        self._authority = authority
+        self._discovery_dependencies = dependencies
+        self._streams: list[object] = []
+        self._observer: _FilesystemGenerationObserver | None = None
+        directory_paths: dict[str, Path] = {}
+        try:
+            for dependency in dependencies:
+                path = dependency.identity.canonical
+                role, _relative = _dependency_binding(path, authority)
+                binding = next(
+                    item for item in (authority.source_root, *authority.external_roots)
+                    if item.stable_role == role
+                )
+                relative_parent = path.parent.relative_to(binding.resolved_root)
+                current = binding.resolved_root.parent
+                for directory in (current, binding.resolved_root):
+                    directory_paths.setdefault(os.path.normcase(str(directory)), directory)
+                current = binding.resolved_root
+                for part in relative_parent.parts:
+                    current = current / part
+                    directory_paths.setdefault(os.path.normcase(str(current)), current)
+            if len(directory_paths) > 65536:
+                raise AuditInfrastructureError("dependency generation directory ceiling exceeded")
+            self._directories = tuple(
+                (path, self._directory_snapshot(path))
+                for path in directory_paths.values()
+            )
+            self._files = tuple(
+                (dependency.identity.canonical,
+                 self._file_snapshot(dependency.identity.canonical.stat()))
+                for dependency in dependencies
+            )
+            if len(self._directories) + len(self._files) > 131072:
+                raise AuditInfrastructureError("dependency generation owner ceiling exceeded")
+            for path, snapshot in self._files:
+                stream = path.open("rb")
+                opened = os.fstat(stream.fileno())
+                if (
+                    self._file_snapshot(opened)[:4] != snapshot[:4]
+                    or self._file_snapshot(path.stat()) != snapshot
+                ):
+                    stream.close()
+                    raise AuditInfrastructureError("dependency changed while guards were armed")
+                self._streams.append(stream)
+            self._observer = _FilesystemGenerationObserver(
+                tuple((path, True) for path, _snapshot in self._directories)
+                + tuple((path, False) for path, _snapshot in self._files)
+            )
+            self._observer.drain()
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _file_snapshot(metadata) -> tuple[int, int | None, int, int, int]:
+        return (
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+            int(metadata.st_size),
+            int(metadata.st_mtime_ns),
+            int(getattr(metadata, "st_ctime_ns", 0)),
+        )
+
+    @staticmethod
+    def _directory_snapshot(path: Path) -> tuple[int, int | None, int]:
+        metadata = path.stat()
+        if not os.path.isdir(path):
+            raise AuditInfrastructureError("dependency directory guard is invalid")
+        return (
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+            int(metadata.st_mode),
+        )
+
+    def validate_and_hash(self) -> tuple[DependencyDigest, ...]:
+        if self._observer is None:
+            raise AuditInfrastructureError("dependency generation guards are not armed")
+        self._observer.drain()
+        for path, expected in self._directories:
+            if self._directory_snapshot(path) != expected:
+                raise AuditInfrastructureError("dependency directory generation changed")
+        result: list[DependencyDigest] = []
+        for stream, (path, expected) in zip(self._streams, self._files):
+            opened = os.fstat(stream.fileno())
+            if (
+                self._file_snapshot(opened)[:4] != expected[:4]
+                or self._file_snapshot(path.stat()) != expected
+            ):
+                raise AuditInfrastructureError("dependency generation changed")
+            dependency = next(
+                dependency
+                for dependency in self._discovery_dependencies
+                if dependency.identity.canonical == path
+            )
+            digest = hashlib.sha256()
+            stream.seek(0)
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+            stream.seek(0)
+            if self._file_snapshot(os.fstat(stream.fileno()))[:4] != expected[:4]:
+                raise AuditInfrastructureError("dependency generation changed while hashing")
+            result.append(DependencyDigest(
+                dependency.stable_role,
+                dependency.role_relative_path,
+                dependency.identity,
+                digest.hexdigest(),
+            ))
+        self._observer.drain()
+        for path, expected in self._directories:
+            if self._directory_snapshot(path) != expected:
+                raise AuditInfrastructureError("dependency directory generation changed")
+        return tuple(result)
+
+    def bind(self, dependencies: tuple[DependencyDigest, ...]) -> "_DependencyGenerationGuards":
+        if dependencies != self._discovery_dependencies:
+            raise AuditInfrastructureError("dependency guard binding changed")
+        self._discovery_dependencies = dependencies
+        return self
+
+    def close(self) -> None:
+        errors: list[BaseException] = []
+        observer = getattr(self, "_observer", None)
+        if observer is not None:
+            try:
+                observer.close()
+            except BaseException as error:
+                errors.append(error)
+            self._observer = None
+        for stream in reversed(getattr(self, "_streams", ())):
+            try:
+                stream.close()
+            except BaseException as error:
+                errors.append(error)
+        self._streams = []
+        if errors:
+            raise AuditInfrastructureError("dependency generation guard cleanup failed") from errors[0]
+
+
+def discover_configuration(
+    configuration: PreprocessConfiguration,
+    dependency_roots: DependencyRootAuthority,
+    production: Mapping[PurePosixPath, FileIdentity],
+    limits: AuditLimits,
+    deadline: float,
+    cancel_event: object | None = None,
+) -> PreprocessDiscovery:
+    authority = validate_dependency_root_authority(
+        dependency_roots,
+        expected_digest=configuration.dependency_root_authority_digest,
+    )
+    consumer = _StreamDigestConsumer()
+    with tempfile.TemporaryDirectory(
+        prefix=".gpu-capability-discovery-",
+    ) as temporary:
+        suffix = ".json" if configuration.family in {
+            CompilerFamily.MSVC, CompilerFamily.CLANG_CL
+        } else ".d"
+        rewritten = rewrite_preprocess_command(
+            configuration, Path(temporary) / f"dependencies{suffix}"
+        )
+        run_bounded_preprocessor(
+            rewritten, configuration, limits, deadline, consumer, cancel_event
+        )
+        identities = _parse_dependency_output(
+            rewritten, configuration, authority, production
+        )
+        dependencies = _dependency_digests(identities, authority)
+    return PreprocessDiscovery(consumer.finish(), dependencies, identities)
+
+
+def stabilize_and_parse_configuration(
+    configuration: PreprocessConfiguration,
+    dependency_roots: DependencyRootAuthority,
+    production: Mapping[PurePosixPath, FileIdentity],
+    limits: AuditLimits,
+    deadline: float,
+    cancel_event: object | None = None,
+) -> tuple[PreprocessedTranslationUnitView, PreprocessDiscovery, PreprocessStageTimings]:
+    discovery_started = time.monotonic()
+    discovery = discover_configuration(
+        configuration, dependency_roots, production, limits, deadline, cancel_event
+    )
+    discovery_seconds = time.monotonic() - discovery_started
+    authority = validate_dependency_root_authority(
+        dependency_roots,
+        expected_digest=configuration.dependency_root_authority_digest,
+    )
+    guards = _DependencyGenerationGuards(discovery.dependencies, authority).bind(
+        discovery.dependencies
+    )
+    accepted_started = time.monotonic()
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise AuditInfrastructureError("preprocessing cancelled before accepted launch")
+        builder = PreprocessedStreamBuilder(
+            configuration, production, limits, _current_process_rss_bytes
+        )
+        consumer = _StreamDigestConsumer(builder.feed)
+        with tempfile.TemporaryDirectory(
+            prefix=".gpu-capability-accepted-",
+        ) as temporary:
+            suffix = ".json" if configuration.family in {
+                CompilerFamily.MSVC, CompilerFamily.CLANG_CL
+            } else ".d"
+            rewritten = rewrite_preprocess_command(
+                configuration, Path(temporary) / f"dependencies{suffix}"
+            )
+            guards.validate_and_hash()
+            run_bounded_preprocessor(
+                rewritten, configuration, limits, deadline, consumer, cancel_event
+            )
+            accepted_identities = _parse_dependency_output(
+                rewritten, configuration, authority, production
+            )
+            accepted_dependencies = guards.validate_and_hash()
+            if tuple(item.identity for item in accepted_dependencies) != accepted_identities:
+                raise AuditInfrastructureError("dependency closure changed")
+        accepted_stream = consumer.finish()
+        if accepted_stream.byte_count != discovery.stream.byte_count:
+            raise AuditInfrastructureError("raw preprocessed byte count changed")
+        if accepted_stream.sha256 != discovery.stream.sha256:
+            raise AuditInfrastructureError("raw preprocessed output changed")
+        if accepted_dependencies != discovery.dependencies:
+            raise AuditInfrastructureError("dependency closure changed")
+        view = builder.finalize(accepted_identities)
+    finally:
+        guards.close()
+    return (
+        view,
+        discovery,
+        PreprocessStageTimings(
+            discovery_seconds, time.monotonic() - accepted_started
+        ),
     )
 
 
@@ -773,16 +1179,21 @@ def preprocess_configuration(
 
 def load_or_preprocess(
     configuration: PreprocessConfiguration,
+    dependency_roots: DependencyRootAuthority,
     production: Mapping[PurePosixPath, FileIdentity],
     cache: PreprocessCache,
     limits: AuditLimits,
     deadline: float,
-    cancel_event: threading.Event | None = None,
+    cancel_event: object | None = None,
 ) -> PreprocessedTranslationUnitView:
     """Return a validated cache hit or publish one complete compiler result."""
 
     if not isinstance(cache, PreprocessCache):
         raise AuditInfrastructureError("preprocess cache is invalid")
+    authority = validate_dependency_root_authority(
+        dependency_roots,
+        expected_digest=configuration.dependency_root_authority_digest,
+    )
     cached = cache.load(configuration)
     if cached is not None:
         return cached
@@ -790,40 +1201,26 @@ def load_or_preprocess(
         raise AuditInfrastructureError(
             f"configuration {configuration.digest} cancelled before preprocessing"
         )
-    discovery = preprocess_configuration(
+    accepted, discovery, _stages = stabilize_and_parse_configuration(
         configuration,
+        authority,
         production,
         limits,
         deadline,
         cancel_event,
     )
-    if discovery.configuration != configuration:
-        raise AuditInfrastructureError(
-            "preprocessor returned a mismatched discovery configuration"
-        )
-    discovery_semantic_digest = _preprocessed_view_semantic_digest(discovery)
     try:
-        snapshots = cache._snapshot_dependencies(discovery.dependencies, force=True)
+        snapshots = cache._snapshot_dependencies(
+            discovery.dependency_identities, force=True
+        )
     except OSError as error:
         raise AuditInfrastructureError(
             "dependency changed during preprocessing"
         ) from error
-    del discovery
-    accepted = preprocess_configuration(
-        configuration,
-        production,
-        limits,
-        deadline,
-        cancel_event,
-    )
     if accepted.configuration != configuration:
         raise AuditInfrastructureError(
             "preprocessor returned a mismatched accepted configuration"
         )
-    if _preprocessed_view_semantic_digest(accepted) != discovery_semantic_digest:
-        # Volatile macros are deliberately fail-closed: reproducible compiler
-        # output is required before it can be bound to a content snapshot.
-        raise AuditInfrastructureError("nondeterministic preprocessed output")
     return cache._publish_stabilized(accepted, snapshots)
 
 
@@ -851,6 +1248,8 @@ def _configuration_semantics(
         configuration.arguments,
         configuration.environment_digest,
         configuration.digest,
+        configuration.dependency_root_authority_digest,
+        configuration.compiler_capability_digest,
     )
 
 
@@ -996,12 +1395,14 @@ def collect_configurations(
     root: Path,
     databases: tuple[Path, ...],
     environment: Mapping[str, str],
+    dependency_roots: DependencyRootAuthority,
 ) -> tuple[PreprocessConfiguration, ...]:
     """Normalize every database entry and coalesce only semantic duplicates."""
 
     if not isinstance(root, Path):
         raise AuditInfrastructureError("production root is invalid")
     lexical_root = root.absolute()
+    authority = validate_dependency_root_authority(dependency_roots)
     if not isinstance(databases, tuple) or not databases:
         raise AuditInfrastructureError("at least one compile database is required")
     # This validates environment keys and values before compiler probing begins.
@@ -1010,6 +1411,8 @@ def collect_configurations(
     # Enumeration has already rejected every aliasing root component, so this
     # resolution cannot hide a symlink/reparse traversal from identity checks.
     canonical_root = lexical_root.resolve(strict=True)
+    if canonical_root != authority.source_root.resolved_root:
+        raise AuditInfrastructureError("collection root differs from dependency authority")
     canonical_databases = sorted(
         {_database_path(lexical_root, database) for database in databases},
         key=lambda path: (str(path).casefold(), str(path)),
@@ -1033,6 +1436,7 @@ def collect_configurations(
                 production,
                 environment,
                 limits,
+                authority,
             )
             previous = by_digest.get(configuration.digest)
             if previous is None:
@@ -1149,13 +1553,20 @@ def _view_production_provenance(
 
 def preprocess_all(
     configurations: tuple[PreprocessConfiguration, ...],
+    dependency_roots: DependencyRootAuthority,
     production: Mapping[PurePosixPath, FileIdentity],
     cache: PreprocessCache,
     limits: AuditLimits,
 ) -> tuple[tuple[PreprocessedTranslationUnitView, ...], CoverageReport]:
     """Preprocess every semantic configuration under one bounded coordinator."""
 
+    authority = validate_dependency_root_authority(dependency_roots)
     ordered = _validated_orchestration_inputs(configurations, production, cache, limits)
+    if any(
+        item.dependency_root_authority_digest != authority.portable_authority_digest
+        for item in ordered
+    ):
+        raise AuditInfrastructureError("configuration dependency authority differs")
     configured_families = frozenset(item.family for item in ordered)
     has_objcpp = any(_configuration_is_objcpp(item) for item in ordered)
     has_windows_backend = any(
@@ -1192,6 +1603,7 @@ def preprocess_all(
     def execute(configuration: PreprocessConfiguration) -> PreprocessedTranslationUnitView:
         return load_or_preprocess(
             configuration,
+            authority,
             production,
             cache,
             limits,

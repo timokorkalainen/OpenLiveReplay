@@ -30,9 +30,12 @@ from gpu_capability_command import (  # noqa: E402
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
+    CompilerExecutableCapability,
     CompilerFamily,
+    DependencyRootBinding,
     FileIdentity,
     PreprocessConfiguration,
+    build_dependency_root_authority,
 )
 
 
@@ -44,6 +47,7 @@ class CompileEntryDecodeTests(unittest.TestCase):
         self.database.parent.mkdir()
 
     def tearDown(self) -> None:
+        _clear_compiler_inspection_memo_for_tests()
         self.temporary.cleanup()
 
     def test_structured_arguments_are_preferred_and_directory_is_canonical(self):
@@ -451,8 +455,12 @@ class ConfigurationTests(unittest.TestCase):
             )
         }
         self.environment = {"PATH": str(self.compiler.parent), "GPU_MODE": "on"}
+        self.dependency_roots = build_dependency_root_authority(
+            self.source_root, {"toolchain": self.compiler.parent}
+        )
 
     def tearDown(self) -> None:
+        _clear_compiler_inspection_memo_for_tests()
         self.temporary.cleanup()
 
     def entry(self, *, file: str = "../playback/gpu/file.cpp", arguments=None):
@@ -473,6 +481,7 @@ class ConfigurationTests(unittest.TestCase):
                 self.production,
                 self.environment if environment is None else environment,
                 AuditLimits(),
+                self.dependency_roots,
             )
 
     def test_make_configuration_normalizes_all_semantic_inputs(self):
@@ -504,12 +513,28 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotEqual(first.digest, changed.digest)
         self.assertNotIn("secret-value", repr(first))
 
+    def test_compiler_capability_holds_helper_and_versioned_runtime_siblings(self):
+        helper = self.compiler.parent / "cc1plus.exe"
+        runtime = self.compiler.parent / "libcompiler-runtime.so.1"
+        helper.write_bytes(b"helper")
+        runtime.write_bytes(b"runtime")
+        configuration = self.make()
+        self.assertEqual(
+            tuple(
+                item.role_relative_path.as_posix()
+                for item in configuration.compiler_capability.resolved_runtime_closure
+            ),
+            ("cc1plus.exe", "g++.exe", "libcompiler-runtime.so.1"),
+        )
+
     def test_compiler_content_metadata_and_version_all_affect_digest(self):
         baseline = self.make()
+        _clear_compiler_inspection_memo_for_tests()
         self.compiler.write_bytes(b"compiler-content-b")
         content_changed = self.make()
         self.assertNotEqual(baseline.digest, content_changed.digest)
 
+        _clear_compiler_inspection_memo_for_tests()
         before = self.compiler.stat().st_mtime_ns
         os.utime(self.compiler, ns=(before + 10_000_000, before + 10_000_000))
         metadata_changed = self.make()
@@ -524,13 +549,18 @@ class ConfigurationTests(unittest.TestCase):
         ):
             version_changed = make_configuration(
                 self.entry(), self.database, 3, self.source_root, self.production,
-                self.environment, AuditLimits()
+                self.environment, AuditLimits(), self.dependency_roots
             )
         self.assertNotEqual(metadata_changed.digest, version_changed.digest)
 
     def test_compiler_cannot_change_between_version_probe_and_fingerprint(self):
         def replace_during_probe(*_args, **_kwargs):
-            self.compiler.write_bytes(b"replacement-compiler-content")
+            try:
+                self.compiler.write_bytes(b"replacement-compiler-content")
+            except OSError as error:
+                raise AuditInfrastructureError(
+                    "compiler executable changed during compiler version probe"
+                ) from error
             return b"g++.exe (GCC) 13.1.0\n"
 
         with mock.patch(
@@ -541,7 +571,7 @@ class ConfigurationTests(unittest.TestCase):
         ):
             make_configuration(
                 self.entry(), self.database, 3, self.source_root, self.production,
-                self.environment, AuditLimits()
+                self.environment, AuditLimits(), self.dependency_roots
             )
 
     def test_normalized_version_output_is_stable(self):
@@ -551,7 +581,7 @@ class ConfigurationTests(unittest.TestCase):
         ):
             first = make_configuration(
                 self.entry(), self.database, 3, self.source_root, self.production,
-                self.environment, AuditLimits()
+                self.environment, AuditLimits(), self.dependency_roots
             )
         with mock.patch(
             "gpu_capability_command._probe_compiler_version",
@@ -559,7 +589,7 @@ class ConfigurationTests(unittest.TestCase):
         ):
             second = make_configuration(
                 self.entry(), self.database, 3, self.source_root, self.production,
-                self.environment, AuditLimits()
+                self.environment, AuditLimits(), self.dependency_roots
             )
         self.assertEqual(first.digest, second.digest)
 
@@ -587,6 +617,7 @@ class ConfigurationTests(unittest.TestCase):
                         self.production,
                         self.environment,
                         AuditLimits(),
+                        self.dependency_roots,
                     )
                 )
             except BaseException as error:
@@ -617,7 +648,12 @@ class ConfigurationTests(unittest.TestCase):
             snapshot = _compiler_metadata_snapshot(compiler)
             if not replaced:
                 replaced = True
-                compiler.write_bytes(b"compiler-replaced-after-cache-key")
+                try:
+                    compiler.write_bytes(b"compiler-replaced-after-cache-key")
+                except OSError as error:
+                    raise AuditInfrastructureError(
+                        "compiler executable changed during compiler version probe"
+                    ) from error
             return snapshot
 
         with mock.patch(
@@ -637,6 +673,7 @@ class ConfigurationTests(unittest.TestCase):
                 self.production,
                 self.environment,
                 AuditLimits(),
+                self.dependency_roots,
             )
 
         self.assertTrue(replaced)
@@ -815,7 +852,8 @@ class ConfigurationTests(unittest.TestCase):
             ), self.assertRaisesRegex(AuditInfrastructureError, rf"{name}.*unsupported"):
                 make_configuration(
                     entry, self.database, 3, self.source_root, self.production,
-                    dict(self.environment, **{name: value}), AuditLimits()
+                    dict(self.environment, **{name: value}), AuditLimits(),
+                    self.dependency_roots,
                 )
 
     def test_clang_driver_and_response_dialect_overrides_fail_closed(self):
@@ -837,7 +875,7 @@ class ConfigurationTests(unittest.TestCase):
             ), self.assertRaisesRegex(AuditInfrastructureError, "driver mode|response.*quoting"):
                 make_configuration(
                     entry, self.database, 3, self.source_root, self.production,
-                    self.environment, AuditLimits()
+                    self.environment, AuditLimits(), self.dependency_roots
                 )
 
     def test_response_expansion_precedes_source_validation(self):
@@ -1048,15 +1086,28 @@ class CommandRewriteTests(unittest.TestCase):
             line_count=1,
             production=True,
         )
+        compiler = (self.root / compiler_name).resolve()
+        executable = FileIdentity(compiler, None, 3, 81, 0, False)
+        binding = DependencyRootBinding(
+            "toolchain", self.root.resolve(),
+            FileIdentity(self.root.resolve(), None, 3, 82, 0, False),
+        )
+        capability = CompilerExecutableCapability(
+            "windows", executable, "1" * 64, "2" * 64, object(), binding,
+            (), (), "3" * 64, (),
+        )
         return PreprocessConfiguration(
             entry_id="compile_commands.json:0",
             family=family,
-            compiler=(self.root / compiler_name).resolve(),
+            compiler=compiler,
             working_directory=self.root.resolve(),
             source=identity,
             arguments=arguments,
             environment_digest="environment",
             digest=f"cfg-{family.value}",
+            dependency_root_authority_digest="a" * 64,
+            compiler_capability_digest=capability.capability_digest,
+            compiler_capability=capability,
         )
 
     def rewrite(

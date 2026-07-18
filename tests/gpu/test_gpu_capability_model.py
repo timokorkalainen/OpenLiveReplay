@@ -22,10 +22,14 @@ from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
     CompactTokenSequence,
+    CompilerExecutableCapability,
+    CompilerInspection,
     CompilerFamily,
     CoverageReport,
     ConfigurationAuditResult,
     DependencyDigest,
+    DependencyRootAuthority,
+    DependencyRootBinding,
     FileIdentity,
     PackedTokenRun,
     PreprocessedToken,
@@ -35,7 +39,10 @@ from gpu_capability_model import (  # noqa: E402
     _check_casefold_collision,
     _validate_native_canonical_text,
     _walk_production_entries,
+    build_dependency_root_authority,
+    decode_compiler_inspection,
     decode_local_dependency_digest,
+    encode_compiler_inspection,
     encode_local_dependency_digest,
     enumerate_production_identities,
     portable_dependency_key,
@@ -61,6 +68,18 @@ class ModelTests(unittest.TestCase):
 
     def configuration(self, *, digest: str = "cfg-a") -> PreprocessConfiguration:
         identity = self.identity()
+        executable_identity = FileIdentity(
+            Path("C:/toolchain/g++.exe"), None, 3, 10, 0, False
+        )
+        toolchain = DependencyRootBinding(
+            "toolchain",
+            Path("C:/toolchain"),
+            FileIdentity(Path("C:/toolchain"), None, 3, 11, 0, False),
+        )
+        capability = CompilerExecutableCapability(
+            "windows", executable_identity, "1" * 64, "2" * 64, object(),
+            toolchain, (), (), "3" * 64, (),
+        )
         return PreprocessConfiguration(
             entry_id="compile_commands.json:0",
             family=CompilerFamily.GCC,
@@ -70,6 +89,9 @@ class ModelTests(unittest.TestCase):
             arguments=("-std=c++17", "playback/gpu/example.cpp"),
             environment_digest="environment-a",
             digest=digest,
+            dependency_root_authority_digest="a" * 64,
+            compiler_capability_digest=capability.capability_digest,
+            compiler_capability=capability,
         )
 
     def sequence(self) -> CompactTokenSequence:
@@ -96,6 +118,84 @@ class ModelTests(unittest.TestCase):
             identity=identity or self.identity(),
             sha256=sha256,
         )
+
+    def test_dependency_root_authority_binds_local_roots_and_portable_layout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "source"
+            sdk = root / "sdk"
+            source.mkdir()
+            sdk.mkdir()
+            authority = build_dependency_root_authority(source, {"sdk:test": sdk})
+        self.assertIsInstance(authority, DependencyRootAuthority)
+        self.assertIsInstance(authority.source_root, DependencyRootBinding)
+        self.assertEqual(authority.source_root.stable_role, "production")
+        self.assertEqual(authority.external_roots[0].stable_role, "sdk:test")
+        self.assertRegex(authority.portable_authority_digest, r"\A[0-9a-f]{64}\Z")
+
+    def test_compiler_inspection_is_exact_frozen_and_strict(self):
+        identity = FileIdentity(
+            canonical=Path("C:/toolchain/g++.exe"),
+            relative=None,
+            device=3,
+            inode=9,
+            line_count=0,
+            production=False,
+        )
+        inspection = CompilerInspection(
+            CompilerFamily.GCC,
+            identity,
+            "a" * 64,
+            "g++ (GCC) 14.1.0",
+            "b" * 64,
+            "c" * 64,
+            "d" * 64,
+        )
+        self.assertEqual(
+            tuple(inspection.__dataclass_fields__),
+            (
+                "compiler_family",
+                "executable_identity",
+                "executable_sha256",
+                "normalized_version",
+                "driver_fingerprint",
+                "inspection_arguments_digest",
+                "executable_capability_digest",
+            ),
+        )
+        self.assertFalse(hasattr(inspection, "__dict__"))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            inspection.normalized_version = "changed"
+        replacements = {
+            "compiler_family": True,
+            "executable_identity": object(),
+            "executable_sha256": "A" * 64,
+            "normalized_version": "",
+            "driver_fingerprint": "b" * 63,
+            "inspection_arguments_digest": "not-a-digest",
+            "executable_capability_digest": "D" * 64,
+        }
+        for field, value in replacements.items():
+            with self.subTest(field=field), self.assertRaises(AuditInfrastructureError):
+                dataclasses.replace(inspection, **{field: value})
+
+    def test_compiler_inspection_codec_is_exact_and_rejects_unknown_keys(self):
+        identity = FileIdentity(
+            canonical=Path("C:/toolchain/g++.exe"), relative=None, device=3,
+            inode=9, line_count=0, production=False,
+        )
+        inspection = CompilerInspection(
+            CompilerFamily.GCC, identity, "a" * 64, "g++ (GCC) 14.1.0",
+            "b" * 64, "c" * 64, "d" * 64,
+        )
+        payload = encode_compiler_inspection(inspection)
+        self.assertEqual(decode_compiler_inspection(payload), inspection)
+        document = json.loads(payload)
+        document["unknown"] = 1
+        with self.assertRaisesRegex(AuditInfrastructureError, "schema"):
+            decode_compiler_inspection(
+                json.dumps(document, separators=(",", ":")).encode("ascii")
+            )
 
     def test_configuration_audit_result_is_compact_frozen_and_sorted(self):
         dependency = self.dependency()

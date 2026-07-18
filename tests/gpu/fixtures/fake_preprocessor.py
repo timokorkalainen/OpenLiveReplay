@@ -79,6 +79,9 @@ def main() -> int:
             "malformed",
             "child-sleep",
             "child-exit",
+            "different-second-output",
+            "different-second-byte-count",
+            "wait-for-cancel",
         ),
         required=True,
     )
@@ -89,6 +92,7 @@ def main() -> int:
     parser.add_argument("--sleep-seconds", type=float, default=30.0)
     parser.add_argument("--child-pid-file", type=Path)
     parser.add_argument("--outside-path", type=Path)
+    parser.add_argument("--invocation-counter", type=Path)
     parser.add_argument(
         "--dependency-mode",
         choices=("valid", "missing", "malformed", "outside"),
@@ -99,6 +103,19 @@ def main() -> int:
     options, unknown = parser.parse_known_args()
     source = _source_from_unknown(unknown)
     dependency_path = options.gcc_dependencies or options.msvc_dependencies
+
+    invocation = (
+        2
+        if dependency_path is not None
+        and dependency_path.parent.name.startswith(".gpu-capability-accepted-")
+        else 1
+    )
+    if options.invocation_counter is not None:
+        try:
+            invocation = int(options.invocation_counter.read_text(encoding="ascii")) + 1
+        except FileNotFoundError:
+            pass
+        options.invocation_counter.write_text(str(invocation), encoding="ascii")
 
     dependency_source = source
     if options.dependency_mode == "outside" and options.outside_path is not None:
@@ -120,6 +137,9 @@ def main() -> int:
         _write_chunks(sys.stdout.buffer, _marker(options.family, source) + b"partial_token\n")
         return 9
     if options.fixture_mode == "sleep":
+        time.sleep(options.sleep_seconds)
+        return 0
+    if options.fixture_mode == "wait-for-cancel":
         time.sleep(options.sleep_seconds)
         return 0
     if options.fixture_mode == "child-sleep":
@@ -168,7 +188,12 @@ def main() -> int:
             remaining -= count
         _write_chunks(sys.stdout.buffer, b"\n")
     else:
-        _write_chunks(sys.stdout.buffer, b"lease . nativeHandle ( ) ;\n")
+        output = b"lease . nativeHandle ( ) ;\n"
+        if options.fixture_mode == "different-second-output" and invocation > 1:
+            output = b"Lease . nativeHandle ( ) ;\n"
+        elif options.fixture_mode == "different-second-byte-count" and invocation > 1:
+            output += b" "
+        _write_chunks(sys.stdout.buffer, output)
     return 0
 
 

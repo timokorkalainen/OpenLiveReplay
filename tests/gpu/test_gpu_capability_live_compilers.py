@@ -20,6 +20,7 @@ from gpu_capability_model import (  # noqa: E402
     CompilerFamily,
     PreprocessedTranslationUnitView,
     enumerate_production_identities,
+    build_dependency_root_authority,
 )
 from gpu_capability_runner import collect_configurations, preprocess_all  # noqa: E402
 from gpu_capability_provenance import (  # noqa: E402
@@ -350,8 +351,11 @@ def _run_live_fixture_impl(
             "arguments": arguments,
         },)), encoding="utf-8", newline="\n")
         environment = dict(os.environ)
+        dependency_roots = build_dependency_root_authority(
+            root, {"toolchain": compiler.parent}
+        )
         configurations = collect_configurations(
-            root, (database,), environment
+            root, (database,), environment, dependency_roots
         )
         if len(configurations) != 1:
             raise AuditInfrastructureError(
@@ -366,6 +370,7 @@ def _run_live_fixture_impl(
         remaining_seconds = budget.remaining_seconds()
         views, coverage = preprocess_all(
             configurations,
+            dependency_roots,
             production,
             cache,
             AuditLimits(workers=1, total_seconds=remaining_seconds),
@@ -763,7 +768,7 @@ FORWARD(lease.safe)();
                 budget=budget,
             )
 
-        limits = preprocess.call_args.args[3]
+        limits = preprocess.call_args.args[4]
         self.assertAlmostEqual(limits.total_seconds, 202.5)
 
     def test_fixture_expiry_during_setup_prevents_preprocess_start(self):

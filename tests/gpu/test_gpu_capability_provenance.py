@@ -14,7 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
+    CompilerExecutableCapability,
     CompilerFamily,
+    DependencyRootBinding,
     FileIdentity,
     PreprocessConfiguration,
     _current_process_rss_bytes,
@@ -64,6 +66,19 @@ class ProvenanceTests(unittest.TestCase):
         )
 
     def configuration(self, family=CompilerFamily.GCC):
+        executable = self.identity(
+            None, canonical="C:/toolchain/compiler.exe", line_count=0,
+            production=False,
+        )
+        binding = DependencyRootBinding(
+            "toolchain", Path("C:/toolchain"),
+            self.identity(None, canonical="C:/toolchain", line_count=0,
+                          production=False),
+        )
+        capability = CompilerExecutableCapability(
+            "windows", executable, "1" * 64, "2" * 64, object(), binding,
+            (), (), "3" * 64, (),
+        )
         return PreprocessConfiguration(
             entry_id="compile_commands.json:0",
             family=family,
@@ -73,6 +88,9 @@ class ProvenanceTests(unittest.TestCase):
             arguments=("../playback/a.cpp",),
             environment_digest="env",
             digest="cfg",
+            dependency_root_authority_digest="a" * 64,
+            compiler_capability_digest=capability.capability_digest,
+            compiler_capability=capability,
         )
 
     def builder(self, *, family=CompilerFamily.GCC, limits=None, rss_reader=None):
