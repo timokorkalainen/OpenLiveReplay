@@ -1685,10 +1685,14 @@ class PreprocessCache:
                                 final_validation()
                             return winner
                         stale = self.root / f".stale-{key}-{uuid.uuid4().hex}"
+                        stale_identity = _directory_identity(
+                            _ordinary_directory(entry)
+                        )
                         try:
                             os.rename(entry, stale)
                         except FileNotFoundError:
                             stale = None
+                            stale_identity = None
                         try:
                             published_identity = _directory_identity(
                                 _ordinary_directory(temporary)
@@ -1704,8 +1708,12 @@ class PreprocessCache:
                                 final_validation()
                             return winner
                         finally:
-                            if stale is not None:
-                                _remove_held_flat_directory(stale)
+                            if stale is not None and not _remove_held_flat_directory(
+                                stale, expected_identity=stale_identity
+                            ):
+                                raise AuditInfrastructureError(
+                                    "cannot remove stale cache entry"
+                                )
                     else:
                         try:
                             published_identity = _directory_identity(

@@ -1128,6 +1128,94 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("cc1plus", closure_names)
         self.assertTrue(closure_names.isdisjoint({"cc1", "collect2", "as", "ld"}))
 
+    def test_attached_msvc_language_selectors_bind_exact_frontend_and_memo_source(self):
+        from gpu_capability_command import _preprocess_helper_selection_key
+
+        controls = (
+            (("/Tcfile.cpp",), "c", "/Tcfile.cpp"),
+            (("/Tpfile.c",), "c++", "/Tpfile.c"),
+            (("/TP", "/Tcfile.cpp"), "c", "/Tcfile.cpp"),
+            (("/Tcfile.cpp", "/TP"), "c", "/Tcfile.cpp"),
+        )
+        keys = [
+            _preprocess_helper_selection_key(
+                arguments, CompilerFamily.MSVC, self.build
+            )
+            for arguments, _expected_language, _expected_binding in controls
+        ]
+        for (arguments, expected_language, expected_binding), key in zip(controls, keys):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(key[0], expected_language)
+                self.assertIn(expected_binding, key[1])
+        self.assertNotEqual(keys[0], keys[2])
+        self.assertNotEqual(
+            keys[0],
+            _preprocess_helper_selection_key(
+                ("/Tcother.cpp",), CompilerFamily.MSVC, self.build
+            ),
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "conflicting.*language.*selector"
+        ):
+            _preprocess_helper_selection_key(
+                ("/Tcfile.cpp", "/Tpfile.cpp"),
+                CompilerFamily.MSVC,
+                self.build,
+            )
+
+        c_frontend = self.compiler.parent / "c1.dll"
+        cxx_frontend = self.compiler.parent / "c1xx.dll"
+        c_frontend.write_bytes(b"c frontend")
+        cxx_frontend.write_bytes(b"cxx frontend")
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            side_effect=self.real_driver_selected_helper_paths,
+        ):
+            c_capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0,
+                compiler_family=CompilerFamily.MSVC,
+                launcher_environment=self.environment,
+                working_directory=self.build,
+                preprocess_arguments=("/Tcfile.cpp",),
+            )
+            cxx_capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0,
+                compiler_family=CompilerFamily.MSVC,
+                launcher_environment=self.environment,
+                working_directory=self.build,
+                preprocess_arguments=("/Tpfile.c",),
+            )
+        self.assertIsNot(c_capability, cxx_capability)
+        self.assertIn(
+            "c1.dll",
+            {item.role_relative_path.name for item in c_capability.resolved_runtime_closure},
+        )
+        self.assertIn(
+            "c1xx.dll",
+            {item.role_relative_path.name for item in cxx_capability.resolved_runtime_closure},
+        )
+
+    def test_posix_probe_containment_consumes_owned_process_group_once(self):
+        class Process:
+            pid = 5151
+
+        with mock.patch(
+            "gpu_capability_command.os.name", "posix"
+        ), mock.patch(
+            "gpu_capability_command.os.killpg", create=True
+        ) as killpg, mock.patch(
+            "gpu_capability_command.signal.SIGKILL", 9, create=True
+        ):
+            containment = capability_command._ProbeContainment()
+            containment.attach(Process())
+            containment.terminate()
+            containment.close()
+            containment.close()
+        killpg.assert_called_once_with(5151, 9)
+
     def test_delay_import_directory_obeys_context_metadata_ceiling(self):
         image = CompilerIdentificationTests.pe_delay_import_runtime_image(
             "delay-runtime.dll"

@@ -179,9 +179,11 @@ class _ProcessContainment:
         if self._job is not None:
             self._job.terminate()
             return
-        if self._pid is not None:
+        pid = self._pid
+        self._pid = None
+        if pid is not None:
             try:
-                os.killpg(self._pid, signal.SIGKILL)
+                os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
 
@@ -189,7 +191,7 @@ class _ProcessContainment:
         if self._job is not None:
             self._job.close()
         else:
-            self.terminate()
+            self._pid = None
 
 
 class _WindowsJob:

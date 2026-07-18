@@ -715,10 +715,14 @@ def _run_probe_command(
             containment.attach(process)
             containment.release(process)
         except OSError as error:
+            if os.name != "nt":
+                containment.terminate()
             containment.close()
             raise AuditInfrastructureError(f"compiler version probe failed: {compiler}") from error
         except AuditInfrastructureError:
             if process is not None:
+                if os.name != "nt":
+                    containment.terminate()
                 process.kill()
                 process.wait(timeout=1.0)
             containment.close()
@@ -751,6 +755,8 @@ def _run_probe_command(
         finally:
             # Closing the Windows job or killing the POSIX process group also
             # removes descendants after a nominally successful parent exit.
+            if os.name != "nt":
+                containment.terminate()
             containment.close()
         observed = os.fstat(stdout_stream.fileno()).st_size + os.fstat(
             stderr_stream.fileno()
@@ -824,9 +830,11 @@ class _ProbeContainment:
         if self._job is not None:
             self._job.terminate()
             return
-        if self._pid is not None:
+        pid = self._pid
+        self._pid = None
+        if pid is not None:
             try:
-                os.killpg(self._pid, signal.SIGKILL)
+                os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
 
@@ -834,7 +842,7 @@ class _ProbeContainment:
         if self._job is not None:
             self._job.close()
             return
-        self.terminate()
+        self._pid = None
 
 
 class _WindowsProbeJob:
@@ -2384,6 +2392,54 @@ def _driver_selected_helper_paths(
     return tuple(result)
 
 
+def _msvc_language_selectors(
+    arguments: tuple[str, ...], working_directory: Path
+) -> tuple[str | None, dict[str, str], tuple[str, ...]]:
+    global_language: str | None = None
+    per_source: dict[str, str] = {}
+    bindings: list[str] = []
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        spelling = _msvc_slash_spelling(value)
+        if spelling in {"/TC", "/TP"}:
+            global_language = "c" if spelling == "/TC" else "c++"
+            bindings.append(value)
+            index += 1
+            continue
+        language: str | None = None
+        candidate: str | None = None
+        if spelling in {"/Tc", "/Tp"}:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(
+                    f"compiler language selector requires a source: {value}"
+                )
+            language = "c" if spelling == "/Tc" else "c++"
+            candidate = arguments[index + 1]
+            bindings.append(value)
+            index += 2
+        elif spelling.startswith(("/Tc", "/Tp")) and len(value) > 3:
+            language = "c" if spelling.startswith("/Tc") else "c++"
+            candidate = value[3:]
+            bindings.append(value)
+            index += 1
+        else:
+            index += 1
+            continue
+        if candidate == "-":
+            raise AuditInfrastructureError("stdin cannot be a compile source")
+        canonical = _canonical_argument_path(candidate, working_directory)
+        source_key = os.path.normcase(str(canonical))
+        previous = per_source.get(source_key)
+        if previous is not None and previous != language:
+            raise AuditInfrastructureError(
+                "conflicting per-source compiler language selectors"
+            )
+        per_source[source_key] = language
+        bindings.append(source_key)
+    return global_language, per_source, tuple(bindings)
+
+
 def _preprocess_language(
     arguments: tuple[str, ...],
     family: CompilerFamily,
@@ -2403,9 +2459,34 @@ def _preprocess_language(
             continue
         if lowered.startswith("-x") and len(value) > 2:
             explicit = value[2:].casefold()
-        elif lowered in {"/tc", "/tp"}:
-            explicit = "c" if lowered == "/tc" else "c++"
         index += 1
+    if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
+        global_language, per_source, _bindings = _msvc_language_selectors(
+            arguments, working_directory
+        )
+        if source_path is None and len(per_source) == 1:
+            source_path = Path(next(iter(per_source)))
+        selected_language = global_language
+        if source_path is not None:
+            source_key = os.path.normcase(str(_canonical_argument_path(
+                str(source_path), working_directory
+            )))
+            selected_language = per_source.get(source_key, global_language)
+        if selected_language is not None:
+            if explicit is not None:
+                aliases = {
+                    "c": "c", "cpp-output": "c", "c-header": "c",
+                    "c++": "c++", "c++-cpp-output": "c++", "c++-header": "c++",
+                    "objective-c": "objective-c",
+                    "objective-c-cpp-output": "objective-c",
+                    "objective-c++": "objective-c++",
+                    "objective-c++-cpp-output": "objective-c++",
+                }
+                if aliases.get(explicit) != selected_language:
+                    raise AuditInfrastructureError(
+                        "conflicting compiler language selectors"
+                    )
+            explicit = selected_language
     aliases = {
         "c": "c", "cpp-output": "c", "c-header": "c",
         "c++": "c++", "c++-cpp-output": "c++", "c++-header": "c++",
@@ -2447,6 +2528,11 @@ def _preprocess_helper_selection_key(
         arguments, family, working_directory
     )
     selectors: list[str] = []
+    if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
+        _global, _per_source, language_bindings = _msvc_language_selectors(
+            arguments, working_directory
+        )
+        selectors.extend(language_bindings)
     index = 0
     value_options = {"-B", "--gcc-toolchain", "--target", "-target"}
     while index < len(arguments):

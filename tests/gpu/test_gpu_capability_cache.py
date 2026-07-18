@@ -23,8 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gpu_capability_cache import (  # noqa: E402
     CompilerInspectionCache,
     PreprocessCache,
+    _directory_identity,
     _hash_cache,
     _hash_lock,
+    _remove_held_flat_directory,
     _PublicationGuard,
     compiler_inspection_cache_key,
 )
@@ -1540,6 +1542,39 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             "cannot remove cache publication temporary after OSError: disk full",
         ):
             cache.publish(self.view())
+
+    def test_invalid_entry_replacement_cleanup_failure_is_fatal_and_bounded(self):
+        cache = PreprocessCache(self.cache_root)
+        cache.publish(self.view())
+        entry = self.entry(cache)
+        original_identity = _directory_identity(entry.stat())
+        (entry / "manifest.json").write_text("{", encoding="utf-8")
+
+        real_remove = _remove_held_flat_directory
+
+        stale_identities = []
+
+        def fail_stale(path, *, expected_identity=None):
+            if path.name.startswith(".stale-"):
+                stale_identities.append(expected_identity)
+                return False
+            return real_remove(path, expected_identity=expected_identity)
+
+        with mock.patch(
+            "gpu_capability_cache._remove_held_flat_directory",
+            side_effect=fail_stale,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "cannot remove stale cache entry"
+        ):
+            cache.publish(self.view())
+
+        self.assertEqual(stale_identities, [original_identity])
+        stale = list(self.cache_root.glob(".stale-*"))
+        self.assertEqual(len(stale), 1)
+        self.assertFalse(entry.exists())
+        cache.publish(self.view())
+        self.assertEqual(len(list(self.cache_root.glob(".stale-*"))), 1)
+        self.assertIsNotNone(cache.load(self.configuration))
 
     def test_cleanup_removes_only_expired_incomplete_entries(self):
         cache = PreprocessCache(self.cache_root)

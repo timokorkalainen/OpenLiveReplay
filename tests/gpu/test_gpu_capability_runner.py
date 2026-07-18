@@ -807,6 +807,32 @@ class BoundedPreprocessorTests(unittest.TestCase):
         self.assertEqual(job._kernel32.CloseHandle.call_count, 2)
         self.assertIsNone(job._handle)
 
+    def test_posix_containment_signals_each_owned_generation_at_most_once(self):
+        class Process:
+            pid = 4242
+
+        sequences = (
+            ("normal", ("terminate", "close")),
+            ("timeout", ("terminate", "terminate", "close")),
+            ("error", ("terminate", "close", "close")),
+            ("close-twice", ("close", "close")),
+        )
+        for name, actions in sequences:
+            with self.subTest(name=name), mock.patch(
+                "gpu_capability_runner.os.name", "posix"
+            ), mock.patch(
+                "gpu_capability_runner.os.killpg", create=True
+            ) as killpg, mock.patch(
+                "gpu_capability_runner.signal.SIGKILL", 9, create=True
+            ):
+                containment = capability_runner._ProcessContainment()
+                containment.attach(Process())
+                for action in actions:
+                    getattr(containment, action)()
+                self.assertLessEqual(killpg.call_count, 1)
+                if "terminate" in actions:
+                    killpg.assert_called_once_with(4242, 9)
+
     def test_malformed_output_and_dependency_fail_closed(self):
         with self.assertRaisesRegex(
             AuditInfrastructureError,
