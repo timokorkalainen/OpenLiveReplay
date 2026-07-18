@@ -42,6 +42,7 @@ _COMPLETE_SECONDS = 14 * 24 * 60 * 60
 _IO_BLOCK_BYTES = 64 * 1024
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _MAX_RECORD_BYTES = 16 * 1024 * 1024
+_DEFAULT_CACHE_OPERATION_SECONDS = 240.0
 _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _hash_cache: dict[tuple[object, ...], str] = {}
 _hash_lock = threading.Lock()
@@ -1086,6 +1087,7 @@ class CompilerInspectionCache:
         if len(encoded) > _COMPILER_INSPECTION_MAX_BYTES:
             raise AuditInfrastructureError("compiler inspection manifest is too large")
         temporary = self.root / f".tmp-inspection-{uuid.uuid4().hex}"
+        temporary_identity: tuple[int, int | None, int, int] | None = None
         path = self._path(key)
         with self._root_lock(
             pipeline_deadline, cancel_event
@@ -1095,9 +1097,14 @@ class CompilerInspectionCache:
             try:
                 self._assert_root()
                 with temporary.open("xb") as stream:
-                    stream.write(encoded)
-                    stream.flush()
-                    os.fsync(stream.fileno())
+                    try:
+                        stream.write(encoded)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    finally:
+                        temporary_identity = _file_identity_tuple(
+                            os.fstat(stream.fileno())
+                        )
                 self._assert_root()
                 try:
                     _regular_unlinked_file(path)
@@ -1123,15 +1130,30 @@ class CompilerInspectionCache:
                             raise AuditInfrastructureError(
                                 "concurrent compiler inspection winner differs"
                             )
+                        if _file_identity_tuple(
+                            _regular_unlinked_file(temporary)
+                        ) != temporary_identity:
+                            raise AuditInfrastructureError(
+                                "compiler inspection publication temporary was replaced"
+                            )
                         temporary.unlink()
                         return winner
                 os.replace(temporary, path)
                 self._assert_root()
-            except OSError as error:
+            except BaseException as error:
                 try:
-                    temporary.unlink()
-                except OSError:
+                    if (
+                        temporary_identity is not None
+                        and _file_identity_tuple(_regular_unlinked_file(temporary))
+                        == temporary_identity
+                    ):
+                        temporary.unlink()
+                except (FileNotFoundError, OSError):
                     pass
+                if isinstance(error, AuditInfrastructureError):
+                    raise
+                if not isinstance(error, OSError):
+                    raise
                 raise AuditInfrastructureError("cannot publish compiler inspection") from error
         return inspection
 
@@ -1164,6 +1186,49 @@ class PreprocessCache:
         self.maximum_entries = maximum_entries
         self._root_identity = _directory_identity(root_metadata)
         self._publication_lock = threading.Lock()
+
+    @staticmethod
+    def _operation_deadline(deadline: float | None) -> float:
+        if deadline is None:
+            return time.monotonic() + _DEFAULT_CACHE_OPERATION_SECONDS
+        return deadline
+
+    def _root_lock(
+        self, deadline: float, cancel_event: object | None = None
+    ) -> _SharedCacheFileLock:
+        return _SharedCacheFileLock(
+            self.root / ".preprocess-root.lock",
+            self.root,
+            self._root_identity,
+            deadline,
+            cancel_event,
+        )
+
+    def _key_lock(
+        self,
+        key: str,
+        deadline: float,
+        cancel_event: object | None = None,
+    ) -> _SharedCacheFileLock:
+        lane = hashlib.sha256(f"preprocess:{key}".encode("utf-8")).digest()[0] % 8
+        return _SharedCacheFileLock(
+            self.root / f".preprocess-key-{lane}.lock",
+            self.root,
+            self._root_identity,
+            deadline,
+            cancel_event,
+        )
+
+    def _acquire_key_barrier(
+        self,
+        key: str,
+        deadline: float,
+        cancel_event: object | None = None,
+    ) -> _SharedCacheFileLock:
+        key_lock = self._key_lock(key, deadline, cancel_event)
+        with self._root_lock(deadline, cancel_event):
+            key_lock.__enter__()
+        return key_lock
 
     def _assert_root_identity(self) -> None:
         try:
@@ -1294,8 +1359,24 @@ class PreprocessCache:
     def load(
         self,
         configuration: PreprocessConfiguration,
+        deadline: float | None = None,
+        cancel_event: object | None = None,
     ) -> PreprocessedTranslationUnitView | None:
         key = self._configuration_key(configuration)
+        operation_deadline = self._operation_deadline(deadline)
+        key_lock = self._acquire_key_barrier(
+            key, operation_deadline, cancel_event
+        )
+        try:
+            return self._load_unlocked(configuration, key)
+        finally:
+            key_lock.__exit__(None, None, None)
+
+    def _load_unlocked(
+        self,
+        configuration: PreprocessConfiguration,
+        key: str,
+    ) -> PreprocessedTranslationUnitView | None:
         entry = self.root / key
         try:
             self._assert_root_identity()
@@ -1422,6 +1503,8 @@ class PreprocessCache:
         snapshots: tuple[_DependencySnapshot, ...],
         *,
         final_validation: Callable[[], None] | None = None,
+        deadline: float | None = None,
+        cancel_event: object | None = None,
     ) -> PreprocessedTranslationUnitView:
         if not isinstance(view, PreprocessedTranslationUnitView):
             raise AuditInfrastructureError("preprocessed view is invalid")
@@ -1436,6 +1519,7 @@ class PreprocessCache:
                 "dependency closure changed during preprocessing"
             )
         key = self._configuration_key(view.configuration)
+        operation_deadline = self._operation_deadline(deadline)
         temporary = self.root / f".tmp-{key}-{uuid.uuid4().hex}"
         entry = self.root / key
         published_identity: tuple[int, int | None] | None = None
@@ -1466,56 +1550,88 @@ class PreprocessCache:
                 )
                 self._validate_stable_dependencies(view.dependencies, snapshots)
             (temporary / "active.lock").unlink()
-            with self._publication_lock:
-                if entry.exists():
-                    winner = self.load(view.configuration)
-                    if winner is not None:
-                        winner = self._accept_winner(view, winner)
-                        self._discard_losing_temporary(temporary)
-                        if final_validation is not None:
-                            final_validation()
-                        return winner
-                    stale = self.root / f".stale-{key}-{uuid.uuid4().hex}"
-                    try:
-                        os.rename(entry, stale)
-                    except FileNotFoundError:
-                        stale = None
-                    try:
-                        published_identity = _directory_identity(
-                            _ordinary_directory(temporary)
-                        )
-                        os.rename(temporary, entry)
-                    except FileExistsError:
-                        winner = self.load(view.configuration)
-                        if winner is None:
-                            raise
-                        winner = self._accept_winner(view, winner)
-                        self._discard_losing_temporary(temporary)
-                        if final_validation is not None:
-                            final_validation()
-                        return winner
-                    finally:
-                        if stale is not None:
-                            _remove_held_flat_directory(stale)
-                else:
-                    try:
-                        published_identity = _directory_identity(
-                            _ordinary_directory(temporary)
-                        )
-                        os.rename(temporary, entry)
-                    except FileExistsError:
-                        winner = self.load(view.configuration)
-                        if winner is None:
-                            raise
-                        winner = self._accept_winner(view, winner)
-                        self._discard_losing_temporary(temporary)
-                        if final_validation is not None:
-                            final_validation()
-                        return winner
-            self._record_access(key)
-            if final_validation is not None:
-                final_validation()
-            return view
+            key_lock = self._acquire_key_barrier(
+                key, operation_deadline, cancel_event
+            )
+            try:
+                self._publication_lock.acquire()
+            except BaseException:
+                key_lock.__exit__(None, None, None)
+                raise
+            try:
+                try:
+                    if entry.exists():
+                        winner = self._load_unlocked(view.configuration, key)
+                        if winner is not None:
+                            winner = self._accept_winner(view, winner)
+                            self._discard_losing_temporary(temporary)
+                            if final_validation is not None:
+                                final_validation()
+                            return winner
+                        stale = self.root / f".stale-{key}-{uuid.uuid4().hex}"
+                        try:
+                            os.rename(entry, stale)
+                        except FileNotFoundError:
+                            stale = None
+                        try:
+                            published_identity = _directory_identity(
+                                _ordinary_directory(temporary)
+                            )
+                            os.rename(temporary, entry)
+                        except FileExistsError:
+                            winner = self._load_unlocked(view.configuration, key)
+                            if winner is None:
+                                raise
+                            winner = self._accept_winner(view, winner)
+                            self._discard_losing_temporary(temporary)
+                            if final_validation is not None:
+                                final_validation()
+                            return winner
+                        finally:
+                            if stale is not None:
+                                _remove_held_flat_directory(stale)
+                    else:
+                        try:
+                            published_identity = _directory_identity(
+                                _ordinary_directory(temporary)
+                            )
+                            os.rename(temporary, entry)
+                        except FileExistsError:
+                            winner = self._load_unlocked(view.configuration, key)
+                            if winner is None:
+                                raise
+                            winner = self._accept_winner(view, winner)
+                            self._discard_losing_temporary(temporary)
+                            if final_validation is not None:
+                                final_validation()
+                            return winner
+                    self._record_access(key)
+                    if final_validation is not None:
+                        final_validation()
+                    return view
+                except (AuditInfrastructureError, OSError, ValueError) as error:
+                    _remove_held_flat_directory(temporary)
+                    if published_identity is not None and not _remove_held_flat_directory(
+                        entry, expected_identity=published_identity
+                    ):
+                        try:
+                            current_identity = _directory_identity(
+                                _ordinary_directory(entry)
+                            )
+                        except (FileNotFoundError, OSError):
+                            current_identity = None
+                        if current_identity == published_identity:
+                            raise AuditInfrastructureError(
+                                "cannot remove invalid cache publication"
+                            ) from error
+                    if isinstance(error, AuditInfrastructureError):
+                        raise
+                    raise AuditInfrastructureError(
+                        f"cannot publish GPU capability cache: {error}"
+                    ) from error
+            finally:
+                self._publication_lock.release()
+                key_lock.__exit__(None, None, None)
         except (AuditInfrastructureError, OSError, ValueError) as error:
             _remove_held_flat_directory(temporary)
             if published_identity is not None and not _remove_held_flat_directory(

@@ -1482,7 +1482,7 @@ def load_or_preprocess(
         configuration.compiler_capability, authority,
         deadline=deadline, cancel_event=cancel_event,
     )
-    cached = cache.load(configuration)
+    cached = cache.load(configuration, deadline, cancel_event)
     if cached is not None:
         return cached
     if cancel_event is not None and cancel_event.is_set():
@@ -1515,7 +1515,11 @@ def load_or_preprocess(
                 "preprocessor returned a mismatched accepted configuration"
             )
         return cache._publish_stabilized(
-            accepted, snapshots, final_validation=validate_generation
+            accepted,
+            snapshots,
+            final_validation=validate_generation,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
 
     accepted, _discovery, _stages = stabilize_and_parse_configuration(

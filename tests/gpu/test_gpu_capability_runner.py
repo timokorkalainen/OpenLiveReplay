@@ -1164,14 +1164,17 @@ class BoundedPreprocessorTests(unittest.TestCase):
         second_view = self.altered_view(first_view)
         views = {"first": first_view, "second": second_view}
         entry = cache_root / caches[0]._configuration_key(configuration)
-        barrier = threading.Barrier(2)
+        rename_entered = threading.Event()
+        release_rename = threading.Event()
         real_rename = os.rename
         successes: list[PreprocessedTranslationUnitView] = []
         failures: list[BaseException] = []
 
         def rename(source, destination) -> None:
             if Path(source).name.startswith(".tmp-") and Path(destination) == entry:
-                barrier.wait(timeout=5.0)
+                rename_entered.set()
+                if not release_rename.wait(timeout=5.0):
+                    raise AssertionError("rename release timed out")
             real_rename(source, destination)
 
         def preprocess(*_arguments, publication, **_kwargs):
@@ -1203,18 +1206,36 @@ class BoundedPreprocessorTests(unittest.TestCase):
         with mock.patch(
             "gpu_capability_runner.stabilize_and_parse_configuration", side_effect=preprocess
         ), mock.patch("gpu_capability_cache.os.rename", side_effect=rename):
-            threads = [
-                threading.Thread(target=run, args=(cache,), name=name)
-                for cache, name in zip(caches, ("first", "second"))
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10.0)
+            first_thread = threading.Thread(
+                target=run, args=(caches[0],), name="first"
+            )
+            second_thread = threading.Thread(
+                target=run, args=(caches[1],), name="second"
+            )
+            first_thread.start()
+            self.assertTrue(rename_entered.wait(timeout=5.0))
+            second_thread.start()
+            try:
+                time.sleep(0.2)
+                self.assertEqual(successes, [])
+                self.assertEqual(failures, [])
+            finally:
+                release_rename.set()
+                first_thread.join(timeout=10.0)
+                second_thread.join(timeout=10.0)
+            threads = (first_thread, second_thread)
         self.assertFalse(any(thread.is_alive() for thread in threads))
-        self.assertEqual(len(successes), 1)
-        self.assertEqual(len(failures), 1)
-        self.assertRegex(str(failures[0]), "concurrent cache winner differs")
+        self.assertEqual(len(successes), 2)
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            len(
+                {
+                    capability_model._preprocessed_view_semantic_digest(view)
+                    for view in successes
+                }
+            ),
+            1,
+        )
 
 
 class OrchestrationTests(unittest.TestCase):

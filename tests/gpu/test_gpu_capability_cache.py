@@ -85,6 +85,127 @@ def _publish_equal_inspection_in_spawned_process(
         result_queue.put(("error", type(error).__name__, str(error)))
 
 
+def _spawned_preprocess_fixture(
+    fixture_root: str,
+) -> tuple[PreprocessConfiguration, FileIdentity, FileIdentity]:
+    root = Path(fixture_root)
+    main_path = root / "playback" / "a.cpp"
+    header_path = root / "playback" / "a.h"
+    compiler = root / "toolchain" / "g++.exe"
+
+    def identity(path: Path, relative: str | None = None) -> FileIdentity:
+        metadata = path.stat()
+        return FileIdentity(
+            path.resolve(),
+            PurePosixPath(relative) if relative is not None else None,
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+            len(path.read_bytes().splitlines()),
+            relative is not None,
+        )
+
+    main = identity(main_path, "playback/a.cpp")
+    header = identity(header_path, "playback/a.h")
+    authority = build_dependency_root_authority(root, {})
+    executable = identity(compiler)
+    binding = DependencyRootBinding(
+        "toolchain",
+        compiler.parent.resolve(),
+        FileIdentity(
+            compiler.parent.resolve(), None, executable.device,
+            executable.inode, 0, False,
+        ),
+    )
+    capability = CompilerExecutableCapability(
+        "windows", dataclasses.replace(executable, line_count=0),
+        "1" * 64, "2" * 64, object(), binding, (), (), "3" * 64, (),
+    )
+    configuration = PreprocessConfiguration(
+        entry_id="compile_commands.json:0",
+        family=CompilerFamily.GCC,
+        compiler=compiler,
+        working_directory=root,
+        source=main,
+        arguments=("-std=c++17", str(main_path)),
+        environment_digest="environment-one",
+        digest="compiler-fingerprint-one",
+        dependency_root_authority_digest=authority.portable_authority_digest,
+        compiler_capability_digest=capability.capability_digest,
+        compiler_capability=capability,
+    )
+    return configuration, main, header
+
+
+def _publish_preprocess_cache_in_spawned_process(
+    cache_root: str,
+    fixture_root: str,
+    validation_fails: bool,
+    validation_entered_path: str,
+    release_validation_path: str,
+    result_connection,
+) -> None:
+    deadline = time.monotonic() + 15.0
+    configuration, main, header = _spawned_preprocess_fixture(fixture_root)
+    tokens = CompactTokenSequence._from_packed(
+        configuration,
+        spellings=(b"lease", b".", b"nativeHandle"),
+        identities=(main, header),
+        spelling_ids=array("I", [0, 1, 2]),
+        identity_ids=array("I", [0, 0, 1]),
+        inclusion_ids=array("I", [1, 1, 2]),
+        original_lines=array("I", [1, 1, 1]),
+    )
+    view = PreprocessedTranslationUnitView(
+        configuration, tokens, (main, header)
+    )
+    cache = PreprocessCache(Path(cache_root))
+    snapshots = cache._snapshot_dependencies(view.dependencies, force=True)
+
+    def final_validation() -> None:
+        Path(validation_entered_path).write_bytes(b"1")
+        while (
+            not Path(release_validation_path).exists()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        if not Path(release_validation_path).exists():
+            raise AssertionError("final validation release timed out")
+        if validation_fails:
+            raise AuditInfrastructureError("forced final validation failure")
+
+    try:
+        result = cache._publish_stabilized(
+            view,
+            snapshots,
+            final_validation=final_validation,
+            deadline=deadline,
+        )
+        result_connection.send(("ok", result is not None))
+    except BaseException as error:
+        result_connection.send(("error", type(error).__name__, str(error)))
+    finally:
+        result_connection.close()
+
+
+def _load_preprocess_cache_in_spawned_process(
+    cache_root: str,
+    fixture_root: str,
+    load_started_path: str,
+    result_connection,
+) -> None:
+    try:
+        configuration, _main, _header = _spawned_preprocess_fixture(fixture_root)
+        Path(load_started_path).write_bytes(b"1")
+        result = PreprocessCache(Path(cache_root)).load(
+            configuration, time.monotonic() + 15.0
+        )
+        result_connection.send(("ok", result is not None))
+    except BaseException as error:
+        result_connection.send(("error", type(error).__name__, str(error)))
+    finally:
+        result_connection.close()
+
+
 class _PreprocessCacheFixture:
     def setUp(self) -> None:
         with _hash_lock:
@@ -694,6 +815,7 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 self.authority, "e" * 64, self.capability_digest,
                 self.closure_digest, different, time.monotonic() + 10.0,
             )
+        self.assertEqual(list(self.cache.root.glob(".tmp-inspection-*")), [])
 
     def test_live_compiler_mutation_during_cache_decode_remains_fatal(self):
         inspection = self.inspection()
@@ -946,18 +1068,176 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         self.assertIsNotNone(cache.load(self.configuration))
         self.assertEqual(len([path for path in self.cache_root.iterdir() if path.name[0].isalnum()]), 1)
 
-    def test_two_cache_instances_remove_atomic_rename_loser_temporary(self):
+    def test_reader_cannot_escape_while_final_validation_pauses_then_fails(self):
+        publisher = PreprocessCache(self.cache_root)
+        reader = PreprocessCache(self.cache_root)
+        view = self.view()
+        snapshots = publisher._snapshot_dependencies(view.dependencies, force=True)
+        validation_entered = threading.Event()
+        release_validation = threading.Event()
+        reader_done = threading.Event()
+        publication_failures: list[BaseException] = []
+        reader_results: list[PreprocessedTranslationUnitView | None] = []
+
+        def final_validation() -> None:
+            validation_entered.set()
+            if not release_validation.wait(timeout=5.0):
+                raise AssertionError("final validation release timed out")
+            raise AuditInfrastructureError("forced final validation failure")
+
+        def publish() -> None:
+            try:
+                publisher._publish_stabilized(
+                    view, snapshots, final_validation=final_validation
+                )
+            except BaseException as error:
+                publication_failures.append(error)
+
+        def load() -> None:
+            try:
+                reader_results.append(reader.load(self.configuration))
+            finally:
+                reader_done.set()
+
+        publisher_thread = threading.Thread(target=publish)
+        publisher_thread.start()
+        self.assertTrue(validation_entered.wait(timeout=5.0))
+        reader_thread = threading.Thread(target=load)
+        reader_thread.start()
+        try:
+            self.assertFalse(
+                reader_done.wait(timeout=0.2),
+                "reader returned while final validation was unresolved",
+            )
+        finally:
+            release_validation.set()
+            publisher_thread.join(timeout=10.0)
+            reader_thread.join(timeout=10.0)
+        self.assertFalse(publisher_thread.is_alive())
+        self.assertFalse(reader_thread.is_alive())
+        self.assertEqual(len(publication_failures), 1)
+        self.assertRegex(str(publication_failures[0]), "forced final validation failure")
+        self.assertEqual(reader_results, [None])
+
+    def test_spawned_reader_waits_for_failed_and_successful_final_validation(self):
+        context = multiprocessing.get_context("spawn")
+        for validation_fails in (True, False):
+            with self.subTest(validation_fails=validation_fails):
+                publisher = PreprocessCache(self.cache_root)
+                view = self.view()
+                snapshots = publisher._snapshot_dependencies(
+                    view.dependencies, force=True
+                )
+                validation_entered_path = self.root / (
+                    f"spawned-validation-entered-{int(validation_fails)}"
+                )
+                release_validation_path = self.root / (
+                    f"spawned-validation-release-{int(validation_fails)}"
+                )
+                result_connection, child_connection = context.Pipe(duplex=False)
+                publisher_process = context.Process(
+                    target=_publish_preprocess_cache_in_spawned_process,
+                    args=(
+                        str(self.cache_root),
+                        str(self.root),
+                        validation_fails,
+                        str(validation_entered_path),
+                        str(release_validation_path),
+                        child_connection,
+                    ),
+                )
+                publisher_process.start()
+                child_connection.close()
+                reader_started_path = self.root / (
+                    f"spawned-reader-started-{int(validation_fails)}"
+                )
+                reader_connection, reader_child_connection = context.Pipe(
+                    duplex=False
+                )
+                reader_process = context.Process(
+                    target=_load_preprocess_cache_in_spawned_process,
+                    args=(
+                        str(self.cache_root),
+                        str(self.root),
+                        str(reader_started_path),
+                        reader_child_connection,
+                    ),
+                )
+                try:
+                    started_deadline = time.monotonic() + 10.0
+                    while (
+                        not validation_entered_path.exists()
+                        and time.monotonic() < started_deadline
+                    ):
+                        time.sleep(0.01)
+                    self.assertTrue(validation_entered_path.exists())
+                    reader_process.start()
+                    reader_child_connection.close()
+                    reader_started_deadline = time.monotonic() + 10.0
+                    while (
+                        not reader_started_path.exists()
+                        and time.monotonic() < reader_started_deadline
+                    ):
+                        time.sleep(0.01)
+                    self.assertTrue(reader_started_path.exists())
+                    self.assertFalse(
+                        reader_connection.poll(0.2),
+                        "spawned reader returned while final validation was unresolved",
+                    )
+                finally:
+                    release_validation_path.write_bytes(b"1")
+                    publisher_process.join(timeout=10.0)
+                    if reader_process.pid is not None:
+                        reader_process.join(timeout=10.0)
+                    if publisher_process.is_alive():
+                        publisher_process.terminate()
+                        publisher_process.join(timeout=5.0)
+                    if reader_process.is_alive():
+                        reader_process.terminate()
+                        reader_process.join(timeout=5.0)
+                self.assertEqual(publisher_process.exitcode, 0)
+                self.assertEqual(reader_process.exitcode, 0)
+                try:
+                    self.assertTrue(result_connection.poll(2.0))
+                    publisher_result = result_connection.recv()
+                    self.assertTrue(reader_connection.poll(2.0))
+                    reader_result = reader_connection.recv()
+                finally:
+                    result_connection.close()
+                    reader_connection.close()
+                    validation_entered_path.unlink(missing_ok=True)
+                    release_validation_path.unlink(missing_ok=True)
+                    reader_started_path.unlink(missing_ok=True)
+                    publisher_process.close()
+                    reader_process.close()
+                if validation_fails:
+                    self.assertEqual(publisher_result[0:2], ("error", "AuditInfrastructureError"))
+                else:
+                    self.assertEqual(publisher_result, ("ok", True))
+                self.assertEqual(reader_result, ("ok", not validation_fails))
+
+    def test_two_cache_instances_serialize_public_entry_observation(self):
         first = PreprocessCache(self.cache_root)
         second = PreprocessCache(self.cache_root)
         key = first._configuration_key(self.configuration)
         entry = self.cache_root / key
-        barrier = threading.Barrier(2)
+        rename_entered = threading.Event()
+        release_rename = threading.Event()
+        rename_count = 0
+        rename_count_lock = threading.Lock()
         real_rename = os.rename
         failures: list[BaseException] = []
 
         def rename(source, destination) -> None:
+            nonlocal rename_count
             if Path(source).name.startswith(f".tmp-{key}-") and Path(destination) == entry:
-                barrier.wait(timeout=5.0)
+                with rename_count_lock:
+                    rename_count += 1
+                    current_count = rename_count
+                if current_count == 1:
+                    rename_entered.set()
+                    if not release_rename.wait(timeout=5.0):
+                        raise AssertionError("rename release timed out")
             real_rename(source, destination)
 
         def publish(cache: PreprocessCache) -> None:
@@ -967,18 +1247,69 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 failures.append(error)
 
         with mock.patch("gpu_capability_cache.os.rename", side_effect=rename):
-            threads = [
-                threading.Thread(target=publish, args=(cache,))
-                for cache in (first, second)
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10.0)
+            first_thread = threading.Thread(target=publish, args=(first,))
+            second_thread = threading.Thread(target=publish, args=(second,))
+            first_thread.start()
+            self.assertTrue(rename_entered.wait(timeout=5.0))
+            second_thread.start()
+            try:
+                time.sleep(0.2)
+                self.assertEqual(rename_count, 1)
+            finally:
+                release_rename.set()
+                first_thread.join(timeout=10.0)
+                second_thread.join(timeout=10.0)
+            threads = (first_thread, second_thread)
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(failures, [])
+        self.assertEqual(rename_count, 1)
         self.assertIsNotNone(first.load(self.configuration))
         self.assertEqual(list(self.cache_root.glob(f".tmp-{key}-*")), [])
+
+    def test_blocked_preprocess_reader_honors_deadline_and_cancellation(self):
+        publisher = PreprocessCache(self.cache_root)
+        reader = PreprocessCache(self.cache_root)
+        view = self.view()
+        snapshots = publisher._snapshot_dependencies(view.dependencies, force=True)
+        validation_entered = threading.Event()
+        release_validation = threading.Event()
+        publication_failures: list[BaseException] = []
+
+        def final_validation() -> None:
+            validation_entered.set()
+            if not release_validation.wait(timeout=10.0):
+                raise AssertionError("final validation release timed out")
+
+        def publish() -> None:
+            try:
+                publisher._publish_stabilized(
+                    view,
+                    snapshots,
+                    final_validation=final_validation,
+                    deadline=time.monotonic() + 15.0,
+                )
+            except BaseException as error:
+                publication_failures.append(error)
+
+        publisher_thread = threading.Thread(target=publish)
+        publisher_thread.start()
+        self.assertTrue(validation_entered.wait(timeout=5.0))
+        try:
+            with self.assertRaisesRegex(AuditInfrastructureError, "lock deadline"):
+                reader.load(self.configuration, time.monotonic() + 0.05)
+            cancelled = threading.Event()
+            cancelled.set()
+            with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+                reader.load(
+                    self.configuration,
+                    time.monotonic() + 5.0,
+                    cancelled,
+                )
+        finally:
+            release_validation.set()
+            publisher_thread.join(timeout=10.0)
+        self.assertFalse(publisher_thread.is_alive())
+        self.assertEqual(publication_failures, [])
 
     def test_valid_winner_fails_if_losing_temporary_cannot_be_removed(self):
         winner = PreprocessCache(self.cache_root)

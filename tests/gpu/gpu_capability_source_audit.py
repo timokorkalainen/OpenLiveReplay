@@ -7018,7 +7018,7 @@ AUDIT_ENGINE_STAGE_BYTES = b"task-2-capability-stabilization"
 _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "gpu_capability_command.py": 1,
     "test_gpu_capability_audit_lanes.py": 1,
-    "test_gpu_capability_cache.py": 1,
+    "test_gpu_capability_cache.py": 2,
     "test_gpu_capability_command.py": 1,
     "test_gpu_capability_model.py": 1,
     "test_gpu_capability_provenance.py": 1,
