@@ -109,25 +109,38 @@ class _FilesystemGenerationObserver:
         libc = ctypes.CDLL(None, use_errno=True)
         initialize = getattr(libc, "inotify_init1", None)
         add_watch = getattr(libc, "inotify_add_watch", None)
-        if initialize is None or add_watch is None:
+        remove_watch = getattr(libc, "inotify_rm_watch", None)
+        if initialize is None or add_watch is None or remove_watch is None:
             raise AuditInfrastructureError("Linux inotify generation guards are unsupported")
         initialize.argtypes = (ctypes.c_int,)
         initialize.restype = ctypes.c_int
         add_watch.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
         add_watch.restype = ctypes.c_int
+        remove_watch.argtypes = (ctypes.c_int, ctypes.c_int)
+        remove_watch.restype = ctypes.c_int
         descriptor = int(initialize(os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)))
         if descriptor < 0:
             raise AuditInfrastructureError("Linux inotify generation guard setup failed")
         self._handles.append(descriptor)
-        mask = 0x00000002 | 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080
-        mask |= 0x00000200 | 0x00000400 | 0x00000800
-        watches: set[int] = set()
-        for path, _is_directory in paths:
+        mask = (
+            0x00000002 | 0x00000004 | 0x00000008
+            | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
+            | 0x00000400 | 0x00000800 | 0x00002000 | 0x02000000
+        )
+        watches: list[int] = []
+        directory_watches: set[int] = set()
+        self._owner = (remove_watch, watches)
+        for path, is_directory in paths:
             watch = int(add_watch(descriptor, os.fsencode(path), mask))
-            if watch < 0 or watch in watches:
+            if watch < 0:
                 raise AuditInfrastructureError("Linux inotify generation guard setup failed")
-            watches.add(watch)
-        self._owner = watches
+            if watch in watches:
+                if is_directory and watch in directory_watches:
+                    continue
+                raise AuditInfrastructureError("Linux inotify generation guard setup failed")
+            watches.append(watch)
+            if is_directory:
+                directory_watches.add(watch)
 
     def _arm_macos(self, paths: tuple[tuple[Path, bool], ...]) -> None:
         import select
@@ -213,6 +226,24 @@ class _FilesystemGenerationObserver:
             if queue is not None:
                 try:
                     queue.close()
+                except OSError as error:
+                    errors.append(error)
+        elif self._backend == "linux":
+            import ctypes
+            import errno
+
+            descriptor = self._handles[0] if self._handles else None
+            if descriptor is not None and self._owner is not None:
+                remove_watch, watches = self._owner
+                for watch in reversed(watches):
+                    ctypes.set_errno(0)
+                    if remove_watch(descriptor, watch) != 0:
+                        error_number = ctypes.get_errno()
+                        if error_number != errno.EINVAL:
+                            errors.append(OSError(error_number, "inotify_rm_watch failed"))
+            for descriptor in reversed(self._handles):
+                try:
+                    os.close(descriptor)
                 except OSError as error:
                     errors.append(error)
         else:

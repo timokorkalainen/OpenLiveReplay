@@ -2656,6 +2656,9 @@ def open_compiler_executable_capability(
         query_environment, query_working_directory,
         pipeline_deadline, cancel_event,
     )
+    alias_paths = tuple(dict.fromkeys(
+        Path(os.path.normpath(str(path))) for path in alias_paths
+    ))
     candidates = list(candidate_paths)
 
     streams: list[object] = []

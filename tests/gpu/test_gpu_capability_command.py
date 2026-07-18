@@ -1661,6 +1661,19 @@ class ConfigurationTests(unittest.TestCase):
             )
         self.assertIn(alias, capability.native_owner.alias_paths)
         self.assertIn(runtime.resolve(), capability.native_owner.file_paths)
+        try:
+            displaced = alias.with_name(f"{alias.name}.displaced")
+            alias.rename(displaced)
+            alias.symlink_to(runtime)
+            alias.unlink()
+            displaced.rename(alias)
+            with self.assertRaisesRegex(AuditInfrastructureError, "generation change"):
+                capability.native_owner.validate(
+                    content=False, deadline=time.monotonic() + 10.0,
+                    cancel_event=None,
+                )
+        finally:
+            capability.native_owner.close()
 
     def test_runtime_aggregate_is_reserved_before_any_binary_payload_read(self):
         runtimes = []

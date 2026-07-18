@@ -820,6 +820,61 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 cancelled,
             )
 
+    @unittest.skipIf(os.name == "nt", "POSIX flock semantics only")
+    def test_shared_lock_rejects_carrier_replacement_after_first_acquisition(self):
+        lock_type = capability_cache._SharedCacheFileLock
+        carrier = self.cache.root / ".compiler-inspection-root.lock"
+        first = lock_type(
+            carrier,
+            self.cache.root,
+            self.cache._root_identity,
+            time.monotonic() + 10.0,
+        )
+        first.__enter__()
+        attempted = threading.Event()
+        outcomes = []
+        real_lock = _PublicationGuard._lock
+
+        def observe_wait(stream, *, blocking):
+            acquired = real_lock(stream, blocking=blocking)
+            if not acquired:
+                attempted.set()
+            return acquired
+
+        def acquire_second():
+            second = lock_type(
+                carrier,
+                self.cache.root,
+                self.cache._root_identity,
+                time.monotonic() + 5.0,
+            )
+            try:
+                with second:
+                    outcomes.append("acquired")
+            except BaseException as error:
+                outcomes.append(error)
+
+        try:
+            with mock.patch.object(
+                _PublicationGuard, "_lock", side_effect=observe_wait
+            ):
+                waiter = threading.Thread(target=acquire_second)
+                waiter.start()
+                self.assertTrue(attempted.wait(timeout=2.0))
+                displaced = carrier.with_name(f"{carrier.name}.displaced")
+                carrier.rename(displaced)
+                carrier.write_bytes(b"1")
+                first.__exit__(None, None, None)
+                waiter.join(timeout=2.0)
+                self.assertFalse(waiter.is_alive())
+        finally:
+            if first.stream is not None:
+                first.__exit__(None, None, None)
+
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], AuditInfrastructureError)
+        self.assertRegex(str(outcomes[0]), "lock namespace")
+
     def test_inspection_publication_rejects_unsafe_shared_lock_carrier(self):
         inspection = self.inspection()
         seed = self.root / "inspection-lock-seed"
@@ -1589,6 +1644,73 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             "cannot remove cache publication temporary after OSError: disk full",
         ):
             cache.publish(self.view())
+
+    def test_preexisting_uuid_temporary_survives_failed_identity_capture(self):
+        cache = PreprocessCache(self.cache_root)
+        temporary = self.cache_root / (
+            f".tmp-{cache._configuration_key(self.configuration)}-{'f' * 32}"
+        )
+        temporary.mkdir()
+        manifest = temporary / "manifest.json"
+        payload = temporary / "payload.bin"
+        manifest.write_bytes(b"preexisting manifest")
+        payload.write_bytes(b"preexisting payload")
+
+        with mock.patch(
+            "gpu_capability_cache.uuid.uuid4",
+            return_value=mock.Mock(hex="f" * 32),
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "cannot publish GPU capability cache"
+        ):
+            cache.publish(self.view())
+
+        self.assertTrue(temporary.is_dir())
+        self.assertEqual(manifest.read_bytes(), b"preexisting manifest")
+        self.assertEqual(payload.read_bytes(), b"preexisting payload")
+
+    def test_replacement_during_temporary_identity_capture_survives(self):
+        cache = PreprocessCache(self.cache_root)
+        temporary = self.cache_root / (
+            f".tmp-{cache._configuration_key(self.configuration)}-{'e' * 32}"
+        )
+        displaced = temporary.with_name(f"{temporary.name}.displaced")
+        real_ordinary_directory = capability_cache._ordinary_directory
+
+        def replace_before_identity_capture(path):
+            if Path(path) == temporary and not displaced.exists():
+                temporary.rename(displaced)
+                temporary.mkdir()
+                (temporary / "manifest.json").write_bytes(b"replacement manifest")
+                (temporary / "payload.bin").write_bytes(b"replacement payload")
+                raise OSError("temporary identity capture failed")
+            return real_ordinary_directory(path)
+
+        try:
+            with mock.patch(
+                "gpu_capability_cache.uuid.uuid4",
+                return_value=mock.Mock(hex="e" * 32),
+            ), mock.patch(
+                "gpu_capability_cache._ordinary_directory",
+                side_effect=replace_before_identity_capture,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "cannot publish GPU capability cache"
+            ):
+                cache.publish(self.view())
+
+            self.assertTrue(temporary.is_dir())
+            self.assertEqual(
+                (temporary / "manifest.json").read_bytes(),
+                b"replacement manifest",
+            )
+            self.assertEqual(
+                (temporary / "payload.bin").read_bytes(),
+                b"replacement payload",
+            )
+        finally:
+            if temporary.exists():
+                _remove_held_flat_directory(temporary)
+            if displaced.exists():
+                _remove_held_flat_directory(displaced)
 
     def test_invalid_entry_replacement_cleanup_failure_is_fatal_and_bounded(self):
         cache = PreprocessCache(self.cache_root)

@@ -1520,7 +1520,7 @@ class OrchestrationTests(unittest.TestCase):
             read_fd, write_fd = os.pipe()
             observer = object.__new__(_FilesystemGenerationObserver)
             observer._backend = "linux"
-            observer._owner = set()
+            observer._owner = None
             observer._handles = [read_fd]
             observer._closed = False
             os.set_blocking(read_fd, False)

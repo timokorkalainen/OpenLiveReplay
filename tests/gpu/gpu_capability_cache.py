@@ -204,6 +204,17 @@ class _SharedCacheFileLock:
         if _directory_identity(metadata) != self.root_identity:
             raise AuditInfrastructureError("cache root was replaced")
 
+    def _assert_carrier(self, stream) -> None:
+        carrier = _regular_unlinked_file(self.path)
+        opened = os.fstat(stream.fileno())
+        if (
+            int(opened.st_dev) != int(carrier.st_dev)
+            or int(opened.st_ino) != int(carrier.st_ino)
+            or int(getattr(opened, "st_nlink", 1)) != 1
+            or int(opened.st_size) != 1
+        ):
+            raise OSError("cache lock carrier changed while opening")
+
     def __enter__(self) -> "_SharedCacheFileLock":
         if (
             not isinstance(self.deadline, (int, float))
@@ -221,20 +232,14 @@ class _SharedCacheFileLock:
             except FileExistsError:
                 stream = self.path.open("r+b")
             self.stream = stream
-            carrier = _regular_unlinked_file(self.path)
-            opened = os.fstat(stream.fileno())
-            if (
-                int(opened.st_dev) != int(carrier.st_dev)
-                or int(opened.st_ino) != int(carrier.st_ino)
-                or int(getattr(opened, "st_nlink", 1)) != 1
-                or int(opened.st_size) != 1
-            ):
-                raise OSError("cache lock carrier changed while opening")
+            self._assert_carrier(stream)
             while not _PublicationGuard._lock(stream, blocking=False):
                 self._check_budget()
                 time.sleep(min(0.01, max(0.0, self.deadline - time.monotonic())))
+            self._assert_carrier(stream)
             self._check_budget()
             self._assert_root()
+            self._assert_carrier(stream)
             return self
         except BaseException as error:
             if self.stream is not None:
@@ -1800,18 +1805,19 @@ class PreprocessCache:
                 self._publication_lock.release()
                 key_lock.__exit__(None, None, None)
         except (AuditInfrastructureError, OSError, ValueError) as error:
-            if not _remove_held_flat_directory(
-                temporary, expected_identity=temporary_identity
-            ):
-                try:
-                    temporary.lstat()
-                except FileNotFoundError:
-                    pass
-                else:
-                    raise AuditInfrastructureError(
-                        "cannot remove cache publication temporary after "
-                        f"{type(error).__name__}: {error}"
-                    ) from error
+            if temporary_identity is not None:
+                if not _remove_held_flat_directory(
+                    temporary, expected_identity=temporary_identity
+                ):
+                    try:
+                        temporary.lstat()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise AuditInfrastructureError(
+                            "cannot remove cache publication temporary after "
+                            f"{type(error).__name__}: {error}"
+                        ) from error
             if published_identity is not None and not _remove_held_flat_directory(
                 entry, expected_identity=published_identity
             ):

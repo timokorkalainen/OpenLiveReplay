@@ -297,6 +297,61 @@ class ModelTests(unittest.TestCase):
             )
         self.assertEqual(closed, [101])
 
+    def test_linux_generation_observer_no_follows_and_removes_exact_watches(self):
+        class Callable:
+            def __init__(self, function):
+                self.function = function
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *arguments):
+                return self.function(*arguments)
+
+        added = []
+        removed = []
+        watch_ids = iter((41, 42))
+        initialize = Callable(lambda _flags: 17)
+
+        def add_watch(descriptor, path, mask):
+            added.append((descriptor, path, mask))
+            return next(watch_ids)
+
+        add = Callable(add_watch)
+        remove = Callable(
+            lambda descriptor, watch: removed.append((descriptor, watch)) or 0
+        )
+        libc = SimpleNamespace(
+            inotify_init1=initialize,
+            inotify_add_watch=add,
+            inotify_rm_watch=remove,
+        )
+        observer = object.__new__(_FilesystemGenerationObserver)
+        observer._backend = "linux"
+        observer._owner = None
+        observer._handles = []
+        observer._closed = False
+        required_mask = (
+            0x00000002 | 0x00000004 | 0x00000008
+            | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
+            | 0x00000400 | 0x00000800 | 0x00002000 | 0x02000000
+        )
+        with mock.patch("ctypes.CDLL", return_value=libc), mock.patch(
+            "gpu_capability_model.os.O_NONBLOCK", 0x800, create=True
+        ), mock.patch(
+            "gpu_capability_model.os.O_CLOEXEC", 0x80000, create=True
+        ), mock.patch("gpu_capability_model.os.close") as close:
+            observer._arm_linux(
+                ((Path("/toolchain/lib.so"), False),
+                 (Path("/toolchain/lib.so.1"), False))
+            )
+            self.assertEqual(
+                [(descriptor, mask) for descriptor, _path, mask in added],
+                [(17, required_mask), (17, required_mask)],
+            )
+            observer.close()
+        self.assertEqual(removed, [(17, 42), (17, 41)])
+        close.assert_called_once_with(17)
+
     def test_configuration_audit_result_is_compact_frozen_and_sorted(self):
         dependency = self.dependency()
         finding = AuditResultFinding(
