@@ -429,6 +429,60 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 self.closure_digest, time.monotonic() + 10.0,
             )
 
+    def test_inspection_publish_rejects_preexisting_hardlinked_destination(self):
+        inspection = self.inspection()
+        key = compiler_inspection_cache_key(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64,
+            executable_capability_digest=self.capability_digest,
+            resolved_runtime_closure_digest=self.closure_digest,
+        )
+        destination = self.cache._path(key)
+        seed = self.root / "inspection-hardlink-seed"
+        seed.write_bytes(b"unsafe destination")
+        try:
+            os.link(seed, destination)
+        except OSError as error:
+            self.skipTest(f"hardlinks unavailable: {error}")
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "alias|namespace|ordinary"
+        ):
+            self.cache.publish(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, inspection, time.monotonic() + 10.0,
+            )
+        self.assertEqual(os.path.samefile(seed, destination), True)
+
+    def test_existing_equal_inspection_winner_is_preserved(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        key = compiler_inspection_cache_key(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64,
+            executable_capability_digest=self.capability_digest,
+            resolved_runtime_closure_digest=self.closure_digest,
+        )
+        destination = self.cache._path(key)
+        before = destination.stat()
+        self.assertEqual(
+            self.cache.publish(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, inspection, time.monotonic() + 10.0,
+            ),
+            inspection,
+        )
+        after = destination.stat()
+        self.assertEqual(
+            (int(after.st_dev), int(after.st_ino)),
+            (int(before.st_dev), int(before.st_ino)),
+        )
+
     def test_live_compiler_mutation_during_cache_decode_remains_fatal(self):
         inspection = self.inspection()
         self.cache.publish(

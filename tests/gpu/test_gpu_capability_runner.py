@@ -173,7 +173,10 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 deadline if deadline is not None else time.monotonic() + 10.0,
             )
 
-    def stabilize_fixture(self, mode: str, *extra: str):
+    def stabilize_fixture(
+        self, mode: str, *extra: str,
+        cancel_event: object | None = None,
+    ):
         configuration = self.configuration(mode)
 
         def rewrite(_configuration, dependency_output):
@@ -203,6 +206,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 self.production,
                 AuditLimits(rss_bytes=2**63 - 1),
                 time.monotonic() + 10.0,
+                cancel_event,
             )
 
     def test_cold_stabilization_invokes_twice_but_builds_once(self):
@@ -917,7 +921,13 @@ class BoundedPreprocessorTests(unittest.TestCase):
             "gpu_capability_runner.stabilize_and_parse_configuration",
             return_value=(
                 expected,
-                SimpleNamespace(dependency_identities=expected.dependencies),
+                SimpleNamespace(
+                    dependency_identities=expected.dependencies,
+                    dependencies=capability_runner._dependency_digests(
+                        expected.dependencies, self.dependency_roots,
+                        time.monotonic() + 10.0, None,
+                    ),
+                ),
                 None,
             ),
         ) as preprocess:
@@ -981,6 +991,60 @@ class BoundedPreprocessorTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertIsNone(cache.load(configuration))
 
+    def test_post_accepted_same_inode_mutation_never_publishes_old_tokens(self):
+        configuration = self.configuration("success")
+        cache = PreprocessCache(self.root / "cache")
+        before = self.source.stat()
+
+        def mutate_after_accepted(*_arguments, **_kwargs):
+            result = self.stabilize_fixture("success")
+            self.source.write_text("other.nativeHandle();\n", encoding="utf-8")
+            after = self.source.stat()
+            self.assertEqual(int(after.st_ino), int(before.st_ino))
+            self.assertEqual(
+                self.source.read_text(encoding="utf-8").count("\n"),
+                self.identity.line_count,
+            )
+            return result
+
+        with mock.patch(
+            "gpu_capability_runner.stabilize_and_parse_configuration",
+            side_effect=mutate_after_accepted,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "dependency content changed"
+        ):
+            load_or_preprocess(
+                configuration,
+                self.dependency_roots,
+                self.production,
+                cache,
+                AuditLimits(rss_bytes=2**63 - 1),
+                time.monotonic() + 10.0,
+            )
+        self.assertIsNone(cache.load(configuration))
+
+    def test_cancellation_after_accepted_dependency_parse_prevents_success(self):
+        cancellation = threading.Event()
+        original = capability_runner._parse_dependency_output
+        calls = 0
+
+        def cancel_after_accepted(*arguments, **kwargs):
+            nonlocal calls
+            result = original(*arguments, **kwargs)
+            calls += 1
+            if calls == 2:
+                cancellation.set()
+            return result
+
+        with mock.patch(
+            "gpu_capability_runner._parse_dependency_output",
+            side_effect=cancel_after_accepted,
+        ), self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            self.stabilize_fixture(
+                "success", cancel_event=cancellation
+            )
+        self.assertEqual(calls, 2)
+
     def test_load_or_preprocess_rejects_transient_output_even_when_content_is_restored(self):
         configuration = self.configuration("success")
         cache = PreprocessCache(self.root / "cache")
@@ -1025,7 +1089,13 @@ class BoundedPreprocessorTests(unittest.TestCase):
 
         def preprocess(*_arguments):
             view = views[threading.current_thread().name]
-            return view, SimpleNamespace(dependency_identities=view.dependencies), None
+            return view, SimpleNamespace(
+                dependency_identities=view.dependencies,
+                dependencies=capability_runner._dependency_digests(
+                    view.dependencies, self.dependency_roots,
+                    time.monotonic() + 10.0, None,
+                ),
+            ), None
 
         def run(cache: PreprocessCache) -> None:
             try:
@@ -1358,6 +1428,81 @@ class OrchestrationTests(unittest.TestCase):
             ),
             dependencies,
         )
+
+    def test_final_guarded_hash_polls_cancellation_before_during_and_after(self):
+        sequence = 0
+
+        def arm(payload: str):
+            nonlocal sequence
+            sequence += 1
+            relative = f"playback/cancel-guard-{sequence}.h"
+            path = self.write_source(relative, payload)
+            identity = self.identity(path, relative)
+            dependencies = capability_runner._dependency_digests(
+                (identity,), self.dependency_roots,
+                time.monotonic() + 10.0, None,
+            )
+            discovery = capability_runner.PreprocessDiscovery(
+                capability_runner.StreamDigest("a" * 64, 1),
+                dependencies, (identity,),
+            )
+            preflight = capability_runner.preflight_dependency_generation_guards(
+                discovery, self.dependency_roots, AuditLimits()
+            )
+            return capability_runner.arm_dependency_generation_guards(
+                preflight, self.dependency_roots, time.monotonic() + 10.0
+            )
+
+        before = threading.Event()
+        before.set()
+        with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            capability_runner.validate_and_hash_guarded_dependencies(
+                arm("before\n"), time.monotonic() + 10.0, before
+            )
+
+        during = threading.Event()
+        during_guards = arm("x" * (2 * 1024 * 1024 + 1))
+        during_owner = during_guards[0].platform_watch
+        wrapped = during_owner._streams[0]
+
+        class CancellingStream:
+            def fileno(self):
+                return wrapped.fileno()
+
+            def seek(self, *arguments):
+                return wrapped.seek(*arguments)
+
+            def read(self, *arguments):
+                chunk = wrapped.read(*arguments)
+                if chunk:
+                    during.set()
+                return chunk
+
+            def close(self):
+                wrapped.close()
+
+        during_owner._streams[0] = CancellingStream()
+        with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            capability_runner.validate_and_hash_guarded_dependencies(
+                during_guards, time.monotonic() + 10.0, during
+            )
+
+        after = threading.Event()
+        after_guards = arm("after\n")
+        after_owner = after_guards[0].platform_watch
+        real_validate = after_owner.validate_and_hash
+
+        def cancel_after(deadline, cancel_event):
+            result = real_validate(deadline, cancel_event)
+            after.set()
+            return result
+
+        with mock.patch.object(
+            after_owner, "validate_and_hash", side_effect=cancel_after
+        ), self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            capability_runner.validate_and_hash_guarded_dependencies(
+                after_guards, time.monotonic() + 10.0, after
+            )
 
     def test_guard_metadata_admission_fails_before_first_open_or_watch(self):
         fields = AuditLimits.__dataclass_fields__

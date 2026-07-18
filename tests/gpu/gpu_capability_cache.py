@@ -976,6 +976,32 @@ class CompilerInspectionCache:
                     stream.flush()
                     os.fsync(stream.fileno())
                 self._assert_root()
+                try:
+                    _regular_unlinked_file(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    raise AuditInfrastructureError(
+                        "compiler inspection cache namespace is unsafe"
+                    ) from error
+                else:
+                    winner = self.load(
+                        compiler,
+                        compiler_family,
+                        launcher_environment,
+                        authority,
+                        expected_audit_engine_fingerprint,
+                        executable_capability_digest,
+                        resolved_runtime_closure_digest,
+                        pipeline_deadline,
+                    )
+                    if winner is not None:
+                        if winner != inspection:
+                            raise AuditInfrastructureError(
+                                "concurrent compiler inspection winner differs"
+                            )
+                        temporary.unlink()
+                        return winner
                 os.replace(temporary, path)
                 self._assert_root()
             except OSError as error:

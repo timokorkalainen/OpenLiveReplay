@@ -1242,10 +1242,14 @@ def _guard_owner(
 def validate_and_hash_guarded_dependencies(
     guards: tuple[DependencyGenerationGuard, ...],
     deadline: float,
+    cancel_event: object | None = None,
 ) -> tuple[DependencyDigest, ...]:
     owner = _guard_owner(guards)
     try:
-        return owner.validate_and_hash(deadline, None)
+        _check_dependency_budget(deadline, cancel_event)
+        result = owner.validate_and_hash(deadline, cancel_event)
+        _check_dependency_budget(deadline, cancel_event)
+        return result
     finally:
         owner.close()
 
@@ -1343,7 +1347,7 @@ def stabilize_and_parse_configuration(
                 deadline, cancel_event,
             )
             accepted_dependencies = validate_and_hash_guarded_dependencies(
-                guards, deadline
+                guards, deadline, cancel_event
             )
             if tuple(item.identity for item in accepted_dependencies) != accepted_identities:
                 raise AuditInfrastructureError("dependency closure changed")
@@ -1482,6 +1486,14 @@ def load_or_preprocess(
         raise AuditInfrastructureError(
             "dependency changed during preprocessing"
         ) from error
+    if len(snapshots) != len(discovery.dependencies) or any(
+        snapshot.identity != dependency.identity
+        or snapshot.sha256 != dependency.sha256
+        for snapshot, dependency in zip(snapshots, discovery.dependencies)
+    ):
+        raise AuditInfrastructureError(
+            "dependency content changed during preprocessing"
+        )
     if accepted.configuration != configuration:
         raise AuditInfrastructureError(
             "preprocessor returned a mismatched accepted configuration"
