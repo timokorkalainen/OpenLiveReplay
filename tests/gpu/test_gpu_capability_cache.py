@@ -821,7 +821,7 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             )
 
     @unittest.skipIf(os.name == "nt", "POSIX flock semantics only")
-    def test_shared_lock_rejects_carrier_replacement_after_first_acquisition(self):
+    def test_shared_lock_serializes_waiter_across_carrier_replacement(self):
         lock_type = capability_cache._SharedCacheFileLock
         carrier = self.cache.root / ".compiler-inspection-root.lock"
         first = lock_type(
@@ -833,14 +833,6 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         first.__enter__()
         attempted = threading.Event()
         outcomes = []
-        real_lock = _PublicationGuard._lock
-
-        def observe_wait(stream, *, blocking):
-            acquired = real_lock(stream, blocking=blocking)
-            if not acquired:
-                attempted.set()
-            return acquired
-
         def acquire_second():
             second = lock_type(
                 carrier,
@@ -849,31 +841,70 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 time.monotonic() + 5.0,
             )
             try:
+                attempted.set()
                 with second:
                     outcomes.append("acquired")
             except BaseException as error:
                 outcomes.append(error)
 
         try:
-            with mock.patch.object(
-                _PublicationGuard, "_lock", side_effect=observe_wait
-            ):
-                waiter = threading.Thread(target=acquire_second)
-                waiter.start()
-                self.assertTrue(attempted.wait(timeout=2.0))
-                displaced = carrier.with_name(f"{carrier.name}.displaced")
-                carrier.rename(displaced)
-                carrier.write_bytes(b"1")
-                first.__exit__(None, None, None)
-                waiter.join(timeout=2.0)
-                self.assertFalse(waiter.is_alive())
+            waiter = threading.Thread(target=acquire_second)
+            waiter.start()
+            self.assertTrue(attempted.wait(timeout=2.0))
+            displaced = carrier.with_name(f"{carrier.name}.displaced")
+            carrier.rename(displaced)
+            carrier.write_bytes(b"1")
+            time.sleep(0.05)
+            self.assertTrue(waiter.is_alive())
+            first.__exit__(None, None, None)
+            waiter.join(timeout=2.0)
+            self.assertFalse(waiter.is_alive())
         finally:
             if first.stream is not None:
                 first.__exit__(None, None, None)
 
         self.assertEqual(len(outcomes), 1)
-        self.assertIsInstance(outcomes[0], AuditInfrastructureError)
-        self.assertRegex(str(outcomes[0]), "lock namespace")
+        self.assertEqual(outcomes[0], "acquired")
+
+    @unittest.skipIf(os.name == "nt", "POSIX flock semantics only")
+    def test_post_replacement_opener_cannot_split_lock_namespace(self):
+        lock_type = capability_cache._SharedCacheFileLock
+        carrier = self.cache.root / ".compiler-inspection-root.lock"
+        first = lock_type(
+            carrier,
+            self.cache.root,
+            self.cache._root_identity,
+            time.monotonic() + 10.0,
+        )
+        first.__enter__()
+        displaced = carrier.with_name(f"{carrier.name}.displaced")
+        carrier.rename(displaced)
+        carrier.write_bytes(b"1")
+        outcomes = []
+
+        def acquire_replacement_carrier():
+            try:
+                with lock_type(
+                    carrier,
+                    self.cache.root,
+                    self.cache._root_identity,
+                    time.monotonic() + 0.15,
+                ):
+                    outcomes.append("acquired-concurrently")
+            except BaseException as error:
+                outcomes.append(error)
+
+        waiter = threading.Thread(target=acquire_replacement_carrier)
+        try:
+            waiter.start()
+            waiter.join(timeout=2.0)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(len(outcomes), 1)
+            self.assertIsInstance(outcomes[0], AuditInfrastructureError)
+            self.assertRegex(str(outcomes[0]), "deadline|namespace")
+        finally:
+            first.__exit__(None, None, None)
+            waiter.join(timeout=2.0)
 
     def test_inspection_publication_rejects_unsafe_shared_lock_carrier(self):
         inspection = self.inspection()
@@ -1556,6 +1587,126 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                     call.kwargs == {"blocking": False}
                     for call in acquire.call_args_list
                 ))
+
+    def test_publication_guard_replacement_survives_failed_cleanup(self):
+        directory = self.root / "active-guard-replacement"
+        directory.mkdir()
+        guard_path = directory / "active.lock"
+        displaced = directory / "owned-active.lock"
+        replacement = b"replacement publication guard"
+
+        def replace_before_cleanup(path):
+            self.assertEqual(Path(path), guard_path)
+            guard_path.rename(displaced)
+            guard_path.write_bytes(replacement)
+
+        cancelled = threading.Event()
+        cancelled.set()
+        try:
+            with mock.patch(
+                "gpu_capability_cache._before_file_temporary_cleanup",
+                side_effect=replace_before_cleanup,
+                create=True,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "publication guard.*replaced"
+            ):
+                with _PublicationGuard(
+                    guard_path, time.monotonic() + 10.0, cancelled
+                ):
+                    self.fail("cancelled publication guard was entered")
+            self.assertEqual(guard_path.read_bytes(), replacement)
+        finally:
+            guard_path.unlink(missing_ok=True)
+            displaced.unlink(missing_ok=True)
+
+    def test_record_access_replacement_survives_failed_cleanup(self):
+        cache = PreprocessCache(self.cache_root)
+        key = "a" * 64
+        temporary = self.cache_root / f".tmp-access-{key}-{'f' * 32}"
+        displaced = self.cache_root / "owned-access-temporary"
+        replacement = b"replacement access marker"
+
+        def replace_before_cleanup(path):
+            self.assertEqual(Path(path), temporary)
+            temporary.rename(displaced)
+            temporary.write_bytes(replacement)
+
+        try:
+            with mock.patch(
+                "gpu_capability_cache.uuid.uuid4",
+                return_value=mock.Mock(hex="f" * 32),
+            ), mock.patch(
+                "gpu_capability_cache.os.utime",
+                side_effect=OSError("access timestamp failed"),
+            ), mock.patch(
+                "gpu_capability_cache._before_file_temporary_cleanup",
+                side_effect=replace_before_cleanup,
+                create=True,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "access temporary.*replaced"
+            ):
+                cache._record_access(key)
+            self.assertEqual(temporary.read_bytes(), replacement)
+        finally:
+            temporary.unlink(missing_ok=True)
+            displaced.unlink(missing_ok=True)
+
+    def test_publication_guard_owned_cleanup_failure_is_fatal(self):
+        directory = self.root / "active-guard-cleanup-failure"
+        directory.mkdir()
+        guard_path = directory / "active.lock"
+        cancelled = threading.Event()
+        cancelled.set()
+        real_unlink = Path.unlink
+
+        def reject_guard_unlink(path, *args, **kwargs):
+            if Path(path) == guard_path:
+                raise PermissionError("deterministic guard cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                Path, "unlink", autospec=True, side_effect=reject_guard_unlink
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "cannot remove cache publication guard temporary.*cancelled",
+            ):
+                with _PublicationGuard(
+                    guard_path, time.monotonic() + 10.0, cancelled
+                ):
+                    self.fail("cancelled publication guard was entered")
+            self.assertTrue(guard_path.exists())
+        finally:
+            guard_path.unlink(missing_ok=True)
+
+    def test_record_access_owned_cleanup_failure_is_fatal(self):
+        cache = PreprocessCache(self.cache_root)
+        key = "b" * 64
+        temporary = self.cache_root / f".tmp-access-{key}-{'e' * 32}"
+        real_unlink = Path.unlink
+
+        def reject_access_unlink(path, *args, **kwargs):
+            if Path(path) == temporary:
+                raise PermissionError("deterministic access cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with mock.patch(
+                "gpu_capability_cache.uuid.uuid4",
+                return_value=mock.Mock(hex="e" * 32),
+            ), mock.patch(
+                "gpu_capability_cache.os.utime",
+                side_effect=OSError("access timestamp failed"),
+            ), mock.patch.object(
+                Path, "unlink", autospec=True, side_effect=reject_access_unlink
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "cannot remove cache access temporary.*timestamp failed",
+            ):
+                cache._record_access(key)
+            self.assertTrue(temporary.exists())
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def test_explicit_cache_deadline_is_capped_from_operation_start(self):
         with mock.patch(

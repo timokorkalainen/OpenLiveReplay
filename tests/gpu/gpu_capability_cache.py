@@ -79,6 +79,7 @@ class _PublicationGuard:
         self.deadline = deadline
         self.cancel_event = cancel_event
         self.stream = None
+        self.temporary_identity: tuple[int, int] | None = None
 
     def _check_budget(self) -> None:
         if self.cancel_event is not None:
@@ -132,6 +133,9 @@ class _PublicationGuard:
 
     def __enter__(self) -> "_PublicationGuard":
         self.stream = self.path.open("x+b")
+        self.temporary_identity = _file_ownership_identity(
+            os.fstat(self.stream.fileno())
+        )
         self.stream.write(b"1")
         self.stream.flush()
         try:
@@ -150,13 +154,12 @@ class _PublicationGuard:
         except BaseException as error:
             self.stream.close()
             self.stream = None
-            try:
-                self.path.unlink()
-            except OSError as cleanup_error:
-                raise AuditInfrastructureError(
-                    "cannot remove cache publication guard after "
-                    f"{type(error).__name__}: {error}"
-                ) from cleanup_error
+            _cleanup_owned_temporary_file(
+                self.path,
+                self.temporary_identity,
+                "cache publication guard temporary",
+                error,
+            )
             raise
 
     def __exit__(self, _type, _value, _traceback) -> None:
@@ -178,13 +181,18 @@ class _SharedCacheFileLock:
         root_identity: tuple[int, int | None],
         deadline: float,
         cancel_event: object | None = None,
+        namespace_path: Path | None = None,
     ) -> None:
         self.path = path
         self.root = root
         self.root_identity = root_identity
         self.deadline = deadline
         self.cancel_event = cancel_event
+        self.namespace_path = namespace_path
         self.stream = None
+        self.namespace_stream = None
+        self._namespace_locked = False
+        self._root_fd: int | None = None
 
     def _check_budget(self) -> None:
         if self.cancel_event is not None:
@@ -205,7 +213,11 @@ class _SharedCacheFileLock:
             raise AuditInfrastructureError("cache root was replaced")
 
     def _assert_carrier(self, stream) -> None:
-        carrier = _regular_unlinked_file(self.path)
+        self._assert_carrier_at(self.path, stream)
+
+    @staticmethod
+    def _assert_carrier_at(path: Path, stream) -> None:
+        carrier = _regular_unlinked_file(path)
         opened = os.fstat(stream.fileno())
         if (
             int(opened.st_dev) != int(carrier.st_dev)
@@ -214,6 +226,64 @@ class _SharedCacheFileLock:
             or int(opened.st_size) != 1
         ):
             raise OSError("cache lock carrier changed while opening")
+
+    def _acquire_root_anchor(self) -> None:
+        if os.name == "nt":
+            return
+        import fcntl
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        fd = os.open(self.root, flags)
+        self._root_fd = fd
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or _directory_identity(opened) != self.root_identity
+        ):
+            raise AuditInfrastructureError("cache root was replaced")
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                self._check_budget()
+                time.sleep(min(
+                    0.01, max(0.0, self.deadline - time.monotonic())
+                ))
+        self._check_budget()
+        self._assert_root()
+        if _directory_identity(os.fstat(fd)) != self.root_identity:
+            raise AuditInfrastructureError("cache root was replaced")
+
+    def _release_root_anchor(self) -> None:
+        if self._root_fd is None:
+            return
+        fd = self._root_fd
+        self._root_fd = None
+        try:
+            if os.name != "nt":
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _release_namespace(self) -> None:
+        if self.namespace_stream is None:
+            return
+        stream = self.namespace_stream
+        self.namespace_stream = None
+        try:
+            if self._namespace_locked:
+                _PublicationGuard._unlock(stream)
+        finally:
+            self._namespace_locked = False
+            stream.close()
 
     def __enter__(self) -> "_SharedCacheFileLock":
         if (
@@ -224,6 +294,26 @@ class _SharedCacheFileLock:
         self._check_budget()
         try:
             self._assert_root()
+            self._acquire_root_anchor()
+            if self.namespace_path is not None and self.namespace_path != self.path:
+                try:
+                    namespace_stream = self.namespace_path.open("x+b")
+                    namespace_stream.write(b"1")
+                    namespace_stream.flush()
+                    os.fsync(namespace_stream.fileno())
+                except FileExistsError:
+                    namespace_stream = self.namespace_path.open("r+b")
+                self.namespace_stream = namespace_stream
+                self._assert_carrier_at(self.namespace_path, namespace_stream)
+                while not _PublicationGuard._lock(
+                    namespace_stream, blocking=False
+                ):
+                    self._check_budget()
+                    time.sleep(min(
+                        0.01, max(0.0, self.deadline - time.monotonic())
+                    ))
+                self._namespace_locked = True
+                self._assert_carrier_at(self.namespace_path, namespace_stream)
             try:
                 stream = self.path.open("x+b")
                 stream.write(b"1")
@@ -242,9 +332,15 @@ class _SharedCacheFileLock:
             self._assert_carrier(stream)
             return self
         except BaseException as error:
-            if self.stream is not None:
-                self.stream.close()
-                self.stream = None
+            try:
+                if self.stream is not None:
+                    self.stream.close()
+                    self.stream = None
+            finally:
+                try:
+                    self._release_namespace()
+                finally:
+                    self._release_root_anchor()
             if isinstance(error, AuditInfrastructureError):
                 raise
             raise AuditInfrastructureError(
@@ -256,8 +352,14 @@ class _SharedCacheFileLock:
         try:
             _PublicationGuard._unlock(self.stream)
         finally:
-            self.stream.close()
-            self.stream = None
+            try:
+                self.stream.close()
+                self.stream = None
+            finally:
+                try:
+                    self._release_namespace()
+                finally:
+                    self._release_root_anchor()
 
 
 def _temporary_publication_is_active(path: Path) -> bool:
@@ -865,6 +967,45 @@ def _held_compiler_snapshot(compiler: Path) -> tuple[FileIdentity, str]:
     )
 
 
+def _file_ownership_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int] | None:
+    inode = int(metadata.st_ino)
+    if inode == 0:
+        return None
+    return int(metadata.st_dev), inode
+
+
+def _before_file_temporary_cleanup(_path: Path) -> None:
+    """Test seam for deterministic temporary replacement-race coverage."""
+
+
+def _cleanup_owned_temporary_file(
+    path: Path,
+    expected_identity: tuple[int, int] | None,
+    label: str,
+    original_error: BaseException,
+) -> None:
+    if expected_identity is None:
+        return
+    _before_file_temporary_cleanup(path)
+    try:
+        metadata = _regular_unlinked_file(path)
+    except FileNotFoundError:
+        return
+    except OSError as cleanup_error:
+        raise AuditInfrastructureError(f"{label} was replaced") from cleanup_error
+    if _file_ownership_identity(metadata) != expected_identity:
+        raise AuditInfrastructureError(f"{label} was replaced") from original_error
+    try:
+        path.unlink()
+    except OSError as cleanup_error:
+        raise AuditInfrastructureError(
+            f"cannot remove {label} after "
+            f"{type(original_error).__name__}: {original_error}"
+        ) from cleanup_error
+
+
 def compiler_inspection_cache_key(
     compiler: Path,
     compiler_family: CompilerFamily,
@@ -973,6 +1114,7 @@ class CompilerInspectionCache:
             self._root_identity,
             deadline,
             cancel_event,
+            self.root / ".compiler-inspection-root.lock",
         )
 
     def load(
@@ -1175,9 +1317,7 @@ class CompilerInspectionCache:
         temporary = self.root / f".tmp-inspection-{uuid.uuid4().hex}"
         temporary_identity: tuple[int, int | None, int, int] | None = None
         path = self._path(key)
-        with self._root_lock(
-            operation_deadline, cancel_event
-        ), self._key_lock(
+        with self._key_lock(
             key, operation_deadline, cancel_event
         ):
             try:
@@ -1338,6 +1478,7 @@ class PreprocessCache:
             self._root_identity,
             deadline,
             cancel_event,
+            self.root / ".preprocess-root.lock",
         )
 
     def _acquire_key_barrier(
@@ -1347,8 +1488,7 @@ class PreprocessCache:
         cancel_event: object | None = None,
     ) -> _SharedCacheFileLock:
         key_lock = self._key_lock(key, deadline, cancel_event)
-        with self._root_lock(deadline, cancel_event):
-            key_lock.__enter__()
+        key_lock.__enter__()
         return key_lock
 
     def _assert_root_identity(self) -> None:
@@ -1391,9 +1531,13 @@ class PreprocessCache:
 
     def _record_access(self, key: str, now: float | None = None) -> None:
         temporary = self.root / f".tmp-access-{key}-{uuid.uuid4().hex}"
+        temporary_identity: tuple[int, int] | None = None
         try:
             self._assert_root_identity()
             with temporary.open("xb") as stream:
+                temporary_identity = _file_ownership_identity(
+                    os.fstat(stream.fileno())
+                )
                 stream.write(b"1\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -1402,11 +1546,13 @@ class PreprocessCache:
             self._assert_root_identity()
             os.replace(temporary, self._access_path(key))
             self._assert_root_identity()
-        except OSError:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
+        except OSError as error:
+            _cleanup_owned_temporary_file(
+                temporary,
+                temporary_identity,
+                "cache access temporary",
+                error,
+            )
 
     def _load_manifest(self, entry: Path, key: str) -> dict[str, object]:
         _ordinary_directory(entry)

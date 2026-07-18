@@ -82,9 +82,16 @@ class _FilesystemGenerationObserver:
         self._owner = (kernel32, close_handle)
         invalid = ctypes.c_void_p(-1).value
         for path, is_directory in paths:
-            access = 0 if is_directory else 0x80000000  # GENERIC_READ
+            metadata = path.lstat()
+            is_alias = stat.S_ISLNK(metadata.st_mode) or bool(
+                getattr(metadata, "st_file_attributes", 0) & _REPARSE_ATTRIBUTE
+            )
+            access = 0 if is_directory or is_alias else 0x80000000  # GENERIC_READ
             share = 0x1 | (0x2 if is_directory else 0)  # never FILE_SHARE_DELETE
-            flags = 0x02000000 if is_directory else 0x00000080
+            flags = (
+                (0x02000000 if is_directory or is_alias else 0x00000080)
+                | (0x00200000 if is_alias else 0)
+            )
             handle = create_file(str(path), access, share, None, 3, flags, None)
             numeric = ctypes.cast(handle, ctypes.c_void_p).value
             if numeric in (None, invalid):

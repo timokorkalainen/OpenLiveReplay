@@ -4,6 +4,7 @@ import dataclasses
 import inspect
 import locale
 import os
+import re
 import subprocess
 import struct
 import sys
@@ -1675,6 +1676,43 @@ class ConfigurationTests(unittest.TestCase):
         finally:
             capability.native_owner.close()
 
+    @unittest.skipIf(os.name == "nt", "directory symlink mutation proof runs under WSL")
+    def test_nested_runtime_ancestor_symlink_swap_restore_is_guarded(self):
+        real_directory = self.compiler.parent / "real-runtime-directory"
+        alias_directory = self.compiler.parent / "runtime-directory-alias"
+        real_directory.mkdir()
+        runtime = real_directory / "libancestor.so"
+        runtime.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        try:
+            alias_directory.symlink_to(real_directory, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"directory symlinks unavailable: {error}")
+
+        resolved = capability_command._resolve_runtime_candidate(
+            alias_directory / runtime.name, self.dependency_roots
+        )
+        self.assertIsNotNone(resolved)
+        resolved_path, aliases = resolved
+        self.assertIn(alias_directory, aliases)
+        chains = capability_command._runtime_path_chains(
+            self.dependency_roots, (resolved_path, *aliases)
+        )
+        observer = capability_command._FilesystemGenerationObserver(
+            tuple((path, True) for path in chains)
+            + tuple((path, False) for path in aliases)
+            + ((resolved_path, False),)
+        )
+        displaced = alias_directory.with_name(f"{alias_directory.name}.displaced")
+        try:
+            alias_directory.rename(displaced)
+            alias_directory.symlink_to(real_directory, target_is_directory=True)
+            alias_directory.unlink()
+            displaced.rename(alias_directory)
+            with self.assertRaisesRegex(AuditInfrastructureError, "generation change"):
+                observer.drain()
+        finally:
+            observer.close()
+
     def test_runtime_aggregate_is_reserved_before_any_binary_payload_read(self):
         runtimes = []
         for index in range(5):
@@ -1872,7 +1910,8 @@ class ConfigurationTests(unittest.TestCase):
             "gpu_capability_command._probe_compiler_version",
             side_effect=replace_during_probe,
         ), self.assertRaisesRegex(
-            AuditInfrastructureError, "changed during compiler version probe"
+            AuditInfrastructureError,
+            "changed during compiler version probe|generation change observed",
         ):
             make_configuration(
                 self.entry(), self.database, 3, self.source_root, self.production,
@@ -1968,7 +2007,8 @@ class ConfigurationTests(unittest.TestCase):
             "gpu_capability_command._probe_compiler_version"
         ) as probe, self.assertRaisesRegex(
             AuditInfrastructureError,
-            "compiler executable changed during compiler version probe",
+            "compiler executable changed during compiler version probe|"
+            "generation change observed",
         ):
             make_configuration(
                 self.entry(),
@@ -2331,7 +2371,7 @@ class ConfigurationTests(unittest.TestCase):
             "import os,pathlib,subprocess,sys\n"
             "if os.environ.get('GPU_PROBE_SITE_GUARD') != '1':\n"
             " os.environ['GPU_PROBE_SITE_GUARD']='1'\n"
-            " child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], env=os.environ.copy())\n"
+            " child=subprocess.Popen([os.environ['GPU_PROBE_PYTHON'], '-c', 'import time; time.sleep(30)'], env=os.environ.copy())\n"
             " pathlib.Path(os.environ['GPU_PROBE_STARTUP_PID']).write_text(str(child.pid), encoding='ascii')\n",
             encoding="utf-8",
         )
@@ -2346,7 +2386,7 @@ class ConfigurationTests(unittest.TestCase):
         parent.write_text(
             "import os,pathlib,subprocess,sys\n"
             f"child_code={child_code!r}\n"
-            "child=subprocess.Popen([sys.executable, '-c', child_code], env=os.environ.copy())\n"
+            "child=subprocess.Popen([os.environ['GPU_PROBE_PYTHON'], '-c', child_code], env=os.environ.copy())\n"
             "pathlib.Path(os.environ['GPU_PROBE_PID']).write_text(str(child.pid), encoding='ascii')\n"
             "print('gcc (GCC) 13.1.0', flush=True)\n",
             encoding="utf-8",
@@ -2356,6 +2396,7 @@ class ConfigurationTests(unittest.TestCase):
             GPU_PROBE_PID=str(pid_file),
             GPU_PROBE_STARTUP_PID=str(startup_pid_file),
             GPU_PROBE_HEARTBEAT=str(heartbeat),
+            GPU_PROBE_PYTHON=str(Path(sys.executable).resolve()),
             PYTHONPATH=str(fixture),
         )
         from gpu_capability_command import _run_probe_command, _WindowsProbeJob
@@ -2364,6 +2405,14 @@ class ConfigurationTests(unittest.TestCase):
             python_roots["windows-system"] = Path(
                 os.environ.get("SystemRoot", "C:/Windows")
             ).resolve()
+        else:
+            runtime_imports = capability_command._binary_runtime_imports(
+                Path(sys.executable)
+            )
+            for index, interpreter in enumerate(runtime_imports.interpreters):
+                python_roots[f"python-interpreter-{index}"] = Path(
+                    interpreter
+                ).resolve().parent
         python_authority = build_dependency_root_authority(fixture, python_roots)
         capability = open_compiler_executable_capability(
             Path(sys.executable), python_authority, time.monotonic() + 60.0

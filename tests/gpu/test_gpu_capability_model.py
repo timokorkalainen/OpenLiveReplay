@@ -289,9 +289,14 @@ class ModelTests(unittest.TestCase):
         observer = object.__new__(_FilesystemGenerationObserver)
         observer._handles = []
         observer._owner = None
-        with mock.patch("ctypes.WinDLL", return_value=kernel32), self.assertRaisesRegex(
-            AuditInfrastructureError, "setup failed"
-        ):
+        regular_metadata = SimpleNamespace(
+            st_mode=0o100644, st_file_attributes=0
+        )
+        with mock.patch(
+            "ctypes.WinDLL", return_value=kernel32
+        ), mock.patch.object(
+            Path, "lstat", return_value=regular_metadata
+        ), self.assertRaisesRegex(AuditInfrastructureError, "setup failed"):
             observer._arm_windows(
                 ((Path("C:/first"), False), (Path("C:/second"), False))
             )

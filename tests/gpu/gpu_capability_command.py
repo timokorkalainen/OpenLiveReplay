@@ -128,12 +128,15 @@ _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
 _RUNTIME_ENUMERATION_ENTRIES = 4096
 _RUNTIME_CLOSURE_FILES = 256
+_RUNTIME_PATH_COMPONENTS = 256
+_RUNTIME_PATH_METADATA_BYTES = 256 * 1024
 _RUNTIME_CONTEXT_STATES = 1024
 _RUNTIME_CONTEXT_METADATA_BYTES = 8 * 1024 * 1024
 _RUNTIME_FILE_BYTES = 256 * 1024 * 1024
 _RUNTIME_TOTAL_BYTES = 1024 * 1024 * 1024
 _RUNTIME_TREE_ENTRIES = 65536
 _RUNTIME_TREE_DIRECTORIES = 4096
+_REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _compiler_inspection_lock = threading.Lock()
 _compiler_capability_lock = threading.Lock()
 _compiler_capability_memo: dict[tuple[object, ...], CompilerExecutableCapability] = {}
@@ -1021,7 +1024,10 @@ def _symlink_snapshot(
         target = os.readlink(path)
     except OSError as error:
         raise AuditInfrastructureError("compiler runtime symlink changed") from error
-    if not stat.S_ISLNK(metadata.st_mode):
+    if not (
+        stat.S_ISLNK(metadata.st_mode)
+        or bool(getattr(metadata, "st_file_attributes", 0) & _REPARSE_ATTRIBUTE)
+    ):
         raise AuditInfrastructureError("compiler runtime symlink changed")
     return (
         int(metadata.st_dev),
@@ -1734,27 +1740,58 @@ def _runtime_binding_for_path(
 def _resolve_runtime_candidate(
     candidate: Path, authority: DependencyRootAuthority
 ) -> tuple[Path, tuple[Path, ...]] | None:
-    aliases = []
-    current = candidate.absolute()
+    aliases: list[Path] = []
+    current = Path(os.path.abspath(candidate))
+    component_count = 0
+    metadata_bytes = 0
     for _depth in range(32):
-        try:
-            metadata = current.lstat()
-        except OSError:
-            return None
-        _runtime_binding_for_path(current, authority)
-        if not stat.S_ISLNK(metadata.st_mode):
-            if not stat.S_ISREG(metadata.st_mode):
+        sentinel = Path(current.anchor)
+        relative = current.relative_to(sentinel)
+        cursor = sentinel
+        redirected = False
+        for index, part in enumerate(relative.parts):
+            component_count += 1
+            cursor = cursor / part
+            metadata_bytes += len(os.fsencode(cursor)) + 64
+            if (
+                component_count > _RUNTIME_PATH_COMPONENTS
+                or metadata_bytes > _RUNTIME_PATH_METADATA_BYTES
+            ):
+                raise AuditInfrastructureError(
+                    "compiler runtime path component metadata ceiling exceeded"
+                )
+            try:
+                metadata = cursor.lstat()
+            except OSError:
                 return None
-            resolved = current.resolve(strict=True)
-            _runtime_binding_for_path(resolved, authority)
-            return resolved, tuple(aliases)
-        aliases.append(current)
-        try:
-            target = Path(os.readlink(current))
-        except OSError as error:
-            raise AuditInfrastructureError("compiler runtime symlink is unreadable") from error
-        current = target if target.is_absolute() else current.parent / target
-        current = current.absolute()
+            is_alias = stat.S_ISLNK(metadata.st_mode) or bool(
+                getattr(metadata, "st_file_attributes", 0) & _REPARSE_ATTRIBUTE
+            )
+            if is_alias:
+                aliases.append(cursor)
+                try:
+                    target = Path(os.readlink(cursor))
+                except OSError as error:
+                    raise AuditInfrastructureError(
+                        "compiler runtime symlink is unreadable"
+                    ) from error
+                redirected_root = (
+                    target if target.is_absolute() else cursor.parent / target
+                )
+                current = Path(os.path.abspath(
+                    redirected_root.joinpath(*relative.parts[index + 1:])
+                ))
+                redirected = True
+                break
+            if index + 1 < len(relative.parts):
+                if not stat.S_ISDIR(metadata.st_mode):
+                    return None
+            elif not stat.S_ISREG(metadata.st_mode):
+                return None
+        if redirected:
+            continue
+        _runtime_binding_for_path(current, authority)
+        return current, tuple(dict.fromkeys(aliases))
     raise AuditInfrastructureError("compiler runtime symlink depth exceeded")
 
 
@@ -2284,8 +2321,21 @@ def _runtime_path_chains(
     result = []
     seen = set()
     for path in paths:
-        binding = _runtime_binding_for_path(path, authority)
-        for directory in _path_chain(binding.resolved_root.parent, path.parent):
+        matches = []
+        for binding in authority.external_roots:
+            try:
+                path.relative_to(binding.resolved_root)
+            except ValueError:
+                continue
+            matches.append(binding)
+        if len(matches) > 1:
+            raise AuditInfrastructureError(
+                f"compiler runtime path is mapped by ambiguous authority roots: {path}"
+            )
+        sentinel = (
+            matches[0].resolved_root.parent if matches else Path(path.anchor)
+        )
+        for directory in _path_chain(sentinel, path.parent):
             key = os.path.normcase(str(directory))
             if key not in seen:
                 seen.add(key)
