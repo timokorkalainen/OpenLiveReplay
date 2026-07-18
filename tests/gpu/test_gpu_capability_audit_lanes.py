@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import tracemalloc
+import types
 import unittest
 from array import array
 from pathlib import Path, PurePosixPath
@@ -42,6 +43,35 @@ from gpu_capability_source_audit import (  # noqa: E402
 
 
 class AuditEngineFingerprintTests(unittest.TestCase):
+    def test_slot_descriptor_owner_rebinding_changes_behavior_and_digest(self):
+        class ForeignPackedColumn:
+            __slots__ = ("_view",)
+
+        packed_column = capability_model._ReadOnlyPackedColumn
+        foreign_view = ForeignPackedColumn.__dict__["_view"]
+        self.assertIsInstance(foreign_view, types.MemberDescriptorType)
+        baseline = capability_audit.audit_engine_fingerprint()
+        with mock.patch.object(packed_column, "_view", foreign_view):
+            with self.assertRaises(TypeError):
+                packed_column(array("I", (1,)))
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+    def test_getset_descriptor_owner_is_structurally_attested(self):
+        type_name = type.__dict__["__name__"]
+        function_name = FunctionType.__dict__["__name__"]
+        self.assertIsInstance(type_name, types.GetSetDescriptorType)
+        self.assertIsInstance(function_name, types.GetSetDescriptorType)
+        packed_column = capability_model._ReadOnlyPackedColumn
+        with mock.patch.object(
+            packed_column, "descriptor_probe", type_name, create=True
+        ):
+            type_owner_fingerprint = capability_audit.audit_engine_fingerprint()
+        with mock.patch.object(
+            packed_column, "descriptor_probe", function_name, create=True
+        ):
+            function_owner_fingerprint = capability_audit.audit_engine_fingerprint()
+        self.assertNotEqual(type_owner_fingerprint, function_owner_fingerprint)
+
     def test_enum_lookup_and_iteration_state_are_attested(self):
         baseline = capability_audit.audit_engine_fingerprint()
         compiler_family = capability_model.CompilerFamily

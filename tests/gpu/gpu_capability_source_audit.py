@@ -7489,6 +7489,42 @@ class _LiveSemanticEncoder:
             )
         return self._encode_enum_live_mapping(name, value, preserve_order=False)
 
+    def _encode_class_descriptor(
+        self,
+        class_object: type,
+        member_name: str,
+        descriptor: object,
+    ) -> bytes:
+        if isinstance(descriptor, types.MemberDescriptorType):
+            descriptor_kind = b"member-descriptor"
+        elif isinstance(descriptor, types.GetSetDescriptorType):
+            descriptor_kind = b"getset-descriptor"
+        else:
+            raise AuditInfrastructureError(
+                "audit engine class descriptor type is unsupported"
+            )
+        descriptor_name = getattr(descriptor, "__name__", None)
+        descriptor_owner = getattr(descriptor, "__objclass__", None)
+        if (
+            not isinstance(member_name, str)
+            or not member_name
+            or not isinstance(descriptor_name, str)
+            or not descriptor_name
+            or not isinstance(descriptor_owner, type)
+        ):
+            raise AuditInfrastructureError(
+                "audit engine class descriptor state is invalid"
+            )
+        return self._frame(
+            descriptor_kind,
+            (
+                member_name.encode("utf-8"),
+                descriptor_name.encode("utf-8"),
+                _semantic_origin_role(descriptor_owner).encode("utf-8"),
+                self.encode(descriptor_owner is class_object),
+            ),
+        )
+
     def _encode_class(self, class_object: type) -> bytes:
         cycle = self._cycle_or_mark(class_object)
         if cycle is not None:
@@ -7593,7 +7629,7 @@ class _LiveSemanticEncoder:
             elif isinstance(member, types.FunctionType):
                 encoded = self.encode(member)
             elif isinstance(member, (types.MemberDescriptorType, types.GetSetDescriptorType)):
-                encoded = self._frame(b"descriptor", (name.encode("utf-8"),))
+                encoded = self._encode_class_descriptor(class_object, name, member)
             elif isinstance(class_object, enum.EnumMeta) and isinstance(member, class_object):
                 continue
             elif (
