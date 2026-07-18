@@ -2066,12 +2066,9 @@ def _driver_selected_helper_paths(
             ))
         matches = []
         for candidate in candidates:
-            try:
-                resolved = _resolve_runtime_candidate(
-                    candidate, owner.dependency_root_authority
-                )
-            except AuditInfrastructureError:
-                continue
+            resolved = _resolve_runtime_candidate(
+                candidate, owner.dependency_root_authority
+            )
             if resolved is not None and resolved[0] not in matches:
                 matches.append(resolved[0])
         if len(matches) > 1:
@@ -2303,7 +2300,10 @@ def open_compiler_executable_capability(
             closure_digest,
             tuple(closure),
         )
-        owner.validate(deadline=pipeline_deadline, cancel_event=cancel_event)
+        owner.validate(
+            content=False, deadline=pipeline_deadline,
+            cancel_event=cancel_event,
+        )
         if compiler_family is not None and _query_driver:
             helpers = _driver_selected_helper_paths(
                 capability,
@@ -2376,7 +2376,7 @@ def validate_compiler_executable_capability(
     if expected_binding != capability.trusted_toolchain_root:
         raise AuditInfrastructureError("compiler executable capability root differs")
     owner.validate(
-        deadline=deadline, cancel_event=cancel_event
+        content=False, deadline=deadline, cancel_event=cancel_event
     )
 
 

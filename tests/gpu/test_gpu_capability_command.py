@@ -568,6 +568,9 @@ class ResponseFileTests(unittest.TestCase):
 
 class ConfigurationTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.real_driver_selected_helper_paths = (
+            capability_command._driver_selected_helper_paths
+        )
         self.driver_helpers = mock.patch(
             "gpu_capability_command._driver_selected_helper_paths", return_value=()
         )
@@ -782,6 +785,40 @@ class ConfigurationTests(unittest.TestCase):
                 launcher_environment={}, working_directory=self.build,
             )
         self.assertEqual(observed, [{}])
+
+    def test_existing_absolute_driver_helper_outside_authority_fails_closed(self):
+        capability = open_compiler_executable_capability(
+            self.compiler.resolve(), self.dependency_roots,
+            time.monotonic() + 10.0,
+        )
+        outside = self.root / "untrusted" / "helper.exe"
+        outside.parent.mkdir()
+        outside.write_bytes(b"existing helper outside authority")
+        with mock.patch(
+            "gpu_capability_command._run_probe_command",
+            return_value=os.fsencode(outside),
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "mapped|trusted toolchain root"
+        ):
+            self.real_driver_selected_helper_paths(
+                capability, CompilerFamily.GCC, self.build, self.environment,
+                self.compiler.parent, {}, time.monotonic() + 10.0, None,
+            )
+
+    def test_absent_optional_driver_helper_remains_optional(self):
+        capability = open_compiler_executable_capability(
+            self.compiler.resolve(), self.dependency_roots,
+            time.monotonic() + 10.0,
+        )
+        with mock.patch(
+            "gpu_capability_command._run_probe_command",
+            return_value=b"definitely-absent-optional-helper",
+        ):
+            selected = self.real_driver_selected_helper_paths(
+                capability, CompilerFamily.GCC, self.build, self.environment,
+                self.compiler.parent, {}, time.monotonic() + 10.0, None,
+            )
+        self.assertEqual(selected, ())
 
     def test_capability_requires_identical_in_process_authority_object(self):
         capability = open_compiler_executable_capability(

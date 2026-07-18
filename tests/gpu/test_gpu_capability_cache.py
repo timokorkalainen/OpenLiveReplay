@@ -367,6 +367,68 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             )
         )
 
+    def test_valid_shaped_inspection_payload_corruption_is_a_cache_miss(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        key = compiler_inspection_cache_key(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64,
+            executable_capability_digest=self.capability_digest,
+            resolved_runtime_closure_digest=self.closure_digest,
+        )
+        path = self.cache._path(key)
+        document = json.loads(path.read_text(encoding="ascii"))
+        embedded = json.loads(base64.b64decode(document["inspection"]).decode("ascii"))
+        embedded["driver_fingerprint"] = "a" * 64
+        document["inspection"] = base64.b64encode(
+            json.dumps(
+                embedded, ensure_ascii=True, separators=(",", ":")
+            ).encode("ascii")
+        ).decode("ascii")
+        path.write_text(
+            json.dumps(document, ensure_ascii=True, separators=(",", ":")),
+            encoding="ascii",
+        )
+        self.assertIsNone(
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
+            )
+        )
+
+    def test_hardlinked_inspection_manifest_is_fatal(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        key = compiler_inspection_cache_key(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64,
+            executable_capability_digest=self.capability_digest,
+            resolved_runtime_closure_digest=self.closure_digest,
+        )
+        manifest = self.cache._path(key)
+        alias = self.root / "inspection-manifest-alias"
+        try:
+            os.link(manifest, alias)
+        except OSError as error:
+            self.skipTest(f"hardlinks unavailable: {error}")
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "alias|namespace|ordinary"
+        ):
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
+            )
+
     def test_live_compiler_mutation_during_cache_decode_remains_fatal(self):
         inspection = self.inspection()
         self.cache.publish(

@@ -221,6 +221,57 @@ class BoundedPreprocessorTests(unittest.TestCase):
         self.assertGreater(stages.accepted_parse_seconds, 0.0)
         self.assertEqual(view.configuration.digest, "cfg-gcc-success")
 
+    def test_cold_stabilization_does_not_rehash_held_compiler_closure(self):
+        hashed_bytes = []
+        original = capability_command._content_sha256
+
+        def counted(stream, **kwargs):
+            hashed_bytes.append(int(os.fstat(stream.fileno()).st_size))
+            return original(stream, **kwargs)
+
+        owner = self.compiler_capability.native_owner
+        self.assertGreater(len(owner.streams), 0)
+        closure_bytes = sum(
+            int(os.fstat(stream.fileno()).st_size) for stream in owner.streams
+        )
+        self.assertGreater(closure_bytes, 0)
+        if os.name == "nt":
+            self.assertEqual(len(owner.streams), 15)
+        with mock.patch(
+            "gpu_capability_command._content_sha256", side_effect=counted
+        ) as content_hash:
+            self.stabilize_fixture("success")
+        self.assertEqual(content_hash.call_count, 0)
+        self.assertEqual(sum(hashed_bytes), 0)
+
+    def test_invalidation_deadline_and_cancellation_prevent_launch(self):
+        with mock.patch(
+            "gpu_capability_runner.subprocess.Popen",
+            side_effect=OSError("Popen reached"),
+        ) as popen, mock.patch.object(
+            self.compiler_capability.native_owner.observer,
+            "drain",
+            side_effect=(
+                None,
+                None,
+                AuditInfrastructureError("generation invalidated"),
+            ),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "generation invalidated"):
+            self.run_direct("success")
+        popen.assert_not_called()
+
+        with mock.patch("gpu_capability_runner.subprocess.Popen") as popen, \
+                self.assertRaisesRegex(AuditInfrastructureError, "global deadline"):
+            self.run_direct("success", deadline=time.monotonic() - 0.001)
+        popen.assert_not_called()
+
+        cancelled = threading.Event()
+        cancelled.set()
+        with mock.patch("gpu_capability_runner.subprocess.Popen") as popen, \
+                self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            self.run_direct("success", cancel_event=cancelled)
+        popen.assert_not_called()
+
     def test_raw_output_and_byte_count_mismatches_publish_nothing(self):
         for mode, message in (
             ("different-second-output", "raw preprocessed output changed"),

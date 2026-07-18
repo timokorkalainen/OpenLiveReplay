@@ -414,7 +414,10 @@ def run_bounded_preprocessor(
     validate_owner = getattr(capability_owner, "validate", None)
     if not callable(validate_owner):
         raise AuditInfrastructureError("compiler executable capability owner is invalid")
-    validate_owner(deadline=effective_deadline, cancel_event=cancel_event)
+    validate_owner(
+        content=False, deadline=effective_deadline,
+        cancel_event=cancel_event,
+    )
     if not command.arguments:
         raise AuditInfrastructureError("rewritten preprocess command is empty")
     try:
@@ -494,6 +497,19 @@ def run_bounded_preprocessor(
                 )
                 launch_options["pass_fds"] = (executable_fd,)
             prepared_arguments = containment.prepare_command(launch_arguments)
+            now = time.monotonic()
+            if cancel_event is not None and cancel_event.is_set():
+                raise AuditInfrastructureError(
+                    "coordinator cancelled before launch"
+                )
+            if now >= effective_deadline:
+                raise AuditInfrastructureError(
+                    f"{deadline_reason} before launch"
+                )
+            validate_owner(
+                content=False, deadline=effective_deadline,
+                cancel_event=cancel_event,
+            )
             now = time.monotonic()
             if cancel_event is not None and cancel_event.is_set():
                 raise AuditInfrastructureError(
@@ -695,7 +711,10 @@ def run_bounded_preprocessor(
                 observed_stdout_bytes=observed_stdout_bytes,
                 stderr_tail=complete_stderr_tail,
             )
-        validate_owner()
+        validate_owner(
+            content=False, deadline=effective_deadline,
+            cancel_event=cancel_event,
+        )
         with stderr_lock:
             complete_stderr_tail = bytes(stderr_tail)
         return ExecutionResult(

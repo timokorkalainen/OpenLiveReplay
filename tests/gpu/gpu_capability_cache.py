@@ -651,7 +651,7 @@ def _after_cleanup_quarantine(_path: Path) -> None:
     """Test seam for deterministic cleanup replacement-race coverage."""
 
 
-_COMPILER_INSPECTION_SCHEMA = "olr-gpu-compiler-inspection-cache-v2"
+_COMPILER_INSPECTION_SCHEMA = "olr-gpu-compiler-inspection-cache-v3"
 _COMPILER_INSPECTION_MAX_BYTES = 512 * 1024
 
 
@@ -812,17 +812,27 @@ class CompilerInspectionCache:
         try:
             self._assert_root()
             metadata = _regular_unlinked_file(path)
-            if metadata.st_size > _COMPILER_INSPECTION_MAX_BYTES:
-                raise ValueError("compiler inspection manifest is too large")
             with _HeldCacheFile(path) as held:
                 assert held.stream is not None
                 payload = held.stream.read(_COMPILER_INSPECTION_MAX_BYTES + 1)
                 held.verify()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise AuditInfrastructureError(
+                "compiler inspection cache namespace is unsafe"
+            ) from error
+        try:
+            if (
+                metadata.st_size > _COMPILER_INSPECTION_MAX_BYTES
+                or len(payload) > _COMPILER_INSPECTION_MAX_BYTES
+            ):
+                raise ValueError("compiler inspection manifest is too large")
             document = json.loads(payload.decode("ascii"))
             if not isinstance(document, dict) or tuple(document) != (
                 "schema", "key", "dependency_root_authority_digest",
                 "executable_capability_digest", "resolved_runtime_closure_digest",
-                "inspection"
+                "inspection_bytes", "inspection_sha256", "inspection"
             ):
                 raise ValueError("compiler inspection manifest schema is invalid")
             if (
@@ -831,36 +841,73 @@ class CompilerInspectionCache:
                 or document["dependency_root_authority_digest"] != authority.portable_authority_digest
                 or document["executable_capability_digest"] != executable_capability_digest
                 or document["resolved_runtime_closure_digest"] != resolved_runtime_closure_digest
+                or not isinstance(document["inspection_bytes"], int)
+                or isinstance(document["inspection_bytes"], bool)
+                or document["inspection_bytes"] < 0
+                or document["inspection_bytes"] > _COMPILER_INSPECTION_MAX_BYTES
+                or not isinstance(document["inspection_sha256"], str)
+                or len(document["inspection_sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in document["inspection_sha256"])
                 or not isinstance(document["inspection"], str)
             ):
                 raise ValueError("compiler inspection manifest is invalid")
             embedded = base64.b64decode(
                 document["inspection"].encode("ascii"), validate=True
             )
+            if (
+                len(embedded) != document["inspection_bytes"]
+                or hashlib.sha256(embedded).hexdigest()
+                != document["inspection_sha256"]
+            ):
+                raise ValueError("compiler inspection payload authentication failed")
+        except (
+            UnicodeError, ValueError, TypeError, json.JSONDecodeError,
+        ):
+            return None
+        try:
             compiler_before = compiler.stat()
-            compiler_generation = (
-                int(compiler_before.st_dev), int(compiler_before.st_ino) or None,
-                int(compiler_before.st_size), int(compiler_before.st_mtime_ns),
-                int(getattr(compiler_before, "st_ctime_ns", 0)),
+        except OSError:
+            return None
+        compiler_generation = (
+            int(compiler_before.st_dev), int(compiler_before.st_ino) or None,
+            int(compiler_before.st_size), int(compiler_before.st_mtime_ns),
+            int(getattr(compiler_before, "st_ctime_ns", 0)),
+        )
+        try:
+            inspection = decode_compiler_inspection(
+                embedded, validation_deadline=pipeline_deadline
             )
+        except AuditInfrastructureError:
+            if time.monotonic() >= pipeline_deadline:
+                raise
             try:
-                inspection = decode_compiler_inspection(
-                    embedded, validation_deadline=pipeline_deadline
-                )
-            except AuditInfrastructureError:
-                if time.monotonic() >= pipeline_deadline:
-                    raise
-                try:
-                    compiler_after = compiler.stat()
-                except OSError:
-                    raise
-                if (
-                    int(compiler_after.st_dev), int(compiler_after.st_ino) or None,
-                    int(compiler_after.st_size), int(compiler_after.st_mtime_ns),
-                    int(getattr(compiler_after, "st_ctime_ns", 0)),
-                ) != compiler_generation:
-                    raise
-                return None
+                compiler_after = compiler.stat()
+            except OSError as error:
+                raise AuditInfrastructureError(
+                    "compiler executable changed during cache decode"
+                ) from error
+            if (
+                int(compiler_after.st_dev), int(compiler_after.st_ino) or None,
+                int(compiler_after.st_size), int(compiler_after.st_mtime_ns),
+                int(getattr(compiler_after, "st_ctime_ns", 0)),
+            ) != compiler_generation:
+                raise
+            return None
+        try:
+            compiler_after = compiler.stat()
+        except OSError as error:
+            raise AuditInfrastructureError(
+                "compiler executable changed during cache decode"
+            ) from error
+        if (
+            int(compiler_after.st_dev), int(compiler_after.st_ino) or None,
+            int(compiler_after.st_size), int(compiler_after.st_mtime_ns),
+            int(getattr(compiler_after, "st_ctime_ns", 0)),
+        ) != compiler_generation:
+            raise AuditInfrastructureError(
+                "compiler executable content changed during cache decode"
+            )
+        try:
             if (
                 inspection.compiler_family is not compiler_family
                 or inspection.executable_capability_digest
@@ -869,8 +916,7 @@ class CompilerInspectionCache:
                 raise ValueError("compiler inspection executable differs")
             return inspection
         except (
-            FileNotFoundError, OSError, UnicodeError, ValueError, TypeError,
-            json.JSONDecodeError,
+            ValueError, TypeError,
         ):
             return None
 
@@ -904,15 +950,16 @@ class CompilerInspectionCache:
             raise AuditInfrastructureError(
                 "compiler inspection publication capability digest differs"
             )
+        embedded = encode_compiler_inspection(inspection)
         document = {
             "schema": _COMPILER_INSPECTION_SCHEMA,
             "key": key,
             "dependency_root_authority_digest": authority.portable_authority_digest,
             "executable_capability_digest": executable_capability_digest,
             "resolved_runtime_closure_digest": resolved_runtime_closure_digest,
-            "inspection": base64.b64encode(
-                encode_compiler_inspection(inspection)
-            ).decode("ascii"),
+            "inspection_bytes": len(embedded),
+            "inspection_sha256": hashlib.sha256(embedded).hexdigest(),
+            "inspection": base64.b64encode(embedded).decode("ascii"),
         }
         encoded = json.dumps(
             document, ensure_ascii=True, separators=(",", ":")
