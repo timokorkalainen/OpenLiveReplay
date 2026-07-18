@@ -32,6 +32,7 @@ from gpu_capability_model import (
     decode_compiler_inspection,
     encode_compiler_inspection,
     validate_dependency_root_authority,
+    _HeldCompilerCapabilityMismatch,
 )
 
 
@@ -64,9 +65,33 @@ def _check_cache_rss(reserve: int = 0) -> None:
 class _PublicationGuard:
     """Cross-process advisory lock that keeps an active temp entry alive."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        deadline: float,
+        cancel_event: object | None = None,
+    ) -> None:
         self.path = path
+        self.deadline = deadline
+        self.cancel_event = cancel_event
         self.stream = None
+
+    def _check_budget(self) -> None:
+        if self.cancel_event is not None:
+            is_set = getattr(self.cancel_event, "is_set", None)
+            if not callable(is_set):
+                raise AuditInfrastructureError(
+                    "cache publication cancellation event is invalid"
+                )
+            cancelled = is_set()
+            if not isinstance(cancelled, bool):
+                raise AuditInfrastructureError(
+                    "cache publication cancellation event is invalid"
+                )
+            if cancelled:
+                raise AuditInfrastructureError("cache publication cancelled")
+        if time.monotonic() >= self.deadline:
+            raise AuditInfrastructureError("cache publication deadline exceeded")
 
     @staticmethod
     def _lock(stream, *, blocking: bool) -> bool:
@@ -105,11 +130,30 @@ class _PublicationGuard:
         self.stream = self.path.open("x+b")
         self.stream.write(b"1")
         self.stream.flush()
-        if not self._lock(self.stream, blocking=True):
+        try:
+            while True:
+                acquired = self._lock(self.stream, blocking=False)
+                try:
+                    self._check_budget()
+                except BaseException:
+                    if acquired:
+                        self._unlock(self.stream)
+                    raise
+                if acquired:
+                    return self
+                remaining = max(0.0, self.deadline - time.monotonic())
+                time.sleep(min(0.01, remaining))
+        except BaseException as error:
             self.stream.close()
             self.stream = None
-            raise OSError("cannot lock cache publication")
-        return self
+            try:
+                self.path.unlink()
+            except OSError as cleanup_error:
+                raise AuditInfrastructureError(
+                    "cannot remove cache publication guard after "
+                    f"{type(error).__name__}: {error}"
+                ) from cleanup_error
+            raise
 
     def __exit__(self, _type, _value, _traceback) -> None:
         assert self.stream is not None
@@ -917,9 +961,17 @@ class CompilerInspectionCache:
         executable_capability_digest: str,
         resolved_runtime_closure_digest: str,
         pipeline_deadline: float,
+        *,
+        held_executable_identity: FileIdentity | None = None,
+        held_executable_sha256: str | None = None,
     ) -> CompilerInspection | None:
         authority = validate_dependency_root_authority(dependency_roots)
-        if time.monotonic() >= pipeline_deadline:
+        operation_started = time.monotonic()
+        operation_deadline = min(
+            pipeline_deadline,
+            operation_started + _DEFAULT_CACHE_OPERATION_SECONDS,
+        )
+        if operation_started >= operation_deadline:
             raise AuditInfrastructureError("compiler inspection cache deadline exceeded")
         key = compiler_inspection_cache_key(
             compiler, compiler_family, launcher_environment, authority,
@@ -994,10 +1046,15 @@ class CompilerInspectionCache:
         )
         try:
             inspection = decode_compiler_inspection(
-                embedded, validation_deadline=pipeline_deadline
+                embedded,
+                validation_deadline=operation_deadline,
+                held_executable_identity=held_executable_identity,
+                held_executable_sha256=held_executable_sha256,
             )
+        except _HeldCompilerCapabilityMismatch:
+            raise
         except AuditInfrastructureError:
-            if time.monotonic() >= pipeline_deadline:
+            if time.monotonic() >= operation_deadline:
                 raise
             try:
                 compiler_after = compiler.stat()
@@ -1053,7 +1110,12 @@ class CompilerInspectionCache:
         cancel_event: object | None = None,
     ) -> CompilerInspection:
         authority = validate_dependency_root_authority(dependency_roots)
-        if time.monotonic() >= pipeline_deadline:
+        operation_started = time.monotonic()
+        operation_deadline = min(
+            pipeline_deadline,
+            operation_started + _DEFAULT_CACHE_OPERATION_SECONDS,
+        )
+        if operation_started >= operation_deadline:
             raise AuditInfrastructureError("compiler inspection cache deadline exceeded")
         key = compiler_inspection_cache_key(
             compiler, compiler_family, launcher_environment, authority,
@@ -1090,9 +1152,9 @@ class CompilerInspectionCache:
         temporary_identity: tuple[int, int | None, int, int] | None = None
         path = self._path(key)
         with self._root_lock(
-            pipeline_deadline, cancel_event
+            operation_deadline, cancel_event
         ), self._key_lock(
-            key, pipeline_deadline, cancel_event
+            key, operation_deadline, cancel_event
         ):
             try:
                 self._assert_root()
@@ -1123,7 +1185,9 @@ class CompilerInspectionCache:
                         expected_audit_engine_fingerprint,
                         executable_capability_digest,
                         resolved_runtime_closure_digest,
-                        pipeline_deadline,
+                        operation_deadline,
+                        held_executable_identity=inspection.executable_identity,
+                        held_executable_sha256=inspection.executable_sha256,
                     )
                     if winner is not None:
                         if winner != inspection:
@@ -1201,9 +1265,10 @@ class PreprocessCache:
 
     @staticmethod
     def _operation_deadline(deadline: float | None) -> float:
-        if deadline is None:
-            return time.monotonic() + _DEFAULT_CACHE_OPERATION_SECONDS
-        return deadline
+        internal_deadline = time.monotonic() + _DEFAULT_CACHE_OPERATION_SECONDS
+        return internal_deadline if deadline is None else min(
+            deadline, internal_deadline
+        )
 
     @staticmethod
     def _check_publication_budget(
@@ -1554,11 +1619,15 @@ class PreprocessCache:
         operation_deadline = self._operation_deadline(deadline)
         temporary = self.root / f".tmp-{key}-{uuid.uuid4().hex}"
         entry = self.root / key
+        temporary_identity: tuple[int, int | None] | None = None
         published_identity: tuple[int, int | None] | None = None
         try:
             self._assert_root_identity()
             temporary.mkdir()
-            with _PublicationGuard(temporary / "active.lock"):
+            temporary_identity = _directory_identity(_ordinary_directory(temporary))
+            with _PublicationGuard(
+                temporary / "active.lock", operation_deadline, cancel_event
+            ):
                 dependency_records: list[dict[str, object]] = []
                 for snapshot in snapshots:
                     dependency_records.append(
@@ -1657,7 +1726,6 @@ class PreprocessCache:
                         final_validation()
                     return view
                 except (AuditInfrastructureError, OSError, ValueError) as error:
-                    _remove_held_flat_directory(temporary)
                     if published_identity is not None and not _remove_held_flat_directory(
                         entry, expected_identity=published_identity
                     ):
@@ -1680,7 +1748,18 @@ class PreprocessCache:
                 self._publication_lock.release()
                 key_lock.__exit__(None, None, None)
         except (AuditInfrastructureError, OSError, ValueError) as error:
-            _remove_held_flat_directory(temporary)
+            if not _remove_held_flat_directory(
+                temporary, expected_identity=temporary_identity
+            ):
+                try:
+                    temporary.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise AuditInfrastructureError(
+                        "cannot remove cache publication temporary after "
+                        f"{type(error).__name__}: {error}"
+                    ) from error
             if published_identity is not None and not _remove_held_flat_directory(
                 entry, expected_identity=published_identity
             ):

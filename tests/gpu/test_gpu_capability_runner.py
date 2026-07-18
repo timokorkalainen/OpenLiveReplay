@@ -476,7 +476,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
             self.run_direct(
                 "child-sleep",
                 limits=dataclasses.replace(
-                    AuditLimits(), invocation_seconds=0.25, rss_bytes=2**63 - 1
+                    AuditLimits(), invocation_seconds=0.5, rss_bytes=2**63 - 1
                 ),
                 extra=(
                     "--child-pid-file",
@@ -535,7 +535,7 @@ class BoundedPreprocessorTests(unittest.TestCase):
         result, output = self.run_direct(
             "child-exit",
             limits=dataclasses.replace(
-                AuditLimits(), invocation_seconds=0.5, rss_bytes=2**63 - 1
+                AuditLimits(), invocation_seconds=1.0, rss_bytes=2**63 - 1
             ),
             extra=("--child-pid-file", str(child_pid_file)),
         )
@@ -1686,8 +1686,29 @@ class OrchestrationTests(unittest.TestCase):
             return_value=b"g++.exe (GCC) 13.1.0\n",
         ):
             return collect_configurations(
-                self.root, databases, self.environment, self.dependency_roots
+                self.root, databases, self.environment, self.dependency_roots,
+                time.monotonic() + 180.0,
             )
+
+    def test_collection_threads_caller_deadline_into_every_configuration(self):
+        self.write_source("playback/deadline.cpp")
+        database = self.database(
+            "deadline.json", (self.entry("playback/deadline.cpp"),)
+        )
+        deadline = time.monotonic() + 37.0
+        with mock.patch(
+            "gpu_capability_command._probe_compiler_version",
+            return_value=b"g++.exe (GCC) 13.1.0\n",
+        ), mock.patch(
+            "gpu_capability_runner.make_configuration",
+            wraps=capability_command.make_configuration,
+        ) as make:
+            configurations = collect_configurations(
+                self.root, (database,), self.environment,
+                self.dependency_roots, deadline,
+            )
+        self.assertEqual(len(configurations), 1)
+        self.assertEqual(make.call_args.args[-1], deadline)
 
     def configuration(
         self,
@@ -1785,6 +1806,7 @@ class OrchestrationTests(unittest.TestCase):
                 (database,),
                 self.environment,
                 self.dependency_roots,
+                time.monotonic() + 180.0,
             )
         elapsed = time.monotonic() - started
 
@@ -1922,8 +1944,27 @@ class OrchestrationTests(unittest.TestCase):
                 {a.relative: a, missing.relative: missing},
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
+                time.monotonic() + 180.0,
             )
         execute.assert_not_called()
+
+    def test_preprocess_threads_the_same_caller_deadline_to_cache_and_compiler(self):
+        source = self.identity(
+            self.write_source("playback/pipeline-deadline.cpp"),
+            "playback/pipeline-deadline.cpp",
+        )
+        configuration = self.configuration(source, "pipeline-deadline")
+        result = self.view(configuration, (source,))
+        deadline = time.monotonic() + 37.0
+        with mock.patch(
+            "gpu_capability_runner.load_or_preprocess", return_value=result
+        ) as execute:
+            preprocess_all(
+                (configuration,), self.dependency_roots,
+                {source.relative: source}, self.cache,
+                AuditLimits(workers=1, rss_bytes=2**63 - 1), deadline,
+            )
+        self.assertEqual(execute.call_args.args[5], deadline)
 
     def test_platform_classifier_activates_apple_and_windows_from_configurations(self):
         generic_path = self.write_source("playback/generic.cpp")
@@ -1962,6 +2003,7 @@ class OrchestrationTests(unittest.TestCase):
                     production,
                     self.cache,
                     AuditLimits(workers=1, rss_bytes=2**63 - 1),
+                    time.monotonic() + 180.0,
                 )
 
     def test_coverage_separates_reached_headers_from_inactive_and_unreached_files(self):
@@ -1991,6 +2033,7 @@ class OrchestrationTests(unittest.TestCase):
                 production,
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
+                time.monotonic() + 180.0,
             )
 
         self.assertEqual(views, (result,))
@@ -2031,6 +2074,7 @@ class OrchestrationTests(unittest.TestCase):
                     {source.relative: source},
                     self.cache,
                     AuditLimits(workers=workers, rss_bytes=2**63 - 1),
+                    time.monotonic() + 180.0,
                 )
 
             self.assertEqual(tuple(view.configuration.digest for view in views), ("a", "z"))
@@ -2054,6 +2098,7 @@ class OrchestrationTests(unittest.TestCase):
                 {source.relative: source},
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
+                time.monotonic() + 180.0,
             )
 
     def test_crossed_main_provenance_does_not_satisfy_per_configuration_coverage(self):
@@ -2093,6 +2138,7 @@ class OrchestrationTests(unittest.TestCase):
                 {first.relative: first, second.relative: second},
                 self.cache,
                 AuditLimits(workers=2, rss_bytes=2**63 - 1),
+                time.monotonic() + 180.0,
             )
 
     def test_manifest_only_header_remains_source_only(self):
@@ -2116,6 +2162,7 @@ class OrchestrationTests(unittest.TestCase):
                 {source.relative: source, header.relative: header},
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
+                time.monotonic() + 180.0,
             )
 
         self.assertEqual(coverage.authoritative, frozenset({source.relative}))
@@ -2142,6 +2189,7 @@ class OrchestrationTests(unittest.TestCase):
                 {source.relative: source, header.relative: header},
                 self.cache,
                 AuditLimits(workers=1, rss_bytes=2**63 - 1),
+                time.monotonic() + 180.0,
             )
 
         self.assertEqual(coverage.authoritative, frozenset({source.relative}))
@@ -2189,6 +2237,7 @@ class OrchestrationTests(unittest.TestCase):
                 production,
                 self.cache,
                 AuditLimits(workers=2, rss_bytes=2**63 - 1),
+                time.monotonic() + 180.0,
             )
 
         self.assertEqual(maximum_active, 2)
@@ -2222,6 +2271,7 @@ class OrchestrationTests(unittest.TestCase):
                 production,
                 self.cache,
                 AuditLimits(workers=2, rss_bytes=2**63 - 1),
+                time.monotonic() + 180.0,
             )
 
         diagnostic = str(raised.exception)

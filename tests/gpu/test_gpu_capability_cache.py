@@ -355,6 +355,43 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             inspection,
         )
 
+    def test_inspection_cache_hit_uses_held_capability_without_rehashing(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        with mock.patch(
+            "gpu_capability_model._current_executable_sha256",
+            side_effect=AssertionError("cache hit reopened compiler for hashing"),
+        ) as current_sha256:
+            loaded = self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
+                held_executable_identity=self.compiler_identity,
+                held_executable_sha256=inspection.executable_sha256,
+            )
+        self.assertEqual(loaded, inspection)
+        current_sha256.assert_not_called()
+
+    def test_inspection_cache_rejects_mismatched_held_capability_binding(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "held capability"):
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
+                held_executable_identity=self.compiler_identity,
+                held_executable_sha256="0" * 64,
+            )
+
     def test_portable_inspection_key_excludes_path_and_native_identity(self):
         other_source = self.root / "other-source"
         other_toolchain = self.root / "other-toolchain"
@@ -1432,6 +1469,45 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 )
                 self.assertIsNone(cache.load(contender_configuration))
 
+    def test_active_publication_guard_honors_deadline_and_cancellation(self):
+        for mode in ("deadline", "cancel"):
+            with self.subTest(mode=mode):
+                directory = self.root / f"active-guard-{mode}"
+                directory.mkdir()
+                cancelled = threading.Event()
+                if mode == "cancel":
+                    cancelled.set()
+                with mock.patch.object(
+                    _PublicationGuard, "_lock", return_value=False,
+                ) as acquire, self.assertRaisesRegex(
+                    AuditInfrastructureError,
+                    "cancelled" if mode == "cancel" else "deadline",
+                ):
+                    with _PublicationGuard(
+                        directory / "active.lock",
+                        time.monotonic() + (5.0 if mode == "cancel" else 0.03),
+                        cancelled,
+                    ):
+                        self.fail("unavailable publication guard was entered")
+                self.assertTrue(acquire.call_count > 0)
+                self.assertTrue(all(
+                    call.kwargs == {"blocking": False}
+                    for call in acquire.call_args_list
+                ))
+
+    def test_explicit_cache_deadline_is_capped_from_operation_start(self):
+        with mock.patch(
+            "gpu_capability_cache.time.monotonic", return_value=1000.0
+        ):
+            self.assertEqual(
+                PreprocessCache._operation_deadline(5000.0),
+                1240.0,
+            )
+            self.assertEqual(
+                PreprocessCache._operation_deadline(1100.0),
+                1100.0,
+            )
+
     def test_valid_winner_fails_if_losing_temporary_cannot_be_removed(self):
         winner = PreprocessCache(self.cache_root)
         winner.publish(self.view())
@@ -1451,6 +1527,20 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 cache.publish(self.view())
         self.assertIsNone(cache.load(self.configuration))
 
+    def test_publish_failure_surfaces_exact_owned_temporary_cleanup_failure(self):
+        cache = PreprocessCache(self.cache_root)
+        with mock.patch(
+            "gpu_capability_cache._write_payload",
+            side_effect=OSError("disk full"),
+        ), mock.patch(
+            "gpu_capability_cache._remove_held_flat_directory",
+            return_value=False,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "cannot remove cache publication temporary after OSError: disk full",
+        ):
+            cache.publish(self.view())
+
     def test_cleanup_removes_only_expired_incomplete_entries(self):
         cache = PreprocessCache(self.cache_root)
         old = self.cache_root / ".tmp-old"
@@ -1469,7 +1559,7 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         active = self.cache_root / ".tmp-active-publication"
         active.mkdir()
         now = time.time()
-        with _PublicationGuard(active / "active.lock"):
+        with _PublicationGuard(active / "active.lock", time.monotonic() + 10.0):
             os.utime(active, (now - 7200, now - 7200))
             cache.cleanup(now)
             self.assertTrue(active.exists())

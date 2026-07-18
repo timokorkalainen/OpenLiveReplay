@@ -1050,6 +1050,7 @@ class _RuntimeImports:
     runpath: tuple[str, ...] = ()
     format_kind: str = "unknown"
     optional_names: tuple[str, ...] = ()
+    interpreters: tuple[str, ...] = ()
 
 
 _LINUX_LDCONFIG_BYTES = 4 * 1024 * 1024
@@ -1492,7 +1493,9 @@ def _elf_runtime_imports(data) -> _RuntimeImports:
                 ) from error
             interpreter_names.append(interpreter)
     if dynamic is None:
-        return _RuntimeImports(tuple(interpreter_names), format_kind="elf")
+        return _RuntimeImports(
+            (), format_kind="elf", interpreters=tuple(interpreter_names)
+        )
     entry_size = struct.calcsize(dynamic_format)
     needed = []
     rpath = []
@@ -1519,7 +1522,9 @@ def _elf_runtime_imports(data) -> _RuntimeImports:
             raise AuditInfrastructureError(
                 "compiler runtime ELF dynamic string table is absent"
             )
-        return _RuntimeImports(tuple(interpreter_names), format_kind="elf")
+        return _RuntimeImports(
+            (), format_kind="elf", interpreters=tuple(interpreter_names)
+        )
     string_offset = None
     for virtual, file_size, file_offset in loads:
         if virtual <= string_virtual < virtual + file_size:
@@ -1531,10 +1536,11 @@ def _elf_runtime_imports(data) -> _RuntimeImports:
         _bounded_c_string(data, string_offset + item) for item in offsets
     ))
     return _RuntimeImports(
-        tuple(dict.fromkeys((*interpreter_names, *decode(needed)))),
+        decode(needed),
         decode(rpath),
         decode(runpath),
         "elf",
+        interpreters=tuple(interpreter_names),
     )
 
 
@@ -1895,6 +1901,34 @@ def _resolve_runtime_name(
     raise AuditInfrastructureError(f"unresolved runtime import: {name}")
 
 
+def _resolve_elf_interpreter(
+    name: str,
+    working_directory: Path,
+    authority: DependencyRootAuthority,
+) -> tuple[Path, tuple[Path, ...]]:
+    if (
+        not isinstance(name, str)
+        or not name
+        or "\0" in name
+    ):
+        raise AuditInfrastructureError("compiler runtime ELF PT_INTERP path is invalid")
+    raw = Path(name)
+    if raw.is_absolute():
+        candidate = raw
+    else:
+        if any(part in ("", ".", "..") for part in raw.parts):
+            raise AuditInfrastructureError(
+                "compiler runtime ELF PT_INTERP path escapes working directory"
+            )
+        candidate = working_directory / raw
+    resolved = _resolve_runtime_candidate(candidate, authority)
+    if resolved is None:
+        raise AuditInfrastructureError(
+            f"unresolved ELF PT_INTERP executable: {name}"
+        )
+    return resolved
+
+
 def _recursive_runtime_paths(
     seeds: tuple[Path, ...],
     executable: Path,
@@ -2017,6 +2051,20 @@ def _recursive_runtime_paths(
         imports = _binary_runtime_imports(
             current, deadline=deadline, cancel_event=cancel_event
         )
+        for interpreter in imports.interpreters:
+            resolved, resolved_aliases = _resolve_elf_interpreter(
+                interpreter, working_directory, authority
+            )
+            reserve(resolved)
+            for alias in resolved_aliases:
+                if alias not in aliases:
+                    aliases.append(alias)
+            pending.append((
+                resolved,
+                process_executable,
+                inherited_rpath,
+                loaded_modules,
+            ))
         for name in imports.names:
             if imports.format_kind == "pe" and name.casefold().startswith(
                 ("api-ms-", "ext-ms-")
@@ -2246,19 +2294,48 @@ def _driver_selected_helper_paths(
     index: Mapping[str, tuple[Path, ...]],
     deadline: float,
     cancel_event: object | None,
+    preprocess_arguments: tuple[str, ...] | None = None,
+    preprocess_language: str | None = None,
 ) -> tuple[Path, ...]:
     owner = capability.native_owner
+    if preprocess_arguments is None:
+        queries = ()
+        required = False
+    else:
+        language = preprocess_language or _preprocess_language(
+            preprocess_arguments, family, working_directory
+        )
+        required = True
+        if family is CompilerFamily.GCC:
+            queries = ({
+                "c": "cc1",
+                "c++": "cc1plus",
+                "objective-c": "cc1obj",
+                "objective-c++": "cc1objplus",
+            }[language],)
+        else:
+            queries = ()
     if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
-        names = ("c1.dll", "c1xx.dll", "c2.dll", "mspdbcore.dll")
+        if preprocess_arguments is None or family is CompilerFamily.CLANG_CL:
+            return ()
+        names = ("c1.dll",) if language in {"c", "objective-c"} else ("c1xx.dll",)
         result = []
         for name in names:
-            candidates = index.get(name, ())
+            sibling = _resolve_runtime_candidate(
+                capability.executable_identity.canonical.parent / name,
+                owner.dependency_root_authority,
+            )
+            candidates = (
+                (sibling[0],) if sibling is not None
+                else index.get(name, ())
+            )
             if len(candidates) == 1:
                 result.append(candidates[0])
+            elif required:
+                raise AuditInfrastructureError(
+                    f"compiler preprocessing helper is unavailable: {name}"
+                )
         return tuple(result)
-    queries = (
-        "cc1", "cc1plus", "collect2", "as", "ld"
-    ) if family is CompilerFamily.GCC else ("clang", "ld.lld", "as", "ld")
     result = []
     for program in queries:
         _check_capability_budget(deadline, cancel_event)
@@ -2300,7 +2377,98 @@ def _driver_selected_helper_paths(
             )
         if matches and matches[0] not in result:
             result.append(matches[0])
+        elif required and not matches:
+            raise AuditInfrastructureError(
+                f"compiler preprocessing helper is unavailable: {program}"
+            )
     return tuple(result)
+
+
+def _preprocess_language(
+    arguments: tuple[str, ...],
+    family: CompilerFamily,
+    working_directory: Path,
+    source_path: Path | None = None,
+) -> str:
+    explicit: str | None = None
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        lowered = value.casefold()
+        if lowered == "-x":
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError("compiler language option requires a value")
+            explicit = arguments[index + 1].casefold()
+            index += 2
+            continue
+        if lowered.startswith("-x") and len(value) > 2:
+            explicit = value[2:].casefold()
+        elif lowered in {"/tc", "/tp"}:
+            explicit = "c" if lowered == "/tc" else "c++"
+        index += 1
+    aliases = {
+        "c": "c", "cpp-output": "c", "c-header": "c",
+        "c++": "c++", "c++-cpp-output": "c++", "c++-header": "c++",
+        "objective-c": "objective-c", "objective-c-cpp-output": "objective-c",
+        "objective-c++": "objective-c++",
+        "objective-c++-cpp-output": "objective-c++",
+    }
+    if explicit is not None:
+        try:
+            return aliases[explicit]
+        except KeyError as error:
+            raise AuditInfrastructureError(
+                f"unsupported compiler preprocessing language: {explicit}"
+            ) from error
+    if source_path is None:
+        sources = _source_inputs(arguments, working_directory, family)
+        if len(sources) != 1:
+            raise AuditInfrastructureError(
+                "compiler preprocessing helper requires exactly one source language"
+            )
+        source_path = sources[0]
+    suffix = source_path.suffix.casefold()
+    if suffix in {".c", ".i"}:
+        return "c"
+    if suffix in {".m", ".mi"}:
+        return "objective-c"
+    if suffix in {".mm", ".mii"}:
+        return "objective-c++"
+    return "c++"
+
+
+def _preprocess_helper_selection_key(
+    arguments: tuple[str, ...],
+    family: CompilerFamily,
+    working_directory: Path,
+    preprocess_language: str | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    language = preprocess_language or _preprocess_language(
+        arguments, family, working_directory
+    )
+    selectors: list[str] = []
+    index = 0
+    value_options = {"-B", "--gcc-toolchain", "--target", "-target"}
+    while index < len(arguments):
+        value = arguments[index]
+        if value in value_options:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(
+                    f"compiler helper selector requires a value: {value}"
+                )
+            selectors.extend((value, arguments[index + 1]))
+            index += 2
+            continue
+        if (
+            value.startswith("-B") and value != "-B"
+            or value.startswith("--gcc-toolchain=")
+            or value.startswith("--target=")
+            or value.startswith("-target=")
+            or value.startswith("-specs=")
+        ):
+            selectors.append(value)
+        index += 1
+    return language, tuple(selectors)
 
 
 def open_compiler_executable_capability(
@@ -2312,6 +2480,8 @@ def open_compiler_executable_capability(
     compiler_family: CompilerFamily | None = None,
     launcher_environment: Mapping[str, str] | None = None,
     working_directory: Path | None = None,
+    preprocess_arguments: tuple[str, ...] | None = None,
+    preprocess_language: str | None = None,
     _extra_candidates: tuple[Path, ...] = (),
     _query_driver: bool = True,
 ) -> CompilerExecutableCapability:
@@ -2328,6 +2498,15 @@ def open_compiler_executable_capability(
         raise AuditInfrastructureError("compiler capability family is invalid")
     if launcher_environment is not None and not isinstance(launcher_environment, Mapping):
         raise AuditInfrastructureError("compiler capability environment is invalid")
+    if preprocess_arguments is not None and (
+        not isinstance(preprocess_arguments, tuple)
+        or not all(isinstance(value, str) for value in preprocess_arguments)
+    ):
+        raise AuditInfrastructureError("compiler preprocessing arguments are invalid")
+    if preprocess_language is not None and preprocess_language not in {
+        "c", "c++", "objective-c", "objective-c++"
+    }:
+        raise AuditInfrastructureError("compiler preprocessing language is invalid")
     query_environment = (
         os.environ if launcher_environment is None else launcher_environment
     )
@@ -2338,6 +2517,16 @@ def open_compiler_executable_capability(
         raise AuditInfrastructureError(
             "compiler capability working directory is unavailable"
         ) from error
+    helper_selection_key = (
+        None
+        if preprocess_arguments is None or compiler_family is None
+        else _preprocess_helper_selection_key(
+            preprocess_arguments,
+            compiler_family,
+            query_working_directory,
+            preprocess_language,
+        )
+    )
     memo_key = (
         os.path.normcase(str(canonical)),
         authority.source_root,
@@ -2345,6 +2534,7 @@ def open_compiler_executable_capability(
         compiler_family,
         _environment_digest(query_environment),
         os.path.normcase(str(query_working_directory)),
+        helper_selection_key,
     )
     with _compiler_capability_lock:
         memoized = _compiler_capability_memo.get(memo_key)
@@ -2510,6 +2700,8 @@ def open_compiler_executable_capability(
                 index,
                 pipeline_deadline,
                 cancel_event,
+                preprocess_arguments,
+                preprocess_language,
             )
             if any(path not in paths for path in helpers):
                 owner.close()
@@ -2521,6 +2713,8 @@ def open_compiler_executable_capability(
                     compiler_family=compiler_family,
                     launcher_environment=launcher_environment,
                     working_directory=query_working_directory,
+                    preprocess_arguments=preprocess_arguments,
+                    preprocess_language=preprocess_language,
                     _extra_candidates=helpers,
                     _query_driver=False,
                 )
@@ -2617,6 +2811,9 @@ def inspect_compiler(
     launch_accountant=None,
     *,
     working_directory: Path | None = None,
+    preprocess_arguments: tuple[str, ...] | None = None,
+    preprocess_language: str | None = None,
+    compiler_capability: CompilerExecutableCapability | None = None,
 ) -> CompilerInspection:
     """Inspect a held compiler capability and return portable exact evidence."""
 
@@ -2625,7 +2822,12 @@ def inspect_compiler(
         raise AuditInfrastructureError("compiler inspection family is invalid")
     if not isinstance(launcher_environment, Mapping):
         raise AuditInfrastructureError("compiler inspection environment is invalid")
-    authority = validate_dependency_root_authority(dependency_roots)
+    authority = (
+        dependency_roots
+        if compiler_capability is not None
+        and isinstance(dependency_roots, DependencyRootAuthority)
+        else validate_dependency_root_authority(dependency_roots)
+    )
     deadline = (
         time.monotonic() + _VERSION_SECONDS
         if pipeline_deadline is None
@@ -2639,14 +2841,23 @@ def inspect_compiler(
     cwd = working_directory or compiler.parent
 
     compiler_snapshot = _compiler_metadata_snapshot(compiler)
-    capability = open_compiler_executable_capability(
-        compiler,
-        authority,
-        deadline,
-        compiler_family=compiler_family,
-        launcher_environment=launcher_environment,
-        working_directory=cwd,
-    )
+    capability = compiler_capability
+    if capability is None:
+        capability = open_compiler_executable_capability(
+            compiler,
+            authority,
+            deadline,
+            compiler_family=compiler_family,
+            launcher_environment=launcher_environment,
+            working_directory=cwd,
+            preprocess_arguments=preprocess_arguments,
+            preprocess_language=preprocess_language,
+        )
+    elif (
+        not isinstance(capability, CompilerExecutableCapability)
+        or capability.executable_identity.canonical != compiler
+    ):
+        raise AuditInfrastructureError("compiler inspection capability differs")
     owner = capability.native_owner
     try:
         validate_compiler_executable_capability(
@@ -2683,9 +2894,6 @@ def inspect_compiler(
         with _compiler_inspection_lock:
             memoized = _compiler_inspection_memo.get(memo_key)
             if memoized is not None:
-                validate_compiler_executable_capability(
-                    capability, authority, deadline=deadline
-                )
                 return memoized
 
             cached = None
@@ -2702,6 +2910,8 @@ def inspect_compiler(
                     capability.capability_digest,
                     capability.resolved_runtime_closure_digest,
                     deadline,
+                    held_executable_identity=capability.executable_identity,
+                    held_executable_sha256=capability.executable_sha256,
                 )
             if cached is not None:
                 if (
@@ -3628,8 +3838,10 @@ def make_configuration(
 ) -> PreprocessConfiguration:
     """Build one stable semantic configuration from a compile database entry."""
 
-    authority = validate_dependency_root_authority(dependency_roots)
-    if authority.source_root.resolved_root != source_root.resolve(strict=False):
+    if not isinstance(dependency_roots, DependencyRootAuthority):
+        raise AuditInfrastructureError("compile dependency authority is invalid")
+    authority = dependency_roots
+    if authority.source_root.resolved_root != source_root:
         raise AuditInfrastructureError("compile source root differs from dependency authority")
     if not isinstance(entry_index, int) or isinstance(entry_index, bool) or entry_index < 0:
         raise AuditInfrastructureError("compile database entry index is invalid")
@@ -3652,7 +3864,27 @@ def make_configuration(
     family_hint = _family_from_name(compiler_argument)
     compiler = _resolve_compiler(compiler_argument, cwd, environment)
     environment_digest = _environment_digest(environment)
+    expanded_arguments = expand_response_files(
+        compiler_arguments, family_hint, cwd, limits
+    )
+    _reject_driver_dialect_overrides(expanded_arguments)
+    _validate_arguments((str(compiler), *expanded_arguments))
+    file_value = entry.get("file")
+    if not isinstance(file_value, str):
+        raise AuditInfrastructureError("compile command file must be a string")
+    source_hint = Path(file_value)
+    if not source_hint.is_absolute():
+        source_hint = cwd / source_hint
+    preprocess_language = _preprocess_language(
+        expanded_arguments, family_hint, cwd, source_hint
+    )
     deadline = pipeline_deadline or (time.monotonic() + limits.total_seconds)
+    compiler_capability = open_compiler_executable_capability(
+        compiler, authority, deadline, compiler_family=family_hint,
+        launcher_environment=environment, working_directory=cwd,
+        preprocess_arguments=expanded_arguments,
+        preprocess_language=preprocess_language,
+    )
     inspection = inspect_compiler(
         compiler,
         family_hint,
@@ -3663,33 +3895,23 @@ def make_configuration(
         deadline,
         limits,
         working_directory=cwd,
+        preprocess_arguments=expanded_arguments,
+        preprocess_language=preprocess_language,
+        compiler_capability=compiler_capability,
     )
     family = inspection.compiler_family
     compiler_fingerprint = inspection.driver_fingerprint
-    compiler_capability = open_compiler_executable_capability(
-        compiler, authority, deadline, compiler_family=family,
-        launcher_environment=environment, working_directory=cwd,
-    )
     if compiler_capability.capability_digest != inspection.executable_capability_digest:
         compiler_capability.native_owner.close()
         raise AuditInfrastructureError("compiler capability changed after inspection")
     if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
         _reject_msvc_environment_arguments(environment)
-    expanded_arguments = expand_response_files(
-        compiler_arguments, family, cwd, limits
-    )
-    _reject_driver_dialect_overrides(expanded_arguments)
-    _validate_arguments((str(compiler), *expanded_arguments))
-
-    file_value = entry.get("file")
-    if not isinstance(file_value, str):
-        raise AuditInfrastructureError("compile command file must be a string")
     source_path = Path(file_value)
     if not source_path.is_absolute():
         source_path = cwd / source_path
     try:
         source_path = source_path.resolve(strict=True)
-        canonical_root = source_root.resolve(strict=True)
+        canonical_root = authority.source_root.resolved_root
     except OSError as error:
         raise AuditInfrastructureError(f"compile entry source is unavailable: {file_value}") from error
     try:
@@ -3741,7 +3963,7 @@ def make_configuration(
     _hash_field(digest_builder, compiler_capability.capability_digest.encode("ascii"))
     digest = digest_builder.hexdigest()
     return PreprocessConfiguration(
-        entry_id=f"{database.resolve()}:{entry_index}",
+        entry_id=f"{database if database.is_absolute() else database.resolve()}:{entry_index}",
         family=family,
         compiler=compiler,
         working_directory=cwd,

@@ -1706,6 +1706,7 @@ def collect_configurations(
     databases: tuple[Path, ...],
     environment: Mapping[str, str],
     dependency_roots: DependencyRootAuthority,
+    pipeline_deadline: float,
 ) -> tuple[PreprocessConfiguration, ...]:
     """Normalize every database entry and coalesce only semantic duplicates."""
 
@@ -1713,11 +1714,19 @@ def collect_configurations(
         raise AuditInfrastructureError("production root is invalid")
     lexical_root = root.absolute()
     authority = validate_dependency_root_authority(dependency_roots)
+    if (
+        not isinstance(pipeline_deadline, (int, float))
+        or isinstance(pipeline_deadline, bool)
+        or time.monotonic() >= pipeline_deadline
+    ):
+        raise AuditInfrastructureError("configuration collection deadline exceeded")
     if not isinstance(databases, tuple) or not databases:
         raise AuditInfrastructureError("at least one compile database is required")
     # This validates environment keys and values before compiler probing begins.
     _environment_digest(environment)
     production = enumerate_production_identities(lexical_root)
+    if time.monotonic() >= pipeline_deadline:
+        raise AuditInfrastructureError("configuration collection deadline exceeded")
     # Enumeration has already rejected every aliasing root component, so this
     # resolution cannot hide a symlink/reparse traversal from identity checks.
     canonical_root = lexical_root.resolve(strict=True)
@@ -1731,6 +1740,10 @@ def collect_configurations(
     by_digest: dict[str, PreprocessConfiguration] = {}
     for database in canonical_databases:
         for entry_index, entry in _load_database_entries(database):
+            if time.monotonic() >= pipeline_deadline:
+                raise AuditInfrastructureError(
+                    "configuration collection deadline exceeded"
+                )
             if not _entry_is_production(
                 entry,
                 database,
@@ -1747,6 +1760,9 @@ def collect_configurations(
                 environment,
                 limits,
                 authority,
+                None,
+                "",
+                pipeline_deadline,
             )
             previous = by_digest.get(configuration.digest)
             if previous is None:
@@ -1867,10 +1883,17 @@ def preprocess_all(
     production: Mapping[PurePosixPath, FileIdentity],
     cache: PreprocessCache,
     limits: AuditLimits,
+    pipeline_deadline: float,
 ) -> tuple[tuple[PreprocessedTranslationUnitView, ...], CoverageReport]:
     """Preprocess every semantic configuration under one bounded coordinator."""
 
     authority = validate_dependency_root_authority(dependency_roots)
+    if (
+        not isinstance(pipeline_deadline, (int, float))
+        or isinstance(pipeline_deadline, bool)
+        or time.monotonic() >= pipeline_deadline
+    ):
+        raise AuditInfrastructureError("preprocess pipeline deadline exceeded")
     ordered = _validated_orchestration_inputs(configurations, production, cache, limits)
     if any(
         item.dependency_root_authority_digest != authority.portable_authority_digest
@@ -1905,7 +1928,7 @@ def preprocess_all(
         )
 
     cancellation = threading.Event()
-    deadline = time.monotonic() + limits.total_seconds
+    deadline = pipeline_deadline
     views: dict[str, PreprocessedTranslationUnitView] = {}
     failures: list[tuple[str, str]] = []
     iterator = iter(ordered)

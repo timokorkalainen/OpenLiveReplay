@@ -335,8 +335,10 @@ class CompilerIdentificationTests(unittest.TestCase):
     def test_elf_pt_interp_and_pe_delay_imports_are_parsed_and_closed(self):
         elf = self.elf_interp_runtime_image("/toolchain/ld-authoritative.so")
         pe = self.pe_delay_import_runtime_image("delay-runtime.dll")
+        elf_imports = capability_command._elf_runtime_imports(elf)
+        self.assertEqual(elf_imports.names, ())
         self.assertEqual(
-            capability_command._elf_runtime_imports(elf).names,
+            elf_imports.interpreters,
             ("/toolchain/ld-authoritative.so",),
         )
         self.assertEqual(
@@ -905,9 +907,10 @@ class ConfigurationTests(unittest.TestCase):
             self.real_driver_selected_helper_paths(
                 capability, CompilerFamily.GCC, self.build, self.environment,
                 self.compiler.parent, {}, time.monotonic() + 10.0, None,
+                ("-c", str(self.source.resolve())),
             )
 
-    def test_absent_optional_driver_helper_remains_optional(self):
+    def test_selected_preprocess_helper_missing_fails_closed(self):
         capability = open_compiler_executable_capability(
             self.compiler.resolve(), self.dependency_roots,
             time.monotonic() + 10.0,
@@ -915,12 +918,14 @@ class ConfigurationTests(unittest.TestCase):
         with mock.patch(
             "gpu_capability_command._run_probe_command",
             return_value=b"definitely-absent-optional-helper",
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "preprocessing helper is unavailable"
         ):
-            selected = self.real_driver_selected_helper_paths(
+            self.real_driver_selected_helper_paths(
                 capability, CompilerFamily.GCC, self.build, self.environment,
                 self.compiler.parent, {}, time.monotonic() + 10.0, None,
+                ("-c", str(self.source.resolve())),
             )
-        self.assertEqual(selected, ())
 
     def test_capability_requires_identical_in_process_authority_object(self):
         capability = open_compiler_executable_capability(
@@ -1054,6 +1059,74 @@ class ConfigurationTests(unittest.TestCase):
                 time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
                 launcher_environment=self.environment, working_directory=self.build,
             )
+
+    def test_relative_pt_interp_is_resolved_as_working_directory_exec_path(self):
+        working_directory = self.compiler.parent / "working"
+        working_directory.mkdir()
+        interpreter = working_directory / "ld-relative.so"
+        interpreter.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        helper = self.compiler.parent / "cc1"
+        helper.write_bytes(
+            CompilerIdentificationTests.elf_interp_runtime_image(
+                interpreter.name
+            )
+        )
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            return_value=(helper.resolve(),),
+        ):
+            capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment=self.environment,
+                working_directory=working_directory,
+            )
+        self.addCleanup(capability.native_owner.close)
+        self.assertIn(
+            "working/ld-relative.so",
+            {
+                item.role_relative_path.as_posix()
+                for item in capability.resolved_runtime_closure
+            },
+        )
+
+    def test_preprocess_helper_closure_selects_only_actual_language_frontend(self):
+        helper = self.compiler.parent / "cc1plus"
+        helper.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        for unused in ("cc1", "collect2", "as", "ld"):
+            (self.compiler.parent / unused).write_bytes(
+                CompilerIdentificationTests.elf_runtime_image()
+            )
+        queries = []
+
+        def query(_capability, arguments, *_rest):
+            queries.append(arguments)
+            return str(helper.resolve()).encode("utf-8")
+
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._run_probe_command", side_effect=query
+        ), mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            side_effect=self.real_driver_selected_helper_paths,
+        ):
+            capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0,
+                compiler_family=CompilerFamily.GCC,
+                launcher_environment=self.environment,
+                working_directory=self.build,
+                preprocess_arguments=("-c", str(self.source.resolve())),
+            )
+        self.addCleanup(capability.native_owner.close)
+        self.assertEqual(queries, [("-print-prog-name=cc1plus",)])
+        closure_names = {
+            item.role_relative_path.name
+            for item in capability.resolved_runtime_closure
+        }
+        self.assertIn("cc1plus", closure_names)
+        self.assertTrue(closure_names.isdisjoint({"cc1", "collect2", "as", "ld"}))
 
     def test_delay_import_directory_obeys_context_metadata_ceiling(self):
         image = CompilerIdentificationTests.pe_delay_import_runtime_image(

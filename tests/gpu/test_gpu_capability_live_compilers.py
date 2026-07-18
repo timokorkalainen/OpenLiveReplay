@@ -399,7 +399,7 @@ def _run_live_fixture_impl(
             root, authority_roots
         )
         configurations = collect_configurations(
-            root, (database,), environment, dependency_roots
+            root, (database,), environment, dependency_roots, budget.deadline
         )
         if len(configurations) != 1:
             raise AuditInfrastructureError(
@@ -438,6 +438,7 @@ def _run_live_fixture_impl(
             production,
             cache,
             AuditLimits(workers=1, total_seconds=remaining_seconds),
+            budget.deadline,
         )
         budget.remaining_seconds()
         if len(views) != 1:
@@ -806,7 +807,7 @@ FORWARD(lease.safe)();
             mock.patch(
                 __name__ + ".collect_configurations",
                 side_effect=collect_after_probe,
-            ),
+            ) as collect,
             mock.patch(
                 __name__ + ".enumerate_production_identities",
                 return_value={},
@@ -838,6 +839,8 @@ FORWARD(lease.safe)();
 
         limits = preprocess.call_args.args[4]
         self.assertAlmostEqual(limits.total_seconds, 202.5)
+        self.assertEqual(collect.call_args.args[4], budget.deadline)
+        self.assertEqual(preprocess.call_args.args[5], budget.deadline)
 
     def test_fixture_expiry_during_setup_prevents_preprocess_start(self):
         now = [100.0]

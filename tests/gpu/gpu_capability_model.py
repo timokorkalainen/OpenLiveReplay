@@ -28,6 +28,10 @@ class AuditInfrastructureError(RuntimeError):
     pass
 
 
+class _HeldCompilerCapabilityMismatch(AuditInfrastructureError):
+    pass
+
+
 class _FilesystemGenerationObserver:
     """Own OS guards that make any watched file/path generation change fatal."""
 
@@ -320,6 +324,8 @@ class CompilerInspection:
         *,
         validation_deadline: float | None = None,
         cancel_event: object | None = None,
+        held_executable_identity: FileIdentity | None = None,
+        held_executable_sha256: str | None = None,
     ) -> None:
         for name, value in (
             ("compiler_family", compiler_family),
@@ -331,19 +337,45 @@ class CompilerInspection:
             ("executable_capability_digest", executable_capability_digest),
         ):
             object.__setattr__(self, name, value)
-        self._validate(validation_deadline, cancel_event)
+        self._validate(
+            validation_deadline,
+            cancel_event,
+            held_executable_identity,
+            held_executable_sha256,
+        )
 
     def _validate(
-        self, validation_deadline: float | None, cancel_event: object | None
+        self,
+        validation_deadline: float | None,
+        cancel_event: object | None,
+        held_executable_identity: FileIdentity | None,
+        held_executable_sha256: str | None,
     ) -> None:
         if not isinstance(self.compiler_family, CompilerFamily):
             raise AuditInfrastructureError("compiler inspection family is invalid")
-        _validate_current_executable_identity(self.executable_identity)
+        if (held_executable_identity is None) != (held_executable_sha256 is None):
+            raise AuditInfrastructureError("compiler inspection held capability is invalid")
+        if held_executable_identity is None:
+            _validate_current_executable_identity(self.executable_identity)
+        else:
+            _validate_executable_identity(held_executable_identity)
+            _validate_digest(
+                held_executable_sha256, "compiler inspection held capability content"
+            )
+            if self.executable_identity != held_executable_identity:
+                raise _HeldCompilerCapabilityMismatch(
+                    "compiler inspection held capability identity differs"
+                )
         _validate_digest(self.executable_sha256, "compiler executable content")
-        if _current_executable_sha256(
-            self.executable_identity, validation_deadline, cancel_event
-        ) != self.executable_sha256:
-            raise AuditInfrastructureError("compiler executable content changed")
+        if held_executable_sha256 is None:
+            if _current_executable_sha256(
+                self.executable_identity, validation_deadline, cancel_event
+            ) != self.executable_sha256:
+                raise AuditInfrastructureError("compiler executable content changed")
+        elif self.executable_sha256 != held_executable_sha256:
+            raise _HeldCompilerCapabilityMismatch(
+                "compiler inspection held capability content differs"
+            )
         if (
             not isinstance(self.normalized_version, str)
             or not self.normalized_version
@@ -1620,6 +1652,8 @@ def decode_compiler_inspection(
     *,
     validation_deadline: float | None = None,
     cancel_event: object | None = None,
+    held_executable_identity: FileIdentity | None = None,
+    held_executable_sha256: str | None = None,
 ) -> CompilerInspection:
     if not isinstance(payload, bytes) or len(payload) > _LOCAL_INSPECTION_MAX_BYTES:
         raise AuditInfrastructureError("compiler inspection payload is invalid")
@@ -1643,6 +1677,8 @@ def decode_compiler_inspection(
         document["executable_capability_digest"],
         validation_deadline=validation_deadline,
         cancel_event=cancel_event,
+        held_executable_identity=held_executable_identity,
+        held_executable_sha256=held_executable_sha256,
     )
 
 
