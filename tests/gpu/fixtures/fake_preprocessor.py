@@ -93,6 +93,7 @@ def main() -> int:
             "different-second-byte-count",
             "wait-for-cancel",
             "mutate-restore",
+            "discovery-mutate-restore",
             "swap-root-restore",
         ),
         required=True,
@@ -161,17 +162,24 @@ def main() -> int:
         dependency_extras,
     )
 
-    if invocation > 1 and options.fixture_mode in {
-        "mutate-restore", "swap-root-restore"
+    discovery_mutated = False
+    mutation_invocation = (
+        invocation == 1
+        if options.fixture_mode == "discovery-mutate-restore"
+        else invocation > 1
+    )
+    if mutation_invocation and options.fixture_mode in {
+        "mutate-restore", "discovery-mutate-restore", "swap-root-restore"
     }:
         if options.mutate_path is None:
             raise SystemExit("mutation mode requires --mutate-path")
         target = options.mutate_path.resolve(strict=True)
         try:
-            if options.fixture_mode == "mutate-restore":
+            if options.fixture_mode in {"mutate-restore", "discovery-mutate-restore"}:
                 original = target.read_bytes()
                 target.write_bytes(original + b"changed")
                 target.write_bytes(original)
+                discovery_mutated = options.fixture_mode == "discovery-mutate-restore"
             else:
                 moved = target.with_name(target.name + ".swapped")
                 target.rename(moved)
@@ -242,6 +250,8 @@ def main() -> int:
         _write_chunks(sys.stdout.buffer, b"\n")
     else:
         output = b"lease . nativeHandle ( ) ;\n"
+        if discovery_mutated:
+            output = b"lease . nativeHandle ( ) ; /* discovery mutation */\n"
         if options.fixture_mode == "different-second-output" and invocation > 1:
             output = b"Lease . nativeHandle ( ) ;\n"
         elif options.fixture_mode == "different-second-byte-count" and invocation > 1:

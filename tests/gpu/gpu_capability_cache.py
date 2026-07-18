@@ -844,6 +844,8 @@ class CompilerInspectionCache:
                 inspection.compiler_family is not compiler_family
                 or inspection.executable_identity != identity
                 or inspection.executable_sha256 != content
+                or inspection.executable_capability_digest
+                != executable_capability_digest
             ):
                 raise ValueError("compiler inspection executable differs")
             return inspection
@@ -880,8 +882,12 @@ class CompilerInspectionCache:
             or inspection.compiler_family is not compiler_family
             or inspection.executable_identity != identity
             or inspection.executable_sha256 != content
+            or inspection.executable_capability_digest
+            != executable_capability_digest
         ):
-            raise AuditInfrastructureError("compiler inspection publication differs")
+            raise AuditInfrastructureError(
+                "compiler inspection publication capability digest differs"
+            )
         document = {
             "schema": _COMPILER_INSPECTION_SCHEMA,
             "key": key,

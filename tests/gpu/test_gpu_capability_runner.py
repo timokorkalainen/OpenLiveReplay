@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_capability_command as capability_command  # noqa: E402
 import gpu_capability_model as capability_model  # noqa: E402
+import gpu_capability_runner as capability_runner  # noqa: E402
 from gpu_capability_command import (  # noqa: E402
     RewrittenCommand,
     _clear_compiler_inspection_memo_for_tests,
@@ -47,6 +48,7 @@ from gpu_capability_runner import (  # noqa: E402
     _DependencyGenerationGuards,
     _WindowsJob,
     collect_configurations,
+    discover_configuration,
     load_or_preprocess,
     preprocess_all,
     preprocess_configuration,
@@ -76,11 +78,16 @@ class BoundedPreprocessorTests(unittest.TestCase):
             production=True,
         )
         self.production = {self.identity.relative: self.identity}
+        authority_roots = {
+            "sdk": self.outside.parent,
+            "toolchain": Path(sys.executable).resolve().parent,
+        }
+        if os.name == "nt":
+            authority_roots["windows-system"] = Path(
+                os.environ.get("SystemRoot", "C:/Windows")
+            ).resolve()
         self.dependency_roots = build_dependency_root_authority(
-            self.root, {
-                "sdk": self.outside.parent,
-                "toolchain": Path(sys.executable).resolve().parent,
-            }
+            self.root, authority_roots
         )
         self.compiler_capability = open_compiler_executable_capability(
             Path(sys.executable).resolve(), self.dependency_roots, time.monotonic() + 10.0
@@ -267,6 +274,34 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 "swap-root-restore", "--mutate-path", str(self.outside.parent),
                 "--extra-dependency", str(self.outside),
             )
+
+    def test_discovery_mutation_restoration_cannot_match_accepted_output(self):
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "raw preprocessed (output|byte count) changed"
+        ):
+            self.stabilize_fixture(
+                "discovery-mutate-restore", "--mutate-path", str(self.source),
+            )
+
+    def test_production_root_and_nested_ancestor_swap_restoration_fail_closed(self):
+        nested_header = self.source.parent / "nested" / "guarded.h"
+        nested_header.parent.mkdir()
+        nested_header.write_text("guarded\n", encoding="utf-8")
+        metadata = nested_header.stat()
+        nested_identity = FileIdentity(
+            nested_header.resolve(), PurePosixPath("playback/nested/guarded.h"),
+            int(metadata.st_dev), int(metadata.st_ino) or None, 1, True,
+        )
+        self.production[nested_identity.relative] = nested_identity
+        expected = "guard prevented generation change" if os.name == "nt" else "generation change"
+        for target in (self.root, nested_header.parent):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                AuditInfrastructureError, expected
+            ):
+                self.stabilize_fixture(
+                    "swap-root-restore", "--mutate-path", str(target),
+                    "--extra-dependency", str(nested_header),
+                )
 
     def test_real_subprocess_accepts_thread_and_spawn_cancellation_events(self):
         events = (threading.Event(), multiprocessing.get_context("spawn").Event())
@@ -981,6 +1016,7 @@ class OrchestrationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.compiler_capability.native_owner.close()
+        _clear_compiler_inspection_memo_for_tests()
         self.temporary.cleanup()
         self.toolchain_temporary.cleanup()
 
@@ -1099,6 +1135,100 @@ class OrchestrationTests(unittest.TestCase):
             load_or_preprocess(
                 configuration, authority, {identity.relative: identity}, self.cache,
                 AuditLimits(rss_bytes=2**63 - 1), time.monotonic() + 10.0,
+            )
+
+    def test_discovery_rejects_local_authority_mismatch_before_compiler_launch(self):
+        source = self.write_source("playback/direct-discovery.cpp")
+        identity = self.identity(source, "playback/direct-discovery.cpp")
+        configuration = self.configuration(identity, "direct-discovery-authority")
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        other_root = Path(other.name).resolve()
+        other_source = other_root / "source"
+        other_toolchain = other_root / "toolchain"
+        other_source.mkdir()
+        other_toolchain.mkdir()
+        authority = build_dependency_root_authority(
+            other_source, {"toolchain": other_toolchain}
+        )
+        self.assertEqual(
+            authority.portable_authority_digest,
+            self.dependency_roots.portable_authority_digest,
+        )
+        with mock.patch(
+            "gpu_capability_runner.run_bounded_preprocessor",
+            side_effect=AssertionError("compiler reached"),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "local dependency authority"):
+            discover_configuration(
+                configuration,
+                authority,
+                {identity.relative: identity},
+                AuditLimits(rss_bytes=2**63 - 1),
+                time.monotonic() + 10.0,
+            )
+
+    def test_stabilization_rejects_local_authority_mismatch_before_discovery(self):
+        source = self.write_source("playback/direct-stabilization.cpp")
+        identity = self.identity(source, "playback/direct-stabilization.cpp")
+        configuration = self.configuration(identity, "direct-stabilization-authority")
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        other_root = Path(other.name).resolve()
+        other_source = other_root / "source"
+        other_toolchain = other_root / "toolchain"
+        other_source.mkdir()
+        other_toolchain.mkdir()
+        authority = build_dependency_root_authority(
+            other_source, {"toolchain": other_toolchain}
+        )
+        with mock.patch(
+            "gpu_capability_runner.discover_configuration",
+            side_effect=AssertionError("discovery reached"),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "local dependency authority"):
+            stabilize_and_parse_configuration(
+                configuration,
+                authority,
+                {identity.relative: identity},
+                AuditLimits(rss_bytes=2**63 - 1),
+                time.monotonic() + 10.0,
+            )
+
+    def test_dependency_aggregate_is_reserved_before_any_payload_open(self):
+        identities = []
+        for index in range(5):
+            path = self.write_source(f"playback/large-{index}.h", "")
+            with path.open("wb") as stream:
+                stream.truncate(220 * 1024 * 1024)
+            identities.append(self.identity(path, f"playback/large-{index}.h"))
+        original_open = Path.open
+
+        def guarded_open(path, *args, **kwargs):
+            if path in {identity.canonical for identity in identities}:
+                raise AssertionError("dependency payload opened before aggregate reservation")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(
+            Path, "open", guarded_open
+        ), self.assertRaisesRegex(AuditInfrastructureError, "total byte ceiling"):
+            capability_runner._dependency_digests(
+                tuple(identities), self.dependency_roots,
+                time.monotonic() + 10.0, None,
+            )
+
+    def test_dependency_hashing_honors_cancellation_and_deadline(self):
+        source = self.write_source("playback/hash-budget.h")
+        identity = self.identity(source, "playback/hash-budget.h")
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            capability_runner._dependency_digests(
+                (identity,), self.dependency_roots,
+                time.monotonic() + 10.0, cancelled,
+            )
+        with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
+            capability_runner._dependency_digests(
+                (identity,), self.dependency_roots,
+                time.monotonic() - 1.0, None,
             )
 
     @staticmethod

@@ -4,6 +4,7 @@ import dataclasses
 import locale
 import os
 import subprocess
+import struct
 import sys
 import tempfile
 import threading
@@ -227,6 +228,81 @@ class LauncherTests(unittest.TestCase):
 
 
 class CompilerIdentificationTests(unittest.TestCase):
+    @staticmethod
+    def elf_runtime_image(
+        *, needed: tuple[str, ...] = (), rpath: tuple[str, ...] = (),
+        runpath: tuple[str, ...] = (),
+    ) -> bytes:
+        strings = bytearray(b"\0")
+        offsets = {}
+        for value in (*needed, *rpath, *runpath):
+            if value not in offsets:
+                offsets[value] = len(strings)
+                strings.extend(value.encode("utf-8") + b"\0")
+        entries = [(1, offsets[value]) for value in needed]
+        entries.extend((15, offsets[value]) for value in rpath)
+        entries.extend((29, offsets[value]) for value in runpath)
+        entries.extend(((5, 0x400200), (0, 0)))
+        dynamic = b"".join(struct.pack("<qQ", *entry) for entry in entries)
+        image = bytearray(0x200 + len(strings))
+        ident = b"\x7fELF" + bytes((2, 1, 1)) + b"\0" * 9
+        struct.pack_into(
+            "<16sHHIQQQIHHHHHH", image, 0, ident, 2, 0x3E, 1,
+            0, 64, 0, 0, 64, 56, 2, 0, 0, 0,
+        )
+        struct.pack_into(
+            "<IIQQQQQQ", image, 64, 1, 4, 0x200, 0x400200, 0,
+            len(strings), len(strings), 1,
+        )
+        struct.pack_into(
+            "<IIQQQQQQ", image, 120, 2, 4, 0x100, 0, 0,
+            len(dynamic), len(dynamic), 8,
+        )
+        image[0x100:0x100 + len(dynamic)] = dynamic
+        image[0x200:] = strings
+        return bytes(image)
+
+    @staticmethod
+    def macho_runtime_image(*, needed: str, rpath: str) -> bytes:
+        def command(kind: int, header_bytes: int, value: str) -> bytes:
+            encoded = value.encode("utf-8") + b"\0"
+            size = (header_bytes + len(encoded) + 7) & ~7
+            payload = bytearray(size)
+            struct.pack_into("<II", payload, 0, kind, size)
+            struct.pack_into("<I", payload, 8, header_bytes)
+            payload[header_bytes:header_bytes + len(encoded)] = encoded
+            return bytes(payload)
+
+        dylib = command(0xC, 24, needed)
+        load_path = command(0x8000001C, 12, rpath)
+        image = bytearray(32 + len(dylib) + len(load_path))
+        struct.pack_into(
+            "<IIIIIIII", image, 0, 0xFEEDFACF, 0, 0, 2, 2,
+            len(dylib) + len(load_path), 0, 0,
+        )
+        image[32:] = dylib + load_path
+        return bytes(image)
+
+    def test_elf_runtime_parser_retains_rpath_and_runpath(self):
+        imports = capability_command._elf_runtime_imports(
+            self.elf_runtime_image(
+                needed=("libchild.so",), rpath=("$ORIGIN/legacy",),
+                runpath=("$ORIGIN/private",),
+            )
+        )
+        self.assertEqual(imports.names, ("libchild.so",))
+        self.assertEqual(imports.rpath, ("$ORIGIN/legacy",))
+        self.assertEqual(imports.runpath, ("$ORIGIN/private",))
+
+    def test_macho_runtime_parser_retains_lc_rpath(self):
+        imports = capability_command._macho_runtime_imports(
+            self.macho_runtime_image(
+                needed="@rpath/libchild.dylib", rpath="@loader_path/../Frameworks"
+            )
+        )
+        self.assertEqual(imports.names, ("@rpath/libchild.dylib",))
+        self.assertEqual(imports.rpath, ("@loader_path/../Frameworks",))
+
     def test_binary_runtime_import_parser_reads_current_executable(self):
         resolver = getattr(capability_command, "_binary_runtime_import_names", None)
         self.assertTrue(callable(resolver), "binary runtime import resolver is absent")
@@ -593,6 +669,311 @@ class ConfigurationTests(unittest.TestCase):
             open_compiler_executable_capability(
                 self.compiler.resolve(), self.dependency_roots,
                 time.monotonic() + 10.0, cancel_event=cancelled,
+            )
+
+    def test_capability_memo_binds_driver_query_environment_and_working_directory(self):
+        helpers = {}
+        for name in ("a", "b", "c"):
+            helper = self.compiler.parent / f"helper-{name}.exe"
+            helper.write_bytes(name.encode("ascii"))
+            helpers[name] = helper.resolve()
+        other_cwd = self.build / "other"
+        other_cwd.mkdir()
+
+        def selected(_capability, _family, cwd, environment, *_rest):
+            if environment["SELECT"] == "a":
+                return (helpers["a"],)
+            return (helpers["c"] if cwd == other_cwd else helpers["b"],)
+
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            side_effect=selected,
+        ) as query:
+            first = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment={"SELECT": "a"}, working_directory=self.build,
+            )
+            second = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment={"SELECT": "b"}, working_directory=self.build,
+            )
+            third = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment={"SELECT": "b"}, working_directory=other_cwd,
+            )
+        closures = [
+            {item.role_relative_path.name for item in capability.resolved_runtime_closure}
+            for capability in (first, second, third)
+        ]
+        self.assertIn("helper-a.exe", closures[0])
+        self.assertIn("helper-b.exe", closures[1])
+        self.assertIn("helper-c.exe", closures[2])
+        self.assertEqual(query.call_count, 3)
+
+    def test_nested_helper_runpath_runtime_and_every_ancestor_are_guarded(self):
+        nested = self.compiler.parent / "libexec" / "nested"
+        runtime_directory = self.compiler.parent / "runtime"
+        nested.mkdir(parents=True)
+        runtime_directory.mkdir()
+        decoy_directory = self.compiler.parent / "decoy"
+        decoy_directory.mkdir()
+        helper = nested / "cc1.exe"
+        runtime = runtime_directory / "libnested.so"
+        helper.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=(runtime.name,), runpath=("$ORIGIN/../../runtime",),
+        ))
+        runtime.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        (decoy_directory / runtime.name).write_bytes(
+            CompilerIdentificationTests.elf_runtime_image()
+        )
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            return_value=(helper.resolve(),),
+        ):
+            capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment=self.environment, working_directory=self.build,
+            )
+        closure_paths = {
+            item.role_relative_path.as_posix()
+            for item in capability.resolved_runtime_closure
+        }
+        self.assertIn("libexec/nested/cc1.exe", closure_paths)
+        self.assertIn("runtime/libnested.so", closure_paths)
+        guarded = set(capability.native_owner.directory_paths)
+        self.assertIn(nested.resolve(), guarded)
+        self.assertIn(runtime_directory.resolve(), guarded)
+
+    def test_unresolved_loader_import_fails_closed(self):
+        nested = self.compiler.parent / "libexec"
+        nested.mkdir()
+        helper = nested / "cc1.exe"
+        helper.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=("missing-runtime.so",), runpath=("$ORIGIN",),
+        ))
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            return_value=(helper.resolve(),),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "unresolved runtime import"):
+            open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment=self.environment, working_directory=self.build,
+            )
+
+    def test_runtime_closure_spans_distinct_authority_roots(self):
+        helper_directory = self.compiler.parent / "libexec"
+        helper_directory.mkdir()
+        helper = helper_directory / "cc1.exe"
+        runtime_root = self.root / "system-runtime"
+        runtime_root.mkdir()
+        runtime = runtime_root / "libsystem.so"
+        helper.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=(runtime.name,), runpath=("$ORIGIN/../../system-runtime",),
+        ))
+        runtime.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        authority = build_dependency_root_authority(
+            self.source_root,
+            {"toolchain": self.compiler.parent, "system-runtime": runtime_root},
+        )
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            return_value=(helper.resolve(),),
+        ):
+            capability = open_compiler_executable_capability(
+                self.compiler.resolve(), authority, time.monotonic() + 10.0,
+                compiler_family=CompilerFamily.GCC,
+                launcher_environment=self.environment,
+                working_directory=self.build,
+            )
+        runtime_evidence = next(
+            item for item in capability.resolved_runtime_closure
+            if item.role_relative_path.name == runtime.name
+        )
+        self.assertEqual(runtime_evidence.stable_role, "system-runtime")
+        self.assertIn(runtime_root.resolve(), capability.native_owner.directory_paths)
+
+    def test_runtime_symlink_alias_and_real_target_are_both_guarded(self):
+        nested = self.compiler.parent / "libexec"
+        runtime_directory = self.compiler.parent / "runtime"
+        real_directory = self.compiler.parent / "real"
+        nested.mkdir()
+        runtime_directory.mkdir()
+        real_directory.mkdir()
+        helper = nested / "cc1.exe"
+        runtime = real_directory / "libnested.so.1"
+        alias = runtime_directory / "libnested.so"
+        helper.write_bytes(CompilerIdentificationTests.elf_runtime_image(
+            needed=(alias.name,), runpath=("$ORIGIN/../runtime",),
+        ))
+        runtime.write_bytes(CompilerIdentificationTests.elf_runtime_image())
+        try:
+            alias.symlink_to(runtime)
+        except OSError as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._driver_selected_helper_paths",
+            return_value=(helper.resolve(),),
+        ):
+            capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                launcher_environment=self.environment, working_directory=self.build,
+            )
+        self.assertIn(alias, capability.native_owner.alias_paths)
+        self.assertIn(runtime.resolve(), capability.native_owner.file_paths)
+
+    def test_runtime_aggregate_is_reserved_before_any_binary_payload_read(self):
+        runtimes = []
+        for index in range(5):
+            runtime = self.compiler.parent / f"runtime-{index}.dll"
+            with runtime.open("wb") as stream:
+                stream.truncate(220 * 1024 * 1024)
+            runtimes.append(runtime)
+        _clear_compiler_inspection_memo_for_tests()
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports",
+            side_effect=AssertionError("runtime payload read before aggregate reservation"),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "total byte ceiling"):
+            open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0,
+            )
+
+    def test_runtime_binary_parser_honors_cancellation_and_deadline(self):
+        runtime = self.compiler.parent / "runtime.dll"
+        runtime.write_bytes(b"MZ" + b"x" * (2 * 1024 * 1024))
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            capability_command._binary_runtime_import_names(
+                runtime, deadline=time.monotonic() + 10.0,
+                cancel_event=cancelled,
+            )
+        with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
+            capability_command._binary_runtime_import_names(
+                runtime, deadline=time.monotonic() - 1.0,
+                cancel_event=None,
+            )
+
+    def test_helper_runtime_replacement_and_nested_ancestor_swap_fail_closed(self):
+        nested = self.compiler.parent / "libexec" / "nested"
+        nested.mkdir(parents=True)
+        helper = nested / "cc1.exe"
+        runtime = nested / "runtime.dll"
+        helper.write_bytes(b"helper")
+        runtime.write_bytes(b"runtime")
+        for target, is_directory in ((helper, False), (runtime, False), (nested, True)):
+            _clear_compiler_inspection_memo_for_tests()
+            with mock.patch(
+                "gpu_capability_command._driver_selected_helper_paths",
+                return_value=(helper.resolve(), runtime.resolve()),
+            ):
+                capability = open_compiler_executable_capability(
+                    self.compiler.resolve(), self.dependency_roots,
+                    time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+                    launcher_environment=self.environment,
+                    working_directory=self.build,
+                )
+            prevented = False
+            try:
+                if is_directory:
+                    moved = target.with_name(target.name + ".moved")
+                    target.rename(moved)
+                    moved.rename(target)
+                else:
+                    original = target.read_bytes()
+                    target.write_bytes(original + b"changed")
+                    target.write_bytes(original)
+            except OSError:
+                prevented = True
+            if prevented:
+                capability.native_owner.validate()
+            else:
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "generation|path chain|content"
+                ):
+                    capability.native_owner.validate()
+
+    def test_permit_to_exec_and_during_exec_changes_fail_closed(self):
+        class Containment:
+            requires_handshake = False
+            popen_arguments = {}
+
+            def prepare_command(self, command): return command
+            def attach(self, _process): pass
+            def release(self, _process): pass
+            def close(self): pass
+            def terminate(self): pass
+
+        class Process:
+            returncode = 0
+
+            def __init__(self, stdout, mutate_on_poll=None):
+                self.stdout = stdout
+                self.mutate_on_poll = mutate_on_poll
+                self.polled = False
+                stdout.write(b"g++ (GCC) 14.1.0\n")
+                stdout.flush()
+
+            def poll(self):
+                if not self.polled and self.mutate_on_poll is not None:
+                    self.polled = True
+                    self.mutate_on_poll()
+                return self.returncode
+
+            def wait(self, timeout=None): return self.returncode
+            def kill(self): self.returncode = -9
+
+        for phase in ("permit", "during"):
+            _clear_compiler_inspection_memo_for_tests()
+            capability = open_compiler_executable_capability(
+                self.compiler.resolve(), self.dependency_roots,
+                time.monotonic() + 10.0,
+            )
+            state = {"prevented": False}
+
+            def mutate_restore():
+                try:
+                    original = self.compiler.read_bytes()
+                    self.compiler.write_bytes(original + b"changed")
+                    self.compiler.write_bytes(original)
+                except OSError:
+                    state["prevented"] = True
+
+            def launch(*_args, **kwargs):
+                if phase == "permit":
+                    mutate_restore()
+                return Process(
+                    kwargs["stdout"],
+                    mutate_restore if phase == "during" else None,
+                )
+
+            detected = False
+            with mock.patch(
+                "gpu_capability_command._ProbeContainment", Containment
+            ), mock.patch(
+                "gpu_capability_command.subprocess.Popen", side_effect=launch
+            ):
+                try:
+                    capability_command._run_probe_command(
+                        capability, ("--version",), self.build,
+                        self.environment, time.monotonic() + 10.0,
+                    )
+                except AuditInfrastructureError as error:
+                    detected = bool(re.search("generation|changed|content", str(error)))
+            self.assertTrue(
+                state["prevented"] or detected,
+                f"{phase} change was neither prevented nor detected",
             )
 
     def test_compiler_content_metadata_and_version_all_affect_digest(self):
@@ -1078,9 +1459,12 @@ class ConfigurationTests(unittest.TestCase):
             PYTHONPATH=str(fixture),
         )
         from gpu_capability_command import _run_probe_command, _WindowsProbeJob
-        python_authority = build_dependency_root_authority(
-            fixture, {"python": Path(sys.executable).resolve().parent}
-        )
+        python_roots = {"python": Path(sys.executable).resolve().parent}
+        if os.name == "nt":
+            python_roots["windows-system"] = Path(
+                os.environ.get("SystemRoot", "C:/Windows")
+            ).resolve()
+        python_authority = build_dependency_root_authority(fixture, python_roots)
         capability = open_compiler_executable_capability(
             Path(sys.executable), python_authority, time.monotonic() + 60.0
         )

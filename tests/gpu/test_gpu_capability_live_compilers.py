@@ -363,8 +363,35 @@ def _run_live_fixture_impl(
             # stubbing collection. Keep those synthetic roots disjoint from
             # the temporary source tree without weakening real-family roots.
             toolchain_root = compiler.parent
+        authority_roots = {"toolchain": toolchain_root.resolve()}
+        runtime_candidates = []
+        if os.name == "nt":
+            runtime_candidates.append((
+                "windows-system",
+                Path(os.environ.get("SystemRoot", "C:/Windows")),
+            ))
+        elif sys.platform.startswith("linux"):
+            runtime_candidates.extend((
+                ("system-lib", Path("/lib")),
+                ("system-lib64", Path("/lib64")),
+            ))
+        elif sys.platform == "darwin":
+            runtime_candidates.append(("system-frameworks", Path("/System")))
+        for role, candidate in runtime_candidates:
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if not resolved.is_dir() or any(
+                resolved == existing
+                or resolved.is_relative_to(existing)
+                or existing.is_relative_to(resolved)
+                for existing in authority_roots.values()
+            ):
+                continue
+            authority_roots[role] = resolved
         dependency_roots = build_dependency_root_authority(
-            root, {"toolchain": toolchain_root}
+            root, authority_roots
         )
         configurations = collect_configurations(
             root, (database,), environment, dependency_roots
@@ -388,6 +415,14 @@ def _run_live_fixture_impl(
         ):
             raise AuditInfrastructureError(
                 "live GCC capability did not resolve the driver-selected cc1 helper"
+            )
+        owner = configurations[0].compiler_capability.native_owner
+        guarded_directories = set(owner.directory_paths)
+        if any(
+            path.parent not in guarded_directories for path in owner.file_paths
+        ):
+            raise AuditInfrastructureError(
+                "live compiler capability omitted a runtime ancestor guard"
             )
         production = enumerate_production_identities(root)
         cache = PreprocessCache(root / "gpu-capability-cache")
@@ -751,7 +786,8 @@ FORWARD(lease.safe)();
             family=CompilerFamily.MSVC,
             digest="cfg-live",
             compiler_capability=SimpleNamespace(
-                resolved_runtime_closure=(object(), object())
+                resolved_runtime_closure=(object(), object()),
+                native_owner=SimpleNamespace(directory_paths=(), file_paths=()),
             ),
         )
         view = SimpleNamespace(configuration=configuration)
@@ -807,7 +843,8 @@ FORWARD(lease.safe)();
             family=CompilerFamily.MSVC,
             digest="cfg-live",
             compiler_capability=SimpleNamespace(
-                resolved_runtime_closure=(object(), object())
+                resolved_runtime_closure=(object(), object()),
+                native_owner=SimpleNamespace(directory_paths=(), file_paths=()),
             ),
         )
         view = SimpleNamespace(configuration=configuration)

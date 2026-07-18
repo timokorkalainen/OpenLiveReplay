@@ -4,9 +4,12 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import weakref
 from pathlib import Path, PurePosixPath
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -45,6 +48,47 @@ class ProvenanceTests(unittest.TestCase):
                 self.adapter_identity,
             )
         }
+
+    def test_dependency_documents_reject_sparse_payload_before_open(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        for name, parser in (("deps.d", parse_gcc_dependencies), ("deps.json", parse_msvc_dependencies)):
+            path = root / name
+            with path.open("wb") as stream:
+                stream.truncate(4 * 1024 * 1024 + 1)
+            original_open = Path.open
+
+            def guarded_open(candidate, *args, **kwargs):
+                if candidate == path:
+                    raise AssertionError("oversized dependency document was opened")
+                return original_open(candidate, *args, **kwargs)
+
+            with self.subTest(name=name), mock.patch.object(
+                Path, "open", guarded_open
+            ), self.assertRaisesRegex(AuditInfrastructureError, "byte ceiling"):
+                parser(
+                    path, deadline=time.monotonic() + 10.0,
+                    cancel_event=None,
+                )
+
+    def test_dependency_document_parsers_honor_cancellation_and_deadline(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        depfile = Path(temporary.name).resolve() / "deps.d"
+        depfile.write_text("out: source.cpp\n", encoding="utf-8")
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            parse_gcc_dependencies(
+                depfile, deadline=time.monotonic() + 10.0,
+                cancel_event=cancelled,
+            )
+        with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
+            parse_gcc_dependencies(
+                depfile, deadline=time.monotonic() - 1.0,
+                cancel_event=None,
+            )
 
     def identity(
         self,

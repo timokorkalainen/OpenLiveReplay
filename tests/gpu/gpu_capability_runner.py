@@ -54,6 +54,21 @@ from gpu_capability_provenance import (
 _IO_CHUNK_BYTES = 4096
 _POLL_SECONDS = 0.01
 _REAP_SECONDS = 1.0
+_DEPENDENCY_FILE_BYTES = 256 * 1024 * 1024
+_DEPENDENCY_TOTAL_BYTES = 1024 * 1024 * 1024
+
+
+def _check_dependency_budget(
+    deadline: float | None, cancel_event: object | None
+) -> None:
+    if cancel_event is not None:
+        is_set = getattr(cancel_event, "is_set", None)
+        if not callable(is_set):
+            raise AuditInfrastructureError("dependency cancellation event is invalid")
+        if is_set():
+            raise AuditInfrastructureError("dependency hashing cancelled")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise AuditInfrastructureError("dependency hashing deadline exceeded")
 
 
 @dataclass(frozen=True)
@@ -799,15 +814,20 @@ def _dependency_binding(
 def _hash_dependency_identity(
     identity: FileIdentity,
     authority: DependencyRootAuthority,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+    expected_snapshot: tuple[int, int | None, int, int, int] | None = None,
 ) -> DependencyDigest:
     path = identity.canonical
     stable_role, relative = _dependency_binding(path, authority)
     digest = hashlib.sha256()
     try:
+        _check_dependency_budget(deadline, cancel_event)
         before = path.stat()
         with path.open("rb") as stream:
             opened = os.fstat(stream.fileno())
             while chunk := stream.read(1024 * 1024):
+                _check_dependency_budget(deadline, cancel_event)
                 digest.update(chunk)
             after_open = os.fstat(stream.fileno())
         after = path.stat()
@@ -821,6 +841,8 @@ def _hash_dependency_identity(
         int(getattr(item, "st_ctime_ns", 0)),
     )
     expected = snapshot(before)
+    if expected_snapshot is not None and expected != expected_snapshot:
+        raise AuditInfrastructureError("dependency changed before hashing")
     if (
         snapshot(opened)[:4] != expected[:4]
         or snapshot(after_open)[:4] != expected[:4]
@@ -833,9 +855,37 @@ def _hash_dependency_identity(
 
 
 def _dependency_digests(
-    identities: tuple[FileIdentity, ...], authority: DependencyRootAuthority
+    identities: tuple[FileIdentity, ...],
+    authority: DependencyRootAuthority,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
 ) -> tuple[DependencyDigest, ...]:
-    return tuple(_hash_dependency_identity(identity, authority) for identity in identities)
+    snapshots = []
+    total_bytes = 0
+    for identity in identities:
+        _check_dependency_budget(deadline, cancel_event)
+        try:
+            metadata = identity.canonical.stat()
+        except OSError as error:
+            raise AuditInfrastructureError("dependency changed before hashing") from error
+        snapshot = (
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) else None,
+            int(metadata.st_size), int(metadata.st_mtime_ns),
+            int(getattr(metadata, "st_ctime_ns", 0)),
+        )
+        if snapshot[2] > _DEPENDENCY_FILE_BYTES:
+            raise AuditInfrastructureError("dependency per-file byte ceiling exceeded")
+        total_bytes += snapshot[2]
+        if total_bytes > _DEPENDENCY_TOTAL_BYTES:
+            raise AuditInfrastructureError("dependency total byte ceiling exceeded")
+        snapshots.append(snapshot)
+    return tuple(
+        _hash_dependency_identity(
+            identity, authority, deadline, cancel_event, snapshot
+        )
+        for identity, snapshot in zip(identities, snapshots)
+    )
 
 
 def _parse_dependency_output(
@@ -843,11 +893,19 @@ def _parse_dependency_output(
     configuration: PreprocessConfiguration,
     authority: DependencyRootAuthority,
     production: Mapping[PurePosixPath, FileIdentity],
+    deadline: float | None = None,
+    cancel_event: object | None = None,
 ) -> tuple[FileIdentity, ...]:
     if rewritten.dependency_format == "gcc-depfile":
-        paths = parse_gcc_dependencies(rewritten.dependency_output)
+        paths = parse_gcc_dependencies(
+            rewritten.dependency_output, deadline=deadline,
+            cancel_event=cancel_event,
+        )
     elif rewritten.dependency_format == "msvc-json":
-        paths = parse_msvc_dependencies(rewritten.dependency_output)
+        paths = parse_msvc_dependencies(
+            rewritten.dependency_output, deadline=deadline,
+            cancel_event=cancel_event,
+        )
     else:
         raise AuditInfrastructureError(
             f"unsupported dependency format: {rewritten.dependency_format}"
@@ -856,6 +914,8 @@ def _parse_dependency_output(
         _absolute_dependencies(paths, configuration.working_directory),
         authority.source_root.resolved_root,
         production,
+        deadline=deadline,
+        cancel_event=cancel_event,
     )
 
 
@@ -943,7 +1003,11 @@ class _DependencyGenerationGuards:
             int(metadata.st_mode),
         )
 
-    def validate_and_hash(self) -> tuple[DependencyDigest, ...]:
+    def validate_and_hash(
+        self,
+        deadline: float | None = None,
+        cancel_event: object | None = None,
+    ) -> tuple[DependencyDigest, ...]:
         if self._observer is None:
             raise AuditInfrastructureError("dependency generation guards are not armed")
         self._observer.drain()
@@ -951,6 +1015,14 @@ class _DependencyGenerationGuards:
             if self._directory_snapshot(path) != expected:
                 raise AuditInfrastructureError("dependency directory generation changed")
         result: list[DependencyDigest] = []
+        total_bytes = 0
+        for _path, expected in self._files:
+            _check_dependency_budget(deadline, cancel_event)
+            if expected[2] > _DEPENDENCY_FILE_BYTES:
+                raise AuditInfrastructureError("dependency per-file byte ceiling exceeded")
+            total_bytes += expected[2]
+            if total_bytes > _DEPENDENCY_TOTAL_BYTES:
+                raise AuditInfrastructureError("dependency total byte ceiling exceeded")
         for stream, (path, expected) in zip(self._streams, self._files):
             opened = os.fstat(stream.fileno())
             if (
@@ -966,6 +1038,7 @@ class _DependencyGenerationGuards:
             digest = hashlib.sha256()
             stream.seek(0)
             while chunk := stream.read(1024 * 1024):
+                _check_dependency_budget(deadline, cancel_event)
                 digest.update(chunk)
             stream.seek(0)
             if self._file_snapshot(os.fstat(stream.fileno()))[:4] != expected[:4]:
@@ -1019,6 +1092,9 @@ def discover_configuration(
         dependency_roots,
         expected_digest=configuration.dependency_root_authority_digest,
     )
+    validate_compiler_executable_capability(
+        configuration.compiler_capability, authority
+    )
     consumer = _StreamDigestConsumer()
     with tempfile.TemporaryDirectory(
         prefix=".gpu-capability-discovery-",
@@ -1033,9 +1109,12 @@ def discover_configuration(
             rewritten, configuration, limits, deadline, consumer, cancel_event
         )
         identities = _parse_dependency_output(
-            rewritten, configuration, authority, production
+            rewritten, configuration, authority, production,
+            deadline, cancel_event,
         )
-        dependencies = _dependency_digests(identities, authority)
+        dependencies = _dependency_digests(
+            identities, authority, deadline, cancel_event
+        )
     return PreprocessDiscovery(consumer.finish(), dependencies, identities)
 
 
@@ -1047,15 +1126,18 @@ def stabilize_and_parse_configuration(
     deadline: float,
     cancel_event: object | None = None,
 ) -> tuple[PreprocessedTranslationUnitView, PreprocessDiscovery, PreprocessStageTimings]:
+    authority = validate_dependency_root_authority(
+        dependency_roots,
+        expected_digest=configuration.dependency_root_authority_digest,
+    )
+    validate_compiler_executable_capability(
+        configuration.compiler_capability, authority
+    )
     discovery_started = time.monotonic()
     discovery = discover_configuration(
         configuration, dependency_roots, production, limits, deadline, cancel_event
     )
     discovery_seconds = time.monotonic() - discovery_started
-    authority = validate_dependency_root_authority(
-        dependency_roots,
-        expected_digest=configuration.dependency_root_authority_digest,
-    )
     guards = _DependencyGenerationGuards(discovery.dependencies, authority).bind(
         discovery.dependencies
     )
@@ -1076,14 +1158,17 @@ def stabilize_and_parse_configuration(
             rewritten = rewrite_preprocess_command(
                 configuration, Path(temporary) / f"dependencies{suffix}"
             )
-            guards.validate_and_hash()
+            guards.validate_and_hash(deadline, cancel_event)
             run_bounded_preprocessor(
                 rewritten, configuration, limits, deadline, consumer, cancel_event
             )
             accepted_identities = _parse_dependency_output(
-                rewritten, configuration, authority, production
+                rewritten, configuration, authority, production,
+                deadline, cancel_event,
             )
-            accepted_dependencies = guards.validate_and_hash()
+            accepted_dependencies = guards.validate_and_hash(
+                deadline, cancel_event
+            )
             if tuple(item.identity for item in accepted_dependencies) != accepted_identities:
                 raise AuditInfrastructureError("dependency closure changed")
         accepted_stream = consumer.finish()

@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import sys
+import time
 from array import array
 from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -37,6 +38,66 @@ _SPOOF_MARKER = re.compile(
 _BOOTSTRAP_PSEUDO_FILES = frozenset(
     {"<built-in>", "<command-line>", "<command line>"}
 )
+_DEPENDENCY_DOCUMENT_BYTES = 4 * 1024 * 1024
+_DEPENDENCY_FILE_BYTES = 256 * 1024 * 1024
+
+
+def _check_dependency_io_budget(
+    deadline: float | None, cancel_event: object | None
+) -> None:
+    if cancel_event is not None:
+        is_set = getattr(cancel_event, "is_set", None)
+        if not callable(is_set):
+            raise _fail("dependency cancellation event is invalid")
+        if is_set():
+            raise _fail("dependency I/O cancelled")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _fail("dependency I/O deadline exceeded")
+
+
+def _read_bounded_dependency_file(
+    path: Path,
+    *,
+    byte_ceiling: int,
+    deadline: float | None,
+    cancel_event: object | None,
+) -> bytes:
+    _check_dependency_io_budget(deadline, cancel_event)
+    try:
+        before = path.stat()
+    except OSError as error:
+        raise _fail(f"dependency file is unavailable: {path}") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise _fail("dependency file is not regular")
+    if before.st_size > byte_ceiling:
+        raise _fail("dependency file byte ceiling exceeded")
+    payload = bytearray()
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            while chunk := stream.read(64 * 1024):
+                _check_dependency_io_budget(deadline, cancel_event)
+                if len(payload) + len(chunk) > byte_ceiling:
+                    raise _fail("dependency file byte ceiling exceeded")
+                payload.extend(chunk)
+            after_open = os.fstat(stream.fileno())
+        after = path.stat()
+    except OSError as error:
+        raise _fail(f"dependency file changed while reading: {path}") from error
+    snapshot = lambda item: (
+        int(item.st_dev), int(item.st_ino) if int(item.st_ino) else None,
+        int(item.st_size), int(item.st_mtime_ns),
+        int(getattr(item, "st_ctime_ns", 0)),
+    )
+    expected = snapshot(before)
+    if (
+        snapshot(opened)[:4] != expected[:4]
+        or snapshot(after_open)[:4] != expected[:4]
+        or snapshot(after) != expected
+        or len(payload) != before.st_size
+    ):
+        raise _fail("dependency file changed while reading")
+    return bytes(payload)
 _PUNCTUATORS = tuple(
     sorted(
         (
@@ -154,11 +215,16 @@ def _decode_path_bytes(value: bytes) -> str:
     return decoded
 
 
-def _physical_line_count(path: Path) -> int:
-    try:
-        data = path.read_bytes()
-    except OSError as error:
-        raise _fail(f"dependency is unavailable: {path}") from error
+def _physical_line_count(
+    path: Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+) -> int:
+    data = _read_bounded_dependency_file(
+        path, byte_ceiling=_DEPENDENCY_FILE_BYTES,
+        deadline=deadline, cancel_event=cancel_event,
+    )
     return data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
 
 
@@ -179,13 +245,18 @@ def _deduplicate_paths(paths: list[Path]) -> tuple[Path, ...]:
     return tuple(result)
 
 
-def parse_gcc_dependencies(path: Path) -> tuple[Path, ...]:
+def parse_gcc_dependencies(
+    path: Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+) -> tuple[Path, ...]:
     """Parse one GCC/Clang Make depfile without resolving relative paths."""
 
-    try:
-        data = path.read_bytes()
-    except OSError as error:
-        raise _fail(f"cannot read GCC dependency file: {path}") from error
+    data = _read_bounded_dependency_file(
+        path, byte_ceiling=_DEPENDENCY_DOCUMENT_BYTES,
+        deadline=deadline, cancel_event=cancel_event,
+    )
     if b"\x00" in data:
         raise _fail("GCC dependency file contains an embedded NUL")
     data = data.replace(b"\\\r\n", b"").replace(b"\\\n", b"")
@@ -248,11 +319,20 @@ def _json_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def parse_msvc_dependencies(path: Path) -> tuple[Path, ...]:
+def parse_msvc_dependencies(
+    path: Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+) -> tuple[Path, ...]:
     """Parse an MSVC `/sourceDependencies` JSON document."""
 
     try:
-        text = path.read_text(encoding="utf-8-sig", errors="strict")
+        payload = _read_bounded_dependency_file(
+            path, byte_ceiling=_DEPENDENCY_DOCUMENT_BYTES,
+            deadline=deadline, cancel_event=cancel_event,
+        )
+        text = payload.decode("utf-8-sig", errors="strict")
         document = json.loads(text, object_pairs_hook=_json_no_duplicates)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise _fail(f"cannot parse MSVC dependency JSON: {path}") from error
@@ -274,6 +354,9 @@ def validate_dependency_identities(
     paths: tuple[Path, ...],
     source_root: Path,
     production: Mapping[PurePosixPath, FileIdentity],
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
 ) -> tuple[FileIdentity, ...]:
     """Canonicalize dependencies and bind production paths to locked identities."""
 
@@ -302,6 +385,7 @@ def validate_dependency_identities(
     result: list[FileIdentity] = []
     seen: set[str] = set()
     for supplied in paths:
+        _check_dependency_io_budget(deadline, cancel_event)
         if not supplied.is_absolute():
             raise _fail("dependency path must be absolute before identity validation")
         alias = _path_alias(supplied)
@@ -335,7 +419,9 @@ def validate_dependency_identities(
             ) or (
                 locked_inode is not None
                 and int(metadata.st_ino) != locked_inode
-            ) or _physical_line_count(canonical) != locked.line_count:
+            ) or _physical_line_count(
+                canonical, deadline=deadline, cancel_event=cancel_event
+            ) != locked.line_count:
                 raise _fail("production dependency changed after enumeration")
             result.append(locked)
             continue
@@ -355,7 +441,9 @@ def validate_dependency_identities(
                 relative=None,
                 device=device,
                 inode=inode,
-                line_count=_physical_line_count(canonical),
+                line_count=_physical_line_count(
+                    canonical, deadline=deadline, cancel_event=cancel_event
+                ),
                 production=False,
             )
         )

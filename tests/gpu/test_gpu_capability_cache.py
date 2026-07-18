@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import base64
 import hashlib
 import inspect
 import json
@@ -37,6 +38,7 @@ from gpu_capability_model import (  # noqa: E402
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
     build_dependency_root_authority,
+    encode_compiler_inspection,
 )
 
 
@@ -228,6 +230,52 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             resolved_runtime_closure_digest="d" * 64,
         )
         self.assertNotEqual(first, second)
+
+    def test_inspection_publish_rejects_contradictory_embedded_capability_digest(self):
+        contradictory = dataclasses.replace(
+            self.inspection(), executable_capability_digest="a" * 64
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "capability digest"
+        ):
+            self.cache.publish(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, contradictory, time.monotonic() + 10.0,
+            )
+
+    def test_inspection_load_rejects_contradictory_embedded_capability_digest(self):
+        inspection = self.inspection()
+        self.cache.publish(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64, self.capability_digest,
+            self.closure_digest, inspection, time.monotonic() + 10.0,
+        )
+        key = compiler_inspection_cache_key(
+            self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+            self.authority, "e" * 64,
+            executable_capability_digest=self.capability_digest,
+            resolved_runtime_closure_digest=self.closure_digest,
+        )
+        path = self.cache._path(key)
+        document = json.loads(path.read_text(encoding="ascii"))
+        contradictory = dataclasses.replace(
+            inspection, executable_capability_digest="a" * 64
+        )
+        document["inspection"] = base64.b64encode(
+            encode_compiler_inspection(contradictory)
+        ).decode("ascii")
+        path.write_text(
+            json.dumps(document, ensure_ascii=True, separators=(",", ":")),
+            encoding="ascii",
+        )
+        self.assertIsNone(
+            self.cache.load(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.authority, "e" * 64, self.capability_digest,
+                self.closure_digest, time.monotonic() + 10.0,
+            )
+        )
 
     def test_equal_portable_digest_with_different_local_roots_fails_before_access(self):
         other_source = self.root / "second-source"
