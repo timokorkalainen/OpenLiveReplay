@@ -253,6 +253,7 @@ def _delete_verified_windows_lock_carrier_temporary(
         )
 
     primary_error: BaseException | None = None
+    primary_traceback = None
     try:
         information = FileInformation()
         if not kernel32.GetFileInformationByHandle(
@@ -339,11 +340,14 @@ def _delete_verified_windows_lock_carrier_temporary(
             )
     except BaseException as error:
         primary_error = error
+        primary_traceback = sys.exc_info()[2]
         error = None
         raise
     finally:
         preserved_primary = primary_error
+        saved_primary_traceback = primary_traceback
         primary_error = None
+        primary_traceback = None
         close_error = None
         close_failure = None
         diagnostic_note = None
@@ -365,9 +369,10 @@ def _delete_verified_windows_lock_carrier_temporary(
                         raise close_failure
                     finally:
                         close_failure = None
-                # BaseException descriptors bypass ordinary subclass hooks.
-                # add_note() assigns through the subtype, so install a copied
-                # note list separately and keep both diagnostics best-effort.
+                # Keep both diagnostics best-effort.  Even unbound
+                # BaseException operations can reach subclass data
+                # descriptors, so the exact active traceback is restored
+                # after every attachment attempt.
                 try:
                     BaseException.__setattr__(
                         preserved_primary,
@@ -396,7 +401,12 @@ def _delete_verified_windows_lock_carrier_temporary(
                 except BaseException:
                     pass
         finally:
+            if preserved_primary is not None:
+                BaseException.with_traceback(
+                    preserved_primary, saved_primary_traceback
+                )
             preserved_primary = None
+            saved_primary_traceback = None
             close_error = None
             close_failure = None
             diagnostic_note = None

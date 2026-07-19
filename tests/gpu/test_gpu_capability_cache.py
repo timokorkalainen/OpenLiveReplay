@@ -2160,40 +2160,29 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             quarantine.unlink(missing_ok=True)
 
     @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
-    def test_lock_carrier_cleanup_ignores_hostile_attachment_failures(self):
+    def test_lock_carrier_cleanup_restores_traceback_after_hostile_secondary_setter(
+        self,
+    ):
         import ctypes
 
-        class HostileAttachmentPrimary(AuditInfrastructureError):
+        class TracebackErasingSetterPrimary(AuditInfrastructureError):
             @property
             def secondary_close_error(self):
+                return None
+
+            @secondary_close_error.setter
+            def secondary_close_error(self, _value):
+                BaseException.with_traceback(self, None)
                 raise RuntimeError("secondary diagnostic blocked")
 
-            @property
-            def __notes__(self):
-                raise RuntimeError("notes blocked")
-
-            def __setattr__(self, name, value):
-                if name in {
-                    "__cause__",
-                    "__context__",
-                    "__suppress_context__",
-                    "__traceback__",
-                }:
-                    BaseException.__setattr__(self, name, value)
-                    return
-                raise RuntimeError("attribute blocked")
-
-            def add_note(self, _note):
-                raise RuntimeError("note blocked")
-
-        quarantine = self.cache.root / ".quarantine-lock-hostile-notes"
+        quarantine = self.cache.root / ".quarantine-lock-hostile-setter"
         quarantine.write_bytes(b"owned lock carrier temporary")
         expected_identity = capability_cache._file_ownership_identity(
             quarantine.stat()
         )
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         real_close = kernel32.CloseHandle
-        primary = HostileAttachmentPrimary("hostile attachment failure")
+        primary = TracebackErasingSetterPrimary("hostile setter failure")
 
         def raise_primary(_path):
             raise primary
@@ -2213,15 +2202,120 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 kernel32,
                 "CloseHandle",
                 side_effect=close_then_report_failure,
-            ) as close_handle, self.assertRaises(
-                HostileAttachmentPrimary
-            ) as raised:
-                capability_cache._delete_verified_windows_lock_carrier_temporary(
-                    quarantine,
-                    expected_identity,
-                    OSError("deterministic initialization failure"),
-                )
-            self.assertIs(raised.exception, primary)
+            ) as close_handle:
+                try:
+                    capability_cache._delete_verified_windows_lock_carrier_temporary(
+                        quarantine,
+                        expected_identity,
+                        primary,
+                    )
+                except TracebackErasingSetterPrimary as raised:
+                    self.assertIs(raised, primary)
+                    traceback_nodes = []
+                    traceback_frames = []
+                    current = raised.__traceback__
+                    while current is not None:
+                        traceback_nodes.append(current)
+                        traceback_frames.append(current.tb_frame)
+                        current = current.tb_next
+                    self.assertIs(
+                        traceback_frames[-1].f_code,
+                        raise_primary.__code__,
+                    )
+                    helper_frames = [
+                        frame
+                        for frame in traceback_frames
+                        if frame.f_code
+                        is capability_cache._delete_verified_windows_lock_carrier_temporary.__code__
+                    ]
+                    self.assertEqual(len(helper_frames), 1)
+                    for name, value in helper_frames[0].f_locals.items():
+                        self.assertIsNot(value, primary, name)
+                        self.assertFalse(
+                            any(value is node for node in traceback_nodes),
+                            name,
+                        )
+                else:
+                    self.fail("hostile setter primary did not propagate")
+            close_handle.assert_called_once()
+        finally:
+            quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_restores_traceback_after_hostile_notes_getter(
+        self,
+    ):
+        import ctypes
+
+        class TracebackErasingNotesPrimary(AuditInfrastructureError):
+
+            @property
+            def __notes__(self):
+                BaseException.with_traceback(self, None)
+                raise RuntimeError("notes blocked")
+
+        quarantine = self.cache.root / ".quarantine-lock-hostile-notes"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        real_close = kernel32.CloseHandle
+        primary = TracebackErasingNotesPrimary("hostile notes failure")
+
+        def raise_primary(_path):
+            raise primary
+
+        def close_then_report_failure(handle):
+            self.assertTrue(real_close(handle))
+            ctypes.set_last_error(6)
+            return False
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch(
+                "gpu_capability_cache._before_windows_lock_carrier_temporary_delete",
+                side_effect=raise_primary,
+            ), mock.patch.object(
+                kernel32,
+                "CloseHandle",
+                side_effect=close_then_report_failure,
+            ) as close_handle:
+                try:
+                    capability_cache._delete_verified_windows_lock_carrier_temporary(
+                        quarantine,
+                        expected_identity,
+                        primary,
+                    )
+                except TracebackErasingNotesPrimary as raised:
+                    self.assertIs(raised, primary)
+                    traceback_nodes = []
+                    traceback_frames = []
+                    current = raised.__traceback__
+                    while current is not None:
+                        traceback_nodes.append(current)
+                        traceback_frames.append(current.tb_frame)
+                        current = current.tb_next
+                    self.assertIs(
+                        traceback_frames[-1].f_code,
+                        raise_primary.__code__,
+                    )
+                    helper_frames = [
+                        frame
+                        for frame in traceback_frames
+                        if frame.f_code
+                        is capability_cache._delete_verified_windows_lock_carrier_temporary.__code__
+                    ]
+                    self.assertEqual(len(helper_frames), 1)
+                    for name, value in helper_frames[0].f_locals.items():
+                        self.assertIsNot(value, primary, name)
+                        self.assertFalse(
+                            any(value is node for node in traceback_nodes),
+                            name,
+                        )
+                else:
+                    self.fail("hostile notes primary did not propagate")
             close_handle.assert_called_once()
         finally:
             quarantine.unlink(missing_ok=True)
