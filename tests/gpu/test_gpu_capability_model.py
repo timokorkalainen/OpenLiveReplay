@@ -447,8 +447,67 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(
             summary.findings[0].configurations, ("1" * 64, "2" * 64)
         )
+        canonical = encode_canonical_summary(summary)
+        self.assertEqual(canonical, encode_canonical_summary(summary))
+        self.assertGreater(budget.committed_bytes, 0)
+        summary.release()
+        self.assertEqual(budget.live_bytes, 0)
+
+    def test_finish_reserves_immutable_copy_before_marking_finished(self):
+        configuration = self.configuration(digest="1" * 64)
+        result = ConfigurationAuditResult(
+            configuration.digest,
+            "a" * 64,
+            (self.dependency(),),
+            (PurePosixPath("playback/gpu/example.cpp"),),
+            (
+                AuditResultFinding(
+                    PurePosixPath("playback/gpu/example.cpp"),
+                    7,
+                    "nativeHandle()",
+                    "outside lease",
+                ),
+            ),
+        )
+        calibration_budget = CompactResultMemoryBudget()
+        calibration = StreamingResultAggregator(
+            (configuration,), calibration_budget, AuditLimits()
+        )
+        calibration.accept_validated_result(
+            configuration,
+            result,
+            calibration_budget.reserve(
+                compact_result_retained_bytes(result)
+            ).commit(),
+        )
+        accepted_peak = calibration_budget.peak_live_bytes
+
+        budget = CompactResultMemoryBudget(accepted_peak)
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        aggregator.accept_validated_result(
+            configuration,
+            result,
+            budget.reserve(compact_result_retained_bytes(result)).commit(),
+        )
+        before = (
+            aggregator.accepted_count,
+            len(aggregator._reached),
+            len(aggregator._findings),
+            len(aggregator._digests),
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "final"):
+            aggregator.finish()
+        self.assertFalse(aggregator._finished)
         self.assertEqual(
-            encode_canonical_summary(summary), encode_canonical_summary(summary)
+            (
+                aggregator.accepted_count,
+                len(aggregator._reached),
+                len(aggregator._findings),
+                len(aggregator._digests),
+            ),
+            before,
         )
 
     def test_aggregate_growth_failure_occurs_before_insert(self):
@@ -461,11 +520,17 @@ class ModelTests(unittest.TestCase):
             (),
         )
         retained = compact_result_retained_bytes(result)
-        budget = CompactResultMemoryBudget(retained)
-        ownership = budget.reserve(retained).commit()
+        calibration_budget = CompactResultMemoryBudget()
+        calibration = StreamingResultAggregator(
+            (configuration,), calibration_budget, AuditLimits()
+        )
+        base_bytes = calibration_budget.committed_bytes
+        del calibration
+        budget = CompactResultMemoryBudget(base_bytes + retained + 4096)
         aggregator = StreamingResultAggregator(
             (configuration,), budget, AuditLimits()
         )
+        ownership = budget.reserve(retained).commit()
         with self.assertRaisesRegex(AuditInfrastructureError, "before insert"):
             aggregator.accept_validated_result(configuration, result, ownership)
         self.assertEqual(aggregator.accepted_count, 0)
@@ -524,6 +589,7 @@ class ModelTests(unittest.TestCase):
         exact_limit = (
             calibration_budget.committed_bytes
             + compact_result_retained_bytes(results[250])
+            + 4096
         )
         budget = CompactResultMemoryBudget(exact_limit)
         aggregator = StreamingResultAggregator(configurations, budget, AuditLimits())
@@ -558,6 +624,69 @@ class ModelTests(unittest.TestCase):
             before,
         )
         ownership.release()
+        self.assertLessEqual(budget.peak_live_bytes, 128 << 20)
+
+    def test_251st_production_scale_result_fails_at_actual_128_mib_frontier(self):
+        configurations = tuple(
+            self.configuration(digest=f"{index:064x}")
+            for index in range(251)
+        )
+        shared_expression = "x" * 58_800
+
+        def result_for(index: int) -> ConfigurationAuditResult:
+            findings = tuple(
+                AuditResultFinding(
+                    PurePosixPath(
+                        f"playback/frontier/{index:04d}-{finding_index:02d}.cpp"
+                    ),
+                    1,
+                    shared_expression,
+                    f"frontier-{index:04d}-{finding_index:02d}",
+                )
+                for finding_index in range(9)
+            )
+            return ConfigurationAuditResult(
+                configurations[index].digest,
+                "a" * 64,
+                (self.dependency(),),
+                (),
+                findings,
+            )
+
+        budget = CompactResultMemoryBudget(128 << 20)
+        aggregator = StreamingResultAggregator(
+            configurations, budget, AuditLimits()
+        )
+        for index in range(250):
+            result = result_for(index)
+            aggregator.accept_validated_result(
+                configurations[index],
+                result,
+                budget.reserve(compact_result_retained_bytes(result)).commit(),
+            )
+        before = (
+            aggregator.accepted_count,
+            len(aggregator._findings),
+            budget.committed_bytes,
+        )
+        final_result = result_for(250)
+        final_ownership = budget.reserve(
+            compact_result_retained_bytes(final_result)
+        ).commit()
+        with self.assertRaisesRegex(AuditInfrastructureError, "before insert"):
+            aggregator.accept_validated_result(
+                configurations[250], final_result, final_ownership
+            )
+        self.assertEqual(
+            (
+                aggregator.accepted_count,
+                len(aggregator._findings),
+                before[2],
+            ),
+            before,
+        )
+        final_ownership.release()
+        self.assertGreater(budget.peak_live_bytes, 127 << 20)
         self.assertLessEqual(budget.peak_live_bytes, 128 << 20)
 
     def test_publication_permit_binds_complete_result_generation(self):

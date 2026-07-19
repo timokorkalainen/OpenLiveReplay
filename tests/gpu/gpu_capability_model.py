@@ -401,6 +401,25 @@ class CompactResultMemoryBudget:
             else:
                 raise AuditInfrastructureError("compact result ownership state is invalid")
 
+    def _replace_committed(self, old_bytes: int, new_bytes: int) -> None:
+        with self._lock:
+            if old_bytes > self._committed_bytes:
+                raise AuditInfrastructureError(
+                    "compact result ownership accounting underflow"
+                )
+            live_without_old = (
+                self._reserved_bytes + self._committed_bytes - old_bytes
+            )
+            if new_bytes > self.maximum_bytes - live_without_old:
+                raise AuditInfrastructureError(
+                    "replacement exceeds aggregate 128 MiB compact result limit"
+                )
+            self._committed_bytes += new_bytes - old_bytes
+            self._peak_live_bytes = max(
+                self._peak_live_bytes,
+                self._reserved_bytes + self._committed_bytes,
+            )
+
 
 class CompactResultOwnership:
     """Linear ownership token; commit and release are each permitted once."""
@@ -443,6 +462,24 @@ class CompactResultOwnership:
             raise AuditInfrastructureError("compact result ownership was already released")
         self._budget._release(self.byte_count, self._state)
         self._state = "released"
+
+    def replace_committed(
+        self, byte_count: int, *, label: str
+    ) -> "CompactResultOwnership":
+        if (
+            self._state != "committed"
+            or not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+            or not isinstance(label, str)
+            or not label
+        ):
+            raise AuditInfrastructureError(
+                "compact result ownership replacement is invalid"
+            )
+        self._budget._replace_committed(self.byte_count, byte_count)
+        self._state = "released"
+        return CompactResultOwnership(self._budget, byte_count, "committed", label)
 
     def __del__(self) -> None:
         try:
@@ -2296,13 +2333,24 @@ class StreamingResultAggregator:
         digests = tuple(item.digest for item in configurations)
         if len(set(digests)) != len(digests):
             raise AuditInfrastructureError("streaming result configurations are not unique")
+        base_bytes = 256 + sum(
+            128 + len(digest.encode("ascii")) for digest in digests
+        )
+        base_ownership = budget.reserve(
+            base_bytes, label="streaming aggregate base index"
+        ).commit()
         self._expected = configurations
-        self._expected_index = {
-            configuration.digest: index
-            for index, configuration in enumerate(configurations)
-        }
+        try:
+            self._expected_index = {
+                configuration.digest: index
+                for index, configuration in enumerate(configurations)
+            }
+        except BaseException:
+            base_ownership.release()
+            raise
         self._budget = budget
         self._limits = limits
+        self._base_ownership: CompactResultOwnership | None = base_ownership
         self._accepted: set[str] = set()
         self._reached: dict[str, PurePosixPath] = {}
         self._findings: dict[
@@ -2355,10 +2403,10 @@ class StreamingResultAggregator:
         ).commit()
 
     def _growth_for(self, result: ConfigurationAuditResult) -> CompactResultGrowth:
-        new_paths = tuple(
-            path for path in result.reached_production
-            if path.as_posix() not in self._reached
-        )
+        coverage_bytes = 0
+        for path in result.reached_production:
+            if path.as_posix() not in self._reached:
+                coverage_bytes += 160 + len(path.as_posix().encode("utf-8"))
         finding_bytes = 0
         for finding in result.findings:
             key = _audit_finding_key(finding)
@@ -2370,32 +2418,25 @@ class StreamingResultAggregator:
                     + len(finding.expression.encode("utf-8"))
                     + len(finding.reason.encode("utf-8"))
                 )
-        new_digests = tuple(
-            (
+        digest_bytes = 0
+        for dependency in result.dependencies:
+            digest_key = (
                 dependency.stable_role,
                 dependency.role_relative_path.as_posix(),
                 dependency.sha256,
             )
-            for dependency in result.dependencies
-            if (
-                dependency.stable_role,
-                dependency.role_relative_path.as_posix(),
-                dependency.sha256,
-            ) not in self._digests
-        )
+            if digest_key not in self._digests:
+                digest_bytes += (
+                    256
+                    + len(digest_key[0].encode("ascii"))
+                    + len(digest_key[1].encode("utf-8"))
+                    + len(digest_key[2])
+                )
         return CompactResultGrowth(
             configuration_index_bytes=192,
-            coverage_index_bytes=sum(
-                160 + len(path.as_posix().encode("utf-8")) for path in new_paths
-            ),
+            coverage_index_bytes=coverage_bytes,
             finding_index_bytes=finding_bytes,
-            digest_state_bytes=sum(
-                256
-                + len(role.encode("ascii"))
-                + len(path.encode("utf-8"))
-                + len(digest)
-                for role, path, digest in new_digests
-            ),
+            digest_state_bytes=digest_bytes,
         )
 
     def accept_validated_result(
@@ -2425,17 +2466,25 @@ class StreamingResultAggregator:
             or ownership.byte_count < compact_result_retained_bytes(result)
         ):
             raise AuditInfrastructureError("streaming result ownership is invalid")
-        growth = self._growth_for(result)
-        if growth.total_bytes > self._limits.compact_aggregate_bytes:
-            raise AuditInfrastructureError("aggregate growth exceeds 128 MiB limit")
+        workspace = self._budget.reserve(
+            4096, label="aggregate growth workspace"
+        ).commit()
         try:
-            growth_ownership = self._budget.reserve(
-                growth.total_bytes, label="aggregate growth 128 MiB limit"
-            ).commit()
-        except AuditInfrastructureError as error:
-            raise AuditInfrastructureError(
-                "aggregate growth exceeds 128 MiB limit before insert"
-            ) from error
+            growth = self._growth_for(result)
+            if growth.total_bytes > self._limits.compact_aggregate_bytes:
+                raise AuditInfrastructureError(
+                    "aggregate growth exceeds 128 MiB limit"
+                )
+            try:
+                growth_ownership = self._budget.reserve(
+                    growth.total_bytes, label="aggregate growth 128 MiB limit"
+                ).commit()
+            except AuditInfrastructureError as error:
+                raise AuditInfrastructureError(
+                    "aggregate growth exceeds 128 MiB limit before insert"
+                ) from error
+        finally:
+            workspace.release()
 
         self._accepted.add(configuration.digest)
         for path in result.reached_production:
@@ -2462,26 +2511,93 @@ class StreamingResultAggregator:
     def finish(self) -> StreamingAuditSummary:
         if self._finished:
             raise AuditInfrastructureError("streaming result aggregate is already finished")
-        self._finished = True
-        if self._cold_ownership is not None and not self._cold_ownership.released:
-            self._cold_ownership.release()
-        findings = tuple(
-            AggregatedAuditResultFinding(
-                finding,
-                tuple(sorted(configurations, key=self._expected_index.__getitem__)),
-            )
-            for _key, (finding, configurations) in sorted(self._findings.items())
+        accepted_count = len(self._accepted)
+        finding_configuration_count = sum(
+            len(configurations)
+            for _finding, configurations in self._findings.values()
         )
-        return StreamingAuditSummary(
-            tuple(
+        finalization_bytes = (
+            8192
+            + 24 * accepted_count
+            + 24 * len(self._reached)
+            + 32 * len(self._digests)
+            + 192 * len(self._findings)
+            + 24 * finding_configuration_count
+            + 16 * len(self._growth_ownerships)
+        )
+        replaced_cold_bytes: int | None = None
+        try:
+            if (
+                self._cold_ownership is not None
+                and not self._cold_ownership.released
+            ):
+                replaced_cold_bytes = self._cold_ownership.byte_count
+                finalization_ownership = self._cold_ownership.replace_committed(
+                    finalization_bytes,
+                    label="streaming aggregate final immutable copy",
+                )
+                self._cold_ownership = None
+            else:
+                finalization_ownership = self._budget.reserve(
+                    finalization_bytes,
+                    label="streaming aggregate final immutable copy",
+                ).commit()
+        except AuditInfrastructureError as error:
+            raise AuditInfrastructureError(
+                "streaming aggregate finalization exceeds 128 MiB before copy"
+            ) from error
+        try:
+            configurations = tuple(
                 configuration.digest for configuration in self._expected
                 if configuration.digest in self._accepted
-            ),
-            tuple(self._reached[key] for key in sorted(self._reached)),
-            findings,
-            tuple(sorted(self._digests)),
-            tuple(self._growth_ownerships),
-        )
+            )
+            reached = tuple(self._reached[key] for key in sorted(self._reached))
+            findings = tuple(
+                AggregatedAuditResultFinding(
+                    finding,
+                    tuple(
+                        sorted(
+                            finding_configurations,
+                            key=self._expected_index.__getitem__,
+                        )
+                    ),
+                )
+                for _key, (finding, finding_configurations) in sorted(
+                    self._findings.items()
+                )
+            )
+            digests = tuple(sorted(self._digests))
+            assert self._base_ownership is not None
+            ownerships = (
+                self._base_ownership,
+                *self._growth_ownerships,
+                finalization_ownership,
+            )
+            summary = StreamingAuditSummary(
+                configurations,
+                reached,
+                findings,
+                digests,
+                ownerships,
+            )
+        except BaseException:
+            if replaced_cold_bytes is not None:
+                self._cold_ownership = finalization_ownership.replace_committed(
+                    replaced_cold_bytes,
+                    label="batch retained result limit cold slot",
+                )
+            else:
+                finalization_ownership.release()
+            raise
+        self._finished = True
+        self._base_ownership = None
+        self._growth_ownerships.clear()
+        self._accepted.clear()
+        self._reached.clear()
+        self._findings.clear()
+        self._digests.clear()
+        self._expected_index.clear()
+        return summary
 
 
 def encode_local_dependency_digest(dependency: DependencyDigest) -> bytes:
