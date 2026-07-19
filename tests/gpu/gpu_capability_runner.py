@@ -440,7 +440,8 @@ def run_bounded_preprocessor(
     stderr_lock = threading.Lock()
 
     def read_stdout() -> None:
-        assert process is not None and process.stdout is not None
+        if process is None or process.stdout is None:
+            raise AuditInfrastructureError("preprocessor stdout reader is unavailable")
         try:
             while not stop_readers.is_set():
                 chunk = process.stdout.read(_IO_CHUNK_BYTES)
@@ -468,7 +469,8 @@ def run_bounded_preprocessor(
                     continue
 
     def read_stderr() -> None:
-        assert process is not None and process.stderr is not None
+        if process is None or process.stderr is None:
+            raise AuditInfrastructureError("preprocessor stderr reader is unavailable")
         try:
             while True:
                 chunk = process.stderr.read(_IO_CHUNK_BYTES)
@@ -2007,7 +2009,8 @@ def preprocess_all(
         reached = _view_production_provenance(view, production)
         authoritative.update(reached)
         source = view.configuration.source
-        assert source.relative is not None
+        if source.relative is None:
+            raise AuditInfrastructureError("production source has no relative path")
         if source.relative in reached:
             continue
         # A physically empty main source has no token whose marker can carry

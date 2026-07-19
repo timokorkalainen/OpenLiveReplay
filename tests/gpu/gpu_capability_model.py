@@ -2723,7 +2723,10 @@ class StreamingResultAggregator:
                 )
             )
             digests = tuple(sorted(self._digests))
-            assert self._base_ownership is not None
+            if self._base_ownership is None:
+                raise AuditInfrastructureError(
+                    "streaming result base ownership is unavailable"
+                )
             ownerships = (
                 self._base_ownership,
                 *self._growth_ownerships,

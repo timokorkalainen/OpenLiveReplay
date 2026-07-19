@@ -849,7 +849,7 @@ class _PublicationGuard:
             raise
 
     def __exit__(self, _type, _value, _traceback) -> None:
-        assert self.stream is not None
+        _require(self.stream is not None, "publication guard stream is unavailable")
         try:
             self._unlock(self.stream)
         finally:
@@ -901,7 +901,7 @@ class _SharedCacheFileLock:
             raise AuditInfrastructureError("cache root was replaced")
 
     def _assert_carrier(self, stream) -> None:
-        assert self.anchor_stream is not None
+        _require(self.anchor_stream is not None, "lock carrier anchor is unavailable")
         allowed_sizes = (
             (1, _LOCK_NAMESPACE_BYTES)
             if self.namespace_path is None
@@ -1060,8 +1060,11 @@ class _SharedCacheFileLock:
                 )
             acquired = _PublicationGuard._lock(stream, blocking=False)
             if self.namespace_stream is not None:
-                assert self.namespace_path is not None
-                assert self.namespace_anchor_stream is not None
+                _require(self.namespace_path is not None, "lock namespace path is unavailable")
+                _require(
+                    self.namespace_anchor_stream is not None,
+                    "lock namespace anchor is unavailable",
+                )
                 self._assert_carrier_at(
                     self.namespace_path,
                     self.namespace_stream,
@@ -1106,7 +1109,7 @@ class _SharedCacheFileLock:
             ) from error
 
     def __exit__(self, _type, _value, _traceback) -> None:
-        assert self.stream is not None
+        _require(self.stream is not None, "shared cache lock stream is unavailable")
         try:
             _PublicationGuard._unlock(self.stream)
         finally:
@@ -1481,7 +1484,10 @@ class _HeldCacheFile:
         return self
 
     def verify(self) -> None:
-        assert self.stream is not None and self.identity is not None
+        _require(
+            self.stream is not None and self.identity is not None,
+            "held cache file is not open",
+        )
         opened = os.fstat(self.stream.fileno())
         try:
             current = _regular_unlinked_file(self.path)
@@ -1496,7 +1502,7 @@ class _HeldCacheFile:
             raise _UnsafeCacheNamespaceError("cache file changed while held")
 
     def __exit__(self, _type, _value, _traceback) -> None:
-        assert self.stream is not None
+        _require(self.stream is not None, "held cache file stream is unavailable")
         self.stream.close()
         self.stream = None
 
@@ -1629,7 +1635,7 @@ class _HeldDirectory:
                 (self.path / name).unlink()
             return
 
-        assert self._fd is not None
+        _require(self._fd is not None, "held directory descriptor is unavailable")
         names = os.listdir(self._fd)
         metadata = [
             (name, os.stat(name, dir_fd=self._fd, follow_symlinks=False))
@@ -1913,7 +1919,7 @@ class CompilerInspectionCache:
             self._assert_root()
             metadata = _regular_unlinked_file(path)
             with _HeldCacheFile(path) as held:
-                assert held.stream is not None
+                _require(held.stream is not None, "held inspection stream is unavailable")
                 payload = held.stream.read(_COMPILER_INSPECTION_MAX_BYTES + 1)
                 held.verify()
         except FileNotFoundError:
@@ -2702,7 +2708,10 @@ class _HeldDependencyHandle:
         return self
 
     def verify_path(self) -> None:
-        assert self.stream is not None and self.opened_stat is not None
+        _require(
+            self.stream is not None and self.opened_stat is not None,
+            "held dependency is not open",
+        )
         current = self.dependency.identity.canonical.lstat()
         opened = os.fstat(self.stream.fileno())
         if (
@@ -2907,7 +2916,7 @@ class ConfigurationAuditCache:
         marker_payload: bytes | None = None
         try:
             with _HeldCacheFile(marker) as held:
-                assert held.stream is not None
+                _require(held.stream is not None, "held cache marker stream is unavailable")
                 payload = held.stream.read(len(AUDIT_CACHE_SCHEMA_BYTES) + 1)
                 held.verify()
             marker_payload = payload
@@ -2942,7 +2951,7 @@ class ConfigurationAuditCache:
         if marker_payload is None:
             try:
                 with _HeldCacheFile(marker) as held:
-                    assert held.stream is not None
+                    _require(held.stream is not None, "held cache marker stream is unavailable")
                     marker_payload = held.stream.read(
                         len(AUDIT_CACHE_SCHEMA_BYTES) + 1
                     )
@@ -3047,7 +3056,10 @@ class ConfigurationAuditCache:
                 manifest_path = entry / "manifest.json"
                 payload_path = entry / "payload.json"
                 with _HeldCacheFile(manifest_path) as manifest_held:
-                    assert manifest_held.stream is not None
+                    _require(
+                        manifest_held.stream is not None,
+                        "held audit manifest stream is unavailable",
+                    )
                     manifest_payload = manifest_held.stream.read(
                         _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES + 1
                     )
@@ -3061,7 +3073,10 @@ class ConfigurationAuditCache:
                 ):
                     raise ValueError("audit result manifest schema is invalid")
                 with _HeldCacheFile(payload_path) as payload_held:
-                    assert payload_held.stream is not None
+                    _require(
+                        payload_held.stream is not None,
+                        "held audit payload stream is unavailable",
+                    )
                     payload = payload_held.stream.read(
                         _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES + 1
                     )
@@ -3088,8 +3103,14 @@ class ConfigurationAuditCache:
                 except AuditInfrastructureError:
                     normal_exit = True
                     return None
-                assert held_directory.identity is not None
-                assert payload_identity is not None
+                _require(
+                    held_directory.identity is not None,
+                    "held audit directory identity is unavailable",
+                )
+                _require(
+                    payload_identity is not None,
+                    "held audit payload identity is unavailable",
+                )
                 candidate = _AuditCacheCandidate(
                     configuration,
                     key,
@@ -3156,8 +3177,14 @@ class ConfigurationAuditCache:
                 manifest_path = entry / "manifest.json"
                 payload_path = entry / "payload.json"
                 with _HeldCacheFile(manifest_path) as manifest_held:
-                    assert manifest_held.stream is not None
-                    assert manifest_held.identity is not None
+                    _require(
+                        manifest_held.stream is not None,
+                        "held audit manifest stream is unavailable",
+                    )
+                    _require(
+                        manifest_held.identity is not None,
+                        "held audit manifest identity is unavailable",
+                    )
                     if manifest_held.identity[2] > _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES:
                         raise ValueError("audit result manifest is too large")
                     manifest_scratch = result_budget.reserve(
@@ -3177,8 +3204,14 @@ class ConfigurationAuditCache:
                 ):
                     raise ValueError("audit result manifest schema is invalid")
                 with _HeldCacheFile(payload_path) as payload_held:
-                    assert payload_held.stream is not None
-                    assert payload_held.identity is not None
+                    _require(
+                        payload_held.stream is not None,
+                        "held audit payload stream is unavailable",
+                    )
+                    _require(
+                        payload_held.identity is not None,
+                        "held audit payload identity is unavailable",
+                    )
                     payload_size = payload_held.identity[2]
                     if payload_size > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES:
                         raise ValueError("encoded compact audit result limit exceeded")
@@ -3234,8 +3267,14 @@ class ConfigurationAuditCache:
                     metadata_bytes,
                     label="batch retained candidate metadata",
                 ).commit()
-                assert held_directory.identity is not None
-                assert payload_identity is not None
+                _require(
+                    held_directory.identity is not None,
+                    "held audit directory identity is unavailable",
+                )
+                _require(
+                    payload_identity is not None,
+                    "held audit payload identity is unavailable",
+                )
                 candidate = _AuditCacheCandidate(
                     configuration,
                     key,
@@ -4255,7 +4294,10 @@ class PreprocessCache:
             expected_size = document.get("payload_bytes")
             expected_digest = document.get("payload_sha256")
             with _HeldCacheFile(payload) as held:
-                assert held.stream is not None and held.identity is not None
+                _require(
+                    held.stream is not None and held.identity is not None,
+                    "held preprocess payload is not open",
+                )
                 if (
                     not isinstance(expected_size, int)
                     or expected_size < 0

@@ -32,6 +32,7 @@ _MSVC_MARKER = re.compile(
     rb'^\s*#\s*line\s+([0-9]+)\s+"((?:[^"\\]|\\.)*)"\s*$'
 )
 _MARKER_PREFIX = re.compile(rb"^\s*#")
+_PRESERVED_PRAGMA = re.compile(rb"^\s*#\s*pragma(?:\s|$)")
 _SPOOF_MARKER = re.compile(
     rb'(?m)^\s*#\s*(?:line\s+)?[0-9]+\s+"((?:[^"\\]|\\.)*)"'
 )
@@ -327,15 +328,18 @@ def parse_gcc_dependencies(
     rule_end = data.find(b"\n", colon + 1)
     if rule_end >= 0:
         data = data[:rule_end]
+    def begins_escape(index: int) -> bool:
+        return index + 1 < len(data) and data[index + 1] in b" \t\r\n\\#:"
+
     admitted_count = 0
     admitted_metadata = 0
     admitted_bytes = 0
     escaped = False
-    for byte in data[colon + 1 :]:
+    for index, byte in enumerate(data[colon + 1 :], start=colon + 1):
         if escaped:
             admitted_bytes += 1
             escaped = False
-        elif byte == 0x5C:
+        elif byte == 0x5C and begins_escape(index):
             escaped = True
         elif byte in b" \t\r\n":
             if admitted_bytes:
@@ -352,11 +356,11 @@ def parse_gcc_dependencies(
     fields: list[bytes] = []
     current = bytearray()
     escaped = False
-    for byte in data[colon + 1 :]:
+    for index, byte in enumerate(data[colon + 1 :], start=colon + 1):
         if escaped:
             current.append(byte)
             escaped = False
-        elif byte == 0x5C:
+        elif byte == 0x5C and begins_escape(index):
             escaped = True
         elif byte in b" \t\r\n":
             if current:
@@ -410,7 +414,8 @@ def parse_msvc_dependencies(
     if not isinstance(document, dict) or not isinstance(document.get("Data"), dict):
         raise _fail("MSVC dependency JSON has no Data object")
     data = document["Data"]
-    assert isinstance(data, dict)
+    if not isinstance(data, dict):
+        raise _fail("MSVC dependency Data object is invalid")
     source = data.get("Source")
     includes = data.get("Includes")
     if not isinstance(source, str) or not isinstance(includes, list):
@@ -695,6 +700,18 @@ class PreprocessedStreamBuilder:
     def _apply_gcc_marker(
         self, line: int, path: Path, relative: bool, flags: tuple[int, ...]
     ) -> None:
+        if (
+            line == 1
+            and not flags
+            and not self._seen_real_marker
+            and not self._seen_real_code
+            and not self._stack
+            and _path_key(path) == _path_key(self._configuration.working_directory)
+        ):
+            # MinGW GCC emits its working directory between the initial
+            # source-at-line-zero marker and the built-in bootstrap markers.
+            # It is compiler bookkeeping, not a dependency or source frame.
+            return
         if line == 0:
             if self._seen_real_marker or self._seen_real_code:
                 raise _fail("line zero is allowed only for bootstrap pseudo-files")
@@ -722,9 +739,12 @@ class PreprocessedStreamBuilder:
             self._stack.append(self._new_frame(key, line))
         elif 2 in flags:
             matches = [index for index, frame in enumerate(self._stack[:-1]) if frame.path_key == key]
-            if len(matches) != 1:
-                raise _fail("GCC marker return does not name exactly one ancestor")
-            self._stack = self._stack[: matches[0] + 1]
+            if not matches:
+                raise _fail("GCC marker return does not name an ancestor")
+            # Recursive headers can place the same canonical path at several
+            # stack depths. GCC's return flag always closes to the nearest
+            # matching ancestor in the nested include stack.
+            self._stack = self._stack[: matches[-1] + 1]
             self._stack[-1].line = line
         elif self._stack[-1].path_key != key:
             raise _fail("GCC unflagged cross-file transition")
@@ -766,6 +786,8 @@ class PreprocessedStreamBuilder:
         expression = _GCC_MARKER if family in {CompilerFamily.GCC, CompilerFamily.CLANG} else _MSVC_MARKER
         match = expression.fullmatch(content)
         if match is None:
+            if _PRESERVED_PRAGMA.match(content):
+                return False
             if _MARKER_PREFIX.match(content):
                 raise _fail("malformed or unsupported line marker")
             return False
@@ -930,7 +952,9 @@ class PreprocessedStreamBuilder:
             raise _fail("preprocessed stream is already finalized")
         self._finalized = True
         if self._line_buffer:
-            if _MARKER_PREFIX.match(self._line_buffer):
+            if _MARKER_PREFIX.match(self._line_buffer) and not _PRESERVED_PRAGMA.match(
+                self._line_buffer
+            ):
                 raise _fail("truncated line marker at end of compiler output")
             self._process_line(bytes(self._line_buffer))
             self._line_buffer.clear()

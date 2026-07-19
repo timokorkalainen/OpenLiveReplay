@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import dataclasses
 import inspect
 import locale
@@ -46,6 +47,11 @@ from gpu_capability_model import (  # noqa: E402
 
 
 class CompileEntryDecodeTests(unittest.TestCase):
+    def test_command_module_has_no_optimization_sensitive_assertions(self):
+        path = Path(__file__).resolve().with_name("gpu_capability_command.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
+        self.assertFalse(any(isinstance(node, ast.Assert) for node in ast.walk(tree)))
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import dataclasses
 import base64
 import contextlib
@@ -370,6 +371,11 @@ class _PreprocessCacheFixture:
 
 
 class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
+    def test_cache_module_has_no_optimization_sensitive_assertions(self):
+        path = Path(__file__).resolve().with_name("gpu_capability_cache.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
+        self.assertFalse(any(isinstance(node, ast.Assert) for node in ast.walk(tree)))
+
     def setUp(self) -> None:
         _PreprocessCacheFixture.setUp(self)
         self.source = self.root / "inspection-source"

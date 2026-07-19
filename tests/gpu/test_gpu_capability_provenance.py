@@ -1,3 +1,4 @@
+import ast
 import dataclasses
 import gc
 import json
@@ -34,6 +35,11 @@ from gpu_capability_provenance import (  # noqa: E402
 
 
 class ProvenanceTests(unittest.TestCase):
+    def test_provenance_module_has_no_optimization_sensitive_assertions(self):
+        path = Path(__file__).resolve().with_name("gpu_capability_provenance.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
+        self.assertFalse(any(isinstance(node, ast.Assert) for node in ast.walk(tree)))
+
     def setUp(self):
         self.main_identity = self.identity("playback/a.cpp", line_count=50)
         self.header_identity = self.identity("playback/h.h", line_count=50)
@@ -103,6 +109,18 @@ class ProvenanceTests(unittest.TestCase):
                 depfile, deadline=time.monotonic() + 10.0,
                 cancel_event=None,
             )
+
+    def test_gcc_dependency_parser_preserves_mingw_native_path_separators(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        depfile = Path(temporary.name).resolve() / "mingw.d"
+        depfile.write_bytes(
+            b"object.o: D:\\Development\\OpenLiveReplay\\playback\\gpu\\source.cpp\n"
+        )
+        self.assertEqual(
+            parse_gcc_dependencies(depfile),
+            (Path(r"D:\Development\OpenLiveReplay\playback\gpu\source.cpp"),),
+        )
 
     def test_msvc_dependency_entry_count_is_bounded_before_json_materialization(self):
         temporary = tempfile.TemporaryDirectory()
@@ -272,6 +290,40 @@ class ProvenanceTests(unittest.TestCase):
                 b'# 0 "D:/repo/playback/a.cpp"\n',
                 deps=(self.main_identity,),
             )
+
+    def test_gcc_mingw_working_directory_bootstrap_marker_is_ignored(self):
+        stream = (
+            b'# 0 "D:/repo/playback/a.cpp"\n'
+            b'# 1 "D:/repo/build//"\n'
+            b'# 0 "<built-in>"\n# 0 "<command-line>"\n'
+            b'# 1 "D:/repo/playback/a.cpp"\nint ok;\n'
+        )
+        self.assertEqual(len(self.parse(stream, deps=(self.main_identity,)).tokens), 3)
+
+    def test_gcc_preserved_pragma_is_not_misclassified_as_line_marker(self):
+        stream = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b'#pragma GCC visibility push(default)\nint ok;\n'
+        )
+        spellings = b"".join(
+            token.spelling for token in self.parse(stream, deps=(self.main_identity,)).tokens
+        )
+        self.assertIn(b"pragmaGCCvisibilitypush", spellings)
+        self.assertTrue(spellings.endswith(b"intok;"))
+
+    def test_gcc_recursive_include_returns_to_nearest_matching_ancestor(self):
+        stream = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b'# 1 "D:/repo/playback/h.h" 1\n'
+            b'# 10 "D:/repo/playback/a.cpp" 1\n'
+            b'# 2 "D:/repo/playback/h.h" 1\n'
+            b'# 11 "D:/repo/playback/a.cpp" 2\nint ok;\n'
+            b'# 2 "D:/repo/playback/h.h" 2\n'
+            b'# 2 "D:/repo/playback/a.cpp" 2\n'
+        )
+        view = self.parse(stream, deps=(self.main_identity, self.header_identity))
+        self.assertEqual(b"".join(token.spelling for token in view.tokens), b"intok;")
+        self.assertEqual(next(iter(view.tokens)).location.line, 11)
 
     def test_absolute_relative_marker_collision_fails_closed(self):
         with self.assertRaisesRegex(AuditInfrastructureError, "absolute.*relative|relative.*absolute"):

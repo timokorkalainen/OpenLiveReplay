@@ -3652,7 +3652,10 @@ def _clang_cl_forwarded_arguments(arguments: tuple[str, ...]) -> Iterator[str]:
             )
             if forwarder is not None:
                 current = _gnu_forwarded_argument(arguments, index, forwarder)
-                assert current is not None
+                if current is None:
+                    raise AuditInfrastructureError(
+                        "forwarded compiler argument disappeared during classification"
+                    )
                 _, end = current
                 if (forwarder == "-Xclang") == xclang_bucket:
                     yield from arguments[index:end]
@@ -3868,7 +3871,10 @@ def _rewrite_msvc(
         if forwarder is not None:
             if configuration.family is CompilerFamily.CLANG_CL:
                 current = _gnu_forwarded_argument(arguments, index, forwarder)
-                assert current is not None
+                if current is None:
+                    raise AuditInfrastructureError(
+                        "forwarded clang-cl argument disappeared during rewrite"
+                    )
                 _, end = current
                 rewritten.extend(arguments[index:end])
                 index = end

@@ -1,3 +1,4 @@
+import ast
 import dataclasses
 import contextlib
 import io
@@ -37,14 +38,78 @@ from gpu_capability_source_audit import (  # noqa: E402
     REGISTRY_HEADER,
     AggregatedFinding,
     AuditBuffer,
+    AuditAllocationShape,
+    CompilerAuditAnalysis,
     Finding,
     TOKEN_PATTERN,
     aggregate_findings,
     audit_preprocessed_view,
+    audit_allocation_plan,
+    capability_candidate_spellings,
+    conservative_allocation_schema,
+    probe_cpython_allocation_layout,
+    reserve_before_allocation,
+    view_has_capability_spelling,
+    _audit_preprocessed_view_unfiltered,
 )
 
 
 class AuditEngineFingerprintTests(unittest.TestCase):
+    def test_task4_stage_and_module_roots_are_exact(self):
+        self.assertEqual(
+            capability_audit.AUDIT_ENGINE_GRAPH_SCHEMA_BYTES,
+            b"olr-gpu-capability-live-graph-v3",
+        )
+        self.assertEqual(
+            capability_audit.AUDIT_ENGINE_STAGE_BYTES,
+            b"task-4-compact-capability-analysis",
+        )
+        self.assertEqual(
+            tuple(module.__name__ for module in capability_audit._AUDIT_ENGINE_TARGET_MODULES),
+            (
+                "gpu_capability_model",
+                "gpu_capability_source_audit",
+                "gpu_capability_command",
+                "gpu_capability_cache",
+                "gpu_capability_provenance",
+                "gpu_capability_runner",
+            ),
+        )
+
+    def test_task4_semantic_graph_owns_analysis_rules_and_cpp_tokens(self):
+        names = {
+            name for name, _value in capability_audit._enumerate_live_semantic_graph()
+        }
+        for expected in (
+            "gpu_capability_source_audit.AuditBuffer",
+            "gpu_capability_source_audit.CompilerAuditAnalysis",
+            "gpu_capability_source_audit.CapabilityRule",
+            "gpu_capability_source_audit.capability_candidate_spellings",
+            "gpu_capability_source_audit.conservative_allocation_schema",
+            "gpu_capability_source_audit.cpp_tokens",
+            "gpu_capability_provenance.reject_source_line_spoofs",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, names)
+
+    def test_production_modules_have_no_bare_asserts(self):
+        source_directory = Path(__file__).resolve().parent
+        names = (
+            "gpu_capability_model.py",
+            "gpu_capability_command.py",
+            "gpu_capability_runner.py",
+            "gpu_capability_provenance.py",
+            "gpu_capability_cache.py",
+            "gpu_capability_source_audit.py",
+        )
+        for name in names:
+            tree = ast.parse(
+                (source_directory / name).read_text(encoding="utf-8"), filename=name
+            )
+            assertions = [node for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+            with self.subTest(module=name):
+                self.assertEqual(assertions, [])
+
     def test_preprocess_configuration_constructor_inventory_is_exact(self):
         self.assertEqual(
             dict(capability_audit._PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY),
@@ -365,7 +430,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             self.assertIn(expected, names)
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-3-compact-result-streaming",
+            b"task-4-compact-capability-analysis",
         )
 
         marshaled = tuple(
@@ -589,13 +654,13 @@ print(recomputed)
             self.assertEqual(fingerprint(first), fingerprint(second))
             mutated = (second / "gpu_capability_source_audit.py").read_text(encoding="utf-8")
             self.assertIn(
-                'AUDIT_ENGINE_STAGE_BYTES = b"task-3-compact-result-streaming"',
+                'AUDIT_ENGINE_STAGE_BYTES = b"task-4-compact-capability-analysis"',
                 mutated,
             )
             (second / "gpu_capability_source_audit.py").write_text(
                 mutated.replace(
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-3-compact-result-streaming"',
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-3-compact-result-streaming-mutated"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-4-compact-capability-analysis"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-4-compact-capability-analysis-mutated"',
                     1,
                 ),
                 encoding="utf-8",
@@ -772,6 +837,263 @@ class CompilerAuditLaneTests(unittest.TestCase):
             original_lines=array("I", (12,)) * count,
         )
         return PreprocessedTranslationUnitView(configuration, tokens, (identity,))
+
+    def test_candidate_prefilter_does_not_build_audit_buffer(self):
+        view = self.view((
+            self.production("playback/gpu/example.cpp", 1, b"int safe ;"),
+        ))
+        self.assertFalse(view_has_capability_spelling(view))
+        with mock.patch.object(AuditBuffer, "from_preprocessed") as build:
+            self.assertEqual(audit_preprocessed_view(view, self.limits, lambda: 0), [])
+        build.assert_not_called()
+
+    def test_candidate_paths_exclude_production_paths_without_rule_trigger(self):
+        view = self.view((
+            self.production("playback/gpu/example.cpp", 1, b"int safe ;"),
+            self.production(
+                "playback/gpu/gpufence.h", 20, b"surface . nativeHandle ( ) ;"
+            ),
+        ))
+        buffer = AuditBuffer.from_preprocessed(view, self.limits, lambda: 0)
+        self.assertEqual(
+            buffer.candidate_paths(),
+            (PurePosixPath("playback/gpu/gpufence.h"),),
+        )
+
+    def test_capability_candidates_are_mechanically_derived_from_rules(self):
+        expected = frozenset(
+            spelling
+            for rule in capability_audit._CAPABILITY_RULES
+            for spelling in rule.trigger_spellings
+        )
+        self.assertEqual(capability_candidate_spellings(), expected)
+        self.assertNotIn("_CAPABILITY_" + "CANDIDATE_SPELLINGS", capability_audit.__dict__)
+
+    def test_batched_buffer_is_byte_and_location_identical(self):
+        view = self.view((
+            self.external(b"namespace sdk {", line=2, inclusion=3),
+            self.production(
+                "playback/gpu/gpufence.h",
+                71,
+                b"lease.nativeHandle();",
+                inclusion=9,
+            ),
+            self.external(b"}", line=4, inclusion=3),
+        ))
+        buffer = AuditBuffer.from_preprocessed(view, self.limits, lambda: 0)
+        self.assertEqual(
+            buffer.text,
+            "namespace sdk {\nlease . nativeHandle ( ) ;\n}\n",
+        )
+        location = buffer.location_for_line(2)
+        self.assertEqual(location.identity.relative, PurePosixPath("playback/gpu/gpufence.h"))
+        self.assertEqual(location.inclusion_instance, 9)
+        self.assertEqual(location.line, 71)
+
+    def test_filtered_and_forced_unfiltered_results_match_owned_corpus(self):
+        fixtures = (
+            ("empty", self.view((self.production("playback/gpu/empty.cpp", 1, b""),))),
+            ("candidate-free", self.view((self.production(
+                "playback/gpu/example.cpp", 1, b"int value = 7 ;"
+            ),))),
+            ("native-handle", self.view((self.production(
+                "playback/gpu/gpufence.h", 20, b"surface.nativeHandle();"
+            ),))),
+            ("nonlocal-jump", self.view((self.production(
+                "playback/gpu/gpufence.h", 30,
+                b"GpuSyncReadScope scope; scope.withRead(s, [](auto lease) { longjmp(e, 1); });"
+            ),))),
+            ("public-registry", self.view((self.production(
+                str(REGISTRY_HEADER), 40,
+                b"class GpuRetireRegistry { public: void registerRetire(); };"
+            ),))),
+            ("public-op-scope", self.view((self.production(
+                str(OP_SCOPE_HEADER), 50,
+                b"class GpuOpScope { public: void track(); };"
+            ),))),
+            ("literal-only", self.view((self.production(
+                "playback/gpu/example.cpp", 60, b"const char * text = safe ;"
+            ),))),
+        )
+        derived = capability_candidate_spellings()
+        for name, view in fixtures:
+            filtered = audit_preprocessed_view(view, self.limits, lambda: 0)
+            unfiltered = _audit_preprocessed_view_unfiltered(
+                view, self.limits, lambda: 0
+            )
+            with self.subTest(name=name):
+                self.assertEqual(filtered, unfiltered)
+                if unfiltered:
+                    spellings = set(object.__getattribute__(view.tokens, "_spellings"))
+                    self.assertFalse(derived.isdisjoint(spellings))
+
+    def test_one_compiler_analysis_is_reused_across_policy_groups(self):
+        view = self.view((
+            self.production(
+                "playback/gpu/gpufence.h", 70,
+                b"void bad() { GpuSyncReadScope scope; surface.nativeHandle(); }",
+            ),
+            self.production(
+                "playback/output/win/wingpuimportedge.cpp", 80,
+                b"void bad2() { GpuSyncReadScope other; surface.nativeHandle(); }",
+                inclusion=2,
+            ),
+        ))
+        original_tokens = capability_audit.cpp_tokens
+        original_shadow = capability_audit.build_shadow_index
+        with (
+            mock.patch.object(
+                capability_audit, "cpp_tokens", wraps=original_tokens
+            ) as token_calls,
+            mock.patch.object(
+                capability_audit, "build_shadow_index", wraps=original_shadow
+            ) as shadow_calls,
+        ):
+            audit_preprocessed_view(view, self.limits, lambda: 0)
+        self.assertEqual(token_calls.call_count, 1)
+        self.assertEqual(shadow_calls.call_count, 1)
+
+    def test_native_handle_only_analysis_skips_scope_and_shadow_indices(self):
+        view = self.view((self.production(
+            "playback/gpu/gpusurface.h",
+            70,
+            b"class GpuSurface { void * nativeHandle ( ) const ; } ;",
+        ),))
+        with (
+            mock.patch.object(
+                capability_audit,
+                "scope_bindings_linear",
+                side_effect=AssertionError("scope bindings built"),
+            ),
+            mock.patch.object(
+                capability_audit,
+                "build_shadow_index",
+                side_effect=AssertionError("shadow index built"),
+            ),
+        ):
+            self.assertEqual(
+                audit_preprocessed_view(view, self.limits, lambda: 0), []
+            )
+
+    def test_portable_allocation_schema_has_explicit_checked_formulas(self):
+        schema = conservative_allocation_schema()
+        self.assertEqual(schema.schema_version, 1)
+        self.assertEqual(schema.string_bound(7), schema.round_up(
+            schema.str_header_bytes + 8 * 4
+        ))
+        self.assertEqual(schema.bytes_bound(7), schema.round_up(
+            schema.bytes_header_bytes + 8
+        ))
+        self.assertEqual(schema.bytearray_bound(7), schema.round_up(
+            schema.bytearray_header_bytes + 8
+        ))
+        digits = max(1, ((4096).bit_length() + schema.pylong_digit_bits - 1)
+                     // schema.pylong_digit_bits)
+        self.assertEqual(schema.pylong_bound(4096), schema.round_up(
+            schema.pylong_header_bytes
+            + digits * schema.pylong_digit_bytes_upper_bound
+        ))
+        self.assertGreater(schema.dict_bound(1366), schema.dict_bound(1365))
+        with self.assertRaisesRegex(AuditInfrastructureError, "allocation arithmetic"):
+            schema.checked_add(schema.maximum_allocation_bytes, 1)
+        with self.assertRaisesRegex(AuditInfrastructureError, "allocation arithmetic"):
+            schema.checked_multiply(schema.maximum_allocation_bytes, 2)
+
+    def test_allocation_plan_charges_every_declared_phase_overlap(self):
+        schema = conservative_allocation_schema()
+        shape = AuditAllocationShape(
+            text_character_count=131_073,
+            maximum_code_point=255,
+            run_count=19,
+            origin_count=5,
+            chunk_count=3,
+            token_count=40,
+            json_input_chunk_bytes=4097,
+            json_input_chunk_count=2,
+            json_token_count=13,
+            json_string_characters=257,
+            json_integer_values=(1 << 200,),
+            json_list_slots=11,
+            json_tuple_slots=7,
+            json_dict_entries=17,
+            duplicate_key_count=17,
+            production_raw_bytes=8193,
+        )
+        plan = audit_allocation_plan(shape, schema)
+        self.assertEqual(plan.pre_reserved_bytes, sum(plan.phase_charges))
+        for field in (
+            "input_chunks_and_containers",
+            "joined_input_and_join_transient",
+            "final_text",
+            "mapping_arrays",
+            "duplicate_key_structures",
+            "analysis_objects",
+            "json_scanner_decoder",
+            "production_decode_mapping",
+        ):
+            with self.subTest(field=field):
+                self.assertGreater(getattr(plan, field), 0)
+        reservation = reserve_before_allocation(plan.pre_reserved_bytes)
+        reservation.require_before_allocation(plan.pre_reserved_bytes)
+        with self.assertRaisesRegex(AuditInfrastructureError, "pre-reserved allocation"):
+            reservation.require_before_allocation(plan.pre_reserved_bytes + 1)
+
+    def test_dense_view_reserves_chunks_mapping_join_and_final_text_first(self):
+        view = self.one_million_token_view()
+        observations = capability_audit.AuditAllocationObservations()
+        buffer = AuditBuffer.from_preprocessed(
+            view, self.limits, lambda: 0, _allocation_observer=observations
+        )
+        self.assertIs(type(buffer.text), str)
+        self.assertEqual(buffer.text_character_count, len(buffer.text))
+        self.assertEqual(
+            buffer.text_max_code_point, max(map(ord, buffer.text), default=0)
+        )
+        self.assertEqual(
+            observations.events[:2],
+            ["measure-layout", "reserve-all-allocations"],
+        )
+        for slot in (
+            observations.final_str,
+            observations.chunk_list,
+            observations.join_transient,
+            observations.mapping_arrays,
+        ):
+            self.assertTrue(slot.reserved_before_allocation)
+        self.assertLessEqual(observations.maximum_chunk_characters, 64 * 1024)
+        self.assertEqual(observations.final_str.constructions, 1)
+        self.assertLessEqual(
+            observations.peak_charged_bytes, observations.pre_reserved_bytes
+        )
+
+    def test_production_buffer_never_uses_private_cpython_probe(self):
+        view = self.view((self.production(
+            "playback/gpu/example.cpp", 1, b"GpuSyncReadScope scope ;"
+        ),))
+        with mock.patch.object(
+            capability_audit,
+            "probe_cpython_allocation_layout",
+            side_effect=AssertionError("diagnostic probe selected production bounds"),
+        ):
+            AuditBuffer.from_preprocessed(view, self.limits, lambda: 0)
+
+    @unittest.skipUnless(
+        sys.version_info[:3] == (3, 11, 9),
+        "private-layout calibration is pinned to CPython 3.11.9",
+    )
+    def test_runtime_allocation_probe_matches_supported_cpython_3119_objects(self):
+        layout = probe_cpython_allocation_layout()
+        self.assertEqual(layout.python_version, (3, 11, 9))
+        for value, reserved in layout.representative_objects_and_bounds:
+            with self.subTest(type=type(value), value=repr(value)[:40]):
+                self.assertLessEqual(sys.getsizeof(value), reserved)
+
+    def test_runtime_allocation_probe_rejects_other_versions(self):
+        with mock.patch.object(capability_audit.sys, "version_info", (3, 11, 8)):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "CPython 3.11.9 allocation layout"
+            ):
+                probe_cpython_allocation_layout()
 
     def test_nonproduction_scope_context_is_kept_but_not_reported(self):
         view = self.view((

@@ -7,6 +7,7 @@ import argparse
 from array import array
 import bisect
 from collections.abc import Mapping
+import contextvars
 import dataclasses
 from dataclasses import dataclass
 import enum
@@ -36,6 +37,8 @@ from gpu_capability_model import (
     CoverageReport,
     PreprocessedTranslationUnitView,
     SourceLocation,
+    build_dependency_root_authority,
+    enumerate_production_identities,
     _current_process_rss_bytes,
 )
 
@@ -98,30 +101,14 @@ REVIEWED_NATIVE_HANDLE_TYPES = MappingProxyType({
         frozenset({"ID3D11Texture2D"}),
 })
 
-_CAPABILITY_CANDIDATE_SPELLINGS = frozenset({
-    b"GpuOpScope",
-    b"GpuRetireRegistry",
-    b"GpuSyncReadScope",
-    b"_longjmp",
-    b"complete",
-    b"longjmp",
-    b"nativeHandle",
-    b"read",
-    b"registerRetire",
-    b"siglongjmp",
-    b"track",
-    b"withRead",
-}).union(
-    name.encode("ascii")
-    for table in (
-        REVIEWED_NATIVE_HANDLE_SINKS,
-        REVIEWED_NATIVE_HANDLE_METHODS,
-        REVIEWED_NATIVE_HANDLE_MEMBER_SINKS,
-        REVIEWED_NATIVE_HANDLE_TYPES,
-    )
-    for names in table.values()
-    for name in names
-)
+_AUDIT_SPELLING_ALTERNATIVES = MappingProxyType({
+    b"%:%:": b"##  ",
+    b"<:": b"[ ",
+    b":>": b"] ",
+    b"<%": b"{ ",
+    b"%>": b"} ",
+    b"%:": b"# ",
+})
 
 
 @dataclass(frozen=True)
@@ -139,6 +126,418 @@ class Finding:
 class AggregatedFinding:
     finding: Finding
     configurations: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ConservativeAllocationSchema:
+    """Portable closed-form upper bounds; never a private CPython layout model."""
+
+    schema_version: int = 1
+    allocator_alignment_bytes: int = 16
+    maximum_allocation_bytes: int = (1 << 63) - 1
+    pointer_bytes_upper_bound: int = 16
+    pylong_header_bytes: int = 64
+    pylong_digit_bits: int = 15
+    pylong_digit_bytes_upper_bound: int = 4
+    bytes_header_bytes: int = 128
+    bytearray_header_bytes: int = 128
+    bytesio_header_bytes: int = 256
+    str_header_bytes: int = 128
+    list_header_bytes: int = 128
+    tuple_header_bytes: int = 128
+    dict_header_bytes: int = 256
+    dict_index_bytes_upper_bound: int = 8
+    dict_entry_slot_count: int = 3
+    dict_maximum_load_numerator: int = 2
+    dict_maximum_load_denominator: int = 3
+    array_header_bytes: int = 128
+    json_scanner_fixed_bytes: int = 4096
+    json_decoder_fixed_bytes: int = 4096
+    json_encoder_scratch_bytes: int = 4096
+    analysis_fixed_bytes: int = 256 * 1024
+
+    def _nonnegative(self, value: int) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise AuditInfrastructureError("allocation arithmetic input is invalid")
+        return value
+
+    def checked_add(self, *values: int) -> int:
+        total = 0
+        for value in values:
+            value = self._nonnegative(value)
+            if value > self.maximum_allocation_bytes - total:
+                raise AuditInfrastructureError("allocation arithmetic addition overflow")
+            total += value
+        return total
+
+    def checked_multiply(self, left: int, right: int) -> int:
+        left = self._nonnegative(left)
+        right = self._nonnegative(right)
+        if left and right > self.maximum_allocation_bytes // left:
+            raise AuditInfrastructureError("allocation arithmetic multiplication overflow")
+        return left * right
+
+    def round_up(self, raw_bytes: int) -> int:
+        raw_bytes = self._nonnegative(raw_bytes)
+        adjusted = self.checked_add(raw_bytes, self.allocator_alignment_bytes - 1)
+        return adjusted - adjusted % self.allocator_alignment_bytes
+
+    def pylong_bound(self, value: int) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise AuditInfrastructureError("allocation arithmetic integer is invalid")
+        digits = max(
+            1,
+            (abs(value).bit_length() + self.pylong_digit_bits - 1)
+            // self.pylong_digit_bits,
+        )
+        return self.round_up(self.checked_add(
+            self.pylong_header_bytes,
+            self.checked_multiply(digits, self.pylong_digit_bytes_upper_bound),
+        ))
+
+    def bytes_bound(self, length: int) -> int:
+        return self.round_up(self.checked_add(
+            self.bytes_header_bytes, self.checked_add(length, 1)
+        ))
+
+    def bytearray_bound(self, length: int) -> int:
+        return self.round_up(self.checked_add(
+            self.bytearray_header_bytes, self.checked_add(length, 1)
+        ))
+
+    def bytesio_bound(self, backing_capacity: int) -> int:
+        capacity = self.round_up(backing_capacity)
+        return self.round_up(self.checked_add(self.bytesio_header_bytes, capacity))
+
+    def string_bound(self, code_points: int) -> int:
+        storage = self.checked_multiply(self.checked_add(code_points, 1), 4)
+        return self.round_up(self.checked_add(self.str_header_bytes, storage))
+
+    def list_bound(self, slots: int) -> int:
+        return self.round_up(self.checked_add(
+            self.list_header_bytes,
+            self.checked_multiply(slots, self.pointer_bytes_upper_bound),
+        ))
+
+    def tuple_bound(self, slots: int) -> int:
+        return self.round_up(self.checked_add(
+            self.tuple_header_bytes,
+            self.checked_multiply(slots, self.pointer_bytes_upper_bound),
+        ))
+
+    def dict_capacity(self, entries: int) -> int:
+        entries = self._nonnegative(entries)
+        if entries == 0:
+            return 0
+        required = (
+            self.checked_add(
+                self.checked_multiply(entries, self.dict_maximum_load_denominator),
+                self.dict_maximum_load_numerator - 1,
+            )
+            // self.dict_maximum_load_numerator
+        )
+        capacity = 1
+        while capacity < required:
+            capacity = self.checked_multiply(capacity, 2)
+        return capacity
+
+    def dict_bound(self, entries: int) -> int:
+        capacity = self.dict_capacity(entries)
+        indices = self.checked_multiply(capacity, self.dict_index_bytes_upper_bound)
+        entry_bytes = self.checked_multiply(
+            capacity,
+            self.checked_multiply(
+                self.dict_entry_slot_count, self.pointer_bytes_upper_bound
+            ),
+        )
+        return self.round_up(self.checked_add(
+            self.dict_header_bytes, indices, entry_bytes
+        ))
+
+    def array_bound(self, items: int, item_bytes: int = 4) -> int:
+        return self.round_up(self.checked_add(
+            self.array_header_bytes, self.checked_multiply(items, item_bytes)
+        ))
+
+
+_CONSERVATIVE_ALLOCATION_SCHEMA = ConservativeAllocationSchema()
+
+
+def conservative_allocation_schema() -> ConservativeAllocationSchema:
+    return _CONSERVATIVE_ALLOCATION_SCHEMA
+
+
+@dataclass(frozen=True, slots=True)
+class AuditAllocationShape:
+    text_character_count: int
+    maximum_code_point: int
+    run_count: int
+    origin_count: int
+    chunk_count: int
+    token_count: int
+    json_input_chunk_bytes: int = 0
+    json_input_chunk_count: int = 0
+    json_token_count: int = 0
+    json_string_characters: int = 0
+    json_integer_values: tuple[int, ...] = ()
+    json_list_slots: int = 0
+    json_tuple_slots: int = 0
+    json_dict_entries: int = 0
+    duplicate_key_count: int = 0
+    production_raw_bytes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AuditAllocationPlan:
+    input_chunks_and_containers: int
+    joined_input_and_join_transient: int
+    final_text: int
+    mapping_arrays: int
+    duplicate_key_structures: int
+    analysis_objects: int
+    json_scanner_decoder: int
+    production_decode_mapping: int
+    pre_reserved_bytes: int
+
+    @property
+    def phase_charges(self) -> tuple[int, ...]:
+        return (
+            self.input_chunks_and_containers,
+            self.joined_input_and_join_transient,
+            self.final_text,
+            self.mapping_arrays,
+            self.duplicate_key_structures,
+            self.analysis_objects,
+            self.json_scanner_decoder,
+            self.production_decode_mapping,
+        )
+
+
+def audit_allocation_plan(
+    shape: AuditAllocationShape,
+    schema: ConservativeAllocationSchema | None = None,
+) -> AuditAllocationPlan:
+    schema = conservative_allocation_schema() if schema is None else schema
+    if not isinstance(shape, AuditAllocationShape):
+        raise AuditInfrastructureError("audit allocation shape is invalid")
+    complete_chunks, final_chunk_characters = divmod(
+        shape.text_character_count, AuditBuffer._BLOCK_BYTES
+    )
+    if final_chunk_characters == 0 and complete_chunks:
+        final_chunk_characters = AuditBuffer._BLOCK_BYTES
+        complete_chunks -= 1
+    audit_chunk_objects = schema.checked_add(
+        schema.checked_multiply(
+            complete_chunks,
+            schema.checked_add(
+                schema.bytearray_bound(AuditBuffer._BLOCK_BYTES),
+                schema.string_bound(AuditBuffer._BLOCK_BYTES),
+            ),
+        ),
+        schema.bytearray_bound(final_chunk_characters),
+        schema.string_bound(final_chunk_characters),
+    )
+    input_chunks = schema.checked_add(
+        schema.list_bound(
+            schema.checked_add(shape.chunk_count, shape.json_input_chunk_count)
+        ),
+        audit_chunk_objects,
+        schema.bytes_bound(shape.json_input_chunk_bytes),
+    )
+    joined_input = schema.checked_add(
+        schema.string_bound(shape.text_character_count),
+        schema.string_bound(shape.text_character_count),
+        schema.bytes_bound(shape.json_input_chunk_bytes),
+        schema.bytes_bound(shape.json_input_chunk_bytes),
+    )
+    final_text = schema.string_bound(shape.text_character_count)
+    mapping_arrays = schema.checked_add(
+        schema.tuple_bound(AuditBuffer._RUN_COLUMN_COUNT),
+        *(
+            schema.array_bound(shape.run_count + (1 if index == 9 else 0))
+            for index in range(AuditBuffer._RUN_COLUMN_COUNT)
+        ),
+        schema.bytes_bound(shape.origin_count),
+    )
+    duplicate_keys = schema.checked_add(
+        schema.list_bound(schema.checked_multiply(shape.duplicate_key_count, 2)),
+        schema.dict_bound(shape.duplicate_key_count),
+        schema.string_bound(shape.json_string_characters),
+    )
+    analysis = schema.checked_add(
+        schema.analysis_fixed_bytes,
+        schema.tuple_bound(shape.token_count),
+        schema.list_bound(shape.text_character_count + 1),
+        schema.dict_bound(shape.token_count),
+    )
+    json_integers = schema.checked_add(*(
+        schema.pylong_bound(value) for value in shape.json_integer_values
+    )) if shape.json_integer_values else 0
+    json_objects = schema.checked_add(
+        schema.json_scanner_fixed_bytes,
+        schema.json_decoder_fixed_bytes,
+        schema.json_encoder_scratch_bytes,
+        schema.list_bound(shape.json_list_slots),
+        schema.tuple_bound(shape.json_tuple_slots),
+        schema.dict_bound(shape.json_dict_entries),
+        schema.tuple_bound(shape.json_token_count),
+        schema.string_bound(shape.json_string_characters),
+        json_integers,
+    )
+    production_decode = schema.checked_add(
+        schema.bytes_bound(shape.production_raw_bytes),
+        schema.bytearray_bound(shape.production_raw_bytes),
+        schema.bytesio_bound(shape.production_raw_bytes),
+        schema.string_bound(shape.production_raw_bytes),
+        schema.dict_bound(shape.json_dict_entries),
+    )
+    charges = (
+        input_chunks, joined_input, final_text, mapping_arrays, duplicate_keys,
+        analysis, json_objects, production_decode,
+    )
+    return AuditAllocationPlan(*charges, schema.checked_add(*charges))
+
+
+class AllocationConstructionObservation:
+    __slots__ = ("reserved_before_allocation", "constructions")
+
+    def __init__(self) -> None:
+        self.reserved_before_allocation = False
+        self.constructions = 0
+
+
+class AuditAllocationObservations:
+    __slots__ = (
+        "events",
+        "final_str",
+        "chunk_list",
+        "join_transient",
+        "mapping_arrays",
+        "maximum_chunk_characters",
+        "pre_reserved_bytes",
+        "peak_charged_bytes",
+    )
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.final_str = AllocationConstructionObservation()
+        self.chunk_list = AllocationConstructionObservation()
+        self.join_transient = AllocationConstructionObservation()
+        self.mapping_arrays = AllocationConstructionObservation()
+        self.maximum_chunk_characters = 0
+        self.pre_reserved_bytes = 0
+        self.peak_charged_bytes = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AllocationReservation:
+    reserved_bytes: int
+
+    def require_before_allocation(self, allocation_bytes: int) -> None:
+        if (
+            not isinstance(allocation_bytes, int)
+            or isinstance(allocation_bytes, bool)
+            or allocation_bytes < 0
+            or allocation_bytes > self.reserved_bytes
+        ):
+            raise AuditInfrastructureError(
+                "allocation exceeds pre-reserved allocation bytes"
+            )
+
+
+def reserve_before_allocation(total_bytes: int) -> AllocationReservation:
+    schema = conservative_allocation_schema()
+    schema._nonnegative(total_bytes)
+    if total_bytes > schema.maximum_allocation_bytes:
+        raise AuditInfrastructureError("allocation arithmetic limit exceeded")
+    return AllocationReservation(total_bytes)
+
+
+@dataclass(frozen=True, slots=True)
+class CpythonAllocationLayoutDiagnostic:
+    python_version: tuple[int, int, int]
+    representative_objects_and_bounds: tuple[tuple[object, int], ...]
+
+
+def probe_cpython_allocation_layout() -> CpythonAllocationLayoutDiagnostic:
+    """Diagnostic-only CPython 3.11.9 calibration; production never calls this."""
+
+    version = tuple(sys.version_info[index] for index in range(3))
+    if version != (3, 11, 9):
+        raise AuditInfrastructureError(
+            "CPython 3.11.9 allocation layout diagnostic is unavailable"
+        )
+    schema = conservative_allocation_schema()
+    representatives = (
+        (0, schema.pylong_bound(0)),
+        (1 << 200, schema.pylong_bound(1 << 200)),
+        (b"x" * 257, schema.bytes_bound(257)),
+        (bytearray(257), schema.bytearray_bound(257)),
+        ("x" * 257, schema.string_bound(257)),
+        ([None] * 17, schema.list_bound(17)),
+        ((None,) * 17, schema.tuple_bound(17)),
+        ({index: index for index in range(17)}, schema.dict_bound(17)),
+    )
+    return CpythonAllocationLayoutDiagnostic(version, representatives)
+
+
+@dataclass(frozen=True, slots=True)
+class _MeasuredAuditBufferLayout:
+    shape: AuditAllocationShape
+    retained_bytes: int
+
+
+def _measure_audit_buffer_layout(tokens) -> _MeasuredAuditBufferLayout:
+    schema = conservative_allocation_schema()
+    spelling_ids = object.__getattribute__(tokens, "_spelling_ids")
+    spellings = object.__getattribute__(tokens, "_spellings")
+    character_count = 0
+    maximum_code_point = max(
+        (
+            max(AuditBuffer._audit_spelling(spelling), default=0)
+            for spelling in spellings
+        ),
+        default=0,
+    )
+    run_count = 0
+    origin_mask = 0
+    for packed_run in tokens.iter_runs():
+        run_count = schema.checked_add(run_count, 1)
+        origin_mask |= 1 << packed_run.identity_id
+        for token_index in range(packed_run.start, packed_run.stop):
+            if token_index != packed_run.start:
+                character_count = schema.checked_add(character_count, 1)
+                maximum_code_point = max(maximum_code_point, 32)
+            piece = AuditBuffer._audit_spelling(
+                spellings[spelling_ids[token_index]]
+            )
+            character_count = schema.checked_add(character_count, len(piece))
+        character_count = schema.checked_add(character_count, 1)
+        maximum_code_point = max(maximum_code_point, 10)
+    if character_count > 0xFFFFFFFF or run_count > 0xFFFFFFFF:
+        raise AuditInfrastructureError("normalized audit mapping exceeds unsigned 32-bit range")
+    origin_count = origin_mask.bit_count()
+    mapping_bytes = schema.checked_multiply(
+        schema.checked_add(
+            schema.checked_multiply(run_count, AuditBuffer._RUN_COLUMN_COUNT), 1
+        ),
+        4,
+    )
+    retained = schema.checked_add(character_count, mapping_bytes, origin_count)
+    chunk_count = (
+        character_count + AuditBuffer._BLOCK_BYTES - 1
+    ) // AuditBuffer._BLOCK_BYTES
+    return _MeasuredAuditBufferLayout(
+        AuditAllocationShape(
+            text_character_count=character_count,
+            maximum_code_point=maximum_code_point,
+            run_count=run_count,
+            origin_count=origin_count,
+            chunk_count=chunk_count,
+            token_count=len(tokens),
+        ),
+        retained,
+    )
 
 
 class AuditBuffer:
@@ -173,6 +572,8 @@ class AuditBuffer:
         self._line_starts = self._run_starts
         self._origin_production = origin_production
         self.peak_rss_bytes = peak_rss_bytes
+        self.text_character_count = len(text)
+        self.text_max_code_point = max(map(ord, text), default=0)
 
     @staticmethod
     def _sample_rss(
@@ -193,15 +594,7 @@ class AuditBuffer:
     def _audit_spelling(spelling: bytes) -> bytes:
         if spelling.startswith((b'"', b"'")):
             return b" " * len(spelling)
-        alternatives = {
-            b"%:%:": b"##  ",
-            b"<:": b"[ ",
-            b":>": b"] ",
-            b"<%": b"{ ",
-            b"%>": b"} ",
-            b"%:": b"# ",
-        }
-        return alternatives.get(spelling, spelling)
+        return _AUDIT_SPELLING_ALTERNATIVES.get(spelling, spelling)
 
     @classmethod
     def from_preprocessed(
@@ -209,10 +602,44 @@ class AuditBuffer:
         view: PreprocessedTranslationUnitView,
         limits: AuditLimits,
         rss_reader: Callable[[], int],
+        *,
+        _allocation_observer: AuditAllocationObservations | None = None,
     ) -> "AuditBuffer":
         tokens = view.tokens
-        normalized = bytearray()
-        columns = tuple(array("I") for _unused in range(cls._RUN_COLUMN_COUNT))
+        spelling_ids_packed = object.__getattribute__(tokens, "_spelling_ids")
+        spellings = object.__getattribute__(tokens, "_spellings")
+        identities = object.__getattribute__(tokens, "_identities")
+        measured = _measure_audit_buffer_layout(tokens)
+        layout = measured.shape
+        if _allocation_observer is not None:
+            _allocation_observer.events.append("measure-layout")
+        if measured.retained_bytes > limits.retained_token_bytes:
+            raise AuditInfrastructureError("normalized audit byte limit exceeded")
+        plan = audit_allocation_plan(layout)
+        reservation = reserve_before_allocation(plan.pre_reserved_bytes)
+        peak_rss = cls._sample_rss(
+            rss_reader, limits.rss_bytes, 0, reserve=plan.pre_reserved_bytes
+        )
+        if _allocation_observer is not None:
+            _allocation_observer.events.append("reserve-all-allocations")
+            _allocation_observer.pre_reserved_bytes = plan.pre_reserved_bytes
+            _allocation_observer.peak_charged_bytes = plan.pre_reserved_bytes
+            for observed in (
+                _allocation_observer.final_str,
+                _allocation_observer.chunk_list,
+                _allocation_observer.join_transient,
+                _allocation_observer.mapping_arrays,
+            ):
+                observed.reserved_before_allocation = True
+
+        reservation.require_before_allocation(plan.mapping_arrays)
+        columns = tuple(
+            array("I", (0,))
+            * (layout.run_count + (1 if index == cls._RUN_COLUMN_COUNT - 1 else 0))
+            for index in range(cls._RUN_COLUMN_COUNT)
+        )
+        if _allocation_observer is not None:
+            _allocation_observer.mapping_arrays.constructions += 1
         (
             run_starts,
             run_stops,
@@ -225,62 +652,57 @@ class AuditBuffer:
             change_prefix,
             production_prefix,
         ) = columns
-        production_prefix.append(0)
+        production_prefix[0] = 0
         origin_ids_by_key: dict[tuple[Path | None, PurePosixPath | None, bool], int] = {}
         origin_production = bytearray()
-        peak_rss = cls._sample_rss(rss_reader, limits.rss_bytes, 0)
-        bytes_since_sample = 0
-
-        def mapping_bytes(extra_runs: int = 0) -> int:
-            runs = len(run_starts) + extra_runs
-            return (runs * (cls._RUN_COLUMN_COUNT - 1) + runs + 1) * 4
-
-        def retained_bytes(
-            *, extra_normalized: int = 0, extra_runs: int = 0,
-            extra_origins: int = 0,
-        ) -> int:
-            return (
-                len(normalized)
-                + extra_normalized
-                + mapping_bytes(extra_runs)
-                + len(origin_production)
-                + extra_origins
-            )
+        reservation.require_before_allocation(plan.input_chunks_and_containers)
+        chunks: list[str | None] = [None] * layout.chunk_count
+        if _allocation_observer is not None:
+            _allocation_observer.chunk_list.constructions += 1
+        chunk = bytearray()
+        chunk_index = 0
+        text_characters = 0
 
         def append(piece: bytes) -> None:
-            nonlocal bytes_since_sample, peak_rss
-            projected = retained_bytes(extra_normalized=len(piece))
-            if projected > limits.retained_token_bytes:
-                raise AuditInfrastructureError("normalized audit byte limit exceeded")
-            if bytes_since_sample + len(piece) >= cls._BLOCK_BYTES:
-                peak_rss = cls._sample_rss(
-                    rss_reader,
-                    limits.rss_bytes,
-                    peak_rss,
-                    reserve=cls._BLOCK_BYTES,
-                )
-                bytes_since_sample = 0
-            normalized.extend(piece)
-            bytes_since_sample += len(piece)
+            nonlocal chunk, chunk_index, text_characters
+            piece_length = len(piece)
+            if piece_length <= cls._BLOCK_BYTES - len(chunk):
+                chunk.extend(piece)
+                text_characters += piece_length
+                if len(chunk) == cls._BLOCK_BYTES:
+                    chunks[chunk_index] = chunk.decode("latin-1", errors="strict")
+                    if _allocation_observer is not None:
+                        _allocation_observer.maximum_chunk_characters = max(
+                            _allocation_observer.maximum_chunk_characters, len(chunk)
+                        )
+                    chunk_index += 1
+                    chunk = bytearray()
+                return
+            offset = 0
+            while offset < piece_length:
+                available = cls._BLOCK_BYTES - len(chunk)
+                take = min(available, piece_length - offset)
+                chunk.extend(piece[offset:offset + take])
+                offset += take
+                text_characters += take
+                if len(chunk) == cls._BLOCK_BYTES:
+                    chunks[chunk_index] = chunk.decode("latin-1", errors="strict")
+                    if _allocation_observer is not None:
+                        _allocation_observer.maximum_chunk_characters = max(
+                            _allocation_observer.maximum_chunk_characters, len(chunk)
+                        )
+                    chunk_index += 1
+                    chunk = bytearray()
 
-        for packed_run in tokens.iter_runs():
-            if len(run_starts) % cls._RUN_BLOCK == 0:
-                reserve = cls._RUN_BLOCK * (cls._RUN_COLUMN_COUNT * 4 + 1)
-                peak_rss = cls._sample_rss(
-                    rss_reader, limits.rss_bytes, peak_rss, reserve=reserve
-                )
-            if retained_bytes(extra_runs=1) > limits.retained_token_bytes:
-                raise AuditInfrastructureError("normalized audit byte limit exceeded")
-            normalized_start = len(normalized)
+        for run_index, packed_run in enumerate(tokens.iter_runs()):
+            normalized_start = text_characters
             for token_index in range(packed_run.start, packed_run.stop):
                 if token_index != packed_run.start:
                     append(b" ")
-                spelling_id = tokens.spelling_id_at(token_index)
-                append(cls._audit_spelling(tokens.spelling_for(spelling_id)))
+                spelling_id = spelling_ids_packed[token_index]
+                append(cls._audit_spelling(spellings[spelling_id]))
             append(b"\n")
-            if retained_bytes(extra_runs=1) > limits.retained_token_bytes:
-                raise AuditInfrastructureError("normalized audit byte limit exceeded")
-            identity = tokens.identity_for(packed_run.identity_id)
+            identity = identities[packed_run.identity_id]
             origin_key = (
                 identity.canonical if identity is not None else None,
                 identity.relative if identity is not None else None,
@@ -288,56 +710,77 @@ class AuditBuffer:
             )
             origin_id = origin_ids_by_key.get(origin_key)
             if origin_id is None:
-                if (
-                    retained_bytes(extra_runs=1, extra_origins=1)
-                    > limits.retained_token_bytes
-                ):
-                    raise AuditInfrastructureError("normalized audit byte limit exceeded")
-                identity_bytes = sum(
-                    len(str(value).encode("utf-8", errors="surrogatepass"))
-                    for value in origin_key[:2] if value is not None
-                )
-                peak_rss = cls._sample_rss(
-                    rss_reader,
-                    limits.rss_bytes,
-                    peak_rss,
-                    reserve=1025 + identity_bytes,
-                )
                 origin_id = len(origin_ids_by_key)
                 origin_ids_by_key[origin_key] = origin_id
                 origin_production.append(int(origin_key[2]))
-            changes = change_prefix[-1] if change_prefix else 0
+            changes = change_prefix[run_index - 1] if run_index else 0
             if (
-                origin_ids
+                run_index
                 and (
-                    origin_ids[-1] != origin_id
-                    or inclusion_ids[-1] != packed_run.inclusion_instance
+                    origin_ids[run_index - 1] != origin_id
+                    or inclusion_ids[run_index - 1] != packed_run.inclusion_instance
                 )
             ):
                 changes += 1
-            run_starts.append(normalized_start)
-            run_stops.append(len(normalized))
-            token_starts.append(packed_run.start)
-            token_stops.append(packed_run.stop)
-            identity_ids.append(packed_run.identity_id)
-            origin_ids.append(origin_id)
-            inclusion_ids.append(packed_run.inclusion_instance)
-            original_lines.append(packed_run.original_line)
-            change_prefix.append(changes)
-            production_prefix.append(production_prefix[-1] + int(origin_key[2]))
-        if retained_bytes() > limits.retained_token_bytes:
-            raise AuditInfrastructureError("normalized audit byte limit exceeded")
+            run_starts[run_index] = normalized_start
+            run_stops[run_index] = text_characters
+            token_starts[run_index] = packed_run.start
+            token_stops[run_index] = packed_run.stop
+            identity_ids[run_index] = packed_run.identity_id
+            origin_ids[run_index] = origin_id
+            inclusion_ids[run_index] = packed_run.inclusion_instance
+            original_lines[run_index] = packed_run.original_line
+            change_prefix[run_index] = changes
+            production_prefix[run_index + 1] = (
+                production_prefix[run_index] + int(origin_key[2])
+            )
+        if chunk:
+            chunks[chunk_index] = chunk.decode("latin-1", errors="strict")
+            if _allocation_observer is not None:
+                _allocation_observer.maximum_chunk_characters = max(
+                    _allocation_observer.maximum_chunk_characters, len(chunk)
+                )
+            chunk_index += 1
+        if text_characters != layout.text_character_count or chunk_index != layout.chunk_count:
+            raise AuditInfrastructureError("measured audit text layout changed")
+        if len(origin_production) != layout.origin_count:
+            raise AuditInfrastructureError("measured audit origin count changed")
         peak_rss = cls._sample_rss(
             rss_reader,
             limits.rss_bytes,
             peak_rss,
-            reserve=len(normalized) + len(origin_production),
+            reserve=layout.text_character_count + len(origin_production),
         )
         immutable_origin_production = bytes(origin_production)
-        try:
-            text = normalized.decode("latin-1", errors="strict")
-        except UnicodeDecodeError as error:  # pragma: no cover - latin-1 is total
-            raise AuditInfrastructureError("cannot normalize preprocessed audit bytes") from error
+        if any(item is None for item in chunks):
+            raise AuditInfrastructureError("audit text chunk construction is incomplete")
+        reservation.require_before_allocation(plan.joined_input_and_join_transient)
+        if _allocation_observer is not None:
+            _allocation_observer.join_transient.constructions += 1
+        text = "".join(chunks)  # type: ignore[arg-type]
+        if _allocation_observer is not None:
+            _allocation_observer.final_str.constructions += 1
+        if type(text) is not str:
+            raise AuditInfrastructureError("audit text is not str")
+        if len(text) != layout.text_character_count:
+            raise AuditInfrastructureError("audit text length changed")
+        if max(map(ord, text), default=0) != layout.maximum_code_point:
+            raise AuditInfrastructureError("audit text storage kind changed")
+        expected_mapping_counts = (
+            layout.run_count,
+            layout.run_count,
+            layout.run_count,
+            layout.run_count,
+            layout.run_count,
+            layout.run_count,
+            layout.run_count,
+            layout.run_count,
+            layout.run_count,
+            layout.run_count + 1,
+        )
+        if tuple(map(len, columns)) != expected_mapping_counts:
+            raise AuditInfrastructureError("audit mapping count changed")
+        del chunks, chunk
         peak_rss = cls._sample_rss(rss_reader, limits.rss_bytes, peak_rss)
         return cls(text, view, columns, immutable_origin_production, peak_rss)
 
@@ -381,13 +824,25 @@ class AuditBuffer:
 
     def candidate_paths(self) -> tuple[PurePosixPath, ...]:
         result: set[PurePosixPath] = set()
+        candidates = capability_candidate_spellings()
+        tokens = self._view.tokens
+        identities = object.__getattribute__(tokens, "_identities")
+        spelling_ids = object.__getattribute__(tokens, "_spelling_ids")
+        spellings = object.__getattribute__(tokens, "_spellings")
         for run_index in range(len(self._run_starts)):
-            identity = self._view.tokens.identity_for(self._identity_ids[run_index])
+            identity = identities[self._identity_ids[run_index]]
             if (
                 identity is not None
                 and identity.production
                 and identity.relative is not None
                 and is_production_path(identity.relative)
+                and any(
+                    spellings[spelling_ids[token_index]] in candidates
+                    for token_index in range(
+                        self._token_run_starts[run_index],
+                        self._token_run_stops[run_index],
+                    )
+                )
             ):
                 result.add(identity.relative)
         return tuple(sorted(result, key=PurePosixPath.as_posix))
@@ -397,7 +852,7 @@ class AuditBuffer:
             for token_index in range(
                 self._token_run_starts[run_index], self._token_run_stops[run_index]
             ):
-                if self.token_spelling(token_index) in _CAPABILITY_CANDIDATE_SPELLINGS:
+                if self.token_spelling(token_index) in capability_candidate_spellings():
                     return True
         return False
 
@@ -490,11 +945,30 @@ TOKEN_PATTERN = re.compile(
 RAW_LITERAL_PREFIX = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\(')
 
 
-def cpp_tokens(masked: str, start: int = 0, end: int | None = None) -> list[CppToken]:
+_compiler_analysis_context = contextvars.ContextVar(
+    "gpu_capability_compiler_analysis", default=None
+)
+
+
+def _compiler_tokens(
+    masked: str, start: int = 0, end: int | None = None
+) -> list[CppToken]:
+    analysis = _compiler_analysis_context.get()
+    if analysis is not None and analysis.masked is masked:
+        limit = len(masked) if end is None else end
+        first = bisect.bisect_left(analysis.token_starts, start)
+        last = bisect.bisect_left(analysis.token_starts, limit)
+        return [token for token in analysis.tokens[first:last] if token.end <= limit]
     """Tokenize enough C++ punctuation to enforce a conservative local grammar."""
     limit = len(masked) if end is None else end
     return [CppToken(match.group(), match.start(), match.end())
             for match in TOKEN_PATTERN.finditer(masked, start, limit)]
+
+
+def cpp_tokens(masked: str, start: int = 0, end: int | None = None) -> list[CppToken]:
+    """Public attested tokenizer entry; compiler analysis constructs it once."""
+
+    return _compiler_tokens(masked, start, end)
 
 
 def mask_non_code(source: str) -> str:
@@ -906,7 +1380,7 @@ def source_macro_events(masked: str) \
                 events.append((
                     offset + len(line), define.group(1),
                     MacroDefinition(function_like, tuple(
-                        token.value for token in cpp_tokens(replacement)), parameters,
+                        token.value for token in _compiler_tokens(replacement)), parameters,
                                     variadic)))
         offset += len(line)
     return events, directives
@@ -1028,7 +1502,7 @@ def guarded_macro_composition_findings(
     guarded.update(REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset()))
     guarded.update(REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset()))
     guarded.update(REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset()))
-    tokens = cpp_tokens(translated.masked)
+    tokens = _compiler_tokens(translated.masked)
     environment_events, directive_ranges = source_macro_environment_events(
         translated.masked
     )
@@ -1674,7 +2148,7 @@ def phase_two_capability_findings(path: PurePosixPath, source: str,
             calls_by_receiver.setdefault(receiver, []).append(call)
 
     gpu_names = {binding.declaration.name for binding in scope_bindings}
-    all_tokens = cpp_tokens(masked)
+    all_tokens = _compiler_tokens(masked)
     known_types = declared_type_names(all_tokens)
     gpu_name_positions: set[int] = set()
     lexical_bindings: dict[str, list[tuple[int, int, bool]]] = {}
@@ -1717,7 +2191,7 @@ def phase_two_capability_findings(path: PurePosixPath, source: str,
 
     findings: list[Finding] = []
     boundary_index = 0
-    for token in cpp_tokens(masked):
+    for token in _compiler_tokens(masked):
         while (boundary_index < len(splice_boundaries)
                and splice_boundaries[boundary_index] <= token.start):
             boundary_index += 1
@@ -1970,7 +2444,7 @@ def statement_boolean_use(masked: str, pairs: list[tuple[int, int]], position: i
 
 
 def is_lambda_body(masked: str, block: tuple[int, int]) -> bool:
-    tokens = cpp_tokens(masked, 0, block[0])
+    tokens = _compiler_tokens(masked, 0, block[0])
     bracket_stack: list[int] = []
     bracket_pairs: list[tuple[int, int]] = []
     for index, token in enumerate(tokens):
@@ -2009,7 +2483,7 @@ def stays_in_synchronous_blocks(masked: str, pairs: list[tuple[int, int]],
 
 def type_name_is_source_shadowed(masked: str, pairs: list[tuple[int, int]],
                                  type_name: str, position: int) -> bool:
-    prior_tokens = cpp_tokens(masked, 0, position)
+    prior_tokens = _compiler_tokens(masked, 0, position)
     for index, token in enumerate(prior_tokens):
         if token.value != type_name:
             continue
@@ -2103,8 +2577,8 @@ def native_handle_has_direct_consumer(path: PurePosixPath, masked: str,
     safe_member_calls = REVIEWED_NATIVE_HANDLE_MEMBER_SINKS.get(path, frozenset())
     if not safe_calls:
         return False
-    tokens = cpp_tokens(masked, binding.block[0] + 1, binding.block[1])
-    identity_tokens = cpp_tokens(masked, 0, binding.block[1])
+    tokens = _compiler_tokens(masked, binding.block[0] + 1, binding.block[1])
+    identity_tokens = _compiler_tokens(masked, 0, binding.block[1])
     native_index = next((index for index, token in enumerate(tokens)
                          if token.start == call.start(1)), None)
     if native_index is None or native_index < 2 or native_index + 2 >= len(tokens):
@@ -2120,7 +2594,7 @@ def native_handle_has_direct_consumer(path: PurePosixPath, masked: str,
 def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
                                    pairs: list[tuple[int, int]], binding: HandleBinding, alias: str,
                                    declaration_position: int) -> tuple[bool, int]:
-    tokens = cpp_tokens(masked, declaration_position, binding.block[1])
+    tokens = _compiler_tokens(masked, declaration_position, binding.block[1])
     safe_calls = REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
     safe_member_calls = REVIEWED_NATIVE_HANDLE_MEMBER_SINKS.get(path, frozenset())
     safe_methods = REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset())
@@ -2129,8 +2603,8 @@ def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
         return False, declaration_position
     last_use = declaration_position
     consumed = False
-    tokens = cpp_tokens(masked, alias_block[0] + 1, alias_block[1])
-    identity_tokens = cpp_tokens(masked, 0, alias_block[1])
+    tokens = _compiler_tokens(masked, alias_block[0] + 1, alias_block[1])
+    identity_tokens = _compiler_tokens(masked, 0, alias_block[1])
     for index, token in enumerate(tokens):
         if token.value != alias or token.start == declaration_position:
             continue
@@ -2219,8 +2693,12 @@ def next_nonspace_indices(masked: str) -> list[int]:
     return result
 
 
-def scope_bindings_linear(masked: str,
-                          pairs: list[tuple[int, int]]) -> list[ScopeBinding]:
+def scope_bindings_linear(
+    masked: str,
+    pairs: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    next_nonspace: list[int] | tuple[int, ...] | None = None,
+) -> list[ScopeBinding]:
     declarations = scope_declarations(masked)
     assigned = blocks_for_positions(
         masked, pairs, [declaration.position for declaration in declarations])
@@ -2228,7 +2706,9 @@ def scope_bindings_linear(masked: str,
     paren_pairs = delimiter_pairs(masked, "(", ")")
     declaration_parens = blocks_for_positions(
         masked, paren_pairs, [declaration.position for declaration in declarations])
-    next_nonspace = next_nonspace_indices(masked)
+    next_nonspace = (
+        next_nonspace_indices(masked) if next_nonspace is None else next_nonspace
+    )
     bindings: list[ScopeBinding] = []
     for declaration in declarations:
         lexical_block = assigned.get(declaration.position)
@@ -2309,7 +2789,7 @@ def receiver_binding_name(masked: str, call_position: int) -> str | None:
     Unknown calls and operators remain unresolved rather than being guessed
     from identifiers appearing anywhere in the expression.
     """
-    tokens = cpp_tokens(receiver_expression(masked, call_position))
+    tokens = _compiler_tokens(receiver_expression(masked, call_position))
 
     def documented_std_call(
         start: int, end: int, allowed: frozenset[str],
@@ -2386,7 +2866,7 @@ def receiver_binding_name(masked: str, call_position: int) -> str | None:
 def receiver_binding_references(masked: str, call_position: int) -> set[str]:
     """Return unqualified value names conservatively referenced by a receiver."""
     receiver = receiver_expression(masked, call_position)
-    tokens = cpp_tokens(receiver)
+    tokens = _compiler_tokens(receiver)
     receiver_start = call_position - len(receiver.rstrip())
     selector_prefix = masked[max(0, receiver_start - 64):receiver_start]
     dependent_member_receiver = (
@@ -2436,7 +2916,7 @@ def statement_tokens(masked: str, pairs: list[tuple[int, int]], position: int) -
     block = immediate_block(pairs, position)
     if block is None:
         return []
-    tokens = cpp_tokens(masked, block[0] + 1, block[1])
+    tokens = _compiler_tokens(masked, block[0] + 1, block[1])
     call_index = next((index for index, token in enumerate(tokens)
                        if token.start <= position < token.end), None)
     if call_index is None:
@@ -2539,11 +3019,14 @@ CONTROL_TRANSFER_TOKENS = frozenset({
 
 
 def has_intervening_control_transfer(masked: str, start: int, end: int) -> bool:
-    return any(token.value in CONTROL_TRANSFER_TOKENS for token in cpp_tokens(masked, start, end))
+    return any(
+        token.value in CONTROL_TRANSFER_TOKENS
+        for token in _compiler_tokens(masked, start, end)
+    )
 
 
 def has_intervening_potentially_throwing_call(masked: str, start: int, end: int) -> bool:
-    tokens = cpp_tokens(masked, start, end)
+    tokens = _compiler_tokens(masked, start, end)
     allowed = {
         "alignof", "const_cast", "decltype", "dynamic_cast", "nativeHandle", "read",
         "reinterpret_cast", "sizeof", "static_cast",
@@ -2558,13 +3041,13 @@ def has_intervening_potentially_throwing_call(masked: str, start: int, end: int)
     return False
 
 
-def resolve_scope(scope_bindings: list[ScopeBinding] | dict[str, list[ScopeBinding]], masked: str,
+def resolve_scope(scope_bindings: list[ScopeBinding] | Mapping[str, Iterable[ScopeBinding]], masked: str,
                   pairs: list[tuple[int, int]],
                   call: re.Match[str], shadow_index=None) -> ScopeBinding | None:
     receiver = receiver_binding_name(masked, call.start())
     available = (scope_bindings.get(receiver, ())
-                 if isinstance(scope_bindings, dict) and receiver is not None
-                 else scope_bindings if not isinstance(scope_bindings, dict) else ())
+                 if isinstance(scope_bindings, Mapping) and receiver is not None
+                 else scope_bindings if not isinstance(scope_bindings, Mapping) else ())
     candidates = [
         binding for binding in available
         if binding.declaration.position <= call.start() < binding.block[1]
@@ -2807,7 +3290,7 @@ def lambda_init_capture_shadows(masked: str, pairs: list[tuple[int, int]], name:
                 r"\s*(?:\([^{};]*\)\s*)?(?:mutable\s*)?(?:noexcept\s*)?"
                 r"(?:->\s*[^{};]+)?", suffix):
             continue
-        capture_tokens = cpp_tokens(masked, capture_open + 1, capture_close)
+        capture_tokens = _compiler_tokens(masked, capture_open + 1, capture_close)
         for index, token in enumerate(capture_tokens[:-1]):
             if token.value == name and capture_tokens[index + 1].value == "=":
                 return True
@@ -2815,9 +3298,12 @@ def lambda_init_capture_shadows(masked: str, pairs: list[tuple[int, int]], name:
 
 
 def build_shadow_index(
-    masked: str, pairs: list[tuple[int, int]]
+    masked: str,
+    pairs: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    tokens: list[CppToken] | tuple[CppToken, ...] | None = None,
 ) -> dict[str, tuple[tuple[int, tuple[int, int] | None], ...]]:
-    tokens = cpp_tokens(masked)
+    tokens = _compiler_tokens(masked) if tokens is None else tokens
     known_types = declared_type_names(tokens)
     declarators = [
         token for index, token in enumerate(tokens)
@@ -2829,6 +3315,74 @@ def build_shadow_index(
     for token in declarators:
         mutable.setdefault(token.value, []).append((token.start, blocks.get(token.start)))
     return {name: tuple(entries) for name, entries in mutable.items()}
+
+
+@dataclass(frozen=True, slots=True)
+class CompilerAuditAnalysis:
+    """One immutable parse shared by provenance and every compiler policy key."""
+
+    translated: TranslationText
+    masked: str
+    tokens: tuple[CppToken, ...]
+    has_scope_grammar: bool
+    token_starts: tuple[int, ...]
+    delimiter_pairs: tuple[tuple[int, int], ...]
+    next_nonspace: tuple[int, ...]
+    scope_bindings: tuple[ScopeBinding, ...]
+    scopes_by_name: Mapping[str, tuple[ScopeBinding, ...]]
+    blocks: Mapping[int, tuple[int, int] | None]
+    shadow_index: Mapping[
+        str, tuple[tuple[int, tuple[int, int] | None], ...]
+    ]
+    member_calls: tuple[re.Match[str], ...]
+
+    @classmethod
+    def from_translation(cls, translated: TranslationText) -> "CompilerAuditAnalysis":
+        masked = translated.masked
+        tokens = tuple(cpp_tokens(masked))
+        pairs = tuple(brace_pairs(masked))
+        member_calls = tuple(MEMBER_CALL.finditer(masked))
+        has_scope_grammar = (
+            any(call.group(1) in {"read", "withRead", "complete"} for call in member_calls)
+            or any(token.value == "GpuSyncReadScope" for token in tokens)
+        )
+        if has_scope_grammar:
+            next_nonspace = tuple(next_nonspace_indices(masked))
+            bindings = tuple(scope_bindings_linear(
+                masked, pairs, next_nonspace=next_nonspace
+            ))
+            mutable_scopes: dict[str, list[ScopeBinding]] = {}
+            for binding in bindings:
+                mutable_scopes.setdefault(binding.declaration.name, []).append(binding)
+            scopes = MappingProxyType({
+                name: tuple(values) for name, values in mutable_scopes.items()
+            })
+            blocks = MappingProxyType(blocks_for_positions(
+                masked, pairs, [binding.declaration.position for binding in bindings]
+            ))
+            shadow = MappingProxyType(build_shadow_index(
+                masked, pairs, tokens=tokens
+            ))
+        else:
+            next_nonspace = ()
+            bindings = ()
+            scopes = MappingProxyType({})
+            blocks = MappingProxyType({})
+            shadow = MappingProxyType({})
+        return cls(
+            translated,
+            masked,
+            tokens,
+            has_scope_grammar,
+            tuple(token.start for token in tokens),
+            pairs,
+            next_nonspace,
+            bindings,
+            scopes,
+            blocks,
+            shadow,
+            member_calls,
+        )
 
 
 def name_is_shadowed(name: str, declaration_start: int, declaration_end: int,
@@ -2851,8 +3405,8 @@ def name_is_shadowed(name: str, declaration_start: int, declaration_end: int,
     # classifier.  Truncating at the call's member operator turns an expression
     # such as ``std::as_const(scope).read()`` into the declaration-shaped tail
     # ``as_const(scope)``.
-    tokens = cpp_tokens(masked, declaration_start)
-    known_types = declared_type_names(cpp_tokens(masked))
+    tokens = _compiler_tokens(masked, declaration_start)
+    known_types = declared_type_names(_compiler_tokens(masked))
     for index, token in enumerate(tokens):
         if token.start >= call_position:
             break
@@ -2877,7 +3431,7 @@ def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
                               binding: HandleBinding, shadow_index=None) -> bool:
     """Keep the lease in synchronous blocks while excluding nested callable bodies."""
     allowed_methods = {"desc", "nativeHandle", "nativeSubresource", "valid"}
-    tokens = cpp_tokens(masked, binding.position, binding.block[1])
+    tokens = _compiler_tokens(masked, binding.position, binding.block[1])
     known_types = declared_type_names(tokens)
     for index, token in enumerate(tokens):
         if token.value != binding.name or token.start == binding.position:
@@ -2902,18 +3456,26 @@ def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
 
 def audit_capability_uses(path: PurePosixPath, source: str,
                           *, compiler_view: bool = False,
-                          compiler_translation_text: TranslationText | None = None
+                          compiler_translation_text: TranslationText | None = None,
+                          compiler_analysis: CompilerAuditAnalysis | None = None,
                           ) -> list[Finding]:
-    translated = (compiler_translation_text if compiler_translation_text is not None
+    translated = (compiler_analysis.translated if compiler_analysis is not None
+                  else compiler_translation_text if compiler_translation_text is not None
                   else compiler_translation(source) if compiler_view
                   else translate_source(source))
     masked = translated.masked
-    pairs = brace_pairs(masked)
+    pairs = (
+        compiler_analysis.delimiter_pairs
+        if compiler_analysis is not None else brace_pairs(masked)
+    )
     findings: list[Finding] = []
     if not compiler_view:
         findings.extend(preprocessor_capability_findings(path, translated))
         findings.extend(phase_two_capability_findings(path, source, translated))
-    calls = list(MEMBER_CALL.finditer(masked))
+    calls = list(
+        compiler_analysis.member_calls
+        if compiler_analysis is not None else MEMBER_CALL.finditer(masked)
+    )
     receiver_binding_index = {
         call.start(): (
             receiver_binding_name(masked, call.start()),
@@ -2922,15 +3484,31 @@ def audit_capability_uses(path: PurePosixPath, source: str,
         for call in calls
         if call.group(1) in {"read", "withRead", "complete"}
     }
-    scope_bindings = scope_bindings_linear(masked, pairs)
-    scopes_by_name: dict[str, list[ScopeBinding]] = {}
-    for binding in scope_bindings:
-        scopes_by_name.setdefault(binding.declaration.name, []).append(binding)
-    shadow_index = build_shadow_index(masked, pairs)
+    scope_bindings = list(
+        compiler_analysis.scope_bindings
+        if compiler_analysis is not None else scope_bindings_linear(masked, pairs)
+    )
+    scopes_by_name: Mapping[str, tuple[ScopeBinding, ...] | list[ScopeBinding]]
+    if compiler_analysis is not None:
+        scopes_by_name = compiler_analysis.scopes_by_name
+    else:
+        mutable_scopes: dict[str, list[ScopeBinding]] = {}
+        for binding in scope_bindings:
+            mutable_scopes.setdefault(binding.declaration.name, []).append(binding)
+        scopes_by_name = mutable_scopes
+    shadow_index = (
+        compiler_analysis.shadow_index
+        if compiler_analysis is not None else build_shadow_index(masked, pairs)
+    )
     bound_scope_positions = {
         binding.declaration.position for binding in scope_bindings
     }
-    for declaration in scope_declarations(masked):
+    declarations = (
+        scope_declarations(masked)
+        if compiler_analysis is None or compiler_analysis.has_scope_grammar
+        else ()
+    )
+    for declaration in declarations:
         if declaration.position not in bound_scope_positions:
             findings.append(
                 Finding(path, translated.line_at(declaration.position), "GpuSyncReadScope",
@@ -2961,7 +3539,7 @@ def audit_capability_uses(path: PurePosixPath, source: str,
                 "bypassed by hidden control flow"))
             return
         nonlocal_jump = next((
-            token for token in cpp_tokens(masked, callback_block[0] + 1,
+            token for token in _compiler_tokens(masked, callback_block[0] + 1,
                                           callback_block[1])
             if token.value in {"_longjmp", "longjmp", "siglongjmp"}
         ), None)
@@ -3083,7 +3661,10 @@ def audit_capability_uses(path: PurePosixPath, source: str,
                 path, translated.line_at(binding.position), binding.name,
                 "lease reference must remain inside the immediate callback body"))
 
-    all_tokens = cpp_tokens(masked)
+    all_tokens = list(
+        compiler_analysis.tokens
+        if compiler_analysis is not None else _compiler_tokens(masked)
+    )
     native_call_names = {call.start(1) for call in native_calls}
     for index, token in enumerate(all_tokens):
         if token.value != "nativeHandle" or token.start in native_call_names:
@@ -3214,6 +3795,7 @@ def audit_public_member(
     *,
     candidate_line: Callable[[int], bool] | None = None,
     pretokenized: bool = False,
+    compiler_analysis: CompilerAuditAnalysis | None = None,
 ) -> list[Finding]:
     masked = source if pretokenized else mask_non_code(source)
     class_match = next((
@@ -3228,7 +3810,11 @@ def audit_public_member(
             return []
         return [Finding(path, 1, class_name, "audited class declaration was not found")]
     opening = masked.find("{", class_match.start(), class_match.end())
-    pair = next((candidate for candidate in brace_pairs(masked) if candidate[0] == opening), None)
+    pairs = (
+        compiler_analysis.delimiter_pairs
+        if compiler_analysis is not None else brace_pairs(masked)
+    )
+    pair = next((candidate for candidate in pairs if candidate[0] == opening), None)
     if pair is None:
         return [Finding(path, line_number(source, opening), class_name,
                         "audited class body is incomplete")]
@@ -3253,18 +3839,18 @@ def audit_public_member(
 
 
 def _validate_capability_expression_provenance(
-    buffer: AuditBuffer, translated: TranslationText
+    buffer: AuditBuffer,
+    translated: TranslationText,
+    analysis: CompilerAuditAnalysis,
 ) -> None:
     """Resolve GPU grammar first, then validate only its required token ranges."""
 
     masked = translated.masked
-    pairs = brace_pairs(masked)
-    calls = list(MEMBER_CALL.finditer(masked))
-    scopes = scope_bindings_linear(masked, pairs)
-    scopes_by_name: dict[str, list[ScopeBinding]] = {}
-    for scope in scopes:
-        scopes_by_name.setdefault(scope.declaration.name, []).append(scope)
-    shadow_index = build_shadow_index(masked, pairs)
+    pairs = analysis.delimiter_pairs
+    calls = list(analysis.member_calls)
+    scopes = list(analysis.scope_bindings)
+    scopes_by_name = analysis.scopes_by_name
+    shadow_index = analysis.shadow_index
     handle_bindings: list[HandleBinding] = []
 
     def require_tokens(tokens: list[CppToken]) -> None:
@@ -3356,7 +3942,7 @@ def _validate_capability_expression_provenance(
 
     statement: list[CppToken] = []
     has_production_native = False
-    for token in cpp_tokens(masked):
+    for token in analysis.tokens:
         if token.value in {"{", "}"}:
             statement = []
             has_production_native = False
@@ -3396,6 +3982,52 @@ def _validate_capability_expression_provenance(
                 require_tokens(statement_tokens(masked, pairs, member_position))
 
 
+@dataclass(frozen=True, slots=True)
+class CapabilityRule:
+    trigger_spellings: tuple[bytes, ...]
+    evaluator: Callable[..., list[Finding]]
+
+
+_CAPABILITY_RULES = (
+    CapabilityRule(
+        (
+            b"GpuSyncReadScope",
+            b"_longjmp",
+            b"complete",
+            b"longjmp",
+            b"nativeHandle",
+            b"read",
+            b"siglongjmp",
+            b"withRead",
+        ),
+        audit_capability_uses,
+    ),
+    CapabilityRule(
+        (b"GpuRetireRegistry", b"registerRetire"),
+        audit_public_member,
+    ),
+    CapabilityRule(
+        (b"GpuOpScope", b"track"),
+        audit_public_member,
+    ),
+)
+
+
+def capability_candidate_spellings() -> frozenset[bytes]:
+    return frozenset(
+        spelling
+        for rule in _CAPABILITY_RULES
+        for spelling in rule.trigger_spellings
+    )
+
+
+def view_has_capability_spelling(view: PreprocessedTranslationUnitView) -> bool:
+    if not isinstance(view, PreprocessedTranslationUnitView):
+        raise AuditInfrastructureError("preprocessed audit view is invalid")
+    spellings = object.__getattribute__(view.tokens, "_spellings")
+    return not capability_candidate_spellings().isdisjoint(spellings)
+
+
 def _capability_policy_key(path: PurePosixPath) -> tuple[object, ...]:
     return (
         path == LEASE_HEADER,
@@ -3432,7 +4064,7 @@ def _map_candidate_findings(
     return mapped
 
 
-def audit_preprocessed_view(
+def _audit_preprocessed_view_unfiltered(
     view: PreprocessedTranslationUnitView,
     limits: AuditLimits,
     rss_reader: Callable[[], int],
@@ -3440,7 +4072,7 @@ def audit_preprocessed_view(
     """Apply the established capability grammar to one authoritative full-TU view."""
 
     buffer = AuditBuffer.from_preprocessed(view, limits, rss_reader)
-    if not buffer.has_capability_spelling():
+    if not view_has_capability_spelling(view):
         return []
     candidate_paths = buffer.candidate_paths()
     translated = TranslationText(
@@ -3451,8 +4083,13 @@ def audit_preprocessed_view(
         (),
         buffer._line_starts,
     )
+    analysis = CompilerAuditAnalysis.from_translation(translated)
     buffer.reserve_rss(rss_reader, limits.rss_bytes, len(buffer.text) * 48)
-    _validate_capability_expression_provenance(buffer, translated)
+    context_token = _compiler_analysis_context.set(analysis)
+    try:
+        _validate_capability_expression_provenance(buffer, translated, analysis)
+    finally:
+        _compiler_analysis_context.reset(context_token)
     buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
     findings: list[Finding] = []
     grouped_paths: dict[tuple[object, ...], list[PurePosixPath]] = {}
@@ -3462,12 +4099,17 @@ def audit_preprocessed_view(
         representative = paths[0]
         allowed = frozenset(paths)
         buffer.reserve_rss(rss_reader, limits.rss_bytes, len(buffer.text) * 48)
-        candidate_findings = audit_capability_uses(
-            representative,
-            buffer.text,
-            compiler_view=True,
-            compiler_translation_text=translated,
-        )
+        context_token = _compiler_analysis_context.set(analysis)
+        try:
+            candidate_findings = audit_capability_uses(
+                representative,
+                buffer.text,
+                compiler_view=True,
+                compiler_translation_text=translated,
+                compiler_analysis=analysis,
+            )
+        finally:
+            _compiler_analysis_context.reset(context_token)
         buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
         findings.extend(_map_candidate_findings(
             buffer,
@@ -3510,15 +4152,20 @@ def audit_preprocessed_view(
             )
 
         buffer.reserve_rss(rss_reader, limits.rss_bytes, len(buffer.text) * 16)
-        public_findings = audit_public_member(
-            path,
-            buffer.text,
-            class_name,
-            member_pattern,
-            expression,
-            candidate_line=candidate_line,
-            pretokenized=True,
-        )
+        context_token = _compiler_analysis_context.set(analysis)
+        try:
+            public_findings = audit_public_member(
+                path,
+                buffer.text,
+                class_name,
+                member_pattern,
+                expression,
+                candidate_line=candidate_line,
+                pretokenized=True,
+                compiler_analysis=analysis,
+            )
+        finally:
+            _compiler_analysis_context.reset(context_token)
         buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
         findings.extend(_map_candidate_findings(
             buffer,
@@ -3536,6 +4183,18 @@ def audit_preprocessed_view(
             finding.reason,
         ),
     )
+
+
+def audit_preprocessed_view(
+    view: PreprocessedTranslationUnitView,
+    limits: AuditLimits,
+    rss_reader: Callable[[], int],
+) -> list[Finding]:
+    """Apply the exact audit only when an attested rule can possibly report."""
+
+    if not view_has_capability_spelling(view):
+        return []
+    return _audit_preprocessed_view_unfiltered(view, limits, rss_reader)
 
 
 def aggregate_findings(
@@ -4059,7 +4718,10 @@ def _source_only_declared_bindings(
         return (range_index >= 0
                 and position < directive_ranges[range_index][1])
 
-    tokens = [token for token in cpp_tokens(masked) if not in_directive(token.start)]
+    tokens = [
+        token for token in _compiler_tokens(masked)
+        if not in_directive(token.start)
+    ]
     pairs = brace_pairs(masked)
     brace_closings = {opening: closing for opening, closing in pairs}
     token_scopes: dict[int, tuple[int, int]] = {}
@@ -4799,7 +5461,7 @@ def _source_binding_index(
     }
     scopes_by_token: dict[int, tuple[int, int]] = {}
     lexical_stack: list[tuple[int, int]] = []
-    for token in cpp_tokens(masked):
+    for token in _compiler_tokens(masked):
         if token.value == "}" and lexical_stack:
             lexical_stack.pop()
         scopes_by_token[token.start] = lexical_stack[-1] if lexical_stack else root
@@ -4844,7 +5506,7 @@ def _source_only_receiver_proof(
             return "ordinary", None
         return binding.category, None
 
-    receiver_tokens = cpp_tokens(receiver_expression(masked, call_position))
+    receiver_tokens = _compiler_tokens(receiver_expression(masked, call_position))
     start, stop = strip_transparent_parentheses(
         receiver_tokens, 0, len(receiver_tokens)
     )
@@ -4978,7 +5640,7 @@ def _source_only_unknown_macro_findings(
 
     parenthesis_closings: dict[int, int] = {}
     parenthesis_stack: list[int] = []
-    for token in cpp_tokens(masked):
+    for token in _compiler_tokens(masked):
         if token.value == "(":
             parenthesis_stack.append(token.start)
         elif token.value == ")" and parenthesis_stack:
@@ -7013,8 +7675,8 @@ def run_live_only(
         printer(f"PASS: live compiler capability parity: {family.value}={canonical}")
 
 
-AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v2"
-AUDIT_ENGINE_STAGE_BYTES = b"task-3-compact-result-streaming"
+AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v3"
+AUDIT_ENGINE_STAGE_BYTES = b"task-4-compact-capability-analysis"
 _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "gpu_capability_command.py": 1,
     "test_gpu_capability_audit_lanes.py": 1,
@@ -7033,7 +7695,7 @@ _AUDIT_ENGINE_TARGET_MODULES = (
     _gpu_capability_runner,
 )
 _AUDIT_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
-    "gpu_capability_source_audit": frozenset(),
+    "gpu_capability_source_audit": frozenset({"_compiler_analysis_context"}),
     "gpu_capability_model": frozenset(),
     "gpu_capability_command": frozenset({
         "_compiler_capability_lock",
@@ -7827,17 +8489,160 @@ def _attest_loaded_audit_engine(expected: str | None = None) -> str:
     return actual
 
 
+def profile_compiler_view(
+    source_root: Path,
+    database: Path,
+    source: PurePosixPath,
+) -> str:
+    """Run one representative real compiler view as a developer diagnostic."""
+
+    root = source_root.resolve(strict=True)
+    database = database.resolve(strict=True)
+    external_roots: dict[str, Path] = {}
+    if os.name == "nt":
+        # Keep the diagnostic authority as narrow as the real compiler view.
+        # Drive roots end in a separator and are intentionally rejected by the
+        # canonical dependency identity validator.
+        for role, candidate in (
+            ("qt-toolchain", Path("C:/Qt")),
+            ("windows-system", Path(os.environ.get("SystemRoot", "C:/Windows"))),
+        ):
+            if candidate.is_dir():
+                external_roots[role] = candidate.resolve(strict=True)
+        shared_checkout = root.parents[2] if len(root.parents) > 2 else root.parent
+        sibling_dependencies = shared_checkout / "windows_build"
+        if sibling_dependencies.is_dir():
+            external_roots["workspace-dependencies"] = sibling_dependencies
+    authority = build_dependency_root_authority(root, external_roots)
+    # The diagnostic deliberately exercises a full Qt translation unit.  The
+    # production defaults remain unchanged; allow the Windows stream pump and
+    # Python provenance parser enough time to construct this one profile view.
+    profile_limits = dataclasses.replace(
+        AuditLimits(), invocation_seconds=150.0, total_seconds=360.0
+    )
+    deadline = time.monotonic() + profile_limits.total_seconds
+    configurations = _gpu_capability_runner.collect_configurations(
+        root,
+        (database,),
+        dict(os.environ),
+        authority,
+        deadline,
+    )
+    matches = tuple(
+        configuration
+        for configuration in configurations
+        if configuration.source.relative == source
+    )
+    if not matches:
+        raise AuditInfrastructureError(
+            f"profile source has no compile configuration: {source}"
+        )
+    production = enumerate_production_identities(root)
+    configuration = matches[0]
+    build_started = time.perf_counter()
+    with _gpu_capability_runner.tempfile.TemporaryDirectory(
+        prefix=".gpu-capability-profile-"
+    ) as temporary:
+        suffix = ".json" if configuration.family in {
+            CompilerFamily.MSVC,
+            CompilerFamily.CLANG_CL,
+        } else ".d"
+        rewritten = _gpu_capability_command.rewrite_preprocess_command(
+            configuration, Path(temporary) / f"dependencies{suffix}"
+        )
+        try:
+            completed = _gpu_capability_runner.subprocess.run(
+                rewritten.arguments,
+                cwd=configuration.working_directory,
+                stdin=_gpu_capability_runner.subprocess.DEVNULL,
+                stdout=_gpu_capability_runner.subprocess.PIPE,
+                stderr=_gpu_capability_runner.subprocess.PIPE,
+                timeout=profile_limits.invocation_seconds,
+                check=False,
+            )
+        except (
+            OSError,
+            _gpu_capability_runner.subprocess.SubprocessError,
+        ) as error:
+            raise AuditInfrastructureError(
+                f"profile compiler invocation failed: {error}"
+            ) from error
+        if completed.returncode != 0:
+            raise AuditInfrastructureError(
+                "profile compiler invocation failed: "
+                f"exit={completed.returncode} "
+                f"stderr={completed.stderr[max(0, len(completed.stderr) - 4096):]!r}"
+            )
+        if len(completed.stdout) > profile_limits.stdout_bytes:
+            raise AuditInfrastructureError("profile compiler stdout limit exceeded")
+        if len(completed.stderr) > profile_limits.stderr_bytes:
+            raise AuditInfrastructureError("profile compiler stderr limit exceeded")
+        identities = _gpu_capability_runner._parse_dependency_output(
+            rewritten, configuration, authority, production, deadline, None
+        )
+        builder = _gpu_capability_provenance.PreprocessedStreamBuilder(
+            configuration, production, profile_limits, _current_process_rss_bytes
+        )
+        builder.feed(completed.stdout)
+        view = builder.finalize(identities)
+    build_elapsed = time.perf_counter() - build_started
+    started = time.perf_counter()
+    findings = audit_preprocessed_view(
+        view, profile_limits, _current_process_rss_bytes
+    )
+    elapsed = time.perf_counter() - started
+    if findings:
+        raise AuditInfrastructureError(
+            "profile source produced capability findings: "
+            + "; ".join(
+                findings[index].render()
+                for index in range(min(4, len(findings)))
+            )
+        )
+    if elapsed >= 5.0:
+        raise AuditInfrastructureError(
+            f"representative warm view audit exceeded five seconds: {elapsed:.3f}s"
+        )
+    return (
+        f"source={source} configurations={len(matches)} "
+        f"view={build_elapsed:.3f}s audit={elapsed:.3f}s"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
     # Preserve the committed CTest interface while the compiler-authoritative
     # lane consumes preprocessed views instead of the deleted macro table.
     parser.add_argument("--compile-commands", type=Path)
+    parser.add_argument("--profile-view", type=Path)
+    parser.add_argument("--profile-source", type=PurePosixPath)
     parser.add_argument("--performance-only", action="store_true")
     parser.add_argument("--live-only", action="store_true")
     parser.add_argument("--live-compiler", action="append", default=[])
     parser.add_argument("--require-live-family", action="append", default=[])
     args = parser.parse_args()
+
+    if (args.profile_view is None) != (args.profile_source is None):
+        parser.error("--profile-view and --profile-source must be supplied together")
+    if args.profile_view is not None:
+        if (
+            args.performance_only
+            or args.live_only
+            or args.compile_commands is not None
+            or args.live_compiler
+            or args.require_live_family
+        ):
+            parser.error("profile mode cannot be combined with other audit modes")
+        try:
+            result = profile_compiler_view(
+                args.source_root, args.profile_view, args.profile_source
+            )
+        except (AuditInfrastructureError, OSError) as error:
+            print(f"FAIL: GPU capability compiler-view profile: {error}")
+            return 2
+        print("PASS: GPU capability compiler-view profile: " + result)
+        return 0
 
     if args.live_only:
         if args.performance_only or args.compile_commands is not None:
