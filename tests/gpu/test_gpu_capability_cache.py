@@ -4722,7 +4722,37 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         gc.collect()
         self.assertIsNotNone(result_reference)
         self.assertIsNotNone(result_reference())
-        self.assertEqual(budget.live_bytes, baseline + retained_result_bytes)
+        retained_charge_bytes = None
+        retained_labels = None
+        retained_decoded_charge = None
+        current = retained_error.__traceback__
+        while current is not None:
+            if current.tb_frame.f_code.co_name == "_load_many_prepared":
+                frame_locals = current.tb_frame.f_locals
+                cleanup = frame_locals["ownership_cleanup"]
+                ownerships = (
+                    *cleanup._ownerships,
+                    frame_locals["result_ownership"],
+                )
+                unique = {id(item): item for item in ownerships}
+                retained_charge_bytes = sum(
+                    item.byte_count for item in unique.values()
+                )
+                retained_labels = tuple(
+                    sorted(item.label for item in unique.values())
+                )
+                retained_decoded_charge = frame_locals[
+                    "result_ownership"
+                ].byte_count
+                self.assertTrue(all(item.committed for item in unique.values()))
+                break
+            current = current.tb_next
+        del current, frame_locals, cleanup, ownerships, unique
+        self.assertIn("batch retained result limit", retained_labels)
+        self.assertIn("batch retained candidate metadata", retained_labels)
+        self.assertIn("dependency validation metadata", retained_labels)
+        self.assertEqual(retained_decoded_charge, retained_result_bytes)
+        self.assertEqual(budget.live_bytes, baseline + retained_charge_bytes)
         self.assertEqual(aggregator.accepted_count, 0)
 
         traceback.clear_frames(retained_error.__traceback__)
@@ -4730,6 +4760,348 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         del retained_error
         gc.collect()
         self.assertIsNone(result_reference())
+        self.assertEqual(budget.live_bytes, baseline)
+
+    def test_final_hash_traceback_retains_candidate_and_validation_charges(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        configurations = tuple(
+            dataclasses.replace(self.configuration, digest=f"{index + 1:064x}")
+            for index in range(2)
+        )
+        for configuration in configurations:
+            cache.publish(
+                configuration,
+                self.dependency_roots,
+                dataclasses.replace(
+                    self.result, configuration_digest=configuration.digest
+                ),
+                dataclasses.replace(
+                    self.publication_permit,
+                    configuration_digest=configuration.digest,
+                ),
+                self.pipeline_deadline,
+            )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            configurations, budget, capability_cache.AuditLimits()
+        )
+        baseline = budget.live_bytes
+
+        class TrackedCandidate(capability_cache._AuditCacheCandidate):
+            __slots__ = ("__weakref__",)
+
+        original_metadata = cache._read_authenticated_candidate_metadata
+        original_hash = capability_cache._hash_held_dependency
+        candidate_references = []
+        retained_handles = []
+        hashes = 0
+
+        def track_candidate(*arguments, **keywords):
+            candidate = original_metadata(*arguments, **keywords)
+            if candidate is None:
+                return None
+            tracked = TrackedCandidate(
+                candidate.configuration,
+                candidate.key,
+                candidate.entry_identity,
+                candidate.payload_identity,
+                candidate.dependencies,
+                candidate.manifest_identity,
+                candidate.payload_sha256,
+                candidate.decoded_result_bytes,
+                candidate.metadata_ownership,
+            )
+            candidate_references.append(weakref.ref(tracked))
+            return tracked
+
+        def fail_final_hash(handle):
+            nonlocal hashes
+            hashes += 1
+            if hashes == 2:
+                retained_handles.append(handle)
+                raise AuditInfrastructureError("forced retained final hash failure")
+            return original_hash(handle)
+
+        retained_error = None
+        try:
+            with mock.patch.object(
+                cache,
+                "_read_authenticated_candidate_metadata",
+                side_effect=track_candidate,
+            ), mock.patch(
+                "gpu_capability_cache._hash_held_dependency",
+                side_effect=fail_final_hash,
+            ):
+                cache.load_many(
+                    configurations,
+                    self.dependency_roots,
+                    self.engine,
+                    self.production_snapshot,
+                    budget,
+                    aggregator,
+                    CompactResultColdSlot(1 << 20),
+                    self.pipeline_deadline,
+                )
+        except AuditInfrastructureError as error:
+            retained_error = error
+        else:
+            self.fail("forced final hash failure did not propagate")
+
+        charged_bytes = None
+        labels = None
+        retained_graph = None
+        current = retained_error.__traceback__
+        while current is not None:
+            if current.tb_frame.f_code.co_name == "_load_many_prepared":
+                frame_locals = current.tb_frame.f_locals
+                cleanup = frame_locals["ownership_cleanup"]
+                ownerships = tuple(cleanup._ownerships)
+                charged_bytes = sum(item.byte_count for item in ownerships)
+                labels = tuple(sorted(item.label for item in ownerships))
+                retained_graph = (
+                    len(frame_locals["candidates"]),
+                    len(frame_locals["dependency_users"]),
+                    len(frame_locals["dependency_representatives"]),
+                    len(frame_locals["expected_dependencies"]),
+                    all(item.committed for item in ownerships),
+                )
+                break
+            current = current.tb_next
+        del current, frame_locals, cleanup, ownerships
+        gc.collect()
+        self.assertEqual(hashes, 2)
+        self.assertEqual(len(retained_handles), 1)
+        self.assertIsNone(retained_handles[0].stream)
+        self.assertTrue(all(reference() is not None for reference in candidate_references))
+        self.assertEqual(
+            retained_graph,
+            (2, 1, 1, 2, True),
+        )
+        self.assertEqual(
+            labels,
+            (
+                "batch retained candidate metadata",
+                "batch retained candidate metadata",
+                "dependency validation metadata",
+            ),
+        )
+        self.assertEqual(budget.live_bytes, baseline + charged_bytes)
+
+        retained_handles.clear()
+        traceback.clear_frames(retained_error.__traceback__)
+        retained_error = retained_error.with_traceback(None)
+        del retained_error
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in candidate_references))
+        self.assertEqual(budget.live_bytes, baseline)
+
+    def test_decode_traceback_retains_every_workspace_and_object_charge(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (self.configuration,), budget, capability_cache.AuditLimits()
+        )
+        baseline = budget.live_bytes
+        original_candidate_type = capability_cache._AuditCacheCandidate
+        original_decode = capability_cache._decode_audit_result_payload
+        candidate_constructions = 0
+        result_reference = None
+
+        class TrackedCandidate(original_candidate_type):
+            __slots__ = ("__weakref__",)
+
+        class TrackedResult(ConfigurationAuditResult):
+            __slots__ = ("__weakref__",)
+
+        def track_decoded_result(*arguments, **keywords):
+            nonlocal result_reference
+            result = original_decode(*arguments, **keywords)
+            tracked = TrackedResult(
+                result.configuration_digest,
+                result.audit_engine_fingerprint,
+                result.dependencies,
+                result.reached_production,
+                result.findings,
+            )
+            result_reference = weakref.ref(tracked)
+            return tracked
+
+        def fail_final_candidate_construction(*arguments, **keywords):
+            nonlocal candidate_constructions
+            candidate_constructions += 1
+            candidate = TrackedCandidate(*arguments, **keywords)
+            if candidate_constructions == 2:
+                raise AuditInfrastructureError("forced retained decode failure")
+            return candidate
+
+        retained_error = None
+        try:
+            with mock.patch(
+                "gpu_capability_cache._decode_audit_result_payload",
+                side_effect=track_decoded_result,
+            ), mock.patch(
+                "gpu_capability_cache._AuditCacheCandidate",
+                side_effect=fail_final_candidate_construction,
+            ):
+                cache.load_many(
+                    (self.configuration,),
+                    self.dependency_roots,
+                    self.engine,
+                    self.production_snapshot,
+                    budget,
+                    aggregator,
+                    CompactResultColdSlot(1 << 20),
+                    self.pipeline_deadline,
+                )
+        except AuditInfrastructureError as error:
+            retained_error = error
+        else:
+            self.fail("forced decode failure did not propagate")
+
+        live_ownerships = None
+        retained_payload_bytes = None
+        current = retained_error.__traceback__
+        while current is not None:
+            frame_name = current.tb_frame.f_code.co_name
+            if frame_name == "_load_many_prepared":
+                frame_locals = current.tb_frame.f_locals
+                cleanup = frame_locals["ownership_cleanup"]
+                candidates = tuple(cleanup._ownerships)
+                transient = (
+                    frame_locals["result_ownership"],
+                    frame_locals["decode_workspace"],
+                )
+                unique = {id(item): item for item in (*candidates, *transient)}
+                live_ownerships = tuple(
+                    sorted(
+                        (item.label, item.byte_count, item.committed)
+                        for item in unique.values()
+                    )
+                )
+            elif frame_name == "_read_authenticated_entry":
+                payload = current.tb_frame.f_locals["payload"]
+                retained_payload_bytes = len(payload)
+            current = current.tb_next
+        del current, frame_locals, cleanup, candidates, transient, unique, payload
+        gc.collect()
+        self.assertEqual(candidate_constructions, 2)
+        self.assertIsNotNone(result_reference())
+        self.assertGreater(retained_payload_bytes, 0)
+        self.assertTrue(all(committed for _label, _bytes, committed in live_ownerships))
+        self.assertEqual(
+            tuple(label for label, _bytes, _committed in live_ownerships),
+            (
+                "batch retained candidate metadata",
+                "batch retained result limit",
+                "compact result decode workspace",
+                "dependency validation metadata",
+            ),
+        )
+        self.assertEqual(
+            budget.live_bytes,
+            baseline + sum(byte_count for _label, byte_count, _state in live_ownerships),
+        )
+
+        traceback.clear_frames(retained_error.__traceback__)
+        retained_error = retained_error.with_traceback(None)
+        del retained_error
+        gc.collect()
+        self.assertIsNone(result_reference())
+        self.assertEqual(budget.live_bytes, baseline)
+
+    def test_metadata_preparse_traceback_retains_payload_workspace_charges(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (self.configuration,), budget, capability_cache.AuditLimits()
+        )
+        baseline = budget.live_bytes
+        retained_error = None
+
+        try:
+            with mock.patch(
+                "gpu_capability_cache._preparse_audit_result_payload",
+                side_effect=AuditInfrastructureError(
+                    "forced retained metadata preparse failure"
+                ),
+            ):
+                cache.load_many(
+                    (self.configuration,),
+                    self.dependency_roots,
+                    self.engine,
+                    self.production_snapshot,
+                    budget,
+                    aggregator,
+                    CompactResultColdSlot(1 << 20),
+                    self.pipeline_deadline,
+                )
+        except AuditInfrastructureError as error:
+            retained_error = error
+        else:
+            self.fail("forced metadata preparse failure did not propagate")
+
+        workspace_state = None
+        retained_sizes = None
+        current = retained_error.__traceback__
+        while current is not None:
+            if (
+                current.tb_frame.f_code.co_name
+                == "_read_authenticated_candidate_metadata"
+            ):
+                frame_locals = current.tb_frame.f_locals
+                ownerships = (
+                    frame_locals["manifest_scratch"],
+                    frame_locals["scratch"],
+                )
+                workspace_state = tuple(
+                    sorted(
+                        (item.label, item.byte_count, item.committed)
+                        for item in ownerships
+                    )
+                )
+                retained_sizes = (
+                    len(frame_locals["manifest_payload"]),
+                    len(frame_locals["payload"]),
+                )
+                break
+            current = current.tb_next
+        del current, frame_locals, ownerships
+        gc.collect()
+        self.assertTrue(all(size > 0 for size in retained_sizes))
+        self.assertEqual(
+            tuple(label for label, _bytes, _state in workspace_state),
+            (
+                "compact result manifest workspace",
+                "compact result metadata preparse workspace",
+            ),
+        )
+        self.assertTrue(
+            all(committed for _label, _bytes, committed in workspace_state)
+        )
+        self.assertEqual(
+            budget.live_bytes,
+            baseline
+            + sum(byte_count for _label, byte_count, _state in workspace_state),
+        )
+
+        traceback.clear_frames(retained_error.__traceback__)
+        retained_error = retained_error.with_traceback(None)
+        del retained_error
+        gc.collect()
         self.assertEqual(budget.live_bytes, baseline)
 
     def test_in_place_payload_and_manifest_replacement_cannot_become_a_hit(self):
@@ -4952,7 +5324,7 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         self.assertEqual(budget.live_bytes, baseline)
         recorded_access.assert_not_called()
 
-    def test_load_many_releases_candidate_and_validation_ownership_on_exception(self):
+    def test_load_many_keeps_captured_candidate_exactly_charged_on_exception(self):
         cache = ConfigurationAuditCache(self.cache_root)
         cache.publish(
             self.configuration,
@@ -4990,7 +5362,11 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 CompactResultColdSlot(1 << 20), self.pipeline_deadline,
             )
         self.assertEqual(len(captured), 1)
-        self.assertTrue(captured[0].metadata_ownership.released)
+        candidate_charge = captured[0].metadata_ownership.byte_count
+        self.assertTrue(captured[0].metadata_ownership.committed)
+        self.assertEqual(budget.live_bytes, baseline + candidate_charge)
+        captured.clear()
+        gc.collect()
         self.assertEqual(budget.live_bytes, baseline)
 
     def test_same_path_candidates_with_conflicting_identities_do_not_share_a_hit(self):

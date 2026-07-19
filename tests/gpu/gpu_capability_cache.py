@@ -2769,6 +2769,36 @@ class _AuditCacheCandidate:
     metadata_ownership: CompactResultOwnership | None = None
 
 
+class _TracebackLifetimeOwnerships:
+    """Release temporary ownerships on success; retain them with failures."""
+
+    __slots__ = ("_ownerships",)
+
+    def __init__(self) -> None:
+        self._ownerships: list[CompactResultOwnership] = []
+
+    def __enter__(self) -> "_TracebackLifetimeOwnerships":
+        return self
+
+    def add(self, ownership: CompactResultOwnership) -> None:
+        if (
+            not isinstance(ownership, CompactResultOwnership)
+            or ownership.released
+        ):
+            raise AuditInfrastructureError(
+                "traceback lifetime ownership is invalid"
+            )
+        self._ownerships.append(ownership)
+
+    def __exit__(self, error_type, _error, _traceback) -> bool:
+        if error_type is None:
+            for ownership in reversed(self._ownerships):
+                if not ownership.released:
+                    ownership.release()
+            self._ownerships.clear()
+        return False
+
+
 class ConfigurationAuditCache:
     """Atomic compact-result cache with held-handle dependency validation."""
 
@@ -3006,6 +3036,7 @@ class ConfigurationAuditCache:
         payload = None
         result = None
         candidate = None
+        normal_exit = False
         try:
             with _HeldDirectory(entry) as held_directory:
                 names = frozenset(os.listdir(entry))
@@ -3055,6 +3086,7 @@ class ConfigurationAuditCache:
                         engine=engine,
                     )
                 except AuditInfrastructureError:
+                    normal_exit = True
                     return None
                 assert held_directory.identity is not None
                 assert payload_identity is not None
@@ -3068,8 +3100,10 @@ class ConfigurationAuditCache:
                     hashlib.sha256(payload).hexdigest(),
                     compact_result_retained_bytes(result),
                 )
+                normal_exit = True
                 return candidate, result
         except FileNotFoundError:
+            normal_exit = True
             return None
         except _UnsafeCacheNamespaceError as error:
             raise AuditInfrastructureError("audit cache namespace is unsafe or linked") from error
@@ -3081,15 +3115,17 @@ class ConfigurationAuditCache:
             RecursionError,
             json.JSONDecodeError,
         ):
+            normal_exit = True
             return None
         except OSError as error:
             raise AuditInfrastructureError("audit cache namespace is unsafe") from error
         finally:
-            candidate = None
-            result = None
-            payload = None
-            manifest = None
-            manifest_payload = None
+            if normal_exit:
+                candidate = None
+                result = None
+                payload = None
+                manifest = None
+                manifest_payload = None
 
     def _read_authenticated_candidate_metadata(
         self,
@@ -3108,6 +3144,7 @@ class ConfigurationAuditCache:
         payload = None
         metadata = None
         candidate = None
+        normal_exit = False
         try:
             with _HeldDirectory(entry) as held_directory:
                 if frozenset(os.listdir(entry)) != frozenset(
@@ -3211,8 +3248,10 @@ class ConfigurationAuditCache:
                     metadata_ownership,
                 )
                 metadata_ownership = None
+                normal_exit = True
                 return candidate
         except FileNotFoundError:
+            normal_exit = True
             return None
         except _UnsafeCacheNamespaceError as error:
             raise AuditInfrastructureError(
@@ -3228,21 +3267,26 @@ class ConfigurationAuditCache:
             RecursionError,
             json.JSONDecodeError,
         ):
+            normal_exit = True
             return None
         except OSError as error:
             raise AuditInfrastructureError("audit cache namespace is unsafe") from error
         finally:
-            candidate = None
-            metadata = None
-            payload = None
-            manifest = None
-            manifest_payload = None
-            if scratch is not None and not scratch.released:
-                scratch.release()
-            if manifest_scratch is not None and not manifest_scratch.released:
-                manifest_scratch.release()
-            if metadata_ownership is not None and not metadata_ownership.released:
-                metadata_ownership.release()
+            if normal_exit:
+                candidate = None
+                metadata = None
+                payload = None
+                manifest = None
+                manifest_payload = None
+                if scratch is not None and not scratch.released:
+                    scratch.release()
+                if manifest_scratch is not None and not manifest_scratch.released:
+                    manifest_scratch.release()
+                if (
+                    metadata_ownership is not None
+                    and not metadata_ownership.released
+                ):
+                    metadata_ownership.release()
 
     def _record_access(self, key: str) -> None:
         path = self._access_path(key)
@@ -3412,12 +3456,8 @@ class ConfigurationAuditCache:
         misses: set[str] = set()
         checkpoint = aggregator._checkpoint()
 
-        def release_if_live(ownership: CompactResultOwnership) -> None:
-            if not ownership.released:
-                ownership.release()
-
         try:
-            with contextlib.ExitStack() as ownership_cleanup, contextlib.ExitStack() as dependency_stack:
+            with _TracebackLifetimeOwnerships() as ownership_cleanup, contextlib.ExitStack() as dependency_stack:
                 for configuration in configurations:
                     if time.monotonic() >= deadline:
                         raise AuditInfrastructureError("audit cache deadline exceeded")
@@ -3430,19 +3470,19 @@ class ConfigurationAuditCache:
                         misses.add(configuration.digest)
                         continue
                     if candidate.metadata_ownership is not None:
-                        ownership_cleanup.callback(
-                            release_if_live, candidate.metadata_ownership
-                        )
+                        ownership_cleanup.add(candidate.metadata_ownership)
                     self._validate_dependency_authority(
                         candidate.dependencies, authority
                     )
                     if not self._production_matches(candidate.dependencies, snapshot):
                         misses.add(configuration.digest)
+                        candidate_ownership = candidate.metadata_ownership
+                        candidate = None
                         if (
-                            candidate.metadata_ownership is not None
-                            and not candidate.metadata_ownership.released
+                            candidate_ownership is not None
+                            and not candidate_ownership.released
                         ):
-                            candidate.metadata_ownership.release()
+                            candidate_ownership.release()
                         continue
                     candidates[configuration.digest] = candidate
 
@@ -3455,9 +3495,7 @@ class ConfigurationAuditCache:
                     validation_metadata_bytes,
                     label="dependency validation metadata",
                 ).commit()
-                ownership_cleanup.callback(
-                    release_if_live, validation_metadata_ownership
-                )
+                ownership_cleanup.add(validation_metadata_ownership)
                 dependency_users: dict[str, list[_AuditCacheCandidate]] = {}
                 dependency_representatives: dict[str, DependencyDigest] = {}
                 expected_dependencies: dict[
@@ -3549,6 +3587,7 @@ class ConfigurationAuditCache:
                     result = None
                     accepted = False
                     release_result_ownership = False
+                    release_decode_workspace = False
                     try:
                         decode_workspace = result_budget.reserve(
                             8192 + 9 * candidate.payload_identity[2],
@@ -3558,6 +3597,7 @@ class ConfigurationAuditCache:
                             decoded = self._read_authenticated_entry(
                                 configuration, candidate.key, engine
                             )
+                        release_decode_workspace = True
                         decode_workspace.release()
                         decode_workspace = None
                         if decoded is None:
@@ -3615,6 +3655,7 @@ class ConfigurationAuditCache:
                         decoded = None
                         if (
                             decode_workspace is not None
+                            and release_decode_workspace
                             and not decode_workspace.released
                         ):
                             decode_workspace.release()
@@ -3658,11 +3699,25 @@ class ConfigurationAuditCache:
                     configuration for configuration in configurations
                     if configuration.digest in misses
                 )
-                return ConfigurationAuditLoadBatch(
+                batch = ConfigurationAuditLoadBatch(
                     hit_count,
                     ordered_misses,
                     aggregator.cold_slot_reserved_bytes,
                 )
+                candidate = None
+                decoded_candidate = None
+                result = None
+                dependency = None
+                users = None
+                handle = None
+                candidates.clear()
+                dependency_users.clear()
+                dependency_representatives.clear()
+                expected_dependencies.clear()
+                held.clear()
+                initial.clear()
+                final.clear()
+                return batch
         except BaseException:
             aggregator._rollback_to(checkpoint)
             raise
