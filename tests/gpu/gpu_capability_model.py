@@ -315,6 +315,247 @@ class AuditLimits:
     workers: int = field(default_factory=_default_worker_count)
 
 
+class CompilerLaunchPurpose(enum.Enum):
+    INSPECTION = "inspection"
+    AUDIT_DISCOVERY = "audit-discovery"
+    AUDIT_ACCEPTED = "audit-accepted"
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessStartIdentity:
+    platform_kind: str
+    pid: int
+    native_start_token: str
+    handle_cookie: str
+
+    def __post_init__(self) -> None:
+        if self.platform_kind not in {"windows", "linux", "macos"}:
+            raise AuditInfrastructureError("compiler process platform identity is invalid")
+        if not isinstance(self.pid, int) or isinstance(self.pid, bool) or self.pid <= 0:
+            raise AuditInfrastructureError("compiler process PID identity is invalid")
+        if not isinstance(self.native_start_token, str) or not self.native_start_token:
+            raise AuditInfrastructureError("compiler process start identity is invalid")
+        if not isinstance(self.handle_cookie, str) or not self.handle_cookie:
+            raise AuditInfrastructureError("compiler process handle cookie is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CompilerLaunchEvent:
+    purpose: CompilerLaunchPurpose
+    process_start: ProcessStartIdentity
+    worker_index: int | None = None
+    task_id: str | None = None
+    generation: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.purpose, CompilerLaunchPurpose) or not isinstance(
+            self.process_start, ProcessStartIdentity
+        ):
+            raise AuditInfrastructureError("compiler launch event is invalid")
+        is_audit = self.purpose in {
+            CompilerLaunchPurpose.AUDIT_DISCOVERY,
+            CompilerLaunchPurpose.AUDIT_ACCEPTED,
+        }
+        if is_audit and (
+            not isinstance(self.worker_index, int)
+            or isinstance(self.worker_index, bool)
+            or self.worker_index < 0
+            or not isinstance(self.task_id, str)
+            or not self.task_id
+            or not isinstance(self.generation, int)
+            or isinstance(self.generation, bool)
+            or self.generation < 0
+        ):
+            raise AuditInfrastructureError("audit compiler launch identity is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CachePublicationRequested:
+    worker_index: int
+    generation: int
+    task_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.worker_index, int)
+            or isinstance(self.worker_index, bool)
+            or self.worker_index < 0
+            or not isinstance(self.generation, int)
+            or isinstance(self.generation, bool)
+            or self.generation < 0
+            or not isinstance(self.task_id, str)
+            or not self.task_id
+        ):
+            raise AuditInfrastructureError("cache publication request is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerStageTimings:
+    discovery_seconds: float
+    accepted_parse_seconds: float
+    audit_seconds: float
+    publish_seconds: float
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or value < 0
+            for value in (
+                self.discovery_seconds,
+                self.accepted_parse_seconds,
+                self.audit_seconds,
+                self.publish_seconds,
+            )
+        ):
+            raise AuditInfrastructureError("worker stage timing is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CompactResultDraftBounds:
+    dependency_count: int
+    reached_count: int
+    finding_count: int
+    path_utf8_bytes: int
+    expression_utf8_bytes: int
+    reason_utf8_bytes: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.dependency_count,
+            self.reached_count,
+            self.finding_count,
+            self.path_utf8_bytes,
+            self.expression_utf8_bytes,
+            self.reason_utf8_bytes,
+        )
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in values
+        ):
+            raise AuditInfrastructureError("compact result draft bounds are invalid")
+        limits = AuditLimits()
+        if (
+            self.dependency_count > limits.compact_result_dependencies
+            or self.reached_count > limits.compact_result_reached
+            or self.finding_count > limits.compact_result_findings
+        ):
+            raise AuditInfrastructureError("compact result draft count limit exceeded")
+
+
+class PerTaskCompactReservation:
+    """Linear parent-issued reservation that gates one cold worker miss."""
+
+    __slots__ = (
+        "task_id", "generation", "maximum_bytes", "_charged_bytes",
+        "_peak_bytes", "_released", "_release_phase", "_lock",
+    )
+
+    def __init__(self, task_id: str, generation: int, maximum_bytes: int = 32 << 20) -> None:
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+            or not isinstance(maximum_bytes, int)
+            or isinstance(maximum_bytes, bool)
+            or maximum_bytes <= 0
+            or maximum_bytes > (128 << 20)
+        ):
+            raise AuditInfrastructureError("pre-dispatch compact reservation is invalid")
+        self.task_id = task_id
+        self.generation = generation
+        self.maximum_bytes = maximum_bytes
+        self._charged_bytes = 0
+        self._peak_bytes = 0
+        self._released = False
+        self._release_phase: str | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def released(self) -> bool:
+        with self._lock:
+            return self._released
+
+    @property
+    def charged_bytes(self) -> int:
+        with self._lock:
+            return self._charged_bytes
+
+    @property
+    def peak_bytes(self) -> int:
+        with self._lock:
+            return self._peak_bytes
+
+    @property
+    def release_phase(self) -> str | None:
+        with self._lock:
+            return self._release_phase
+
+    def validate(self, task_id: str, generation: int) -> None:
+        with self._lock:
+            if (
+                self._released
+                or task_id != self.task_id
+                or generation != self.generation
+            ):
+                raise AuditInfrastructureError("worker dispatch reservation differs")
+
+    def require_within_pre_dispatch_reservation(
+        self,
+        task_id: str,
+        encoded_bytes: int,
+        bounds: CompactResultDraftBounds,
+        counting_pass_peak_bytes: int,
+    ) -> int:
+        if (
+            task_id != self.task_id
+            or not isinstance(encoded_bytes, int)
+            or isinstance(encoded_bytes, bool)
+            or encoded_bytes < 0
+            or not isinstance(bounds, CompactResultDraftBounds)
+            or not isinstance(counting_pass_peak_bytes, int)
+            or isinstance(counting_pass_peak_bytes, bool)
+            or counting_pass_peak_bytes < 0
+        ):
+            raise AuditInfrastructureError("pre-dispatch compact reservation differs")
+        terms = (
+            4096,
+            encoded_bytes,
+            counting_pass_peak_bytes,
+            bounds.dependency_count * 768,
+            bounds.reached_count * 256,
+            bounds.finding_count * 640,
+            bounds.path_utf8_bytes,
+            bounds.expression_utf8_bytes,
+            bounds.reason_utf8_bytes,
+        )
+        charged = sum(terms)
+        if charged > (1 << 63) - 1:
+            raise AuditInfrastructureError(
+                "pre-dispatch compact reservation arithmetic overflow"
+            )
+        with self._lock:
+            if self._released or charged > self.maximum_bytes:
+                raise AuditInfrastructureError(
+                    "pre-dispatch compact reservation limit exceeded"
+                )
+            self._charged_bytes = max(self._charged_bytes, charged)
+            self._peak_bytes = max(self._peak_bytes, self._charged_bytes)
+        return charged
+
+    def release(self, phase: str) -> None:
+        if not isinstance(phase, str) or not phase:
+            raise AuditInfrastructureError("compact reservation release phase is invalid")
+        with self._lock:
+            if self._released:
+                raise AuditInfrastructureError("compact reservation was already released")
+            self._released = True
+            self._charged_bytes = 0
+            self._release_phase = phase
+
+
 _COMPACT_RESULT_MAXIMUM_LIVE_BYTES = 128 * 1024 * 1024
 
 
@@ -718,6 +959,32 @@ class PreprocessConfiguration:
             raise AuditInfrastructureError("compiler executable capability is invalid")
         if self.compiler_capability.capability_digest != self.compiler_capability_digest:
             raise AuditInfrastructureError("compiler capability digest disagrees")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationAuditTask:
+    task_id: str
+    generation: int
+    configuration: PreprocessConfiguration
+    dependency_root_authority: DependencyRootAuthority
+    compact_reservation: PerTaskCompactReservation | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.task_id, str)
+            or not self.task_id
+            or not isinstance(self.generation, int)
+            or isinstance(self.generation, bool)
+            or self.generation < 0
+            or not isinstance(self.configuration, PreprocessConfiguration)
+            or not isinstance(self.dependency_root_authority, DependencyRootAuthority)
+        ):
+            raise AuditInfrastructureError("configuration audit task is invalid")
+        if (
+            self.compact_reservation is not None
+            and not isinstance(self.compact_reservation, PerTaskCompactReservation)
+        ):
+            raise AuditInfrastructureError("worker dispatch reservation is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2229,6 +2496,98 @@ class ConfigurationAuditPublicationPermit:
             raise AuditInfrastructureError(
                 "audit publication permit dependencies are not unique and sorted"
             )
+
+
+class _RootPublicationLease:
+    __slots__ = ("_callback", "_released", "_lock")
+
+    def __init__(self, callback: Callable[[], None] | None) -> None:
+        if callback is not None and not callable(callback):
+            raise AuditInfrastructureError("root publication release callback is invalid")
+        self._callback = callback
+        self._released = False
+        self._lock = threading.Lock()
+
+    @property
+    def released(self) -> bool:
+        with self._lock:
+            return self._released
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                raise AuditInfrastructureError("root publication permit was already released")
+            self._released = True
+            callback = self._callback
+            self._callback = None
+        if callback is not None:
+            callback()
+
+
+@dataclass(frozen=True, slots=True)
+class CachePublicationPermit(ConfigurationAuditPublicationPermit):
+    task_id: str
+    generation: int
+    release_callback: Callable[[], None] | None = field(
+        default=None, compare=False, repr=False
+    )
+    root_publication_bytes: int = field(default=8 << 20, init=False)
+    _lease: _RootPublicationLease = field(init=False, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        ConfigurationAuditPublicationPermit.__post_init__(self)
+        if (
+            not isinstance(self.task_id, str)
+            or not self.task_id
+            or not isinstance(self.generation, int)
+            or isinstance(self.generation, bool)
+            or self.generation < 0
+            or self.root_publication_bytes != 8 << 20
+        ):
+            raise AuditInfrastructureError("root publication permit generation is invalid")
+        object.__setattr__(self, "_lease", _RootPublicationLease(self.release_callback))
+
+    @property
+    def released(self) -> bool:
+        return self._lease.released
+
+    def validate_for_task(
+        self,
+        task_id: str,
+        generation: int,
+        configuration_digest: str,
+        audit_engine_fingerprint: str,
+        dependencies: tuple[DependencyDigest, ...],
+    ) -> None:
+        if (
+            self.released
+            or task_id != self.task_id
+            or generation != self.generation
+            or configuration_digest != self.configuration_digest
+            or audit_engine_fingerprint != self.audit_engine_fingerprint
+            or dependencies != self.dependencies
+        ):
+            raise AuditInfrastructureError("root publication permit generation differs")
+
+    def release_root_publication(self) -> None:
+        self._lease.release()
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationAuditOutcome:
+    result: ConfigurationAuditResult
+    stdout_bytes: int
+    stages: WorkerStageTimings
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.result, ConfigurationAuditResult)
+            or not isinstance(self.stdout_bytes, int)
+            or isinstance(self.stdout_bytes, bool)
+            or self.stdout_bytes < 0
+            or not isinstance(self.stages, WorkerStageTimings)
+        ):
+            raise AuditInfrastructureError("configuration audit outcome is invalid")
 
 
 def compact_result_retained_bytes(result: ConfigurationAuditResult) -> int:

@@ -8039,8 +8039,8 @@ def run_live_only(
         printer(f"PASS: live compiler capability parity: {family.value}={canonical}")
 
 
-AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v3"
-AUDIT_ENGINE_STAGE_BYTES = b"task-4-compact-capability-analysis"
+AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v4"
+AUDIT_ENGINE_STAGE_BYTES = b"task-5-audit-discard-worker"
 _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "gpu_capability_command.py": 1,
     "test_gpu_capability_audit_lanes.py": 1,
@@ -8048,7 +8048,7 @@ _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "test_gpu_capability_command.py": 1,
     "test_gpu_capability_model.py": 1,
     "test_gpu_capability_provenance.py": 1,
-    "test_gpu_capability_runner.py": 3,
+    "test_gpu_capability_runner.py": 4,
 })
 _AUDIT_ENGINE_TARGET_MODULES = (
     _gpu_capability_model,
@@ -8069,7 +8069,17 @@ _AUDIT_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
     }),
     "gpu_capability_cache": frozenset({"_hash_cache", "_hash_lock"}),
     "gpu_capability_provenance": frozenset(),
-    "gpu_capability_runner": frozenset(),
+    "gpu_capability_runner": frozenset({
+        "_WORKER_CACHE",
+        "_WORKER_CANCEL_EVENT",
+        "_WORKER_ENGINE",
+        "_WORKER_GENERATION",
+        "_WORKER_INDEX",
+        "_WORKER_LIMITS",
+        "_WORKER_PRODUCTION",
+        "_WORKER_RSS",
+        "_process_handle_associations",
+    }),
 })
 _CLASS_STRUCTURAL_MEMBER_EXCLUSIONS = frozenset({
     "__dict__",
@@ -8740,6 +8750,7 @@ def _marshal_live_semantic_object(loaded_object: object) -> bytes:
 def _is_semantic_constant_name(name: str) -> bool:
     return (
         not name.startswith("__")
+        and not name.startswith("_WORKER_")
         and any(character.isalpha() for character in name)
         and name.upper() == name
         and name not in {"_IMPORTED_MODULE_IDENTITIES"}

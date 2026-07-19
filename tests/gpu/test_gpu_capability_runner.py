@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+import weakref
 from array import array
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType, SimpleNamespace
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gpu_capability_command as capability_command  # noqa: E402
 import gpu_capability_model as capability_model  # noqa: E402
 import gpu_capability_runner as capability_runner  # noqa: E402
+import gpu_capability_source_audit as capability_audit  # noqa: E402
 from gpu_capability_command import (  # noqa: E402
     RewrittenCommand,
     _clear_compiler_inspection_memo_for_tests,
@@ -2505,6 +2507,534 @@ class OrchestrationTests(unittest.TestCase):
         self.assertLess(diagnostic.index("digest=a"), diagnostic.index("digest=z"))
         self.assertIn("failure-a", diagnostic)
         self.assertIn("failure-z", diagnostic)
+
+
+class WorkerAuditTests(unittest.TestCase):
+    class _View:
+        pass
+
+    class _ControlEndpoint:
+        def __init__(self, launch_purposes):
+            self.launch_purposes = tuple(launch_purposes)
+            self.frames = []
+            self.sealed = False
+
+        def send(self, frame, deadline):
+            if time.monotonic() >= deadline:
+                raise AuditInfrastructureError("control endpoint deadline exceeded")
+            self.frames.append(frame)
+
+        def seal_audit_launch_protocol(self, task_id, generation, deadline):
+            events = tuple(
+                frame for frame in self.frames
+                if isinstance(frame, capability_model.CompilerLaunchEvent)
+            )
+            observed = tuple(event.purpose for event in events)
+            expected = (
+                capability_model.CompilerLaunchPurpose.AUDIT_DISCOVERY,
+                capability_model.CompilerLaunchPurpose.AUDIT_ACCEPTED,
+            )
+            if observed != expected or any(
+                event.task_id != task_id or event.generation != generation
+                for event in events
+            ):
+                raise AuditInfrastructureError("audit compiler launch protocol differs")
+            self.sealed = True
+
+    class _CommandEndpoint:
+        def __init__(self, permit=None, error=None):
+            self.permit = permit
+            self.error = error
+            self.receives = 0
+
+        def receive(self, task, cancel_event, deadline, maximum_quantum_seconds):
+            self.receives += 1
+            if self.error is not None:
+                raise self.error
+            return self.permit
+
+    class _Cache:
+        def __init__(self, error=None):
+            self.error = error
+            self.published = []
+            self.loads = 0
+
+        def load(self, *_args, **_kwargs):
+            self.loads += 1
+            raise AssertionError("worker cache hit path reached")
+
+        def publish(self, configuration, dependency_roots, result, permit, deadline):
+            self.published.append((configuration, dependency_roots, result, permit, deadline))
+            if self.error is not None:
+                raise self.error
+            return result
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.build = self.root / "build"
+        self.build.mkdir()
+        self.source = self.root / "playback" / "gpu" / "worker.cpp"
+        self.header = self.root / "playback" / "gpu" / "empty.h"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_text("#include \"empty.h\"\nint worker;\n", encoding="utf-8")
+        self.header.write_bytes(b"")
+        self.toolchain_temporary = tempfile.TemporaryDirectory()
+        self.toolchain = Path(self.toolchain_temporary.name).resolve()
+        self.compiler = self.toolchain / "g++.exe"
+        self.compiler.write_bytes(b"compiler")
+        self.authority = build_dependency_root_authority(
+            self.root, {"toolchain": self.toolchain}
+        )
+        self.capability = open_compiler_executable_capability(
+            self.compiler,
+            self.authority,
+            time.monotonic() + 10.0,
+            compiler_family=CompilerFamily.GCC,
+        )
+        self.source_identity = self._identity(
+            self.source, "playback/gpu/worker.cpp", line_count=2
+        )
+        self.header_identity = self._identity(
+            self.header, "playback/gpu/empty.h", line_count=0
+        )
+        self.configuration = PreprocessConfiguration(
+            entry_id="worker:0",
+            family=CompilerFamily.GCC,
+            compiler=self.compiler,
+            working_directory=self.build,
+            source=self.source_identity,
+            arguments=(str(self.compiler), "-E", str(self.source)),
+            environment_digest=_environment_digest(dict(os.environ)),
+            digest="c" * 64,
+            dependency_root_authority_digest=self.authority.portable_authority_digest,
+            compiler_capability_digest=self.capability.capability_digest,
+            compiler_capability=self.capability,
+        )
+        self.dependencies = tuple(sorted((
+            self._dependency(self.source_identity),
+            self._dependency(self.header_identity),
+        ), key=lambda item: item.role_relative_path.as_posix()))
+        self.production_snapshot = {
+            item.role_relative_path: item for item in self.dependencies
+        }
+        self.engine = capability_audit.audit_engine_fingerprint()
+        self.cancel_event = threading.Event()
+        self.live_views = weakref.WeakSet()
+
+    def tearDown(self):
+        self.capability.native_owner.close()
+        _clear_compiler_inspection_memo_for_tests()
+        self.temporary.cleanup()
+        self.toolchain_temporary.cleanup()
+
+    @staticmethod
+    def _identity(path, relative, *, line_count):
+        metadata = path.stat()
+        return FileIdentity(
+            path,
+            PurePosixPath(relative),
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) else None,
+            line_count,
+            True,
+        )
+
+    def _dependency(self, identity):
+        return DependencyDigest(
+            "production",
+            identity.relative,
+            identity,
+            hashlib.sha256(identity.canonical.read_bytes()).hexdigest(),
+        )
+
+    def _task(self, *, reservation=True):
+        reservation_object = (
+            capability_model.PerTaskCompactReservation("task-a", 7, 32 << 20)
+            if reservation else None
+        )
+        task = capability_model.ConfigurationAuditTask(
+            "task-a", 7, self.configuration, self.authority, reservation_object
+        )
+        return task, reservation_object
+
+    def _permit(self, *, dependencies=None, release_callback=None):
+        return capability_model.CachePublicationPermit(
+            self.configuration.digest,
+            self.engine,
+            self.dependencies if dependencies is None else dependencies,
+            task_id="task-a",
+            generation=7,
+            release_callback=release_callback,
+        )
+
+    def _run_worker(
+        self,
+        *,
+        task=None,
+        launch_purposes=None,
+        command=None,
+        cache=None,
+        dependencies=None,
+        findings=(),
+        audit_error=None,
+        attestation_error=None,
+        stabilize_error=None,
+    ):
+        if task is None:
+            task, _reservation = self._task()
+        if launch_purposes is None:
+            launch_purposes = (
+                capability_model.CompilerLaunchPurpose.AUDIT_DISCOVERY,
+                capability_model.CompilerLaunchPurpose.AUDIT_ACCEPTED,
+            )
+        control = self._ControlEndpoint(launch_purposes)
+        if command is None:
+            command = self._CommandEndpoint(self._permit(
+                dependencies=self.dependencies if dependencies is None else dependencies
+            ))
+        if cache is None:
+            cache = self._Cache()
+        discovery_dependencies = self.dependencies if dependencies is None else dependencies
+
+        def stabilize(*_args, launch_context=None, **_kwargs):
+            if stabilize_error is not None:
+                raise stabilize_error
+            view = self._View()
+            self.live_views.add(view)
+            for index, purpose in enumerate(launch_purposes):
+                launch_context.record_process_start(
+                    purpose,
+                    capability_model.ProcessStartIdentity(
+                        "windows", index + 100, f"start-{index}", f"cookie-{index}"
+                    ),
+                )
+            return (
+                view,
+                capability_runner.PreprocessDiscovery(
+                    capability_runner.StreamDigest("d" * 64, 17),
+                    discovery_dependencies,
+                    tuple(item.identity for item in discovery_dependencies),
+                ),
+                capability_runner.PreprocessStageTimings(1.0, 2.0, 34),
+            )
+
+        def audit(*_args, **_kwargs):
+            if audit_error is not None:
+                raise audit_error
+            return list(findings)
+
+        rss = SimpleNamespace(sample=lambda: 0)
+        with (
+            mock.patch.multiple(
+                capability_runner,
+                _WORKER_INDEX=3,
+                _WORKER_GENERATION=7,
+                _WORKER_PRODUCTION={
+                    self.source_identity.relative: self.source_identity,
+                    self.header_identity.relative: self.header_identity,
+                },
+                _WORKER_LIMITS=AuditLimits(),
+                _WORKER_CANCEL_EVENT=self.cancel_event,
+                _WORKER_ENGINE=self.engine,
+                _WORKER_CACHE=cache,
+                _WORKER_RSS=rss,
+            ),
+            mock.patch.object(
+                capability_runner,
+                "stabilize_and_parse_configuration",
+                new=stabilize,
+            ),
+            mock.patch.object(
+                capability_audit, "audit_preprocessed_view", new=audit
+            ),
+            mock.patch.object(
+                capability_audit,
+                "_attest_loaded_audit_engine",
+                return_value=(self.engine if attestation_error is None else mock.DEFAULT),
+                side_effect=attestation_error,
+            ),
+        ):
+            outcome = capability_runner.audit_configuration_worker(
+                task,
+                self.authority,
+                self.production_snapshot,
+                control,
+                command,
+                time.monotonic() + 30.0,
+            )
+        return outcome, control, command, cache
+
+    def test_worker_returns_only_compact_outcome_drops_view_and_never_loads(self):
+        task, reservation = self._task()
+        outcome, control, _command, cache = self._run_worker(task=task)
+        self.assertIsInstance(outcome, capability_model.ConfigurationAuditOutcome)
+        self.assertFalse(hasattr(outcome, "view"))
+        self.assertEqual(len(self.live_views), 0)
+        self.assertEqual(cache.loads, 0)
+        self.assertEqual(outcome.result.reached_production, (
+            PurePosixPath("playback/gpu/empty.h"),
+            PurePosixPath("playback/gpu/worker.cpp"),
+        ))
+        self.assertEqual(outcome.stdout_bytes, 34)
+        self.assertTrue(control.sealed)
+        self.assertTrue(reservation.released)
+
+    def test_audit_count_comes_only_from_typed_parent_observed_launch_events(self):
+        outcome, control, _command, _cache = self._run_worker()
+        events = tuple(
+            frame for frame in control.frames
+            if isinstance(frame, capability_model.CompilerLaunchEvent)
+        )
+        expected = (
+            capability_model.CompilerLaunchPurpose.AUDIT_DISCOVERY,
+            capability_model.CompilerLaunchPurpose.AUDIT_ACCEPTED,
+        )
+        self.assertEqual(tuple(event.purpose for event in events), expected)
+        self.assertEqual(len(events), len(expected))
+        self.assertFalse(hasattr(outcome, "audit_compiler_invocations"))
+        worker_source = Path(capability_runner.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("stream.byte_count" + " * 2", worker_source)
+        corruptions = {
+            "missing": expected[:1],
+            "duplicate": (expected[0], expected[0], expected[1]),
+            "retry": (*expected, expected[1]),
+            "extra": (*expected, capability_model.CompilerLaunchPurpose.INSPECTION),
+        }
+        for name, purposes in corruptions.items():
+            with self.subTest(corruption=name), self.assertRaisesRegex(
+                AuditInfrastructureError, "audit compiler launch protocol"
+            ):
+                self._run_worker(launch_purposes=purposes)
+
+    def test_generation_engine_and_permit_failures_never_publish(self):
+        changed = dataclasses.replace(self.dependencies[0], sha256="e" * 64)
+        for label, kwargs, expected in (
+            ("production", {"dependencies": (changed, *self.dependencies[1:])},
+             "production snapshot generation"),
+            ("permit", {"command": self._CommandEndpoint(
+                error=AuditInfrastructureError("publication permit unavailable"))},
+             "publication permit unavailable"),
+            ("audit", {"audit_error": AuditInfrastructureError("audit failed")},
+             "audit failed"),
+            ("raw", {"stabilize_error": AuditInfrastructureError(
+                "raw preprocessed output changed")},
+             "raw preprocessed output changed"),
+        ):
+            cache = self._Cache()
+            with self.subTest(label=label), self.assertRaisesRegex(
+                AuditInfrastructureError, expected
+            ):
+                self._run_worker(cache=cache, **kwargs)
+            self.assertEqual(cache.published, [])
+
+        cache = self._Cache()
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "loaded audit engine attestation"
+        ):
+            self._run_worker(
+                cache=cache,
+                attestation_error=AuditInfrastructureError(
+                    "loaded audit engine attestation mismatch"
+                ),
+            )
+        self.assertEqual(cache.published, [])
+
+    def test_restoring_initial_bytes_cannot_hide_mixed_production_generation(self):
+        initial_bytes = self.source.read_bytes()
+        self.source.write_bytes(b"int generation_b;\n")
+        generation_b = self._dependency(self._identity(
+            self.source, "playback/gpu/worker.cpp", line_count=1
+        ))
+        self.source.write_bytes(initial_bytes)
+        mixed = tuple(sorted(
+            (generation_b, self.dependencies[0]),
+            key=lambda item: item.role_relative_path.as_posix(),
+        ))
+        cache = self._Cache()
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "production snapshot generation"
+        ):
+            self._run_worker(cache=cache, dependencies=mixed)
+        self.assertEqual(cache.published, [])
+        self.assertEqual(self.source.read_bytes(), initial_bytes)
+
+    def test_publication_permit_precedes_result_materialization_and_send(self):
+        task, reservation = self._task()
+        command = self._CommandEndpoint(
+            error=AuditInfrastructureError("publication permit unavailable")
+        )
+        cache = self._Cache()
+        with mock.patch.object(
+            capability_runner,
+            "ConfigurationAuditResult",
+            side_effect=AssertionError("compact result materialized"),
+        ) as materialized, self.assertRaisesRegex(
+            AuditInfrastructureError, "publication permit unavailable"
+        ):
+            self._run_worker(task=task, command=command, cache=cache)
+        materialized.assert_not_called()
+        self.assertEqual(cache.published, [])
+        self.assertTrue(reservation.released)
+
+    def test_cancellation_after_root_grant_releases_both_owners_without_publish(self):
+        releases = []
+        permit = self._permit(release_callback=lambda: releases.append("root"))
+        cancel_event = self.cancel_event
+
+        class CancellingCommandEndpoint:
+            def receive(self, task, observed_cancel, deadline, maximum_quantum_seconds):
+                cancel_event.set()
+                return permit
+
+        task, reservation = self._task()
+        cache = self._Cache()
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "cancelled before compact-result materialization"
+        ):
+            self._run_worker(
+                task=task,
+                command=CancellingCommandEndpoint(),
+                cache=cache,
+            )
+        self.assertEqual(cache.published, [])
+        self.assertEqual(releases, ["root"])
+        self.assertTrue(reservation.released)
+
+    def test_process_handle_association_freezes_start_identity_and_has_one_launcher(self):
+        source = Path(capability_runner.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count("subprocess." + "Popen("), 1)
+        table = capability_runner._ProcessHandleAssociationTable()
+        identity = capability_model.ProcessStartIdentity(
+            "windows", 42, "creation-time", "authenticated-cookie"
+        )
+        process = object()
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "preceded handle registration"
+        ):
+            table.require(identity)
+        table.register(identity, process)
+        self.assertIs(table.require(identity), process)
+        self.assertEqual(table.active_count, 1)
+        with self.assertRaisesRegex(AuditInfrastructureError, "cookie differs"):
+            table.release(identity, object())
+        table.release(identity, process)
+        self.assertEqual(table.active_count, 0)
+        with self.assertRaisesRegex(AuditInfrastructureError, "already closed"):
+            table.release(identity, process)
+
+    def test_two_workers_cannot_overlap_the_exact_root_publication_charge(self):
+        releases = []
+        receive_barrier = threading.Barrier(2)
+        publication_gate = threading.Lock()
+        test_case = self
+
+        class SerializedCommandEndpoint:
+            def receive(self, task, cancel_event, deadline, maximum_quantum_seconds):
+                receive_barrier.wait(timeout=10.0)
+                if not publication_gate.acquire(timeout=10.0):
+                    raise AuditInfrastructureError("root publication gate timed out")
+                return test_case._permit(
+                    release_callback=lambda: (
+                        releases.append(task.task_id), publication_gate.release()
+                    )
+                )
+
+        class ObservedCache(self._Cache):
+            def __init__(self):
+                super().__init__()
+                self.active = 0
+                self.maximum_active = 0
+                self.lock = threading.Lock()
+
+            def publish(self, *args):
+                with self.lock:
+                    self.active += 1
+                    self.maximum_active = max(self.maximum_active, self.active)
+                try:
+                    time.sleep(0.05)
+                    return super().publish(*args)
+                finally:
+                    with self.lock:
+                        self.active -= 1
+
+        command = SerializedCommandEndpoint()
+        cache = ObservedCache()
+        tasks = tuple(self._task()[0] for _index in range(2))
+        outcomes = []
+        errors = []
+
+        def execute(task):
+            try:
+                outcomes.append(self._run_worker(
+                    task=task, command=command, cache=cache
+                )[0])
+            except BaseException as error:
+                errors.append(error)
+
+        threads = tuple(threading.Thread(target=execute, args=(task,)) for task in tasks)
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20.0)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual(cache.maximum_active, 1)
+        self.assertEqual(releases, ["task-a", "task-a"])
+        self.assertTrue(all(task.compact_reservation.released for task in tasks))
+
+    def test_missing_reservation_and_cancellation_launch_nothing(self):
+        task, _reservation = self._task(reservation=False)
+        with mock.patch.object(
+            capability_runner, "stabilize_and_parse_configuration"
+        ) as stabilize, self.assertRaisesRegex(
+            AuditInfrastructureError, "dispatch reservation"
+        ):
+            self._run_worker(task=task)
+        stabilize.assert_not_called()
+
+        task, reservation = self._task()
+        task = dataclasses.replace(
+            task,
+            dependency_root_authority=dataclasses.replace(self.authority),
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "authority identity changed"
+        ):
+            self._run_worker(task=task)
+        self.assertTrue(reservation.released)
+
+        task, reservation = self._task()
+        self.cancel_event.set()
+        with mock.patch.object(
+            capability_runner, "stabilize_and_parse_configuration"
+        ) as stabilize, self.assertRaisesRegex(
+            AuditInfrastructureError, "cancelled before discovery"
+        ):
+            self._run_worker(task=task)
+        stabilize.assert_not_called()
+        self.assertTrue(reservation.released)
+
+    def test_forbidden_finding_is_compacted_and_publish_failure_releases_owners(self):
+        finding = capability_audit.Finding(
+            PurePosixPath("playback/gpu/worker.cpp"),
+            2,
+            "lease.nativeHandle()",
+            "raw native handle use",
+        )
+        outcome, _control, _command, _cache = self._run_worker(findings=(finding,))
+        self.assertEqual(len(outcome.result.findings), 1)
+        self.assertEqual(outcome.result.findings[0].reason, "raw native handle use")
+
+        releases = []
+        task, reservation = self._task()
+        command = self._CommandEndpoint(self._permit(release_callback=lambda: releases.append("root")))
+        cache = self._Cache(AuditInfrastructureError("cache publish failed"))
+        with self.assertRaisesRegex(AuditInfrastructureError, "cache publish failed"):
+            self._run_worker(task=task, command=command, cache=cache)
+        self.assertEqual(releases, ["root"])
+        self.assertTrue(reservation.released)
 
 
 if __name__ == "__main__":

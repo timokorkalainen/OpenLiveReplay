@@ -55,14 +55,14 @@ from gpu_capability_source_audit import (  # noqa: E402
 
 
 class AuditEngineFingerprintTests(unittest.TestCase):
-    def test_task4_stage_and_module_roots_are_exact(self):
+    def test_task5_stage_and_module_roots_are_exact(self):
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_GRAPH_SCHEMA_BYTES,
-            b"olr-gpu-capability-live-graph-v3",
+            b"olr-gpu-capability-live-graph-v4",
         )
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-4-compact-capability-analysis",
+            b"task-5-audit-discard-worker",
         )
         self.assertEqual(
             tuple(module.__name__ for module in capability_audit._AUDIT_ENGINE_TARGET_MODULES),
@@ -76,7 +76,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             ),
         )
 
-    def test_task4_semantic_graph_owns_analysis_rules_and_cpp_tokens(self):
+    def test_task5_semantic_graph_owns_worker_and_compact_publication_contract(self):
         names = {
             name for name, _value in capability_audit._enumerate_live_semantic_graph()
         }
@@ -88,9 +88,32 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             "gpu_capability_source_audit.conservative_allocation_schema",
             "gpu_capability_source_audit.cpp_tokens",
             "gpu_capability_provenance.reject_source_line_spoofs",
+            "gpu_capability_model.CachePublicationPermit",
+            "gpu_capability_model.ConfigurationAuditOutcome",
+            "gpu_capability_model.PerTaskCompactReservation",
+            "gpu_capability_model.CompilerLaunchEvent",
+            "gpu_capability_runner.audit_configuration_worker",
+            "gpu_capability_runner.validate_production_dependency_snapshots",
+            "gpu_capability_runner._bounded_compact_result_draft",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, names)
+
+    def test_task5_worker_helper_and_default_rebinding_changes_fingerprint(self):
+        baseline = capability_audit.audit_engine_fingerprint()
+        runner = capability_audit._gpu_capability_runner
+        with mock.patch.object(
+            runner,
+            "validate_production_dependency_snapshots",
+            lambda *_args, **_kwargs: (),
+        ):
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
+        worker = runner.audit_configuration_worker
+        defaults = worker.__defaults__
+        with mock.patch.object(worker, "__defaults__", (None,)):
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+        self.assertEqual(worker.__defaults__, defaults)
 
     def test_production_modules_have_no_bare_asserts(self):
         source_directory = Path(__file__).resolve().parent
@@ -120,7 +143,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
                 "test_gpu_capability_command.py": 1,
                 "test_gpu_capability_model.py": 1,
                 "test_gpu_capability_provenance.py": 1,
-                "test_gpu_capability_runner.py": 3,
+                "test_gpu_capability_runner.py": 4,
             },
         )
         source_directory = Path(__file__).resolve().parent
@@ -430,7 +453,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             self.assertIn(expected, names)
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-4-compact-capability-analysis",
+            b"task-5-audit-discard-worker",
         )
 
         marshaled = tuple(
@@ -654,13 +677,13 @@ print(recomputed)
             self.assertEqual(fingerprint(first), fingerprint(second))
             mutated = (second / "gpu_capability_source_audit.py").read_text(encoding="utf-8")
             self.assertIn(
-                'AUDIT_ENGINE_STAGE_BYTES = b"task-4-compact-capability-analysis"',
+                'AUDIT_ENGINE_STAGE_BYTES = b"task-5-audit-discard-worker"',
                 mutated,
             )
             (second / "gpu_capability_source_audit.py").write_text(
                 mutated.replace(
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-4-compact-capability-analysis"',
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-4-compact-capability-analysis-mutated"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-5-audit-discard-worker"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-5-audit-discard-worker-mutated"',
                     1,
                 ),
                 encoding="utf-8",

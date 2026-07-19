@@ -25,23 +25,31 @@ from gpu_capability_model import (  # noqa: E402
     AuditLimits,
     CompactResultColdSlot,
     CompactResultMemoryBudget,
+    CompactResultDraftBounds,
     CompactTokenSequence,
+    CompilerLaunchEvent,
+    CompilerLaunchPurpose,
     CompilerExecutableCapability,
     CompilerInspection,
     CompilerFamily,
     CoverageReport,
     ConfigurationAuditResult,
+    ConfigurationAuditOutcome,
     ConfigurationAuditPublicationPermit,
+    CachePublicationPermit,
     DependencyDigest,
     DependencyRootAuthority,
     DependencyRootBinding,
     FileIdentity,
     PackedTokenRun,
+    PerTaskCompactReservation,
+    ProcessStartIdentity,
     PreprocessedToken,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
     SourceLocation,
     StreamingResultAggregator,
+    WorkerStageTimings,
     compact_result_retained_bytes,
     encode_canonical_summary,
     _check_casefold_collision,
@@ -813,6 +821,69 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(permit.dependencies, (dependency,))
         with self.assertRaises(AuditInfrastructureError):
             dataclasses.replace(permit, dependencies=(dependency, dependency))
+
+    def test_worker_compact_reservation_and_root_permit_are_linear_and_bounded(self):
+        reservation = PerTaskCompactReservation("task-a", 7, 32 << 20)
+        bounds = CompactResultDraftBounds(1, 1, 1, 64, 32, 48)
+        charged = reservation.require_within_pre_dispatch_reservation(
+            "task-a", 1024, bounds, 512
+        )
+        self.assertGreaterEqual(charged, 1536)
+        self.assertLessEqual(charged, reservation.maximum_bytes)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "pre-dispatch compact reservation"
+        ):
+            reservation.require_within_pre_dispatch_reservation(
+                "different-task", 1024, bounds, 512
+            )
+
+        releases = []
+        dependency = self.dependency()
+        permit = CachePublicationPermit(
+            "c" * 64,
+            "a" * 64,
+            (dependency,),
+            task_id="task-a",
+            generation=7,
+            release_callback=lambda: releases.append("root"),
+        )
+        self.assertEqual(permit.root_publication_bytes, 8 << 20)
+        permit.release_root_publication()
+        self.assertEqual(releases, ["root"])
+        self.assertTrue(permit.released)
+        with self.assertRaisesRegex(AuditInfrastructureError, "already released"):
+            permit.release_root_publication()
+
+        reservation.release("worker-return")
+        self.assertTrue(reservation.released)
+        with self.assertRaisesRegex(AuditInfrastructureError, "already released"):
+            reservation.release("duplicate")
+
+    def test_worker_outcome_and_launch_event_contracts_are_typed(self):
+        result = ConfigurationAuditResult(
+            "c" * 64, "a" * 64, (self.dependency(),), (), ()
+        )
+        stages = WorkerStageTimings(1.0, 2.0, 3.0, 4.0)
+        outcome = ConfigurationAuditOutcome(result, 123, stages)
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(outcome)),
+            ("result", "stdout_bytes", "stages"),
+        )
+        self.assertFalse(hasattr(outcome, "view"))
+
+        identity = ProcessStartIdentity("windows", 42, "start-token", "cookie")
+        event = CompilerLaunchEvent(
+            CompilerLaunchPurpose.AUDIT_DISCOVERY,
+            identity,
+            worker_index=3,
+            task_id="task-a",
+            generation=7,
+        )
+        self.assertEqual(event.process_start, identity)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "audit compiler launch identity"
+        ):
+            dataclasses.replace(event, task_id=None)
 
     def test_dependency_digest_portable_key_and_exact_local_codec_are_separate(self):
         digest = self.dependency()
