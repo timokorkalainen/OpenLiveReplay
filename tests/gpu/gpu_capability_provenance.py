@@ -549,15 +549,20 @@ class PreprocessedStreamBuilder:
     __slots__ = (
         "_configuration",
         "_production",
+        "_production_by_path_key",
         "_limits",
         "_rss_reader",
+        "_deadline",
+        "_cancel_event",
         "_line_buffer",
         "_spellings",
         "_spelling_ids_by_value",
+        "_retained_spelling_bytes",
         "_marker_paths",
         "_marker_aliases",
         "_marker_relative",
         "_marker_ids_by_key",
+        "_retained_marker_alias_bytes",
         "_spelling_ids",
         "_identity_ids",
         "_inclusion_ids",
@@ -578,22 +583,42 @@ class PreprocessedStreamBuilder:
         production: Mapping[PurePosixPath, FileIdentity],
         limits: AuditLimits,
         rss_reader: Callable[[], int],
+        *,
+        deadline: float | None = None,
+        cancel_event: object | None = None,
     ) -> None:
         if not isinstance(configuration, PreprocessConfiguration):
             raise _fail("preprocess configuration is invalid")
         if not isinstance(limits, AuditLimits) or not callable(rss_reader):
             raise _fail("provenance limits or RSS reader are invalid")
+        if deadline is not None and (
+            not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+        ):
+            raise _fail("preprocess stream deadline is invalid")
+        if cancel_event is not None and not callable(
+            getattr(cancel_event, "is_set", None)
+        ):
+            raise _fail("preprocess stream cancellation event is invalid")
         self._configuration = configuration
         self._production = dict(production)
+        self._production_by_path_key = {
+            _path_key(identity.canonical): identity
+            for identity in self._production.values()
+        }
         self._limits = limits
         self._rss_reader = rss_reader
+        self._deadline = float(deadline) if deadline is not None else None
+        self._cancel_event = cancel_event
         self._line_buffer = bytearray()
         self._spellings: list[bytes] = []
         self._spelling_ids_by_value: dict[bytes, int] = {}
+        self._retained_spelling_bytes = 0
         self._marker_paths: list[Path] = []
         self._marker_aliases: list[str] = []
         self._marker_relative: list[bool] = []
         self._marker_ids_by_key: dict[str, int] = {}
+        self._retained_marker_alias_bytes = 0
         self._spelling_ids = array("I")
         self._identity_ids = array("I")
         self._inclusion_ids = array("I")
@@ -606,16 +631,16 @@ class PreprocessedStreamBuilder:
         self._in_block_comment = False
         self._finalized = False
         self._peak_rss_bytes = 0
+        self._check_budget()
         self._sample_rss()
 
     @property
     def retained_bytes(self) -> int:
         return (
             len(self._spelling_ids) * 16
-            + sum(len(value) for value in self._spellings)
-            + len(self._spellings) * _TUPLE_SLOT_BYTES
+            + self._retained_spelling_bytes
             + len(self._line_buffer)
-            + sum(len(value) for value in self._marker_aliases)
+            + self._retained_marker_alias_bytes
         )
 
     @property
@@ -631,6 +656,12 @@ class PreprocessedStreamBuilder:
             raise _fail("coordinator RSS limit exceeded")
         return value
 
+    def _check_budget(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise _fail("preprocessed stream parsing cancelled")
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise _fail("preprocessed stream parsing deadline exceeded")
+
     def _check_retained(self, addition: int = 0) -> None:
         if addition < 0 or self.retained_bytes > self._limits.retained_token_bytes - addition:
             raise _fail("retained packed token limit exceeded")
@@ -638,6 +669,8 @@ class PreprocessedStreamBuilder:
     def _resolve_marker_path(self, decoded: str) -> tuple[Path, bool]:
         if decoded.startswith("<") and decoded.endswith(">"):
             return Path(decoded), False
+        if _is_windows_path(decoded) or Path(decoded).is_absolute():
+            return Path(_display_normalized(decoded)), False
         if _is_windows_path(decoded) or Path(decoded).is_absolute():
             return Path(_display_normalized(decoded)), False
         bases: list[Path] = [self._configuration.working_directory]
@@ -648,10 +681,11 @@ class PreprocessedStreamBuilder:
             if not str(current).startswith("<"):
                 bases.append(current.parent)
         candidates = [Path(_display_normalized(base / decoded)) for base in bases]
+        candidate_keys = {_path_key(candidate) for candidate in candidates}
         matching = {
-            _path_key(identity.canonical): identity
-            for identity in self._production.values()
-            if _path_key(identity.canonical) in {_path_key(candidate) for candidate in candidates}
+            key: self._production_by_path_key[key]
+            for key in candidate_keys
+            if key in self._production_by_path_key
         }
         if len(matching) > 1:
             raise _fail("relative marker path has an ambiguous production identity")
@@ -686,6 +720,7 @@ class PreprocessedStreamBuilder:
         self._marker_ids_by_key[key] = marker_id
         self._marker_paths.append(path)
         self._marker_aliases.append(alias)
+        self._retained_marker_alias_bytes += len(alias)
         self._marker_relative.append(relative)
         self._check_retained()
         return marker_id
@@ -828,10 +863,12 @@ class PreprocessedStreamBuilder:
         addition = 16 + intern_addition
         self._check_retained(addition)
         if len(self._spelling_ids) % _BLOCK_SIZE == 0:
+            self._check_budget()
             self._sample_rss(reserve=_BLOCK_SIZE * 16 + _ARRAY_SLACK)
         if intern_addition:
             self._spelling_ids_by_value[spelling] = spelling_id
             self._spellings.append(spelling)
+            self._retained_spelling_bytes += intern_addition
         marker_id = self._marker_ids_by_key[self._stack[-1].path_key]
         self._spelling_ids.append(spelling_id)
         self._identity_ids.append(marker_id)
@@ -911,6 +948,7 @@ class PreprocessedStreamBuilder:
             self._stack[-1].line = self._current_line
 
     def feed(self, chunk: bytes) -> None:
+        self._check_budget()
         if self._finalized:
             raise _fail("preprocessed stream is already finalized")
         if not isinstance(chunk, bytes):
@@ -919,6 +957,7 @@ class PreprocessedStreamBuilder:
             raise _fail("preprocessed stream contains an embedded NUL")
         offset = 0
         while True:
+            self._check_budget()
             newline = chunk.find(b"\n", offset)
             if newline < 0:
                 self._check_retained(len(chunk) - offset)
@@ -978,13 +1017,8 @@ class PreprocessedStreamBuilder:
             identity = dependency_by_key.get(_path_key(marker_path))
             if identity is None:
                 raise _fail(f"line marker does not name a dependency: {marker_path}")
-            production_identity = next(
-                (
-                    candidate
-                    for candidate in self._production.values()
-                    if _path_key(candidate.canonical) == _path_key(marker_path)
-                ),
-                None,
+            production_identity = self._production_by_path_key.get(
+                _path_key(marker_path)
             )
             if production_identity is not None and identity != production_identity:
                 raise _fail("production marker does not match its validated dependency identity")
@@ -1023,6 +1057,7 @@ class PreprocessedStreamBuilder:
         self._original_lines = array("I")
         self._spellings.clear()
         self._spelling_ids_by_value.clear()
+        self._retained_spelling_bytes = 0
         return view
 
 

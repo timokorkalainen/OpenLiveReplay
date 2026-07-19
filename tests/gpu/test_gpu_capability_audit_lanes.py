@@ -847,6 +847,59 @@ class CompilerAuditLaneTests(unittest.TestCase):
             self.assertEqual(audit_preprocessed_view(view, self.limits, lambda: 0), [])
         build.assert_not_called()
 
+    def test_profile_uses_authenticated_stabilized_runner(self):
+        relative = PurePosixPath("playback/gpu/profile.cpp")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "compile_commands.json"
+            database.write_text("[]", encoding="utf-8")
+            source_path = root / Path(*relative.parts)
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text("int profile;\n", encoding="utf-8")
+            identity = self.identity(relative.as_posix(), canonical=str(source_path))
+            configuration = self.configuration(identity)
+            view = self.view(((identity, 1, 1, b"int profile ;"),))
+            authority = object()
+            with (
+                mock.patch.object(
+                    capability_audit,
+                    "build_dependency_root_authority",
+                    return_value=authority,
+                ),
+                mock.patch.object(
+                    capability_audit._gpu_capability_runner,
+                    "collect_configurations",
+                    return_value=(configuration,),
+                ),
+                mock.patch.object(
+                    capability_audit,
+                    "enumerate_production_identities",
+                    return_value={relative: identity},
+                ),
+                mock.patch.object(
+                    capability_audit._gpu_capability_runner,
+                    "stabilize_and_parse_configuration",
+                    return_value=(view, object(), object()),
+                ) as stabilize,
+                mock.patch.object(
+                    capability_audit._gpu_capability_runner.subprocess,
+                    "run",
+                    side_effect=AssertionError("direct subprocess reached"),
+                ),
+                mock.patch.object(
+                    capability_audit,
+                    "audit_preprocessed_view",
+                    return_value=[],
+                ),
+            ):
+                result = capability_audit.profile_compiler_view(
+                    root, database, relative
+                )
+        self.assertIn("configurations=1", result)
+        stabilize.assert_called_once()
+        self.assertEqual(stabilize.call_args.args[3].invocation_seconds, 300.0)
+        self.assertEqual(stabilize.call_args.args[3].total_seconds, 600.0)
+
     def test_candidate_paths_exclude_production_paths_without_rule_trigger(self):
         view = self.view((
             self.production("playback/gpu/example.cpp", 1, b"int safe ;"),
@@ -890,6 +943,50 @@ class CompilerAuditLaneTests(unittest.TestCase):
         self.assertEqual(location.inclusion_instance, 9)
         self.assertEqual(location.line, 71)
 
+    def test_unused_high_byte_spelling_does_not_change_measured_storage_kind(self):
+        identity = self.identity("playback/gpu/example.cpp")
+        configuration = self.configuration(identity)
+        tokens = CompactTokenSequence._from_packed(
+            configuration,
+            spellings=(b"x", b"\xff"),
+            identities=(None, identity),
+            spelling_ids=array("I", (0,)),
+            identity_ids=array("I", (1,)),
+            inclusion_ids=array("I", (1,)),
+            original_lines=array("I", (1,)),
+        )
+        view = PreprocessedTranslationUnitView(configuration, tokens, (identity,))
+        buffer = AuditBuffer.from_preprocessed(view, self.limits, lambda: 0)
+        self.assertEqual(buffer.text, "x\n")
+        self.assertEqual(buffer.text_max_code_point, ord("x"))
+
+    def test_analysis_plan_covers_scope_shaped_peak_allocations(self):
+        identity = self.identity("playback/gpu/example.cpp")
+        statement = (
+            b"GpuSyncReadScope scopeIdentifierWithLongPadding { } "
+        )
+        source = statement * 12_501
+        view = self.view(((identity, 1, 1, source),))
+        buffer = AuditBuffer.from_preprocessed(view, self.limits, lambda: 0)
+        shape = capability_audit._measure_audit_buffer_layout(view.tokens).shape
+        plan = audit_allocation_plan(shape)
+        translated = capability_audit.TranslationText(
+            buffer.text,
+            buffer.text,
+            buffer.text,
+            (),
+            (),
+            buffer._line_starts,
+        )
+        tracemalloc.start()
+        try:
+            analysis = CompilerAuditAnalysis.from_translation(translated)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(analysis.tokens), 50_004)
+        self.assertGreaterEqual(plan.analysis_objects, peak)
+
     def test_filtered_and_forced_unfiltered_results_match_owned_corpus(self):
         fixtures = (
             ("empty", self.view((self.production("playback/gpu/empty.cpp", 1, b""),))),
@@ -926,6 +1023,111 @@ class CompilerAuditLaneTests(unittest.TestCase):
                 if unfiltered:
                     spellings = set(object.__getattribute__(view.tokens, "_spellings"))
                     self.assertFalse(derived.isdisjoint(spellings))
+
+    def test_prefilter_matches_forced_oracle_over_mutation_and_live_corpora(self):
+        captured: dict[tuple[PurePosixPath, str], None] = {}
+        original_capability = capability_audit.audit_capability_uses
+        original_source_only = capability_audit.audit_source_only
+        original_raw = capability_audit.audit_raw_sources
+
+        def record_capability(path, source, *args, **kwargs):
+            if not kwargs.get("compiler_view", False):
+                captured.setdefault((path, source), None)
+            return original_capability(path, source, *args, **kwargs)
+
+        def record_source_only(path, source):
+            captured.setdefault((path, source), None)
+            return original_source_only(path, source)
+
+        def record_raw(sources):
+            for path, source in sources.items():
+                captured.setdefault((path, source), None)
+            return original_raw(sources)
+
+        with (
+            mock.patch.object(
+                capability_audit,
+                "audit_capability_uses",
+                side_effect=record_capability,
+            ),
+            mock.patch.object(
+                capability_audit,
+                "audit_source_only",
+                side_effect=record_source_only,
+            ),
+            mock.patch.object(
+                capability_audit,
+                "audit_raw_sources",
+                side_effect=record_raw,
+            ),
+        ):
+            capability_audit.mutation_self_tests()
+
+        from test_gpu_capability_live_compilers import (
+            FIXTURE_PATH,
+            FORBIDDEN_OUTPUT_ORACLES,
+            SAFE_FIXTURES,
+        )
+
+        for name, output in FORBIDDEN_OUTPUT_ORACLES.items():
+            captured.setdefault(
+                (FIXTURE_PATH, output.decode("ascii") + ";"), None
+            )
+        for name, (_source, output) in SAFE_FIXTURES.items():
+            captured.setdefault(
+                (FIXTURE_PATH, output.decode("ascii") + ";"), None
+            )
+        self.assertGreaterEqual(len(captured), 100)
+
+        derived = capability_candidate_spellings()
+        for index, ((path, source), _unused) in enumerate(captured.items()):
+            try:
+                encoded = source.encode("ascii")
+            except UnicodeEncodeError as error:
+                self.fail(f"owned corpus source is not ASCII: {path}: {error}")
+            view = self.view(((self.identity(path.as_posix()), 1, index + 1, encoded),))
+            filtered = audit_preprocessed_view(view, self.limits, lambda: 0)
+            forced = _audit_preprocessed_view_unfiltered(
+                view, self.limits, lambda: 0
+            )
+            with self.subTest(path=path, corpus_index=index):
+                self.assertEqual(filtered, forced)
+                if forced:
+                    spellings = set(
+                        object.__getattribute__(view.tokens, "_spellings")
+                    )
+                    self.assertFalse(derived.isdisjoint(spellings))
+
+    def test_forced_unfiltered_reference_bypasses_candidate_spellings(self):
+        view = self.view((self.production(
+            "playback/gpu/gpufence.h", 20, b"surface.nativeHandle();"
+        ),))
+        with mock.patch.object(
+            capability_audit,
+            "capability_candidate_spellings",
+            return_value=frozenset(),
+        ):
+            self.assertEqual(
+                audit_preprocessed_view(view, self.limits, lambda: 0), []
+            )
+            forced = _audit_preprocessed_view_unfiltered(
+                view, self.limits, lambda: 0
+            )
+        self.assertTrue(forced)
+        self.assertIn("nativeHandle()", forced[0].expression)
+
+    def test_capability_rule_evaluator_is_the_dispatched_owner(self):
+        view = self.view((self.production(
+            "playback/gpu/gpufence.h", 20, b"surface.nativeHandle();"
+        ),))
+        owner = mock.Mock(wraps=capability_audit.audit_capability_uses)
+        rules = (
+            dataclasses.replace(capability_audit._CAPABILITY_RULES[0], evaluator=owner),
+            *capability_audit._CAPABILITY_RULES[1:],
+        )
+        with mock.patch.object(capability_audit, "_CAPABILITY_RULES", rules):
+            _audit_preprocessed_view_unfiltered(view, self.limits, lambda: 0)
+        self.assertGreater(owner.call_count, 0)
 
     def test_one_compiler_analysis_is_reused_across_policy_groups(self):
         view = self.view((
@@ -1065,6 +1267,26 @@ class CompilerAuditLaneTests(unittest.TestCase):
         self.assertLessEqual(
             observations.peak_charged_bytes, observations.pre_reserved_bytes
         )
+
+    def test_analysis_charge_is_committed_before_final_text_allocation(self):
+        view = self.view((self.production(
+            "playback/gpu/gpufence.h",
+            1,
+            b"GpuSyncReadScope scope ; scope . complete ( ) ;",
+        ),))
+        shape = capability_audit._measure_audit_buffer_layout(view.tokens).shape
+        plan = audit_allocation_plan(shape)
+        self.assertGreater(plan.analysis_objects, 0)
+        observations = capability_audit.AuditAllocationObservations()
+        AuditBuffer.from_preprocessed(
+            view, self.limits, lambda: 0, _allocation_observer=observations
+        )
+        self.assertEqual(observations.pre_reserved_bytes, plan.pre_reserved_bytes)
+        self.assertEqual(
+            observations.events[:2],
+            ["measure-layout", "reserve-all-allocations"],
+        )
+        self.assertTrue(observations.final_str.reserved_before_allocation)
 
     def test_production_buffer_never_uses_private_cpython_probe(self):
         view = self.view((self.production(
@@ -1502,10 +1724,15 @@ class CompilerAuditLaneTests(unittest.TestCase):
         view = self.view((
             self.production("playback/gpu/example.cpp", 1, b"x"),
         ))
+        plan = audit_allocation_plan(
+            capability_audit._measure_audit_buffer_layout(view.tokens).shape
+        )
         with self.assertRaisesRegex(AuditInfrastructureError, "coordinator RSS limit"):
             AuditBuffer.from_preprocessed(
                 view,
-                dataclasses.replace(self.limits, rss_bytes=200_000),
+                dataclasses.replace(
+                    self.limits, rss_bytes=50_000 + plan.pre_reserved_bytes
+                ),
                 lambda: 50_000,
             )
 

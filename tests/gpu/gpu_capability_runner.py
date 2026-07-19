@@ -53,7 +53,7 @@ from gpu_capability_provenance import (
 )
 
 
-_IO_CHUNK_BYTES = 4096
+_IO_CHUNK_BYTES = 256 * 1024
 _POLL_SECONDS = 0.01
 _REAP_SECONDS = 1.0
 _DEPENDENCY_FILE_BYTES = 256 * 1024 * 1024
@@ -1350,7 +1350,12 @@ def stabilize_and_parse_configuration(
         if cancel_event is not None and cancel_event.is_set():
             raise AuditInfrastructureError("preprocessing cancelled before accepted launch")
         builder = PreprocessedStreamBuilder(
-            configuration, production, limits, _current_process_rss_bytes
+            configuration,
+            production,
+            limits,
+            _current_process_rss_bytes,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
         consumer = _StreamDigestConsumer(builder.feed)
         with tempfile.TemporaryDirectory(
@@ -1418,6 +1423,8 @@ def preprocess_configuration(
             production,
             limits,
             _current_process_rss_bytes,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
         with tempfile.TemporaryDirectory(
             prefix=".gpu-capability-dependencies-",

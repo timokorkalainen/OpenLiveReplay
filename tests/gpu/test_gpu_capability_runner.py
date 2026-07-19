@@ -715,6 +715,33 @@ class BoundedPreprocessorTests(unittest.TestCase):
                     lambda _chunk: None,
                 )
 
+    def test_stream_reader_uses_a_large_bounded_transport_chunk(self):
+        self.assertEqual(capability_runner._IO_CHUNK_BYTES, 256 * 1024)
+
+    def test_multi_megabyte_transport_meets_deadline_and_exact_bound(self):
+        byte_count = 3_360_000
+        limits = dataclasses.replace(
+            AuditLimits(),
+            stdout_bytes=byte_count,
+            invocation_seconds=10.0,
+            rss_bytes=2**63 - 1,
+        )
+        started = time.monotonic()
+        result, output = self.run_direct(
+            "overflow",
+            limits=limits,
+            extra=("--stdout-bytes", str(byte_count)),
+        )
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertEqual(result.observed_stdout_bytes, byte_count)
+        self.assertEqual(len(output), byte_count)
+        with self.assertRaisesRegex(AuditInfrastructureError, "stdout.*limit"):
+            self.run_direct(
+                "overflow",
+                limits=dataclasses.replace(limits, stdout_bytes=byte_count - 1),
+                extra=("--stdout-bytes", str(byte_count)),
+            )
+
     def test_global_deadline_wins_when_shorter_than_invocation_limit(self):
         started = time.monotonic()
         with self.assertRaisesRegex(AuditInfrastructureError, "global deadline"):

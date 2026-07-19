@@ -15,6 +15,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import gpu_capability_provenance as provenance  # noqa: E402
+
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
@@ -236,6 +238,56 @@ class ProvenanceTests(unittest.TestCase):
             PurePosixPath("playback/gpu/adapter.h"),
         )
         self.assertEqual(native.location.line, 7)
+
+    def test_absolute_marker_lookup_does_not_rescan_all_production_paths(self):
+        production = {
+            PurePosixPath(f"playback/generated-{index}.h"): self.identity(
+                f"playback/generated-{index}.h"
+            )
+            for index in range(2_000)
+        }
+        production[self.main_identity.relative] = self.main_identity
+        builder = PreprocessedStreamBuilder(
+            self.configuration(), production, AuditLimits(), lambda: 0
+        )
+        original = provenance._path_key
+        calls = 0
+
+        def counted(path):
+            nonlocal calls
+            calls += 1
+            return original(path)
+
+        stream = b''.join(
+            b'# 1 "D:/repo/playback/a.cpp"\nint value;\n'
+            for _index in range(100)
+        )
+        with mock.patch.object(provenance, "_path_key", side_effect=counted):
+            builder.feed(stream)
+        self.assertLess(calls, 1_000)
+
+    def test_stream_builder_enforces_deadline_during_tokenization(self):
+        builder = PreprocessedStreamBuilder(
+            self.configuration(),
+            self.production,
+            AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+            lambda: 0,
+            deadline=time.monotonic() + 0.01,
+        )
+        stream = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            + b"identifier " * 1_000_000
+            + b"\n"
+        )
+        started = time.monotonic()
+        with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
+            builder.feed(stream)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_retained_accounting_uses_incremental_intern_totals(self):
+        slots = set(PreprocessedStreamBuilder.__slots__)
+        self.assertIn("_retained_spelling_bytes", slots)
+        self.assertIn("_retained_marker_alias_bytes", slots)
 
     def test_gcc_balanced_nested_and_repeated_includes_get_distinct_instances(self):
         stream = (

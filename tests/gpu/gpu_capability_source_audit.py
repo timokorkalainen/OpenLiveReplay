@@ -109,6 +109,7 @@ _AUDIT_SPELLING_ALTERNATIVES = MappingProxyType({
     b"%>": b"} ",
     b"%:": b"# ",
 })
+_DEFAULT_CANDIDATE_PATHS = b"derived-capability-paths"
 
 
 @dataclass(frozen=True)
@@ -151,10 +152,11 @@ class ConservativeAllocationSchema:
     dict_maximum_load_numerator: int = 2
     dict_maximum_load_denominator: int = 3
     array_header_bytes: int = 128
+    object_header_bytes: int = 256
+    regex_match_header_bytes: int = 512
     json_scanner_fixed_bytes: int = 4096
     json_decoder_fixed_bytes: int = 4096
     json_encoder_scratch_bytes: int = 4096
-    analysis_fixed_bytes: int = 256 * 1024
 
     def _nonnegative(self, value: int) -> int:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -259,6 +261,34 @@ class ConservativeAllocationSchema:
             self.array_header_bytes, self.checked_multiply(items, item_bytes)
         ))
 
+    def object_bound(self, pointer_slots: int) -> int:
+        return self.round_up(self.checked_add(
+            self.object_header_bytes,
+            self.checked_multiply(pointer_slots, self.pointer_bytes_upper_bound),
+        ))
+
+    def bytes_objects_bound(self, total_length: int, object_count: int) -> int:
+        """Bound separately allocated bytes objects, including every header/slack."""
+
+        return self.checked_add(
+            self.checked_multiply(object_count, self.bytes_header_bytes),
+            total_length,
+            object_count,
+            self.checked_multiply(object_count, self.allocator_alignment_bytes - 1),
+        )
+
+    def string_objects_bound(self, total_code_points: int, object_count: int) -> int:
+        """Bound worst-kind strings without pretending an aggregate has one header."""
+
+        storage = self.checked_multiply(
+            self.checked_add(total_code_points, object_count), 4
+        )
+        return self.checked_add(
+            self.checked_multiply(object_count, self.str_header_bytes),
+            storage,
+            self.checked_multiply(object_count, self.allocator_alignment_bytes - 1),
+        )
+
 
 _CONSERVATIVE_ALLOCATION_SCHEMA = ConservativeAllocationSchema()
 
@@ -285,6 +315,13 @@ class AuditAllocationShape:
     json_dict_entries: int = 0
     duplicate_key_count: int = 0
     production_raw_bytes: int = 0
+    analysis_required: bool = True
+    scope_analysis_required: bool = True
+    token_value_characters: int | None = None
+    nonspace_character_count: int | None = None
+    delimiter_pair_count: int | None = None
+    member_call_count: int | None = None
+    scope_declaration_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,11 +375,14 @@ def audit_allocation_plan(
         schema.string_bound(final_chunk_characters),
     )
     input_chunks = schema.checked_add(
-        schema.list_bound(
-            schema.checked_add(shape.chunk_count, shape.json_input_chunk_count)
-        ),
+        schema.list_bound(shape.chunk_count),
+        schema.list_bound(shape.json_input_chunk_count),
         audit_chunk_objects,
-        schema.bytes_bound(shape.json_input_chunk_bytes),
+        schema.bytes_objects_bound(
+            shape.json_input_chunk_bytes, shape.json_input_chunk_count
+        ),
+        # One block-sized spelling slice can overlap the destination chunk.
+        schema.bytes_bound(min(shape.text_character_count, AuditBuffer._BLOCK_BYTES)),
     )
     joined_input = schema.checked_add(
         schema.string_bound(shape.text_character_count),
@@ -357,19 +397,151 @@ def audit_allocation_plan(
             schema.array_bound(shape.run_count + (1 if index == 9 else 0))
             for index in range(AuditBuffer._RUN_COLUMN_COUNT)
         ),
+        # The mutable flags and immutable copy coexist until construction returns.
+        schema.bytearray_bound(shape.origin_count),
         schema.bytes_bound(shape.origin_count),
+        schema.dict_bound(shape.origin_count),
+        schema.checked_multiply(shape.origin_count, schema.tuple_bound(3)),
+        schema.checked_multiply(
+            shape.origin_count, schema.pylong_bound(shape.origin_count)
+        ),
+        # A lookup key is built before it is known whether it will be retained.
+        schema.tuple_bound(3),
     )
     duplicate_keys = schema.checked_add(
         schema.list_bound(schema.checked_multiply(shape.duplicate_key_count, 2)),
         schema.dict_bound(shape.duplicate_key_count),
         schema.string_bound(shape.json_string_characters),
     )
-    analysis = schema.checked_add(
-        schema.analysis_fixed_bytes,
-        schema.tuple_bound(shape.token_count),
-        schema.list_bound(shape.text_character_count + 1),
-        schema.dict_bound(shape.token_count),
+    token_characters = (
+        shape.text_character_count
+        if shape.token_value_characters is None
+        else shape.token_value_characters
     )
+    nonspace_characters = (
+        shape.text_character_count
+        if shape.nonspace_character_count is None
+        else shape.nonspace_character_count
+    )
+    delimiter_pairs = (
+        shape.token_count // 2
+        if shape.delimiter_pair_count is None
+        else shape.delimiter_pair_count
+    )
+    member_calls = (
+        shape.token_count
+        if shape.member_call_count is None
+        else shape.member_call_count
+    )
+    scope_declarations = (
+        shape.token_count
+        if shape.scope_declaration_count is None
+        else shape.scope_declaration_count
+    )
+    position_integer = schema.pylong_bound(shape.text_character_count)
+    token_objects = schema.checked_add(
+        schema.list_bound(shape.token_count),
+        schema.tuple_bound(shape.token_count),
+        schema.checked_multiply(shape.token_count, schema.object_bound(3)),
+        schema.string_objects_bound(token_characters, shape.token_count),
+        schema.checked_multiply(
+            schema.checked_multiply(shape.token_count, 2), position_integer
+        ),
+        schema.tuple_bound(shape.token_count),
+    )
+    delimiter_objects = schema.checked_add(
+        schema.list_bound(delimiter_pairs),
+        schema.list_bound(delimiter_pairs),
+        schema.tuple_bound(delimiter_pairs),
+        schema.checked_multiply(delimiter_pairs, schema.tuple_bound(2)),
+        schema.checked_multiply(
+            schema.checked_multiply(delimiter_pairs, 2), position_integer
+        ),
+    )
+    member_call_objects = schema.checked_add(
+        schema.tuple_bound(member_calls),
+        schema.checked_multiply(member_calls, schema.regex_match_header_bytes),
+    )
+    scope_objects = 0
+    if shape.scope_analysis_required:
+        next_nonspace_count = schema.checked_add(shape.text_character_count, 1)
+        next_nonspace_objects = schema.checked_add(
+            schema.list_bound(next_nonspace_count),
+            schema.tuple_bound(next_nonspace_count),
+            schema.checked_multiply(nonspace_characters, position_integer),
+            position_integer,
+        )
+        declaration_objects = schema.checked_add(
+            schema.list_bound(scope_declarations),
+            schema.list_bound(scope_declarations),
+            schema.dict_bound(scope_declarations),
+            schema.checked_multiply(
+                scope_declarations, schema.object_bound(4)
+            ),
+            schema.string_objects_bound(token_characters, scope_declarations),
+            schema.checked_multiply(
+                schema.checked_multiply(scope_declarations, 3), position_integer
+            ),
+        )
+        binding_objects = schema.checked_add(
+            schema.list_bound(scope_declarations),
+            schema.tuple_bound(scope_declarations),
+            schema.checked_multiply(
+                scope_declarations, schema.object_bound(2)
+            ),
+        )
+        # scope_bindings_linear builds brace/paren maps, ordered position sets,
+        # assignment maps and stacks.  build_shadow_index builds the same block
+        # work once more for declarators.
+        one_block_assignment = schema.checked_add(
+            schema.checked_multiply(2, schema.dict_bound(delimiter_pairs)),
+            schema.checked_multiply(
+                schema.checked_multiply(delimiter_pairs, 2), schema.tuple_bound(2)
+            ),
+            schema.dict_bound(scope_declarations),
+            schema.dict_bound(scope_declarations),
+            schema.list_bound(scope_declarations),
+            schema.list_bound(delimiter_pairs),
+        )
+        block_work = schema.checked_multiply(3, one_block_assignment)
+        scope_name_index = schema.checked_add(
+            schema.dict_bound(scope_declarations),
+            schema.checked_multiply(
+                scope_declarations, schema.list_bound(1)
+            ),
+            schema.dict_bound(scope_declarations),
+            schema.checked_multiply(
+                scope_declarations, schema.tuple_bound(1)
+            ),
+        )
+        shadow_index = schema.checked_add(
+            schema.list_bound(shape.token_count),
+            schema.dict_bound(shape.token_count),
+            schema.dict_bound(shape.token_count),
+            schema.checked_multiply(shape.token_count, schema.list_bound(1)),
+            schema.checked_multiply(shape.token_count, schema.tuple_bound(2)),
+            schema.dict_bound(shape.token_count),
+            schema.checked_multiply(shape.token_count, schema.tuple_bound(1)),
+        )
+        scope_objects = schema.checked_add(
+            next_nonspace_objects,
+            declaration_objects,
+            binding_objects,
+            block_work,
+            scope_name_index,
+            shadow_index,
+        )
+    analysis = 0
+    if shape.analysis_required:
+        analysis = schema.checked_add(
+            schema.object_bound(6),  # TranslationText
+            schema.object_bound(12),  # CompilerAuditAnalysis
+            schema.checked_multiply(3, schema.object_bound(1)),  # mapping proxies
+            token_objects,
+            delimiter_objects,
+            member_call_objects,
+            scope_objects,
+        )
     json_integers = schema.checked_add(*(
         schema.pylong_bound(value) for value in shape.json_integer_values
     )) if shape.json_integer_values else 0
@@ -491,32 +663,96 @@ def _measure_audit_buffer_layout(tokens) -> _MeasuredAuditBufferLayout:
     schema = conservative_allocation_schema()
     spelling_ids = object.__getattribute__(tokens, "_spelling_ids")
     spellings = object.__getattribute__(tokens, "_spellings")
+    identities = object.__getattribute__(tokens, "_identities")
+    identity_ids = object.__getattribute__(tokens, "_identity_ids")
+    inclusion_ids = object.__getattribute__(tokens, "_inclusion_ids")
+    original_lines = object.__getattribute__(tokens, "_original_lines")
+    candidate_spellings = capability_candidate_spellings()
     character_count = 0
-    maximum_code_point = max(
-        (
-            max(AuditBuffer._audit_spelling(spelling), default=0)
-            for spelling in spellings
-        ),
-        default=0,
-    )
+    maximum_code_point = 0
     run_count = 0
-    origin_mask = 0
-    for packed_run in tokens.iter_runs():
-        run_count = schema.checked_add(run_count, 1)
-        origin_mask |= 1 << packed_run.identity_id
-        for token_index in range(packed_run.start, packed_run.stop):
-            if token_index != packed_run.start:
-                character_count = schema.checked_add(character_count, 1)
-                maximum_code_point = max(maximum_code_point, 32)
-            piece = AuditBuffer._audit_spelling(
-                spellings[spelling_ids[token_index]]
-            )
-            character_count = schema.checked_add(character_count, len(piece))
-        character_count = schema.checked_add(character_count, 1)
+    analysis_required = False
+    previous_identity_id = previous_inclusion_id = previous_original_line = None
+    token_count = len(tokens)
+    for token_index in range(token_count):
+        identity_id = identity_ids[token_index]
+        inclusion_id = inclusion_ids[token_index]
+        original_line = original_lines[token_index]
+        new_run = (
+            token_index == 0
+            or identity_id != previous_identity_id
+            or inclusion_id != previous_inclusion_id
+            or original_line != previous_original_line
+        )
+        if new_run:
+            run_count += 1
+            if token_index:
+                character_count += 1
+                maximum_code_point = max(maximum_code_point, 10)
+        else:
+            character_count += 1
+            maximum_code_point = max(maximum_code_point, 32)
+        previous_identity_id = identity_id
+        previous_inclusion_id = inclusion_id
+        previous_original_line = original_line
+        spelling = spellings[spelling_ids[token_index]]
+        if not analysis_required and spelling in candidate_spellings:
+            analysis_required = True
+        if spelling and spelling[0] in (ord('"'), ord("'")):
+            piece_length = len(spelling)
+            piece_maximum = 32 if piece_length else 0
+        else:
+            piece = _AUDIT_SPELLING_ALTERNATIVES.get(spelling, spelling)
+            piece_length = len(piece)
+            if maximum_code_point < 126 or not piece.isascii():
+                piece_maximum = max(piece, default=0)
+            elif maximum_code_point == 126 and b"\x7f" in piece:
+                piece_maximum = 127
+            else:
+                piece_maximum = maximum_code_point
+        character_count += piece_length
+        maximum_code_point = max(maximum_code_point, piece_maximum)
+    if token_count:
+        character_count += 1
         maximum_code_point = max(maximum_code_point, 10)
+
+    def spelling_occurrences(target: bytes) -> int:
+        try:
+            spelling_id = spellings.index(target)
+        except ValueError:
+            return 0
+        return spelling_ids.count(spelling_id)
+
+    opening_delimiters = (
+        spelling_occurrences(b"{") + spelling_occurrences(b"<%")
+    )
+    closing_delimiters = (
+        spelling_occurrences(b"}") + spelling_occurrences(b"%>")
+    )
+    delimiter_pair_count = min(opening_delimiters, closing_delimiters)
+    member_call_count = (
+        spelling_occurrences(b"read")
+        + spelling_occurrences(b"withRead")
+        + spelling_occurrences(b"complete")
+    )
+    scope_declaration_count = spelling_occurrences(b"GpuSyncReadScope")
+    scope_analysis_required = bool(
+        member_call_count or scope_declaration_count
+    )
+    # Python integers do not wrap.  Validate every accumulated term once before
+    # any allocation formula consumes it, instead of paying checked arithmetic
+    # for each of millions of packed tokens.
+    for measured_value in (
+        character_count,
+        run_count,
+    ):
+        schema.checked_add(measured_value)
     if character_count > 0xFFFFFFFF or run_count > 0xFFFFFFFF:
         raise AuditInfrastructureError("normalized audit mapping exceeds unsigned 32-bit range")
-    origin_count = origin_mask.bit_count()
+    # CompactTokenSequence reserves identity zero for the absent sentinel and
+    # interns every referenced real identity.  Treat duplicate origin keys as
+    # distinct here: this is a capacity bound, not an allocation-heavy set.
+    origin_count = max(0, len(identities) - 1)
     mapping_bytes = schema.checked_multiply(
         schema.checked_add(
             schema.checked_multiply(run_count, AuditBuffer._RUN_COLUMN_COUNT), 1
@@ -534,7 +770,14 @@ def _measure_audit_buffer_layout(tokens) -> _MeasuredAuditBufferLayout:
             run_count=run_count,
             origin_count=origin_count,
             chunk_count=chunk_count,
-            token_count=len(tokens),
+            token_count=token_count,
+            analysis_required=analysis_required,
+            scope_analysis_required=scope_analysis_required,
+            token_value_characters=character_count,
+            nonspace_character_count=character_count,
+            delimiter_pair_count=delimiter_pair_count,
+            member_call_count=member_call_count,
+            scope_declaration_count=scope_declaration_count,
         ),
         retained,
     )
@@ -663,6 +906,16 @@ class AuditBuffer:
         chunk_index = 0
         text_characters = 0
 
+        def flush_full_chunk() -> None:
+            nonlocal chunk, chunk_index
+            chunks[chunk_index] = chunk.decode("latin-1", errors="strict")
+            if _allocation_observer is not None:
+                _allocation_observer.maximum_chunk_characters = max(
+                    _allocation_observer.maximum_chunk_characters, len(chunk)
+                )
+            chunk_index += 1
+            chunk = bytearray()
+
         def append(piece: bytes) -> None:
             nonlocal chunk, chunk_index, text_characters
             piece_length = len(piece)
@@ -670,13 +923,7 @@ class AuditBuffer:
                 chunk.extend(piece)
                 text_characters += piece_length
                 if len(chunk) == cls._BLOCK_BYTES:
-                    chunks[chunk_index] = chunk.decode("latin-1", errors="strict")
-                    if _allocation_observer is not None:
-                        _allocation_observer.maximum_chunk_characters = max(
-                            _allocation_observer.maximum_chunk_characters, len(chunk)
-                        )
-                    chunk_index += 1
-                    chunk = bytearray()
+                    flush_full_chunk()
                 return
             offset = 0
             while offset < piece_length:
@@ -686,22 +933,41 @@ class AuditBuffer:
                 offset += take
                 text_characters += take
                 if len(chunk) == cls._BLOCK_BYTES:
-                    chunks[chunk_index] = chunk.decode("latin-1", errors="strict")
-                    if _allocation_observer is not None:
-                        _allocation_observer.maximum_chunk_characters = max(
-                            _allocation_observer.maximum_chunk_characters, len(chunk)
-                        )
-                    chunk_index += 1
-                    chunk = bytearray()
+                    flush_full_chunk()
+
+        def append_spaces(count: int) -> None:
+            while count:
+                take = min(count, cls._BLOCK_BYTES - len(chunk))
+                append(b" " * take)
+                count -= take
 
         for run_index, packed_run in enumerate(tokens.iter_runs()):
             normalized_start = text_characters
             for token_index in range(packed_run.start, packed_run.stop):
                 if token_index != packed_run.start:
-                    append(b" ")
+                    if len(chunk) == cls._BLOCK_BYTES - 1:
+                        append(b" ")
+                    else:
+                        chunk.append(32)
+                        text_characters += 1
                 spelling_id = spelling_ids_packed[token_index]
-                append(cls._audit_spelling(spellings[spelling_id]))
-            append(b"\n")
+                spelling = spellings[spelling_id]
+                if spelling.startswith((b'"', b"'")):
+                    append_spaces(len(spelling))
+                else:
+                    piece = _AUDIT_SPELLING_ALTERNATIVES.get(spelling, spelling)
+                    if len(piece) <= cls._BLOCK_BYTES - len(chunk):
+                        chunk.extend(piece)
+                        text_characters += len(piece)
+                        if len(chunk) == cls._BLOCK_BYTES:
+                            flush_full_chunk()
+                    else:
+                        append(piece)
+            if len(chunk) == cls._BLOCK_BYTES - 1:
+                append(b"\n")
+            else:
+                chunk.append(10)
+                text_characters += 1
             identity = identities[packed_run.identity_id]
             origin_key = (
                 identity.canonical if identity is not None else None,
@@ -743,7 +1009,7 @@ class AuditBuffer:
             chunk_index += 1
         if text_characters != layout.text_character_count or chunk_index != layout.chunk_count:
             raise AuditInfrastructureError("measured audit text layout changed")
-        if len(origin_production) != layout.origin_count:
+        if len(origin_production) > layout.origin_count:
             raise AuditInfrastructureError("measured audit origin count changed")
         peak_rss = cls._sample_rss(
             rss_reader,
@@ -822,9 +1088,16 @@ class AuditBuffer:
             )
         return self.location_at(self._line_starts[line - 1])
 
-    def candidate_paths(self) -> tuple[PurePosixPath, ...]:
+    def candidate_paths(
+        self,
+        trigger_spellings: frozenset[bytes] | None | bytes = _DEFAULT_CANDIDATE_PATHS,
+    ) -> tuple[PurePosixPath, ...]:
         result: set[PurePosixPath] = set()
-        candidates = capability_candidate_spellings()
+        candidates = (
+            capability_candidate_spellings()
+            if trigger_spellings == _DEFAULT_CANDIDATE_PATHS
+            else trigger_spellings
+        )
         tokens = self._view.tokens
         identities = object.__getattribute__(tokens, "_identities")
         spelling_ids = object.__getattribute__(tokens, "_spelling_ids")
@@ -836,11 +1109,14 @@ class AuditBuffer:
                 and identity.production
                 and identity.relative is not None
                 and is_production_path(identity.relative)
-                and any(
-                    spellings[spelling_ids[token_index]] in candidates
-                    for token_index in range(
-                        self._token_run_starts[run_index],
-                        self._token_run_stops[run_index],
+                and (
+                    candidates is None
+                    or any(
+                        spellings[spelling_ids[token_index]] in candidates
+                        for token_index in range(
+                            self._token_run_starts[run_index],
+                            self._token_run_stops[run_index],
+                        )
                     )
                 )
             ):
@@ -3983,9 +4259,18 @@ def _validate_capability_expression_provenance(
 
 
 @dataclass(frozen=True, slots=True)
+class PublicCapabilityPolicy:
+    path: PurePosixPath
+    class_name: str
+    member_pattern: str
+    expression: str
+
+
+@dataclass(frozen=True, slots=True)
 class CapabilityRule:
     trigger_spellings: tuple[bytes, ...]
     evaluator: Callable[..., list[Finding]]
+    public_policy: PublicCapabilityPolicy | None = None
 
 
 _CAPABILITY_RULES = (
@@ -4005,10 +4290,22 @@ _CAPABILITY_RULES = (
     CapabilityRule(
         (b"GpuRetireRegistry", b"registerRetire"),
         audit_public_member,
+        PublicCapabilityPolicy(
+            REGISTRY_HEADER,
+            "GpuRetireRegistry",
+            r"\bregisterRetire\s*\(",
+            "GpuRetireRegistry::registerRetire()",
+        ),
     ),
     CapabilityRule(
         (b"GpuOpScope", b"track"),
         audit_public_member,
+        PublicCapabilityPolicy(
+            OP_SCOPE_HEADER,
+            "GpuOpScope",
+            r"\btrack\s*\(",
+            "GpuOpScope::track()",
+        ),
     ),
 )
 
@@ -4068,13 +4365,12 @@ def _audit_preprocessed_view_unfiltered(
     view: PreprocessedTranslationUnitView,
     limits: AuditLimits,
     rss_reader: Callable[[], int],
+    *,
+    _filter_rule_paths: bool = False,
 ) -> list[Finding]:
-    """Apply the established capability grammar to one authoritative full-TU view."""
+    """Apply every rule; the default is the independent reference path."""
 
     buffer = AuditBuffer.from_preprocessed(view, limits, rss_reader)
-    if not view_has_capability_spelling(view):
-        return []
-    candidate_paths = buffer.candidate_paths()
     translated = TranslationText(
         buffer.text,
         buffer.text,
@@ -4092,56 +4388,52 @@ def _audit_preprocessed_view_unfiltered(
         _compiler_analysis_context.reset(context_token)
     buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
     findings: list[Finding] = []
-    grouped_paths: dict[tuple[object, ...], list[PurePosixPath]] = {}
-    for path in candidate_paths:
-        grouped_paths.setdefault(_capability_policy_key(path), []).append(path)
-    for paths in grouped_paths.values():
-        representative = paths[0]
-        allowed = frozenset(paths)
-        buffer.reserve_rss(rss_reader, limits.rss_bytes, len(buffer.text) * 48)
-        context_token = _compiler_analysis_context.set(analysis)
-        try:
-            candidate_findings = audit_capability_uses(
-                representative,
-                buffer.text,
-                compiler_view=True,
-                compiler_translation_text=translated,
-                compiler_analysis=analysis,
-            )
-        finally:
-            _compiler_analysis_context.reset(context_token)
-        buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
-        findings.extend(_map_candidate_findings(
-            buffer,
-            allowed,
-            candidate_findings,
-        ))
-
-    public_policies = (
-        (
-            REGISTRY_HEADER,
-            "GpuRetireRegistry",
-            r"\bregisterRetire\s*\(",
-            "GpuRetireRegistry::registerRetire()",
-        ),
-        (
-            OP_SCOPE_HEADER,
-            "GpuOpScope",
-            r"\btrack\s*\(",
-            "GpuOpScope::track()",
-        ),
-    )
-    candidate_path_set = set(candidate_paths)
-    for path, class_name, member_pattern, expression in public_policies:
-        if path not in candidate_path_set:
+    for rule in _CAPABILITY_RULES:
+        path_filter = (
+            frozenset(rule.trigger_spellings) if _filter_rule_paths else None
+        )
+        candidate_paths = buffer.candidate_paths(path_filter)
+        if rule.public_policy is None:
+            grouped_paths: dict[tuple[object, ...], list[PurePosixPath]] = {}
+            for path in candidate_paths:
+                grouped_paths.setdefault(_capability_policy_key(path), []).append(path)
+            for paths in grouped_paths.values():
+                representative = paths[0]
+                allowed = frozenset(paths)
+                buffer.reserve_rss(
+                    rss_reader, limits.rss_bytes, len(buffer.text) * 48
+                )
+                context_token = _compiler_analysis_context.set(analysis)
+                try:
+                    candidate_findings = rule.evaluator(
+                        representative,
+                        buffer.text,
+                        compiler_view=True,
+                        compiler_translation_text=translated,
+                        compiler_analysis=analysis,
+                    )
+                finally:
+                    _compiler_analysis_context.reset(context_token)
+                buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
+                findings.extend(_map_candidate_findings(
+                    buffer,
+                    allowed,
+                    candidate_findings,
+                ))
             continue
-        if not buffer.path_has_spelling(path, class_name.encode("ascii")):
+
+        policy = rule.public_policy
+        if policy.path not in candidate_paths:
+            continue
+        if not buffer.path_has_spelling(
+            policy.path, policy.class_name.encode("ascii")
+        ):
             continue
 
         def candidate_line(
             line: int,
             *,
-            expected: PurePosixPath = path,
+            expected: PurePosixPath = policy.path,
         ) -> bool:
             location = buffer.location_for_line(line)
             identity = location.identity
@@ -4154,12 +4446,12 @@ def _audit_preprocessed_view_unfiltered(
         buffer.reserve_rss(rss_reader, limits.rss_bytes, len(buffer.text) * 16)
         context_token = _compiler_analysis_context.set(analysis)
         try:
-            public_findings = audit_public_member(
-                path,
+            public_findings = rule.evaluator(
+                policy.path,
                 buffer.text,
-                class_name,
-                member_pattern,
-                expression,
+                policy.class_name,
+                policy.member_pattern,
+                policy.expression,
                 candidate_line=candidate_line,
                 pretokenized=True,
                 compiler_analysis=analysis,
@@ -4169,7 +4461,7 @@ def _audit_preprocessed_view_unfiltered(
         buffer.reserve_rss(rss_reader, limits.rss_bytes, 0)
         findings.extend(_map_candidate_findings(
             buffer,
-            frozenset((path,)),
+            frozenset((policy.path,)),
             public_findings,
         ))
 
@@ -4194,7 +4486,9 @@ def audit_preprocessed_view(
 
     if not view_has_capability_spelling(view):
         return []
-    return _audit_preprocessed_view_unfiltered(view, limits, rss_reader)
+    return _audit_preprocessed_view_unfiltered(
+        view, limits, rss_reader, _filter_rule_paths=True
+    )
 
 
 def aggregate_findings(
@@ -8518,7 +8812,7 @@ def profile_compiler_view(
     # production defaults remain unchanged; allow the Windows stream pump and
     # Python provenance parser enough time to construct this one profile view.
     profile_limits = dataclasses.replace(
-        AuditLimits(), invocation_seconds=150.0, total_seconds=360.0
+        AuditLimits(), invocation_seconds=300.0, total_seconds=600.0
     )
     deadline = time.monotonic() + profile_limits.total_seconds
     configurations = _gpu_capability_runner.collect_configurations(
@@ -8540,51 +8834,15 @@ def profile_compiler_view(
     production = enumerate_production_identities(root)
     configuration = matches[0]
     build_started = time.perf_counter()
-    with _gpu_capability_runner.tempfile.TemporaryDirectory(
-        prefix=".gpu-capability-profile-"
-    ) as temporary:
-        suffix = ".json" if configuration.family in {
-            CompilerFamily.MSVC,
-            CompilerFamily.CLANG_CL,
-        } else ".d"
-        rewritten = _gpu_capability_command.rewrite_preprocess_command(
-            configuration, Path(temporary) / f"dependencies{suffix}"
+    view, _discovery, _stages = (
+        _gpu_capability_runner.stabilize_and_parse_configuration(
+            configuration,
+            authority,
+            production,
+            profile_limits,
+            deadline,
         )
-        try:
-            completed = _gpu_capability_runner.subprocess.run(
-                rewritten.arguments,
-                cwd=configuration.working_directory,
-                stdin=_gpu_capability_runner.subprocess.DEVNULL,
-                stdout=_gpu_capability_runner.subprocess.PIPE,
-                stderr=_gpu_capability_runner.subprocess.PIPE,
-                timeout=profile_limits.invocation_seconds,
-                check=False,
-            )
-        except (
-            OSError,
-            _gpu_capability_runner.subprocess.SubprocessError,
-        ) as error:
-            raise AuditInfrastructureError(
-                f"profile compiler invocation failed: {error}"
-            ) from error
-        if completed.returncode != 0:
-            raise AuditInfrastructureError(
-                "profile compiler invocation failed: "
-                f"exit={completed.returncode} "
-                f"stderr={completed.stderr[max(0, len(completed.stderr) - 4096):]!r}"
-            )
-        if len(completed.stdout) > profile_limits.stdout_bytes:
-            raise AuditInfrastructureError("profile compiler stdout limit exceeded")
-        if len(completed.stderr) > profile_limits.stderr_bytes:
-            raise AuditInfrastructureError("profile compiler stderr limit exceeded")
-        identities = _gpu_capability_runner._parse_dependency_output(
-            rewritten, configuration, authority, production, deadline, None
-        )
-        builder = _gpu_capability_provenance.PreprocessedStreamBuilder(
-            configuration, production, profile_limits, _current_process_rss_bytes
-        )
-        builder.feed(completed.stdout)
-        view = builder.finalize(identities)
+    )
     build_elapsed = time.perf_counter() - build_started
     started = time.perf_counter()
     findings = audit_preprocessed_view(
