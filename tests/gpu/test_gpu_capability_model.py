@@ -510,6 +510,70 @@ class ModelTests(unittest.TestCase):
             before,
         )
 
+    def test_accept_validated_result_rolls_back_every_mutation_boundary(self):
+        configuration = self.configuration(digest="1" * 64)
+        result = ConfigurationAuditResult(
+            configuration.digest,
+            "a" * 64,
+            (self.dependency(),),
+            (PurePosixPath("playback/gpu/example.cpp"),),
+            (
+                AuditResultFinding(
+                    PurePosixPath("playback/gpu/example.cpp"),
+                    7,
+                    "nativeHandle()",
+                    "outside lease",
+                ),
+            ),
+        )
+        stages = ("accepted", "reached", "finding", "digest", "ownership")
+        for stage in stages:
+            with self.subTest(stage=stage):
+                budget = CompactResultMemoryBudget()
+                aggregator = StreamingResultAggregator(
+                    (configuration,), budget, AuditLimits()
+                )
+                ownership = budget.reserve(
+                    compact_result_retained_bytes(result)
+                ).commit()
+                before = (
+                    aggregator.accepted_count,
+                    tuple(aggregator._reached.items()),
+                    tuple(aggregator._findings.items()),
+                    tuple(aggregator._digests.items()),
+                    len(aggregator._growth_ownerships),
+                    budget.live_bytes,
+                )
+
+                def fail_at_boundary(observed):
+                    if observed == stage:
+                        raise RuntimeError(f"forced {stage} failure")
+
+                with mock.patch(
+                    "gpu_capability_model._after_streaming_aggregate_mutation",
+                    side_effect=fail_at_boundary,
+                    create=True,
+                ), self.assertRaisesRegex(RuntimeError, f"forced {stage}"):
+                    aggregator.accept_validated_result(
+                        configuration, result, ownership
+                    )
+                self.assertEqual(
+                    (
+                        aggregator.accepted_count,
+                        tuple(aggregator._reached.items()),
+                        tuple(aggregator._findings.items()),
+                        tuple(aggregator._digests.items()),
+                        len(aggregator._growth_ownerships),
+                        budget.live_bytes,
+                    ),
+                    before,
+                )
+                self.assertTrue(ownership.committed)
+                aggregator.accept_validated_result(
+                    configuration, result, ownership
+                )
+                self.assertTrue(ownership.released)
+
     def test_aggregate_growth_failure_occurs_before_insert(self):
         configuration = self.configuration(digest="1" * 64)
         result = ConfigurationAuditResult(

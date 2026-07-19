@@ -2290,6 +2290,19 @@ class StreamingAuditSummary:
                 ownership.release()
 
 
+def _after_streaming_aggregate_mutation(_stage: str) -> None:
+    """Fault-injection boundary for transactional aggregate mutation tests."""
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamingAggregateMutation:
+    configuration_digest: str
+    reached_keys: tuple[str, ...]
+    finding_changes: tuple[tuple[tuple[str, int, str, str], bool], ...]
+    digest_keys: tuple[tuple[str, str, str], ...]
+    growth_ownership: CompactResultOwnership
+
+
 def encode_canonical_summary(summary: StreamingAuditSummary) -> bytes:
     if not isinstance(summary, StreamingAuditSummary):
         raise AuditInfrastructureError("streaming audit summary is invalid")
@@ -2358,6 +2371,7 @@ class StreamingResultAggregator:
         ] = {}
         self._digests: dict[tuple[str, str, str], None] = {}
         self._growth_ownerships: list[CompactResultOwnership] = []
+        self._mutation_journals: list[_StreamingAggregateMutation] = []
         self._cold_ownership: CompactResultOwnership | None = None
         self._finished = False
 
@@ -2406,11 +2420,11 @@ class StreamingResultAggregator:
         coverage_bytes = 0
         for path in result.reached_production:
             if path.as_posix() not in self._reached:
-                coverage_bytes += 160 + len(path.as_posix().encode("utf-8"))
+                coverage_bytes += 176 + len(path.as_posix().encode("utf-8"))
         finding_bytes = 0
         for finding in result.findings:
             key = _audit_finding_key(finding)
-            finding_bytes += 96
+            finding_bytes += 120
             if key not in self._findings:
                 finding_bytes += (
                     320
@@ -2427,7 +2441,7 @@ class StreamingResultAggregator:
             )
             if digest_key not in self._digests:
                 digest_bytes += (
-                    256
+                    272
                     + len(digest_key[0].encode("ascii"))
                     + len(digest_key[1].encode("utf-8"))
                     + len(digest_key[2])
@@ -2486,27 +2500,132 @@ class StreamingResultAggregator:
         finally:
             workspace.release()
 
-        self._accepted.add(configuration.digest)
-        for path in result.reached_production:
-            self._reached.setdefault(path.as_posix(), path)
-        for finding in result.findings:
-            key = _audit_finding_key(finding)
-            existing = self._findings.get(key)
-            if existing is None:
-                self._findings[key] = (finding, [configuration.digest])
-            else:
-                existing[1].append(configuration.digest)
-        for dependency in result.dependencies:
-            self._digests.setdefault(
-                (
+        reached_keys: list[str] = []
+        finding_changes: list[tuple[tuple[str, int, str, str], bool]] = []
+        digest_keys: list[tuple[str, str, str]] = []
+        accepted_inserted = False
+        growth_appended = False
+        journal_appended = False
+        try:
+            self._accepted.add(configuration.digest)
+            accepted_inserted = True
+            _after_streaming_aggregate_mutation("accepted")
+            for path in result.reached_production:
+                path_key = path.as_posix()
+                if path_key not in self._reached:
+                    self._reached[path_key] = path
+                    reached_keys.append(path_key)
+            _after_streaming_aggregate_mutation("reached")
+            for finding in result.findings:
+                key = _audit_finding_key(finding)
+                existing = self._findings.get(key)
+                if existing is None:
+                    self._findings[key] = (finding, [configuration.digest])
+                    finding_changes.append((key, True))
+                else:
+                    existing[1].append(configuration.digest)
+                    finding_changes.append((key, False))
+            _after_streaming_aggregate_mutation("finding")
+            for dependency in result.dependencies:
+                key = (
                     dependency.stable_role,
                     dependency.role_relative_path.as_posix(),
                     dependency.sha256,
-                ),
-                None,
+                )
+                if key not in self._digests:
+                    self._digests[key] = None
+                    digest_keys.append(key)
+            _after_streaming_aggregate_mutation("digest")
+            journal = _StreamingAggregateMutation(
+                configuration.digest,
+                tuple(reached_keys),
+                tuple(finding_changes),
+                tuple(digest_keys),
+                growth_ownership,
             )
-        self._growth_ownerships.append(growth_ownership)
-        ownership.release()
+            self._growth_ownerships.append(growth_ownership)
+            growth_appended = True
+            self._mutation_journals.append(journal)
+            journal_appended = True
+            _after_streaming_aggregate_mutation("ownership")
+            ownership.release()
+        except BaseException:
+            if journal_appended:
+                popped_journal = self._mutation_journals.pop()
+                if popped_journal.growth_ownership is not growth_ownership:
+                    raise AuditInfrastructureError(
+                        "streaming aggregate journal order differs"
+                    )
+            if growth_appended:
+                popped_growth = self._growth_ownerships.pop()
+                if popped_growth is not growth_ownership:
+                    raise AuditInfrastructureError(
+                        "streaming aggregate ownership order differs"
+                    )
+            for key in reversed(digest_keys):
+                self._digests.pop(key)
+            for key, inserted in reversed(finding_changes):
+                if inserted:
+                    self._findings.pop(key)
+                else:
+                    existing = self._findings[key]
+                    if not existing[1] or existing[1][-1] != configuration.digest:
+                        raise AuditInfrastructureError(
+                            "streaming aggregate finding rollback differs"
+                        )
+                    existing[1].pop()
+            for key in reversed(reached_keys):
+                self._reached.pop(key)
+            if accepted_inserted:
+                self._accepted.discard(configuration.digest)
+            if not growth_ownership.released:
+                growth_ownership.release()
+            raise
+
+    def _checkpoint(self) -> int:
+        if self._finished:
+            raise AuditInfrastructureError(
+                "streaming result aggregate is already finished"
+            )
+        return len(self._mutation_journals)
+
+    def _rollback_to(self, checkpoint: int) -> None:
+        if (
+            self._finished
+            or not isinstance(checkpoint, int)
+            or isinstance(checkpoint, bool)
+            or checkpoint < 0
+            or checkpoint > len(self._mutation_journals)
+        ):
+            raise AuditInfrastructureError(
+                "streaming aggregate rollback checkpoint is invalid"
+            )
+        while len(self._mutation_journals) > checkpoint:
+            journal = self._mutation_journals.pop()
+            growth = self._growth_ownerships.pop()
+            if growth is not journal.growth_ownership:
+                raise AuditInfrastructureError(
+                    "streaming aggregate rollback ownership differs"
+                )
+            for key in reversed(journal.digest_keys):
+                self._digests.pop(key)
+            for key, inserted in reversed(journal.finding_changes):
+                if inserted:
+                    self._findings.pop(key)
+                else:
+                    existing = self._findings[key]
+                    if (
+                        not existing[1]
+                        or existing[1][-1] != journal.configuration_digest
+                    ):
+                        raise AuditInfrastructureError(
+                            "streaming aggregate rollback finding differs"
+                        )
+                    existing[1].pop()
+            for key in reversed(journal.reached_keys):
+                self._reached.pop(key)
+            self._accepted.remove(journal.configuration_digest)
+            growth.release()
 
     def finish(self) -> StreamingAuditSummary:
         if self._finished:
@@ -2592,6 +2711,7 @@ class StreamingResultAggregator:
         self._finished = True
         self._base_ownership = None
         self._growth_ownerships.clear()
+        self._mutation_journals.clear()
         self._accepted.clear()
         self._reached.clear()
         self._findings.clear()

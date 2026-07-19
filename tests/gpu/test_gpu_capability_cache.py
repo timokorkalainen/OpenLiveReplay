@@ -4475,33 +4475,29 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         )
         altered_payload = capability_cache.encode_configuration_audit_result(altered)
         altered_manifest = cache._manifest_bytes(key, altered_payload)
-        original_hash = capability_cache._hash_held_dependency
-        reads = 0
+        original_read = cache._read_authenticated_entry
 
-        def replace_after_dependency_validation(handle):
-            nonlocal reads
-            digest = original_hash(handle)
-            reads += 1
-            if reads == 2:
-                for path, payload in (
-                    (entry / "payload.json", altered_payload),
-                    (entry / "manifest.json", altered_manifest),
-                ):
-                    with path.open("r+b") as stream:
-                        stream.seek(0)
-                        stream.write(payload)
-                        stream.truncate()
-                        stream.flush()
-                        os.fsync(stream.fileno())
-            return digest
+        def replace_before_final_decode(*arguments, **keywords):
+            for path, payload in (
+                (entry / "payload.json", altered_payload),
+                (entry / "manifest.json", altered_manifest),
+            ):
+                with path.open("r+b") as stream:
+                    stream.seek(0)
+                    stream.write(payload)
+                    stream.truncate()
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            return original_read(*arguments, **keywords)
 
         budget = CompactResultMemoryBudget()
         aggregator = StreamingResultAggregator(
             (self.configuration,), budget, capability_cache.AuditLimits()
         )
-        with mock.patch(
-            "gpu_capability_cache._hash_held_dependency",
-            side_effect=replace_after_dependency_validation,
+        with mock.patch.object(
+            cache,
+            "_read_authenticated_entry",
+            side_effect=replace_before_final_decode,
         ), self.assertRaisesRegex(
             AuditInfrastructureError, "replaced|generation"
         ):
@@ -4510,6 +4506,214 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 self.production_snapshot, budget, aggregator,
                 CompactResultColdSlot(1 << 20), self.pipeline_deadline,
             )
+
+    def test_dependency_handles_cover_decode_and_final_batch_classification(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        original_read = cache._read_authenticated_entry
+        original_dependency = self.main_path.read_bytes()
+        rewrite_denied = False
+
+        def decode_then_rewrite(*arguments, **keywords):
+            nonlocal rewrite_denied
+            decoded = original_read(*arguments, **keywords)
+            try:
+                self.main_path.write_bytes(b"x" * len(self.main_path.read_bytes()))
+            except OSError:
+                rewrite_denied = True
+            return decoded
+
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (self.configuration,), budget, capability_cache.AuditLimits()
+        )
+        with mock.patch.object(
+            cache,
+            "_read_authenticated_entry",
+            side_effect=decode_then_rewrite,
+        ), mock.patch.object(
+            cache, "_record_access", wraps=cache._record_access
+        ) as recorded_access:
+            batch = cache.load_many(
+                (self.configuration,), self.dependency_roots, self.engine,
+                self.production_snapshot, budget, aggregator,
+                CompactResultColdSlot(1 << 20), self.pipeline_deadline,
+            )
+        if os.name == "nt":
+            self.assertTrue(rewrite_denied)
+            self.assertEqual((batch.hit_count, batch.misses), (1, ()))
+            recorded_access.assert_called_once()
+        else:
+            self.assertFalse(rewrite_denied)
+            self.assertEqual(
+                (batch.hit_count, batch.misses),
+                (0, (self.configuration,)),
+            )
+            self.assertEqual(aggregator.accepted_count, 0)
+            recorded_access.assert_not_called()
+            self.main_path.write_bytes(original_dependency)
+            retry = cache.load_many(
+                (self.configuration,), self.dependency_roots, self.engine,
+                self.production_snapshot, budget, aggregator,
+                CompactResultColdSlot(1 << 20), self.pipeline_deadline,
+            )
+            self.assertEqual((retry.hit_count, retry.misses), (1, ()))
+            self.assertEqual(aggregator.accepted_count, 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX provisional batch rollback semantics")
+    def test_final_drift_rolls_back_only_current_batch_and_records_no_access(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        configurations = tuple(
+            dataclasses.replace(self.configuration, digest=f"{index + 1:064x}")
+            for index in range(3)
+        )
+        results = tuple(
+            dataclasses.replace(self.result, configuration_digest=item.digest)
+            for item in configurations
+        )
+        for configuration, result in zip(
+            configurations[1:], results[1:], strict=True
+        ):
+            cache.publish(
+                configuration,
+                self.dependency_roots,
+                result,
+                dataclasses.replace(
+                    self.publication_permit,
+                    configuration_digest=configuration.digest,
+                ),
+                self.pipeline_deadline,
+            )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            configurations, budget, capability_cache.AuditLimits()
+        )
+        aggregator.accept_validated_result(
+            configurations[0],
+            results[0],
+            budget.reserve(
+                capability_cache.compact_result_retained_bytes(results[0])
+            ).commit(),
+        )
+        original_dependency = self.main_path.read_bytes()
+        original_read = cache._read_authenticated_entry
+        mutated = False
+
+        def decode_then_mutate(*arguments, **keywords):
+            nonlocal mutated
+            decoded = original_read(*arguments, **keywords)
+            if not mutated:
+                mutated = True
+                self.main_path.write_bytes(b"x" * len(original_dependency))
+            return decoded
+
+        with mock.patch.object(
+            cache,
+            "_read_authenticated_entry",
+            side_effect=decode_then_mutate,
+        ), mock.patch.object(cache, "_record_access") as recorded_access:
+            batch = cache.load_many(
+                configurations[1:], self.dependency_roots, self.engine,
+                self.production_snapshot, budget, aggregator,
+                CompactResultColdSlot(1 << 20), self.pipeline_deadline,
+            )
+        self.assertEqual((batch.hit_count, batch.misses), (0, configurations[1:]))
+        self.assertEqual(aggregator.accepted_count, 1)
+        recorded_access.assert_not_called()
+        self.main_path.write_bytes(original_dependency)
+        retry = cache.load_many(
+            configurations[1:], self.dependency_roots, self.engine,
+            self.production_snapshot, budget, aggregator,
+            CompactResultColdSlot(1 << 20), self.pipeline_deadline,
+        )
+        self.assertEqual((retry.hit_count, retry.misses), (2, ()))
+        self.assertEqual(aggregator.accepted_count, 3)
+
+    def test_final_dependency_hash_honors_deadline_and_rolls_back_hits(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (self.configuration,), budget, capability_cache.AuditLimits()
+        )
+        baseline = budget.live_bytes
+        original_hash = capability_cache._hash_held_dependency
+        hashes = 0
+
+        def expire_at_final_boundary(handle):
+            nonlocal hashes
+            hashes += 1
+            if hashes == 2:
+                handle.deadline = time.monotonic() - 1.0
+            return original_hash(handle)
+
+        with mock.patch(
+            "gpu_capability_cache._hash_held_dependency",
+            side_effect=expire_at_final_boundary,
+        ), mock.patch.object(cache, "_record_access") as recorded_access, \
+             self.assertRaisesRegex(AuditInfrastructureError, "hashing deadline"):
+            cache.load_many(
+                (self.configuration,), self.dependency_roots, self.engine,
+                self.production_snapshot, budget, aggregator,
+                CompactResultColdSlot(1 << 20), self.pipeline_deadline,
+            )
+        self.assertEqual(hashes, 2)
+        self.assertEqual(aggregator.accepted_count, 0)
+        self.assertEqual(budget.live_bytes, baseline)
+        recorded_access.assert_not_called()
+
+    def test_load_many_releases_candidate_and_validation_ownership_on_exception(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (self.configuration,), budget, capability_cache.AuditLimits()
+        )
+        baseline = budget.live_bytes
+        captured = []
+        original_metadata = cache._read_authenticated_candidate_metadata
+
+        def capture_metadata(*arguments, **keywords):
+            candidate = original_metadata(*arguments, **keywords)
+            captured.append(candidate)
+            return candidate
+
+        with mock.patch.object(
+            cache,
+            "_read_authenticated_candidate_metadata",
+            side_effect=capture_metadata,
+        ), mock.patch(
+            "gpu_capability_cache._open_dependency_handle",
+            side_effect=AuditInfrastructureError("forced dependency open failure"),
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "forced dependency open failure"
+        ):
+            cache.load_many(
+                (self.configuration,), self.dependency_roots, self.engine,
+                self.production_snapshot, budget, aggregator,
+                CompactResultColdSlot(1 << 20), self.pipeline_deadline,
+            )
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(captured[0].metadata_ownership.released)
+        self.assertEqual(budget.live_bytes, baseline)
 
     def test_same_path_candidates_with_conflicting_identities_do_not_share_a_hit(self):
         authority = build_dependency_root_authority(

@@ -3365,82 +3365,131 @@ class ConfigurationAuditCache:
         authority = validate_dependency_root_authority(dependency_roots)
         snapshot = self._snapshot_map(production_snapshot)
         self._prepare_for_operation(deadline)
+        return self._load_many_prepared(
+            configurations,
+            engine,
+            snapshot,
+            result_budget,
+            aggregator,
+            maximum_cold_slot,
+            deadline,
+            authority,
+        )
+
+    def _load_many_prepared(
+        self,
+        configurations: tuple[PreprocessConfiguration, ...],
+        engine: str,
+        snapshot: dict[str, DependencyDigest],
+        result_budget: CompactResultMemoryBudget,
+        aggregator: StreamingResultAggregator,
+        maximum_cold_slot: CompactResultColdSlot,
+        deadline: float,
+        authority: DependencyRootAuthority,
+    ) -> ConfigurationAuditLoadBatch:
         candidates: dict[str, _AuditCacheCandidate] = {}
         misses: set[str] = set()
-        for configuration in configurations:
-            if time.monotonic() >= deadline:
-                raise AuditInfrastructureError("audit cache deadline exceeded")
-            key = audit_cache_key(configuration.digest, engine)
-            with self._key_lock(key, deadline):
-                candidate = self._read_authenticated_candidate_metadata(
-                    configuration, key, engine, result_budget
-                )
-            if candidate is None:
-                misses.add(configuration.digest)
-                continue
-            self._validate_dependency_authority(candidate.dependencies, authority)
-            if not self._production_matches(candidate.dependencies, snapshot):
-                misses.add(configuration.digest)
-                if (
-                    candidate.metadata_ownership is not None
-                    and not candidate.metadata_ownership.released
-                ):
-                    candidate.metadata_ownership.release()
-                continue
-            candidates[configuration.digest] = candidate
+        checkpoint = aggregator._checkpoint()
 
-        validation_metadata_bytes = 512 + sum(
-            544 + len(str(dependency.identity.canonical).encode("utf-8"))
-            for candidate in candidates.values()
-            for dependency in candidate.dependencies
-        )
-        validation_metadata_ownership = result_budget.reserve(
-            validation_metadata_bytes,
-            label="dependency validation metadata",
-        ).commit()
-        dependency_users: dict[str, list[_AuditCacheCandidate]] = {}
-        dependency_representatives: dict[str, DependencyDigest] = {}
-        expected_dependencies: dict[tuple[str, str], DependencyDigest] = {}
-        limits = AuditLimits()
-        metadata_bytes = 0
-        for candidate in candidates.values():
-            candidate_paths: set[str] = set()
-            for dependency in candidate.dependencies:
-                path_key = _path_key(dependency.identity.canonical)
-                if path_key in candidate_paths:
-                    raise AuditInfrastructureError(
-                        "audit result dependency paths are ambiguous"
-                    )
-                candidate_paths.add(path_key)
-                if path_key not in dependency_representatives:
-                    metadata_bytes += 512 + len(
-                        str(dependency.identity.canonical).encode("utf-8")
-                    )
-                metadata_bytes += 32
-                if (
-                    len(dependency_representatives)
-                    + int(path_key not in dependency_representatives)
-                    > limits.unique_dependency_handles
-                    or metadata_bytes > limits.dependency_handle_metadata_bytes
-                ):
-                    raise AuditInfrastructureError(
-                        "dependency handle or metadata ceiling exceeded before open"
-                    )
-                dependency_users.setdefault(path_key, []).append(candidate)
-                dependency_representatives.setdefault(path_key, dependency)
-                expected_dependencies[
-                    (candidate.configuration.digest, path_key)
-                ] = dependency
-        initial: dict[str, str] = {}
-        final: dict[str, str] = {}
+        def release_if_live(ownership: CompactResultOwnership) -> None:
+            if not ownership.released:
+                ownership.release()
+
         try:
-            with contextlib.ExitStack() as stack:
-                held = {
-                    path_key: stack.enter_context(_open_dependency_handle(dependency))
-                    for path_key, dependency in dependency_representatives.items()
-                }
-                for handle in held.values():
-                    handle.deadline = deadline
+            with contextlib.ExitStack() as ownership_cleanup, contextlib.ExitStack() as dependency_stack:
+                for configuration in configurations:
+                    if time.monotonic() >= deadline:
+                        raise AuditInfrastructureError("audit cache deadline exceeded")
+                    key = audit_cache_key(configuration.digest, engine)
+                    with self._key_lock(key, deadline):
+                        candidate = self._read_authenticated_candidate_metadata(
+                            configuration, key, engine, result_budget
+                        )
+                    if candidate is None:
+                        misses.add(configuration.digest)
+                        continue
+                    if candidate.metadata_ownership is not None:
+                        ownership_cleanup.callback(
+                            release_if_live, candidate.metadata_ownership
+                        )
+                    self._validate_dependency_authority(
+                        candidate.dependencies, authority
+                    )
+                    if not self._production_matches(candidate.dependencies, snapshot):
+                        misses.add(configuration.digest)
+                        if (
+                            candidate.metadata_ownership is not None
+                            and not candidate.metadata_ownership.released
+                        ):
+                            candidate.metadata_ownership.release()
+                        continue
+                    candidates[configuration.digest] = candidate
+
+                validation_metadata_bytes = 512 + sum(
+                    544 + len(str(dependency.identity.canonical).encode("utf-8"))
+                    for candidate in candidates.values()
+                    for dependency in candidate.dependencies
+                )
+                validation_metadata_ownership = result_budget.reserve(
+                    validation_metadata_bytes,
+                    label="dependency validation metadata",
+                ).commit()
+                ownership_cleanup.callback(
+                    release_if_live, validation_metadata_ownership
+                )
+                dependency_users: dict[str, list[_AuditCacheCandidate]] = {}
+                dependency_representatives: dict[str, DependencyDigest] = {}
+                expected_dependencies: dict[
+                    tuple[str, str], DependencyDigest
+                ] = {}
+                limits = AuditLimits()
+                metadata_bytes = 0
+                for candidate in candidates.values():
+                    candidate_paths: set[str] = set()
+                    for dependency in candidate.dependencies:
+                        path_key = _path_key(dependency.identity.canonical)
+                        if path_key in candidate_paths:
+                            raise AuditInfrastructureError(
+                                "audit result dependency paths are ambiguous"
+                            )
+                        candidate_paths.add(path_key)
+                        if path_key not in dependency_representatives:
+                            metadata_bytes += 512 + len(
+                                str(dependency.identity.canonical).encode("utf-8")
+                            )
+                        metadata_bytes += 32
+                        if (
+                            len(dependency_representatives)
+                            + int(path_key not in dependency_representatives)
+                            > limits.unique_dependency_handles
+                            or metadata_bytes
+                            > limits.dependency_handle_metadata_bytes
+                        ):
+                            raise AuditInfrastructureError(
+                                "dependency handle or metadata ceiling exceeded before open"
+                            )
+                        dependency_users.setdefault(path_key, []).append(candidate)
+                        dependency_representatives.setdefault(path_key, dependency)
+                        expected_dependencies[
+                            (candidate.configuration.digest, path_key)
+                        ] = dependency
+
+                held: dict[str, _HeldDependencyHandle] = {}
+                try:
+                    for path_key, dependency in dependency_representatives.items():
+                        handle = dependency_stack.enter_context(
+                            _open_dependency_handle(dependency)
+                        )
+                        handle.deadline = deadline
+                        held[path_key] = handle
+                except _UnsafeCacheNamespaceError as error:
+                    raise AuditInfrastructureError(
+                        "dependency namespace is linked or unsafe"
+                    ) from error
+                except OSError:
+                    misses.update(candidates)
+
+                initial: dict[str, str] = {}
                 for path_key, handle in held.items():
                     initial[path_key] = _hash_held_dependency(handle)
                     opened_identity = handle.opened_stat[:2]
@@ -3448,130 +3497,142 @@ class ConfigurationAuditCache:
                         dependency = expected_dependencies[
                             (candidate.configuration.digest, path_key)
                         ]
-                        expected_identity = (
+                        if (
                             dependency.identity.device,
                             dependency.identity.inode,
-                        )
-                        if expected_identity != opened_identity:
+                        ) != opened_identity:
                             misses.add(candidate.configuration.digest)
-                for path_key, handle in held.items():
-                    final[path_key] = _hash_held_dependency(handle)
-        except _UnsafeCacheNamespaceError as error:
-            raise AuditInfrastructureError("dependency namespace is linked or unsafe") from error
-        except AuditInfrastructureError:
+                for path_key, users in dependency_users.items():
+                    for candidate in users:
+                        expected = expected_dependencies[
+                            (candidate.configuration.digest, path_key)
+                        ].sha256
+                        if initial.get(path_key) != expected:
+                            misses.add(candidate.configuration.digest)
+
+                if misses:
+                    aggregator.reserve_cold_slot(maximum_cold_slot)
+                accepted_digests: list[str] = []
+                hit_count = 0
+                for configuration in configurations:
+                    if configuration.digest in misses:
+                        continue
+                    candidate = candidates[configuration.digest]
+                    result_ownership = result_budget.reserve(
+                        candidate.decoded_result_bytes,
+                        label="batch retained result limit",
+                    ).commit()
+                    try:
+                        decode_workspace = result_budget.reserve(
+                            8192 + 9 * candidate.payload_identity[2],
+                            label="compact result decode workspace",
+                        ).commit()
+                    except BaseException:
+                        result_ownership.release()
+                        raise
+                    try:
+                        with self._key_lock(candidate.key, deadline):
+                            decoded = self._read_authenticated_entry(
+                                configuration, candidate.key, engine
+                            )
+                    except BaseException:
+                        decode_workspace.release()
+                        result_ownership.release()
+                        raise
+                    decode_workspace.release()
+                    if decoded is None:
+                        result_ownership.release()
+                        misses.add(configuration.digest)
+                        if aggregator.cold_slot_reserved_bytes == 0:
+                            aggregator.reserve_cold_slot(maximum_cold_slot)
+                        continue
+                    decoded_candidate, result = decoded
+                    if (
+                        decoded_candidate.entry_identity != candidate.entry_identity
+                        or decoded_candidate.manifest_identity is None
+                        or candidate.manifest_identity is None
+                        or decoded_candidate.manifest_identity[:2]
+                        != candidate.manifest_identity[:2]
+                        or decoded_candidate.payload_identity[:2]
+                        != candidate.payload_identity[:2]
+                        or decoded_candidate.payload_identity[2]
+                        != candidate.payload_identity[2]
+                        or decoded_candidate.payload_sha256
+                        != candidate.payload_sha256
+                        or decoded_candidate.dependencies != candidate.dependencies
+                        or decoded_candidate.decoded_result_bytes
+                        != candidate.decoded_result_bytes
+                    ):
+                        result_ownership.release()
+                        raise AuditInfrastructureError(
+                            "audit cache payload generation was replaced during batch load"
+                        )
+                    try:
+                        self._validate_dependency_authority(
+                            result.dependencies, authority
+                        )
+                        production_matches = self._production_matches(
+                            result.dependencies, snapshot
+                        )
+                    except BaseException:
+                        result_ownership.release()
+                        raise
+                    if not production_matches:
+                        result_ownership.release()
+                        misses.add(configuration.digest)
+                        if aggregator.cold_slot_reserved_bytes == 0:
+                            aggregator.reserve_cold_slot(maximum_cold_slot)
+                        continue
+                    try:
+                        aggregator.accept_validated_result(
+                            configuration, result, result_ownership
+                        )
+                    except BaseException:
+                        if not result_ownership.released:
+                            result_ownership.release()
+                        raise
+                    accepted_digests.append(configuration.digest)
+                    hit_count += 1
+
+                final: dict[str, str] = {}
+                try:
+                    for path_key, handle in held.items():
+                        final[path_key] = _hash_held_dependency(handle)
+                except OSError:
+                    final.clear()
+                final_drift = False
+                for path_key, users in dependency_users.items():
+                    for candidate in users:
+                        expected = expected_dependencies[
+                            (candidate.configuration.digest, path_key)
+                        ].sha256
+                        if final.get(path_key) != expected:
+                            final_drift = True
+                            break
+                    if final_drift:
+                        break
+                if final_drift:
+                    aggregator._rollback_to(checkpoint)
+                    misses.update(accepted_digests)
+                    hit_count = 0
+                    if aggregator.cold_slot_reserved_bytes == 0:
+                        aggregator.reserve_cold_slot(maximum_cold_slot)
+                else:
+                    for digest in accepted_digests:
+                        self._record_access(candidates[digest].key)
+
+                ordered_misses = tuple(
+                    configuration for configuration in configurations
+                    if configuration.digest in misses
+                )
+                return ConfigurationAuditLoadBatch(
+                    hit_count,
+                    ordered_misses,
+                    aggregator.cold_slot_reserved_bytes,
+                )
+        except BaseException:
+            aggregator._rollback_to(checkpoint)
             raise
-        except OSError:
-            for users in dependency_users.values():
-                misses.update(candidate.configuration.digest for candidate in users)
-
-        for path_key, users in dependency_users.items():
-            for candidate in users:
-                expected = expected_dependencies[
-                    (candidate.configuration.digest, path_key)
-                ].sha256
-                if initial.get(path_key) != expected or final.get(path_key) != expected:
-                    misses.add(candidate.configuration.digest)
-
-        dependency_users.clear()
-        dependency_representatives.clear()
-        expected_dependencies.clear()
-        validation_metadata_ownership.release()
-
-        if misses:
-            aggregator.reserve_cold_slot(maximum_cold_slot)
-        hit_count = 0
-        for configuration in configurations:
-            if configuration.digest in misses:
-                continue
-            candidate = candidates[configuration.digest]
-            result_ownership = result_budget.reserve(
-                candidate.decoded_result_bytes,
-                label="batch retained result limit",
-            ).commit()
-            try:
-                decode_workspace = result_budget.reserve(
-                    8192 + 9 * candidate.payload_identity[2],
-                    label="compact result decode workspace",
-                ).commit()
-            except BaseException:
-                result_ownership.release()
-                raise
-            try:
-                with self._key_lock(candidate.key, deadline):
-                    decoded = self._read_authenticated_entry(
-                        configuration, candidate.key, engine
-                    )
-            except BaseException:
-                decode_workspace.release()
-                result_ownership.release()
-                raise
-            decode_workspace.release()
-            if decoded is None:
-                result_ownership.release()
-                misses.add(configuration.digest)
-                if aggregator.cold_slot_reserved_bytes == 0:
-                    aggregator.reserve_cold_slot(maximum_cold_slot)
-                continue
-            decoded_candidate, result = decoded
-            if (
-                decoded_candidate.entry_identity != candidate.entry_identity
-                or decoded_candidate.manifest_identity is None
-                or candidate.manifest_identity is None
-                or decoded_candidate.manifest_identity[:2]
-                != candidate.manifest_identity[:2]
-                or decoded_candidate.payload_identity[:2]
-                != candidate.payload_identity[:2]
-                or decoded_candidate.payload_identity[2]
-                != candidate.payload_identity[2]
-                or decoded_candidate.payload_sha256 != candidate.payload_sha256
-                or decoded_candidate.dependencies != candidate.dependencies
-                or decoded_candidate.decoded_result_bytes
-                != candidate.decoded_result_bytes
-            ):
-                result_ownership.release()
-                raise AuditInfrastructureError(
-                    "audit cache payload generation was replaced during batch load"
-                )
-            try:
-                self._validate_dependency_authority(result.dependencies, authority)
-                production_matches = self._production_matches(
-                    result.dependencies, snapshot
-                )
-            except BaseException:
-                result_ownership.release()
-                raise
-            if not production_matches:
-                result_ownership.release()
-                misses.add(configuration.digest)
-                if aggregator.cold_slot_reserved_bytes == 0:
-                    aggregator.reserve_cold_slot(maximum_cold_slot)
-                continue
-            try:
-                aggregator.accept_validated_result(
-                    configuration, result, result_ownership
-                )
-            except BaseException:
-                if not result_ownership.released:
-                    result_ownership.release()
-                raise
-            hit_count += 1
-            self._record_access(candidates[configuration.digest].key)
-        ordered_misses = tuple(
-            configuration for configuration in configurations
-            if configuration.digest in misses
-        )
-        batch = ConfigurationAuditLoadBatch(
-            hit_count,
-            ordered_misses,
-            aggregator.cold_slot_reserved_bytes,
-        )
-        for candidate in candidates.values():
-            if (
-                candidate.metadata_ownership is not None
-                and not candidate.metadata_ownership.released
-            ):
-                candidate.metadata_ownership.release()
-        return batch
 
     def _remove_audit_entry(self, entry: Path, key: str) -> bool:
         quarantine = entry.with_name(f".quarantine-{key}-{uuid.uuid4().hex}")
