@@ -241,11 +241,68 @@ def _native_process_start_token(process: subprocess.Popen[bytes], platform_kind:
     raise AuditInfrastructureError("compiler process platform identity is invalid")
 
 
+class _MacProcessIdentityHandle:
+    """Retained kqueue process registration that survives child reaping."""
+
+    __slots__ = ("_queue", "_pid", "_note_exit", "_closed")
+
+    def __init__(self, queue, pid: int, note_exit: int) -> None:
+        self._queue = queue
+        self._pid = pid
+        self._note_exit = note_exit
+        self._closed = False
+
+    def validate_exit(self) -> None:
+        if self._closed:
+            raise AuditInfrastructureError("macOS process identity handle is closed")
+        try:
+            events = self._queue.control([], 1, 0)
+        except OSError as error:
+            raise AuditInfrastructureError(
+                "cannot validate retained macOS compiler process identity"
+            ) from error
+        if (
+            len(events) != 1
+            or int(events[0].ident) != self._pid
+            or not (int(events[0].fflags) & self._note_exit)
+        ):
+            raise AuditInfrastructureError("post-exit process identity differs")
+
+    def close(self) -> None:
+        if not self._closed:
+            self._queue.close()
+            self._closed = True
+
+
+def _open_macos_process_identity_handle(pid: int) -> _MacProcessIdentityHandle:
+    import select
+
+    try:
+        queue = select.kqueue()
+        registration = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        queue.control([registration], 0, 0)
+    except (AttributeError, OSError) as error:
+        try:
+            queue.close()
+        except (AttributeError, UnboundLocalError):
+            pass
+        raise AuditInfrastructureError(
+            "cannot retain macOS compiler process identity"
+        ) from error
+    return _MacProcessIdentityHandle(queue, pid, select.KQ_NOTE_EXIT)
+
+
 class CompilerProcessHandleCarrier:
     """Generation-bound parent-observable owner of one compiler process handle."""
 
     __slots__ = (
         "event", "_process", "_observer", "_completed", "_linux_pidfd",
+        "_macos_identity_handle",
     )
 
     def __init__(self, event: CompilerLaunchEvent, process, observer) -> None:
@@ -254,6 +311,7 @@ class CompilerProcessHandleCarrier:
         self._observer = observer
         self._completed = False
         self._linux_pidfd = None
+        self._macos_identity_handle = None
         if event.process_start.platform_kind == "linux" and hasattr(os, "pidfd_open"):
             try:
                 self._linux_pidfd = os.pidfd_open(process.pid)
@@ -261,6 +319,10 @@ class CompilerProcessHandleCarrier:
                 raise AuditInfrastructureError(
                     "cannot retain Linux compiler process identity"
                 ) from error
+        if event.process_start.platform_kind == "macos":
+            self._macos_identity_handle = _open_macos_process_identity_handle(
+                process.pid
+            )
 
     @property
     def process(self):
@@ -282,6 +344,8 @@ class CompilerProcessHandleCarrier:
                     raise AuditInfrastructureError(
                         "post-exit process identity differs"
                     ) from error
+            elif self._macos_identity_handle is not None:
+                self._macos_identity_handle.validate_exit()
             else:
                 observed = _native_process_start_token(
                     self._process, identity.platform_kind
@@ -315,6 +379,9 @@ class CompilerProcessHandleCarrier:
             if self._linux_pidfd is not None:
                 os.close(self._linux_pidfd)
                 self._linux_pidfd = None
+            if self._macos_identity_handle is not None:
+                self._macos_identity_handle.close()
+                self._macos_identity_handle = None
             self._process = None
 
     def abort_before_return(self) -> None:
@@ -327,6 +394,9 @@ class CompilerProcessHandleCarrier:
         if self._linux_pidfd is not None:
             os.close(self._linux_pidfd)
             self._linux_pidfd = None
+        if self._macos_identity_handle is not None:
+            self._macos_identity_handle.close()
+            self._macos_identity_handle = None
         self._process = None
 
 
@@ -1104,6 +1174,28 @@ def _run_probe_command(
     return combined
 
 
+def _resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
+    """Release an already-contained Windows process without a helper child."""
+
+    if os.name != "nt":
+        raise AuditInfrastructureError("Windows process launch gate is unavailable")
+    import ctypes
+    from ctypes import wintypes
+
+    handle = getattr(process, "_handle", None)
+    if handle is None:
+        raise AuditInfrastructureError("Windows process launch handle is unavailable")
+    ntdll = ctypes.WinDLL("ntdll")
+    resume = ntdll.NtResumeProcess
+    resume.argtypes = (wintypes.HANDLE,)
+    resume.restype = ctypes.c_long
+    status = int(resume(handle))
+    if status != 0:
+        raise AuditInfrastructureError(
+            f"Windows process launch gate release failed: status={status:#x}"
+        )
+
+
 class _ProbeContainment:
     """Own the complete version-probe process tree on every supported host."""
 
@@ -1114,7 +1206,12 @@ class _ProbeContainment:
     @property
     def popen_arguments(self) -> dict[str, object]:
         if os.name == "nt":
-            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            return {
+                "creationflags": (
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+                )
+            }
         return {"start_new_session": True}
 
     @property
@@ -1122,16 +1219,7 @@ class _ProbeContainment:
         return os.name == "nt"
 
     def prepare_command(self, command: list[str]) -> list[str]:
-        if os.name != "nt":
-            return command
-        # The trusted helper cannot spawn the real compiler until the parent
-        # assigns it to the kill-on-close job, closing the assignment race.
-        helper = (
-            "import subprocess,sys;"
-            "sys.stdin.buffer.read(1);"
-            "raise SystemExit(subprocess.call(sys.argv[1:]))"
-        )
-        return [sys.executable, "-I", "-S", "-c", helper, *command]
+        return command
 
     def attach(self, process: subprocess.Popen[bytes]) -> None:
         pid = getattr(process, "pid", None)
@@ -1144,10 +1232,9 @@ class _ProbeContainment:
     def release(self, process: subprocess.Popen[bytes]) -> None:
         if not self.requires_handshake or self._pid is None:
             return
-        if process.stdin is None:
-            raise AuditInfrastructureError("compiler probe handshake is unavailable")
-        process.stdin.write(b"1")
-        process.stdin.close()
+        _resume_suspended_windows_process(process)
+        if process.stdin is not None:
+            process.stdin.close()
 
     def terminate(self) -> None:
         if self._job is not None:

@@ -23,11 +23,14 @@ from types import MappingProxyType
 from gpu_capability_cache import (
     PreprocessCache,
     _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES,
+    decode_configuration_audit_result_transport,
+    encode_configuration_audit_result_transport,
 )
 from gpu_capability_command import (
     CompilerProcessHandleCarrier,
     RewrittenCommand,
     _environment_digest,
+    _resume_suspended_windows_process,
     decode_compile_entry,
     make_configuration,
     launch_compiler_process,
@@ -181,7 +184,12 @@ class _ProcessContainment:
     @property
     def popen_arguments(self) -> dict[str, object]:
         if os.name == "nt":
-            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            return {
+                "creationflags": (
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+                )
+            }
         return {"start_new_session": True}
 
     @property
@@ -189,14 +197,7 @@ class _ProcessContainment:
         return os.name == "nt"
 
     def prepare_command(self, command: tuple[str, ...]) -> list[str]:
-        if os.name != "nt":
-            return list(command)
-        helper = (
-            "import subprocess,sys;"
-            "sys.stdin.buffer.read(1);"
-            "raise SystemExit(subprocess.call(sys.argv[1:]))"
-        )
-        return [sys.executable, "-I", "-S", "-c", helper, *command]
+        return list(command)
 
     def attach(self, process: subprocess.Popen[bytes]) -> None:
         self._pid = process.pid
@@ -206,10 +207,9 @@ class _ProcessContainment:
     def release(self, process: subprocess.Popen[bytes]) -> None:
         if not self.requires_handshake:
             return
-        if process.stdin is None:
-            raise AuditInfrastructureError("compiler process handshake is unavailable")
-        process.stdin.write(b"1")
-        process.stdin.close()
+        _resume_suspended_windows_process(process)
+        if process.stdin is not None:
+            process.stdin.close()
 
     def terminate(self) -> None:
         if self._job is not None:
@@ -958,14 +958,21 @@ class _CompactAuditDraft:
             self.audit_engine_fingerprint,
             self.dependencies,
         )
-        return ConfigurationAuditResult(
-            self.configuration_digest,
-            self.audit_engine_fingerprint,
-            self.dependencies,
-            self.reached_production,
-            self.findings,
-            reservation,
+        ownership = reservation.begin_result_ownership(
+            self.task_id, self.generation
         )
+        try:
+            return ConfigurationAuditResult(
+                self.configuration_digest,
+                self.audit_engine_fingerprint,
+                self.dependencies,
+                self.reached_production,
+                self.findings,
+                ownership,
+            )
+        except BaseException:
+            ownership.release("worker-materialization-failure")
+            raise
 
 
 def _compact_findings(findings) -> tuple[AuditResultFinding, ...]:
@@ -1141,6 +1148,7 @@ def _bounded_compact_result_draft(
     dependency_path_bytes = sum(
         len(item.role_relative_path.as_posix().encode("utf-8"))
         + len(str(item.identity.canonical).encode("utf-8"))
+        + len(item.stable_role.encode("ascii"))
         for item in dependencies
     )
     bounds = CompactResultDraftBounds(
@@ -1450,21 +1458,31 @@ def audit_configuration_worker(
         if not isinstance(accepted, ConfigurationAuditResult):
             raise AuditInfrastructureError("cache publication result is invalid")
         if accepted is not result:
+            ownership = result._transport_ownership
+            if ownership is None:
+                raise AuditInfrastructureError(
+                    "cache publication result ownership is unavailable"
+                )
+            rebound = ownership.rebind_materialized_result()
             accepted = ConfigurationAuditResult(
                 accepted.configuration_digest,
                 accepted.audit_engine_fingerprint,
                 accepted.dependencies,
                 accepted.reached_production,
                 accepted.findings,
-                reservation,
+                rebound,
             )
+        transport = encode_configuration_audit_result_transport(accepted)
+        del accepted
+        del result
+        del draft
+        accepted = decode_configuration_audit_result_transport(transport)
         stages = WorkerStageTimings(
             preprocess_stages.discovery_seconds,
             preprocess_stages.accepted_parse_seconds,
             audit_time.elapsed_seconds,
             publish_time.elapsed_seconds,
         )
-        reservation.transfer_to_receiver_result(task.task_id, task.generation)
         return ConfigurationAuditOutcome(
             result=accepted,
             stdout_bytes=preprocess_stages.compiler_stdout_bytes,

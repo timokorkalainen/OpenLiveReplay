@@ -906,6 +906,90 @@ class ConfigurationTests(unittest.TestCase):
             self.assertIsNone(carrier.process)
         self.assertEqual(observer.completed, [])
 
+    def test_macos_carrier_retains_native_exit_identity_before_reap(self):
+        class Process:
+            pid = 42
+            stdin = None
+
+        class Containment:
+            popen_arguments = {}
+
+            def attach(self, _process): pass
+            def release(self, _process): pass
+            def terminate(self): pass
+
+        class Observer:
+            def register_compiler_process_launch(self, _event, _carrier): pass
+            def complete_compiler_process_launch(self, _event, _carrier): pass
+
+        class MacIdentityHandle:
+            def __init__(self):
+                self.validations = 0
+                self.closed = False
+
+            def validate_exit(self):
+                self.validations += 1
+
+            def close(self):
+                self.closed = True
+
+        process = Process()
+        retained = MacIdentityHandle()
+        with mock.patch.object(
+            capability_command.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            capability_command, "_native_process_start_token",
+            return_value="macos-proc:1:2",
+        ) as token, mock.patch.object(
+            capability_command, "_open_macos_process_identity_handle",
+            return_value=retained,
+        ):
+            _process, carrier = capability_command.launch_compiler_process(
+                ("compiler",), cwd=self.build, environment=self.environment,
+                containment=Containment(), platform_kind="macos",
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, launch_options={},
+                purpose=capability_command.CompilerLaunchPurpose.INSPECTION,
+                launch_observer=Observer(),
+            )
+            carrier.complete_after_exit()
+        self.assertEqual(token.call_count, 1)
+        self.assertEqual(retained.validations, 1)
+        self.assertTrue(retained.closed)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS kqueue")
+    def test_macos_carrier_validates_real_process_after_wait_reaps_it(self):
+        class Containment:
+            popen_arguments = {}
+
+            def attach(self, _process): pass
+            def release(self, _process): pass
+            def terminate(self): pass
+
+        class Observer:
+            def __init__(self):
+                self.completed = 0
+
+            def register_compiler_process_launch(self, _event, _carrier): pass
+
+            def complete_compiler_process_launch(self, _event, _carrier):
+                self.completed += 1
+
+        observer = Observer()
+        process, carrier = capability_command.launch_compiler_process(
+            (sys.executable, "-I", "-c", "raise SystemExit(0)"),
+            cwd=self.build,
+            environment=self.environment,
+            containment=Containment(), platform_kind="macos",
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, launch_options={},
+            purpose=capability_command.CompilerLaunchPurpose.INSPECTION,
+            launch_observer=observer,
+        )
+        self.assertEqual(process.wait(timeout=5), 0)
+        carrier.complete_after_exit()
+        self.assertEqual(observer.completed, 1)
+
     def test_shared_boundary_emits_exact_inspection_discovery_accepted_events(self):
         class Process:
             stdin = None

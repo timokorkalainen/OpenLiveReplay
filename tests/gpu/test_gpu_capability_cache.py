@@ -43,6 +43,7 @@ from gpu_capability_model import (  # noqa: E402
     AuditResultFinding,
     AuditInfrastructureError,
     CompactResultColdSlot,
+    CompactResultDraftBounds,
     CompactResultMemoryBudget,
     CompactTokenSequence,
     CompilerExecutableCapability,
@@ -55,6 +56,7 @@ from gpu_capability_model import (  # noqa: E402
     ConfigurationAuditResult,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
+    PerTaskCompactReservation,
     StreamingResultAggregator,
     encode_canonical_summary,
     build_dependency_root_authority,
@@ -3939,6 +3941,30 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 b"{" + b"x" * ((4 << 20) + 1)
             )
         loads.assert_not_called()
+
+    def test_transport_codec_moves_one_reservation_into_decoded_result(self):
+        reservation = PerTaskCompactReservation("task-a", 7, 32 << 20)
+        reservation.require_before_discovery("task-a", 7)
+        bounds = CompactResultDraftBounds(1, 1, 1, 256, 64, 64)
+        payload = capability_cache.encode_configuration_audit_result(self.result)
+        reservation.require_within_pre_dispatch_reservation(
+            "task-a", len(payload), bounds, 4096
+        )
+        reservation.record_exact_canonical_json("task-a", len(payload))
+        ownership = reservation.begin_result_ownership("task-a", 7)
+        owned = dataclasses.replace(self.result, _transport_ownership=ownership)
+
+        transport = capability_cache.encode_configuration_audit_result_transport(owned)
+        with self.assertRaisesRegex(AuditInfrastructureError, "ownership.*transferred"):
+            owned.release_transport_ownership()
+        decoded = capability_cache.decode_configuration_audit_result_transport(transport)
+        self.assertEqual(decoded, self.result)
+        self.assertIsNotNone(decoded._transport_ownership)
+        self.assertEqual(reservation.owner_phase, "receiver-retained-result")
+        with self.assertRaisesRegex(AuditInfrastructureError, "already consumed"):
+            capability_cache.decode_configuration_audit_result_transport(transport)
+        decoded.release_transport_ownership()
+        self.assertTrue(reservation.released)
 
     def test_combined_key_is_used_for_path_lane_and_manifest(self):
         cache = ConfigurationAuditCache(self.cache_root)

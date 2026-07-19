@@ -446,10 +446,15 @@ class CompactResultDraftBounds:
 class PerTaskCompactReservation:
     """Linear parent-issued reservation that gates one cold worker miss."""
 
+    _ENCODED_ENVELOPE_BYTES = 4 << 20
+    _RETAINED_ENVELOPE_BYTES = 16 << 20
+    _COUNTING_WORKSPACE_BYTES = 4096
+    _TRANSPORT_OVERHEAD_BYTES = 8192
+
     __slots__ = (
         "task_id", "generation", "maximum_bytes", "_charged_bytes",
-        "_peak_bytes", "_canonical_json_bytes", "_owner_phase",
-        "_released", "_release_phase", "_lock",
+        "_peak_bytes", "_reserved_encoded_bytes", "_canonical_json_bytes", "_owner_phase",
+        "_owner_serial", "_released", "_release_phase", "_lock",
     )
 
     def __init__(self, task_id: str, generation: int, maximum_bytes: int = 32 << 20) -> None:
@@ -470,8 +475,10 @@ class PerTaskCompactReservation:
         self.maximum_bytes = maximum_bytes
         self._charged_bytes = 0
         self._peak_bytes = 0
+        self._reserved_encoded_bytes = 0
         self._canonical_json_bytes = 0
         self._owner_phase = "parent-pre-dispatch"
+        self._owner_serial = 0
         self._released = False
         self._release_phase: str | None = None
         self._lock = threading.Lock()
@@ -507,12 +514,19 @@ class PerTaskCompactReservation:
             return self._owner_phase
 
     def require_before_discovery(self, task_id: str, generation: int) -> None:
+        valid_envelope_bytes = (
+            self._TRANSPORT_OVERHEAD_BYTES
+            + self._ENCODED_ENVELOPE_BYTES
+            + self._COUNTING_WORKSPACE_BYTES
+            + self._RETAINED_ENVELOPE_BYTES
+        )
         with self._lock:
             if (
                 self._released
                 or task_id != self.task_id
                 or generation != self.generation
                 or self.maximum_bytes < (32 << 20)
+                or valid_envelope_bytes > self.maximum_bytes
             ):
                 raise AuditInfrastructureError(
                     "pre-dispatch compact reservation is inadequate"
@@ -546,16 +560,20 @@ class PerTaskCompactReservation:
             or counting_pass_peak_bytes < 0
         ):
             raise AuditInfrastructureError("pre-dispatch compact reservation differs")
-        terms = (
-            4096,
-            encoded_bytes,
-            counting_pass_peak_bytes,
-            bounds.dependency_count * 768,
-            bounds.reached_count * 256,
-            bounds.finding_count * 640,
+        retained_bytes = sum((
+            1024,
+            bounds.dependency_count * 384,
+            bounds.reached_count * 128,
+            bounds.finding_count * 320,
             bounds.path_utf8_bytes,
             bounds.expression_utf8_bytes,
             bounds.reason_utf8_bytes,
+        ))
+        terms = (
+            self._TRANSPORT_OVERHEAD_BYTES,
+            encoded_bytes,
+            counting_pass_peak_bytes,
+            retained_bytes,
         )
         charged = sum(terms)
         if charged > (1 << 63) - 1:
@@ -563,12 +581,24 @@ class PerTaskCompactReservation:
                 "pre-dispatch compact reservation arithmetic overflow"
             )
         with self._lock:
-            if self._released or charged > self.maximum_bytes:
+            if (
+                self._released
+                or encoded_bytes > self._ENCODED_ENVELOPE_BYTES
+                or counting_pass_peak_bytes > self._COUNTING_WORKSPACE_BYTES
+                or retained_bytes > self._RETAINED_ENVELOPE_BYTES
+                or (
+                    bounds.path_utf8_bytes
+                    + bounds.expression_utf8_bytes
+                    + bounds.reason_utf8_bytes
+                ) > encoded_bytes
+                or charged > self.maximum_bytes
+            ):
                 raise AuditInfrastructureError(
                     "pre-dispatch compact reservation limit exceeded"
                 )
             self._charged_bytes = max(self._charged_bytes, charged)
             self._peak_bytes = max(self._peak_bytes, self._charged_bytes)
+            self._reserved_encoded_bytes = encoded_bytes
         return charged
 
     def record_exact_canonical_json(self, task_id: str, encoded_bytes: int) -> None:
@@ -580,25 +610,99 @@ class PerTaskCompactReservation:
         ):
             raise AuditInfrastructureError("canonical compact result charge is invalid")
         with self._lock:
-            if self._released or self._charged_bytes <= 0:
+            if (
+                self._released
+                or self._charged_bytes <= 0
+                or encoded_bytes != self._reserved_encoded_bytes
+            ):
                 raise AuditInfrastructureError(
                     "canonical compact result was not reserved"
                 )
             self._canonical_json_bytes = encoded_bytes
             self._owner_phase = "worker-bounded-draft"
 
-    def transfer_to_receiver_result(self, task_id: str, generation: int) -> None:
+    def begin_result_ownership(
+        self, task_id: str, generation: int
+    ) -> "CompactResultReservationOwnership":
         with self._lock:
             if (
                 self._released
                 or task_id != self.task_id
                 or generation != self.generation
                 or self._canonical_json_bytes <= 0
+                or self._owner_phase != "worker-bounded-draft"
             ):
                 raise AuditInfrastructureError(
-                    "compact reservation result transfer differs"
+                    "compact reservation result ownership differs"
                 )
-            self._owner_phase = "receiver-retained-result"
+            self._owner_serial += 1
+            self._owner_phase = "worker-materialized-result"
+            serial = self._owner_serial
+        return CompactResultReservationOwnership(
+            self, serial, "worker-materialized-result"
+        )
+
+    def _transfer_result_ownership(
+        self, serial: int, source_phase: str, target_phase: str
+    ) -> "CompactResultReservationOwnership":
+        allowed = {
+            "worker-materialized-result": "serialized-pipe",
+            "serialized-pipe": "receiver-decode",
+            "receiver-decode": "receiver-retained-result",
+        }
+        with self._lock:
+            if (
+                self._released
+                or serial != self._owner_serial
+                or source_phase != self._owner_phase
+                or allowed.get(source_phase) != target_phase
+            ):
+                raise AuditInfrastructureError(
+                    "compact result ownership transfer differs"
+                )
+            self._owner_serial += 1
+            self._owner_phase = target_phase
+            next_serial = self._owner_serial
+        return CompactResultReservationOwnership(
+            self, next_serial, target_phase
+        )
+
+    def _rebind_result_ownership(
+        self, serial: int, source_phase: str
+    ) -> "CompactResultReservationOwnership":
+        with self._lock:
+            if (
+                self._released
+                or serial != self._owner_serial
+                or source_phase != self._owner_phase
+                or source_phase != "worker-materialized-result"
+            ):
+                raise AuditInfrastructureError(
+                    "compact result ownership rebind differs"
+                )
+            self._owner_serial += 1
+            next_serial = self._owner_serial
+        return CompactResultReservationOwnership(
+            self, next_serial, source_phase
+        )
+
+    def _release_result_ownership(
+        self, serial: int, source_phase: str, release_phase: str
+    ) -> None:
+        if not isinstance(release_phase, str) or not release_phase:
+            raise AuditInfrastructureError("compact reservation release phase is invalid")
+        with self._lock:
+            if (
+                self._released
+                or serial != self._owner_serial
+                or source_phase != self._owner_phase
+            ):
+                raise AuditInfrastructureError(
+                    "compact result ownership was transferred"
+                )
+            self._released = True
+            self._owner_phase = "released"
+            self._release_phase = release_phase
 
     def release(self, phase: str) -> None:
         if not isinstance(phase, str) or not phase:
@@ -610,6 +714,54 @@ class PerTaskCompactReservation:
             self._charged_bytes = 0
             self._owner_phase = "released"
             self._release_phase = phase
+
+
+class CompactResultReservationOwnership:
+    """Linear phase token carrying one pre-dispatch reservation."""
+
+    __slots__ = ("_reservation", "_serial", "phase", "_active")
+
+    def __init__(
+        self, reservation: PerTaskCompactReservation, serial: int, phase: str
+    ) -> None:
+        self._reservation = reservation
+        self._serial = serial
+        self.phase = phase
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def reservation(self) -> PerTaskCompactReservation:
+        return self._reservation
+
+    def transfer(self, target_phase: str) -> "CompactResultReservationOwnership":
+        if not self._active:
+            raise AuditInfrastructureError("compact result ownership was transferred")
+        replacement = self._reservation._transfer_result_ownership(
+            self._serial, self.phase, target_phase
+        )
+        self._active = False
+        return replacement
+
+    def rebind_materialized_result(self) -> "CompactResultReservationOwnership":
+        if not self._active:
+            raise AuditInfrastructureError("compact result ownership was transferred")
+        replacement = self._reservation._rebind_result_ownership(
+            self._serial, self.phase
+        )
+        self._active = False
+        return replacement
+
+    def release(self, release_phase: str) -> None:
+        if not self._active:
+            raise AuditInfrastructureError("compact result ownership was transferred")
+        self._reservation._release_result_ownership(
+            self._serial, self.phase, release_phase
+        )
+        self._active = False
 
 
 _COMPACT_RESULT_MAXIMUM_LIVE_BYTES = 128 * 1024 * 1024
@@ -2479,7 +2631,7 @@ class ConfigurationAuditResult:
     dependencies: tuple[DependencyDigest, ...]
     reached_production: tuple[PurePosixPath, ...]
     findings: tuple[AuditResultFinding, ...]
-    _transport_ownership: PerTaskCompactReservation | None = field(
+    _transport_ownership: CompactResultReservationOwnership | None = field(
         default=None, compare=False, repr=False
     )
 
@@ -2537,7 +2689,9 @@ class ConfigurationAuditResult:
             raise AuditInfrastructureError("audit result findings are not unique and sorted")
         if (
             self._transport_ownership is not None
-            and not isinstance(self._transport_ownership, PerTaskCompactReservation)
+            and not isinstance(
+                self._transport_ownership, CompactResultReservationOwnership
+            )
         ):
             raise AuditInfrastructureError("audit result transport ownership is invalid")
 
@@ -2546,6 +2700,10 @@ class ConfigurationAuditResult:
         if ownership is None:
             raise AuditInfrastructureError(
                 "audit result transport ownership is unavailable"
+            )
+        if ownership.phase != "receiver-retained-result":
+            raise AuditInfrastructureError(
+                "audit result transport ownership was transferred"
             )
         ownership.release("retained-result-transition")
 

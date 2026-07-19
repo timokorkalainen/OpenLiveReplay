@@ -7,6 +7,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import shutil
 import subprocess
 import struct
 import sys
@@ -69,6 +70,20 @@ class BoundedPreprocessorTests(unittest.TestCase):
         path = Path(__file__).resolve().with_name("gpu_capability_runner.py")
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
         self.assertFalse(any(isinstance(node, ast.Assert) for node in ast.walk(tree)))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows suspended launch")
+    def test_windows_launch_gate_suspends_the_actual_compiler_without_helper(self):
+        containment = capability_runner._ProcessContainment()
+        try:
+            prepared = containment.prepare_command(("C:/toolchain/g++.exe", "--version"))
+            self.assertEqual(prepared[0], "C:/toolchain/g++.exe")
+            self.assertNotIn("subprocess.call", " ".join(prepared))
+            self.assertTrue(
+                containment.popen_arguments["creationflags"]
+                & getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+            )
+        finally:
+            containment.close()
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -2798,6 +2813,8 @@ class WorkerAuditTests(unittest.TestCase):
         self.assertEqual(outcome.stdout_bytes, 34)
         self.assertTrue(control.sealed)
         self.assertFalse(reservation.released)
+        with self.assertRaisesRegex(AuditInfrastructureError, "ownership.*transferred"):
+            cache.published[0][2].release_transport_ownership()
         outcome.result.release_transport_ownership()
         self.assertTrue(reservation.released)
 
@@ -2941,58 +2958,146 @@ class WorkerAuditTests(unittest.TestCase):
         self.assertEqual(cache.published, [])
 
     def test_restoring_initial_bytes_cannot_hide_mixed_production_generation(self):
-        initial_bytes = self.source.read_bytes()
-        generation_b_bytes = b"int generation_b;\n"
-        self.source.write_bytes(generation_b_bytes)
-        generation_b = self._dependency(self._identity(
-            self.source, "playback/gpu/worker.cpp", line_count=1
-        ))
-        mixed = tuple(sorted(
-            (generation_b, self.dependencies[0]),
-            key=lambda item: item.role_relative_path.as_posix(),
-        ))
+        compiler_text = shutil.which("g++")
+        if compiler_text is None:
+            self.skipTest("requires a production g++ compiler")
+        compiler = Path(compiler_text).resolve()
+        generation_a = b"#define WORKER_VALUE 1\n"
+        generation_b = b"#define WORKER_VALUE 2\n"
+        self.source.write_text(
+            '#include "empty.h"\nint worker = WORKER_VALUE;\n',
+            encoding="utf-8",
+        )
+        self.header.write_bytes(generation_a)
+        production = capability_model.enumerate_production_identities(self.root)
+        toolchain_root = compiler.parent.parent
+        roots = {"toolchain": toolchain_root}
+        runtime_candidates = []
+        if os.name == "nt":
+            runtime_candidates.append((
+                "windows-system",
+                Path(os.environ.get("SystemRoot", "C:/Windows")),
+            ))
+        elif sys.platform.startswith("linux"):
+            runtime_candidates.extend((
+                ("system-lib", Path("/lib")),
+                ("system-lib64", Path("/lib64")),
+            ))
+        elif sys.platform == "darwin":
+            runtime_candidates.append(("system-frameworks", Path("/System")))
+        for role, candidate in runtime_candidates:
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if resolved.is_dir() and not any(
+                resolved == existing
+                or resolved.is_relative_to(existing)
+                or existing.is_relative_to(resolved)
+                for existing in roots.values()
+            ):
+                roots[role] = resolved
+        authority = build_dependency_root_authority(self.root, roots)
+        capability = open_compiler_executable_capability(
+            compiler,
+            authority,
+            time.monotonic() + 30.0,
+            compiler_family=CompilerFamily.GCC,
+        )
+        configuration = dataclasses.replace(
+            self.configuration,
+            entry_id="real-generation-race:0",
+            family=CompilerFamily.GCC,
+            compiler=compiler,
+            working_directory=self.build,
+            source=production[PurePosixPath("playback/gpu/worker.cpp")],
+            arguments=(str(self.source), "-I", str(self.source.parent)),
+            environment_digest=_environment_digest(dict(os.environ)),
+            digest="b" * 64,
+            dependency_root_authority_digest=authority.portable_authority_digest,
+            compiler_capability_digest=capability.capability_digest,
+            compiler_capability=capability,
+        )
+        task = capability_model.ConfigurationAuditTask(
+            "real-generation-race", 11, configuration, authority,
+            capability_model.PerTaskCompactReservation(
+                "real-generation-race", 11, 32 << 20
+            ),
+        )
+        production_snapshot = {
+            relative: DependencyDigest(
+                "production", relative, identity,
+                hashlib.sha256(identity.canonical.read_bytes()).hexdigest(),
+            )
+            for relative, identity in production.items()
+        }
         observed_generations = []
+        events = []
+        test_case = self
 
-        def compile_twice_then_restore(launch_context):
-            for index, purpose in enumerate((
+        class Endpoint:
+            def register_compiler_process_launch(self, event, carrier):
+                observed_generations.append(test_case.header.read_bytes())
+                process = carrier.process
+                test_case.assertEqual(process.pid, event.process_start.pid)
+                test_case.assertNotIn("subprocess.call", " ".join(process.args))
+                if os.name == "nt":
+                    test_case.assertEqual(
+                        Path(process.args[0]).resolve(), compiler
+                    )
+
+            def complete_compiler_process_launch(self, event, _carrier):
+                pass
+
+            def fail_compiler_process_launch(self, _event, _carrier): pass
+
+            def send(self, frame, _deadline):
+                if isinstance(frame, capability_model.CompilerLaunchEvent):
+                    events.append(frame)
+
+            def seal_audit_launch_protocol(self, task_id, generation, _deadline):
+                test_case.assertEqual((task_id, generation), (task.task_id, 11))
+                test_case.header.write_bytes(generation_a)
+
+        self.header.write_bytes(generation_b)
+        deadline = time.monotonic() + 30.0
+        cache = self._Cache()
+        try:
+            with mock.patch.multiple(
+                capability_runner,
+                _WORKER_INDEX=2,
+                _WORKER_GENERATION=11,
+                _WORKER_PRODUCTION=production,
+                _WORKER_LIMITS=AuditLimits(rss_bytes=2**63 - 1),
+                _WORKER_CANCEL_EVENT=threading.Event(),
+                _WORKER_ENGINE=self.engine,
+                _WORKER_CACHE=cache,
+                _WORKER_RSS=SimpleNamespace(sample=lambda: 0),
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "production snapshot generation"
+            ):
+                capability_runner.audit_configuration_worker(
+                    task,
+                    authority,
+                    production_snapshot,
+                    Endpoint(),
+                    self._CommandEndpoint(),
+                    deadline,
+                )
+        finally:
+            capability.native_owner.close()
+            self.header.write_bytes(generation_a)
+        self.assertEqual(
+            tuple(event.purpose for event in events),
+            (
                 capability_model.CompilerLaunchPurpose.AUDIT_DISCOVERY,
                 capability_model.CompilerLaunchPurpose.AUDIT_ACCEPTED,
-            )):
-                observed_generations.append(self.source.read_bytes())
-                launch_context.record_process_start(
-                    purpose,
-                    capability_model.ProcessStartIdentity(
-                        "windows", index + 200,
-                        f"generation-b-{index}", f"cookie-b-{index}",
-                    ),
-                )
-            self.source.write_bytes(initial_bytes)
-            view = self._View()
-            self.live_views.add(view)
-            return (
-                view,
-                capability_runner.PreprocessDiscovery(
-                    capability_runner.StreamDigest("d" * 64, 17),
-                    mixed,
-                    tuple(item.identity for item in mixed),
-                ),
-                capability_runner.PreprocessStageTimings(1.0, 2.0, 34),
-            )
-
-        cache = self._Cache()
-        with self.assertRaisesRegex(
-            AuditInfrastructureError, "production snapshot generation"
-        ):
-            self._run_worker(
-                cache=cache,
-                dependencies=mixed,
-                stabilize_override=compile_twice_then_restore,
-            )
-        self.assertEqual(cache.published, [])
-        self.assertEqual(
-            observed_generations, [generation_b_bytes, generation_b_bytes]
+            ),
         )
-        self.assertEqual(self.source.read_bytes(), initial_bytes)
+        self.assertEqual(observed_generations, [generation_b, generation_b])
+        self.assertEqual(self.header.read_bytes(), generation_a)
+        self.assertEqual(cache.published, [])
+        self.assertTrue(task.compact_reservation.released)
 
     def test_publication_permit_precedes_result_materialization_and_send(self):
         task, reservation = self._task()

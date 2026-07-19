@@ -25,6 +25,7 @@ from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
     CompactResultColdSlot,
+    CompactResultReservationOwnership,
     CompactResultMemoryBudget,
     CompactResultOwnership,
     ConfigurationAuditPublicationPermit,
@@ -2624,6 +2625,69 @@ def decode_configuration_audit_result(payload: bytes) -> ConfigurationAuditResul
         json.JSONDecodeError,
     ) as error:
         raise AuditInfrastructureError("compact audit result payload is invalid") from error
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationAuditResultTransport:
+    """One-shot serialized carrier for a linearly owned compact result."""
+
+    payload: bytes
+    ownership: CompactResultReservationOwnership
+    consumed: bool = False
+
+
+def encode_configuration_audit_result_transport(
+    result: ConfigurationAuditResult,
+) -> ConfigurationAuditResultTransport:
+    ownership = result._transport_ownership
+    if (
+        not isinstance(ownership, CompactResultReservationOwnership)
+        or not ownership.active
+        or ownership.phase != "worker-materialized-result"
+    ):
+        raise AuditInfrastructureError(
+            "compact audit result transport ownership is unavailable"
+        )
+    payload = encode_configuration_audit_result(result)
+    serialized = ownership.transfer("serialized-pipe")
+    try:
+        return ConfigurationAuditResultTransport(payload, serialized)
+    except BaseException:
+        serialized.release("transport-carrier-failure")
+        raise
+
+
+def decode_configuration_audit_result_transport(
+    transport: ConfigurationAuditResultTransport,
+) -> ConfigurationAuditResult:
+    if (
+        not isinstance(transport, ConfigurationAuditResultTransport)
+        or transport.consumed
+        or not transport.ownership.active
+        or transport.ownership.phase != "serialized-pipe"
+    ):
+        raise AuditInfrastructureError(
+            "compact audit result transport was already consumed"
+        )
+    object.__setattr__(transport, "consumed", True)
+    decoding = transport.ownership.transfer("receiver-decode")
+    retained = None
+    try:
+        decoded = decode_configuration_audit_result(transport.payload)
+        retained = decoding.transfer("receiver-retained-result")
+        return ConfigurationAuditResult(
+            decoded.configuration_digest,
+            decoded.audit_engine_fingerprint,
+            decoded.dependencies,
+            decoded.reached_production,
+            decoded.findings,
+            retained,
+        )
+    except BaseException:
+        active = retained if retained is not None else decoding
+        if active.active:
+            active.release("receiver-decode-failure")
+        raise
 
 
 encode_compact_audit_result = encode_configuration_audit_result

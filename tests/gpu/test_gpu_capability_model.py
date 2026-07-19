@@ -830,6 +830,30 @@ class ModelTests(unittest.TestCase):
             inadequate.require_before_discovery("task-small", 7)
         reservation = PerTaskCompactReservation("task-a", 7, 32 << 20)
         reservation.require_before_discovery("task-a", 7)
+        invalid_count_envelope = CompactResultDraftBounds(
+            AuditLimits().compact_result_dependencies,
+            AuditLimits().compact_result_reached,
+            AuditLimits().compact_result_findings,
+            4 << 20,
+            0,
+            0,
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "reservation limit"
+        ):
+            reservation.require_within_pre_dispatch_reservation(
+                "task-a", 4 << 20, invalid_count_envelope, 4096
+            )
+        maximum_valid_findings = (
+            AuditLimits().compact_result_bytes - 1024
+        ) // 320
+        envelope = CompactResultDraftBounds(
+            0, 0, maximum_valid_findings, 0, 0, 0
+        )
+        envelope_charge = reservation.require_within_pre_dispatch_reservation(
+            "task-a", 4 << 20, envelope, 4096
+        )
+        self.assertLessEqual(envelope_charge, 32 << 20)
         bounds = CompactResultDraftBounds(1, 1, 1, 64, 32, 48)
         charged = reservation.require_within_pre_dispatch_reservation(
             "task-a", 1024, bounds, 512
@@ -861,9 +885,12 @@ class ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(AuditInfrastructureError, "already released"):
             permit.release_root_publication()
 
-        reservation.transfer_to_receiver_result("task-a", 7)
+        ownership = reservation.begin_result_ownership("task-a", 7)
+        ownership = ownership.transfer("serialized-pipe")
+        ownership = ownership.transfer("receiver-decode")
+        ownership = ownership.transfer("receiver-retained-result")
         owned_result = ConfigurationAuditResult(
-            "c" * 64, "a" * 64, (dependency,), (), (), reservation
+            "c" * 64, "a" * 64, (dependency,), (), (), ownership
         )
         self.assertFalse(reservation.released)
         owned_result.release_transport_ownership()
