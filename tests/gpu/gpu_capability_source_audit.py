@@ -8066,6 +8066,7 @@ _AUDIT_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
         "_compiler_capability_memo",
         "_compiler_inspection_lock",
         "_compiler_inspection_memo",
+        "_parent_compiler_launch_observer",
     }),
     "gpu_capability_cache": frozenset({"_hash_cache", "_hash_lock"}),
     "gpu_capability_provenance": frozenset(),
@@ -8078,7 +8079,6 @@ _AUDIT_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
         "_WORKER_LIMITS",
         "_WORKER_PRODUCTION",
         "_WORKER_RSS",
-        "_process_handle_associations",
     }),
 })
 _CLASS_STRUCTURAL_MEMBER_EXCLUSIONS = frozenset({

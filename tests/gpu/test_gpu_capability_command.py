@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import ctypes
 import dataclasses
 import inspect
 import locale
@@ -799,6 +800,203 @@ class ConfigurationTests(unittest.TestCase):
                 working_directory=self.build,
             )
         self.assertIsInstance(run.call_args.args[0], CompilerExecutableCapability)
+
+    def test_shared_compiler_boundary_owns_inspection_and_exact_macos_abi(self):
+        info_type = capability_command._macos_proc_bsdinfo_type()
+        self.assertEqual(ctypes.sizeof(info_type), 136)
+        fields = dict(info_type._fields_)
+        self.assertEqual(fields["pbi_comm"]._length_, 16)
+        self.assertEqual(fields["pbi_name"]._length_, 32)
+
+        boundary_source = inspect.getsource(
+            capability_command.launch_compiler_process
+        )
+        runner_source = Path(capability_command.__file__).with_name(
+            "gpu_capability_runner.py"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(boundary_source.count("subprocess." + "Popen("), 1)
+        self.assertEqual(runner_source.count("subprocess." + "Popen("), 0)
+
+    def test_inspection_uses_typed_shared_launch_boundary(self):
+        capability = open_compiler_executable_capability(
+            self.compiler.resolve(), self.dependency_roots,
+            time.monotonic() + 10.0, compiler_family=CompilerFamily.GCC,
+        )
+        self.addCleanup(capability.native_owner.close)
+        observer = object()
+        with mock.patch.object(
+            capability_command,
+            "launch_compiler_process",
+            side_effect=AuditInfrastructureError("inspection boundary reached"),
+        ) as launch, self.assertRaisesRegex(
+            AuditInfrastructureError, "inspection boundary reached"
+        ):
+            inspect_compiler(
+                self.compiler.resolve(), CompilerFamily.GCC, self.environment,
+                self.dependency_roots, pipeline_deadline=time.monotonic() + 10.0,
+                launch_accountant=observer, working_directory=self.build,
+                compiler_capability=capability,
+            )
+        self.assertEqual(
+            launch.call_args.kwargs["purpose"],
+            capability_command.CompilerLaunchPurpose.INSPECTION,
+        )
+        self.assertIs(launch.call_args.kwargs["launch_observer"], observer)
+
+    def test_parent_carrier_revalidates_process_identity_after_exit(self):
+        class Process:
+            pid = 42
+            stdin = None
+
+        class Containment:
+            requires_handshake = False
+            popen_arguments = {}
+
+            def attach(self, process):
+                self.process = process
+
+            def release(self, process):
+                self.released = process
+
+            def terminate(self):
+                pass
+
+        class Observer:
+            def __init__(self):
+                self.registered = []
+                self.completed = []
+
+            def register_compiler_process_launch(self, event, carrier):
+                self.registered.append((event, carrier))
+
+            def complete_compiler_process_launch(self, event, carrier):
+                self.completed.append((event, carrier))
+
+        process = Process()
+        observer = Observer()
+        with mock.patch.object(
+            capability_command.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            capability_command, "_native_process_start_token",
+            side_effect=("native-start", "reused-start"),
+        ):
+            returned, carrier = capability_command.launch_compiler_process(
+                ("compiler", "--version"),
+                cwd=self.build,
+                environment=self.environment,
+                containment=Containment(),
+                platform_kind="windows",
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                launch_options={},
+                purpose=capability_command.CompilerLaunchPurpose.INSPECTION,
+                launch_observer=observer,
+            )
+            self.assertIs(returned, process)
+            self.assertIs(observer.registered[0][1], carrier)
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "post-exit process identity differs"
+            ):
+                carrier.complete_after_exit()
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "already completed"
+            ):
+                carrier.complete_after_exit()
+            self.assertIsNone(carrier.process)
+        self.assertEqual(observer.completed, [])
+
+    def test_shared_boundary_emits_exact_inspection_discovery_accepted_events(self):
+        class Process:
+            stdin = None
+
+            def __init__(self, pid):
+                self.pid = pid
+
+        class Containment:
+            requires_handshake = False
+            popen_arguments = {}
+
+            def attach(self, _process): pass
+            def release(self, _process): pass
+            def terminate(self): pass
+
+        class Observer:
+            def __init__(self):
+                self.events = []
+
+            def register_compiler_process_launch(self, event, _carrier):
+                self.events.append(event)
+
+            def complete_compiler_process_launch(self, _event, _carrier):
+                pass
+
+        purposes = (
+            capability_command.CompilerLaunchPurpose.INSPECTION,
+            capability_command.CompilerLaunchPurpose.AUDIT_DISCOVERY,
+            capability_command.CompilerLaunchPurpose.AUDIT_ACCEPTED,
+        )
+        processes = [Process(100 + index) for index in range(3)]
+        tokens = tuple(
+            token
+            for index in range(3)
+            for token in (f"start-{index}", f"start-{index}")
+        )
+        observer = Observer()
+        with mock.patch.object(
+            capability_command.subprocess, "Popen", side_effect=processes
+        ), mock.patch.object(
+            capability_command, "_native_process_start_token",
+            side_effect=tokens,
+        ):
+            for index, purpose in enumerate(purposes):
+                audit = purpose is not capability_command.CompilerLaunchPurpose.INSPECTION
+                _process, carrier = capability_command.launch_compiler_process(
+                    ("compiler",),
+                    cwd=self.build,
+                    environment=self.environment,
+                    containment=Containment(),
+                    platform_kind="windows",
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    launch_options={},
+                    purpose=purpose,
+                    launch_observer=observer,
+                    worker_index=(3 if audit else None),
+                    task_id=("task-a" if audit else None),
+                    generation=(7 if audit else None),
+                )
+                carrier.complete_after_exit()
+        self.assertEqual(tuple(event.purpose for event in observer.events), purposes)
+        self.assertTrue(all(
+            event.task_id == "task-a" and event.generation == 7
+            for event in observer.events[1:]
+        ))
+
+    def test_parent_registry_rejects_pid_reuse_and_releases_failed_carrier(self):
+        registry = capability_command._ParentCompilerLaunchObserver()
+        first = capability_command.CompilerLaunchEvent(
+            capability_command.CompilerLaunchPurpose.INSPECTION,
+            capability_command.ProcessStartIdentity(
+                "windows", 42, "start-a", "cookie-a"
+            ),
+        )
+        reused = capability_command.CompilerLaunchEvent(
+            capability_command.CompilerLaunchPurpose.INSPECTION,
+            capability_command.ProcessStartIdentity(
+                "windows", 42, "start-b", "cookie-b"
+            ),
+        )
+        first_carrier = object()
+        registry.register_compiler_process_launch(first, first_carrier)
+        self.assertEqual(registry.active_count, 1)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "carrier is duplicated"
+        ):
+            registry.register_compiler_process_launch(reused, object())
+        registry.fail_compiler_process_launch(first, first_carrier)
+        self.assertEqual(registry.active_count, 0)
 
     def test_unreferenced_sibling_directory_is_not_scanned_into_closure(self):
         _clear_compiler_inspection_memo_for_tests()
@@ -1817,6 +2015,7 @@ class ConfigurationTests(unittest.TestCase):
 
         class Process:
             returncode = 0
+            pid = 4242
 
             def __init__(self, stdout, mutate_on_poll=None):
                 self.stdout = stdout
@@ -1863,6 +2062,9 @@ class ConfigurationTests(unittest.TestCase):
                 "gpu_capability_command._ProbeContainment", Containment
             ), mock.patch(
                 "gpu_capability_command.subprocess.Popen", side_effect=launch
+            ), mock.patch(
+                "gpu_capability_command._native_process_start_token",
+                return_value="test-process-start",
             ):
                 try:
                     capability_command._run_probe_command(
@@ -2244,6 +2446,8 @@ class ConfigurationTests(unittest.TestCase):
         self.addCleanup(capability.native_owner.close)
 
         class FakeProcess:
+            pid = 4242
+
             def __init__(self, *, stdout, payload=b"", running=False, **_kwargs):
                 stdout.write(payload)
                 stdout.flush()
@@ -2263,7 +2467,16 @@ class ConfigurationTests(unittest.TestCase):
         def overflow_process(*_args, **kwargs):
             return FakeProcess(stdout=kwargs["stdout"], payload=b"x" * (1024 * 1024 + 1))
 
-        with mock.patch("gpu_capability_command.subprocess.Popen", side_effect=overflow_process) as popen:
+        with mock.patch(
+            "gpu_capability_command.subprocess.Popen", side_effect=overflow_process
+        ) as popen, mock.patch(
+            "gpu_capability_command._native_process_start_token",
+            return_value="test-process-start",
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "attach"
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "release"
+        ):
             with self.assertRaisesRegex(AuditInfrastructureError, "version output limit"):
                 from gpu_capability_command import _probe_compiler_version
                 _probe_compiler_version(capability, CompilerFamily.GCC, self.build, self.environment)
@@ -2276,7 +2489,16 @@ class ConfigurationTests(unittest.TestCase):
             ),
         ), mock.patch(
             "gpu_capability_command.time.monotonic", side_effect=(10.0, 16.0)
-        ), mock.patch("gpu_capability_command.time.sleep"):
+        ), mock.patch(
+            "gpu_capability_command.time.sleep"
+        ), mock.patch(
+            "gpu_capability_command._native_process_start_token",
+            return_value="test-process-start",
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "attach"
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "release"
+        ):
             with self.assertRaisesRegex(AuditInfrastructureError, "version probe timeout"):
                 from gpu_capability_command import _probe_compiler_version
                 _probe_compiler_version(capability, CompilerFamily.GCC, self.build, self.environment)
@@ -2299,6 +2521,7 @@ class ConfigurationTests(unittest.TestCase):
 
         class Process:
             returncode = 0
+            pid = 4242
 
             def __init__(self, *_args, stdout, **_kwargs):
                 stdout.write(b"g++ (GCC) 14.1.0\n")
@@ -2315,6 +2538,13 @@ class ConfigurationTests(unittest.TestCase):
             "gpu_capability_command._ProbeContainment", Containment
         ), mock.patch(
             "gpu_capability_command.subprocess.Popen", Process
+        ), mock.patch(
+            "gpu_capability_command._native_process_start_token",
+            return_value="test-process-start",
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "attach"
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "release"
         ):
             capability_command._run_probe_command(
                 capability, ("--version",), self.build, self.environment,
@@ -2337,6 +2567,7 @@ class ConfigurationTests(unittest.TestCase):
 
         class FakeProcess:
             returncode = 0
+            pid = 4242
 
             def __init__(self, command, *, stderr, **_kwargs):
                 captured["command"] = tuple(command)
@@ -2354,7 +2585,16 @@ class ConfigurationTests(unittest.TestCase):
             def wait(self, timeout=None):
                 return self.returncode
 
-        with mock.patch("gpu_capability_command.subprocess.Popen", FakeProcess):
+        with mock.patch(
+            "gpu_capability_command.subprocess.Popen", FakeProcess
+        ), mock.patch(
+            "gpu_capability_command._native_process_start_token",
+            return_value="test-process-start",
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "attach"
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "release"
+        ):
             from gpu_capability_command import _probe_compiler_version
             output = _probe_compiler_version(
                 capability, CompilerFamily.MSVC, self.build, self.environment

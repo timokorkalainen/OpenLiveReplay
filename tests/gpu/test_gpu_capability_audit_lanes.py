@@ -115,6 +115,14 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
         self.assertEqual(worker.__defaults__, defaults)
 
+        command = capability_audit._gpu_capability_command
+        with mock.patch.object(
+            command,
+            "launch_compiler_process",
+            lambda *_args, **_kwargs: (_args, _kwargs),
+        ):
+            self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
+
     def test_production_modules_have_no_bare_asserts(self):
         source_directory = Path(__file__).resolve().parent
         names = (
@@ -443,9 +451,12 @@ class AuditEngineFingerprintTests(unittest.TestCase):
         for expected in (
             "gpu_capability_cache.ConfigurationAuditCache",
             "gpu_capability_cache.audit_cache_key",
+            "gpu_capability_command.CompilerProcessHandleCarrier",
+            "gpu_capability_command.launch_compiler_process",
             "gpu_capability_model.CompactResultMemoryBudget",
             "gpu_capability_model.ConfigurationAuditResult",
             "gpu_capability_model.DependencyDigest",
+            "gpu_capability_model.PerTaskCompactReservation",
             "gpu_capability_model.StreamingResultAggregator",
             "gpu_capability_source_audit.cpp_tokens",
             "gpu_capability_source_audit._header_operand_after_leading_comments",

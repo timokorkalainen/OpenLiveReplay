@@ -448,7 +448,8 @@ class PerTaskCompactReservation:
 
     __slots__ = (
         "task_id", "generation", "maximum_bytes", "_charged_bytes",
-        "_peak_bytes", "_released", "_release_phase", "_lock",
+        "_peak_bytes", "_canonical_json_bytes", "_owner_phase",
+        "_released", "_release_phase", "_lock",
     )
 
     def __init__(self, task_id: str, generation: int, maximum_bytes: int = 32 << 20) -> None:
@@ -469,6 +470,8 @@ class PerTaskCompactReservation:
         self.maximum_bytes = maximum_bytes
         self._charged_bytes = 0
         self._peak_bytes = 0
+        self._canonical_json_bytes = 0
+        self._owner_phase = "parent-pre-dispatch"
         self._released = False
         self._release_phase: str | None = None
         self._lock = threading.Lock()
@@ -492,6 +495,29 @@ class PerTaskCompactReservation:
     def release_phase(self) -> str | None:
         with self._lock:
             return self._release_phase
+
+    @property
+    def canonical_json_bytes(self) -> int:
+        with self._lock:
+            return self._canonical_json_bytes
+
+    @property
+    def owner_phase(self) -> str:
+        with self._lock:
+            return self._owner_phase
+
+    def require_before_discovery(self, task_id: str, generation: int) -> None:
+        with self._lock:
+            if (
+                self._released
+                or task_id != self.task_id
+                or generation != self.generation
+                or self.maximum_bytes < (32 << 20)
+            ):
+                raise AuditInfrastructureError(
+                    "pre-dispatch compact reservation is inadequate"
+                )
+            self._owner_phase = "worker-audit"
 
     def validate(self, task_id: str, generation: int) -> None:
         with self._lock:
@@ -545,6 +571,35 @@ class PerTaskCompactReservation:
             self._peak_bytes = max(self._peak_bytes, self._charged_bytes)
         return charged
 
+    def record_exact_canonical_json(self, task_id: str, encoded_bytes: int) -> None:
+        if (
+            task_id != self.task_id
+            or not isinstance(encoded_bytes, int)
+            or isinstance(encoded_bytes, bool)
+            or encoded_bytes <= 0
+        ):
+            raise AuditInfrastructureError("canonical compact result charge is invalid")
+        with self._lock:
+            if self._released or self._charged_bytes <= 0:
+                raise AuditInfrastructureError(
+                    "canonical compact result was not reserved"
+                )
+            self._canonical_json_bytes = encoded_bytes
+            self._owner_phase = "worker-bounded-draft"
+
+    def transfer_to_receiver_result(self, task_id: str, generation: int) -> None:
+        with self._lock:
+            if (
+                self._released
+                or task_id != self.task_id
+                or generation != self.generation
+                or self._canonical_json_bytes <= 0
+            ):
+                raise AuditInfrastructureError(
+                    "compact reservation result transfer differs"
+                )
+            self._owner_phase = "receiver-retained-result"
+
     def release(self, phase: str) -> None:
         if not isinstance(phase, str) or not phase:
             raise AuditInfrastructureError("compact reservation release phase is invalid")
@@ -553,6 +608,7 @@ class PerTaskCompactReservation:
                 raise AuditInfrastructureError("compact reservation was already released")
             self._released = True
             self._charged_bytes = 0
+            self._owner_phase = "released"
             self._release_phase = phase
 
 
@@ -2423,6 +2479,9 @@ class ConfigurationAuditResult:
     dependencies: tuple[DependencyDigest, ...]
     reached_production: tuple[PurePosixPath, ...]
     findings: tuple[AuditResultFinding, ...]
+    _transport_ownership: PerTaskCompactReservation | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         limits = AuditLimits()
@@ -2476,6 +2535,19 @@ class ConfigurationAuditResult:
         finding_keys = tuple(_audit_finding_key(item) for item in self.findings)
         if finding_keys != tuple(sorted(finding_keys)) or len(set(finding_keys)) != len(finding_keys):
             raise AuditInfrastructureError("audit result findings are not unique and sorted")
+        if (
+            self._transport_ownership is not None
+            and not isinstance(self._transport_ownership, PerTaskCompactReservation)
+        ):
+            raise AuditInfrastructureError("audit result transport ownership is invalid")
+
+    def release_transport_ownership(self) -> None:
+        ownership = self._transport_ownership
+        if ownership is None:
+            raise AuditInfrastructureError(
+                "audit result transport ownership is unavailable"
+            )
+        ownership.release("retained-result-transition")
 
 
 @dataclass(frozen=True, slots=True)

@@ -823,13 +823,20 @@ class ModelTests(unittest.TestCase):
             dataclasses.replace(permit, dependencies=(dependency, dependency))
 
     def test_worker_compact_reservation_and_root_permit_are_linear_and_bounded(self):
+        inadequate = PerTaskCompactReservation("task-small", 7, (32 << 20) - 1)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "pre-dispatch compact reservation"
+        ):
+            inadequate.require_before_discovery("task-small", 7)
         reservation = PerTaskCompactReservation("task-a", 7, 32 << 20)
+        reservation.require_before_discovery("task-a", 7)
         bounds = CompactResultDraftBounds(1, 1, 1, 64, 32, 48)
         charged = reservation.require_within_pre_dispatch_reservation(
             "task-a", 1024, bounds, 512
         )
         self.assertGreaterEqual(charged, 1536)
         self.assertLessEqual(charged, reservation.maximum_bytes)
+        reservation.record_exact_canonical_json("task-a", 1024)
         with self.assertRaisesRegex(
             AuditInfrastructureError, "pre-dispatch compact reservation"
         ):
@@ -854,7 +861,12 @@ class ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(AuditInfrastructureError, "already released"):
             permit.release_root_publication()
 
-        reservation.release("worker-return")
+        reservation.transfer_to_receiver_result("task-a", 7)
+        owned_result = ConfigurationAuditResult(
+            "c" * 64, "a" * 64, (dependency,), (), (), reservation
+        )
+        self.assertFalse(reservation.released)
+        owned_result.release_transport_ownership()
         self.assertTrue(reservation.released)
         with self.assertRaisesRegex(AuditInfrastructureError, "already released"):
             reservation.release("duplicate")

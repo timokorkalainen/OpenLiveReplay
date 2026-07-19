@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import queue
-import secrets
 import signal
 import stat
 import subprocess
@@ -21,16 +20,22 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 
-from gpu_capability_cache import PreprocessCache
+from gpu_capability_cache import (
+    PreprocessCache,
+    _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES,
+)
 from gpu_capability_command import (
+    CompilerProcessHandleCarrier,
     RewrittenCommand,
     _environment_digest,
     decode_compile_entry,
     make_configuration,
+    launch_compiler_process,
     rewrite_preprocess_command,
     validate_compiler_executable_capability,
 )
 from gpu_capability_model import (
+    AUDIT_RESULT_SCHEMA_BYTES,
     AuditResultFinding,
     AuditInfrastructureError,
     AuditLimits,
@@ -357,146 +362,6 @@ def _terminate_and_reap(
         raise containment_error
 
 
-class _ProcessHandleAssociationTable:
-    """Own authenticated process handles from launch through final phase seal."""
-
-    def __init__(self) -> None:
-        self._entries: dict[ProcessStartIdentity, object] = {}
-        self._lock = threading.Lock()
-
-    @property
-    def active_count(self) -> int:
-        with self._lock:
-            return len(self._entries)
-
-    def register(self, identity: ProcessStartIdentity, process: object) -> None:
-        if not isinstance(identity, ProcessStartIdentity) or process is None:
-            raise AuditInfrastructureError("compiler process handle association is invalid")
-        with self._lock:
-            if identity in self._entries or any(
-                existing.pid == identity.pid
-                and existing.handle_cookie == identity.handle_cookie
-                for existing in self._entries
-            ):
-                raise AuditInfrastructureError("compiler process handle association is duplicated")
-            self._entries[identity] = process
-
-    def require(self, identity: ProcessStartIdentity) -> object:
-        with self._lock:
-            process = self._entries.get(identity)
-            if process is None:
-                raise AuditInfrastructureError(
-                    "compiler launch event preceded handle registration"
-                )
-            return process
-
-    def release(self, identity: ProcessStartIdentity, process: object) -> None:
-        with self._lock:
-            existing = self._entries.get(identity)
-            if existing is None:
-                raise AuditInfrastructureError("compiler process handle was already closed")
-            if existing is not process:
-                raise AuditInfrastructureError("compiler process handle cookie differs")
-            del self._entries[identity]
-
-
-_process_handle_associations = _ProcessHandleAssociationTable()
-
-
-def _native_process_start_token(
-    process: subprocess.Popen[bytes], platform_kind: str
-) -> str:
-    if platform_kind == "windows":
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetProcessTimes.argtypes = (
-            wintypes.HANDLE,
-            ctypes.POINTER(wintypes.FILETIME),
-            ctypes.POINTER(wintypes.FILETIME),
-            ctypes.POINTER(wintypes.FILETIME),
-            ctypes.POINTER(wintypes.FILETIME),
-        )
-        kernel32.GetProcessTimes.restype = wintypes.BOOL
-        creation = wintypes.FILETIME()
-        exit_time = wintypes.FILETIME()
-        kernel_time = wintypes.FILETIME()
-        user_time = wintypes.FILETIME()
-        process_handle = getattr(process, "_handle", None)
-        if process_handle is None or not kernel32.GetProcessTimes(
-            process_handle,
-            ctypes.byref(creation),
-            ctypes.byref(exit_time),
-            ctypes.byref(kernel_time),
-            ctypes.byref(user_time),
-        ):
-            raise AuditInfrastructureError("cannot authenticate Windows process start")
-        value = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
-        return f"windows-filetime:{value}"
-    if platform_kind == "linux":
-        try:
-            stat_text = Path(f"/proc/{process.pid}/stat").read_text(encoding="ascii")
-            close = stat_text.rfind(")")
-            fields = stat_text[close + 2:].split()
-            start_ticks = fields[19]
-            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
-                encoding="ascii"
-            ).strip()
-        except (OSError, IndexError, ValueError) as error:
-            raise AuditInfrastructureError("cannot authenticate Linux process start") from error
-        if not boot_id or not start_ticks.isdigit():
-            raise AuditInfrastructureError("Linux process start identity is invalid")
-        return f"linux-proc:{boot_id}:{start_ticks}"
-    if platform_kind == "macos":
-        import ctypes
-
-        class _ProcBsdInfo(ctypes.Structure):
-            _fields_ = (
-                ("pbi_flags", ctypes.c_uint32),
-                ("pbi_status", ctypes.c_uint32),
-                ("pbi_xstatus", ctypes.c_uint32),
-                ("pbi_pid", ctypes.c_uint32),
-                ("pbi_ppid", ctypes.c_uint32),
-                ("pbi_uid", ctypes.c_uint32),
-                ("pbi_gid", ctypes.c_uint32),
-                ("pbi_ruid", ctypes.c_uint32),
-                ("pbi_rgid", ctypes.c_uint32),
-                ("pbi_svuid", ctypes.c_uint32),
-                ("pbi_svgid", ctypes.c_uint32),
-                ("rfu_1", ctypes.c_uint32),
-                ("pbi_comm", ctypes.c_char * 17),
-                ("pbi_name", ctypes.c_char * 33),
-                ("pbi_nfiles", ctypes.c_uint32),
-                ("pbi_pgid", ctypes.c_uint32),
-                ("pbi_pjobc", ctypes.c_uint32),
-                ("e_tdev", ctypes.c_uint32),
-                ("e_tpgid", ctypes.c_uint32),
-                ("pbi_nice", ctypes.c_int32),
-                ("pbi_start_tvsec", ctypes.c_uint64),
-                ("pbi_start_tvusec", ctypes.c_uint64),
-            )
-
-        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-        query = libproc.proc_pidinfo
-        query.argtypes = (
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
-            ctypes.c_void_p,
-            ctypes.c_int,
-        )
-        query.restype = ctypes.c_int
-        info = _ProcBsdInfo()
-        received = query(
-            process.pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)
-        )
-        if received != ctypes.sizeof(info) or info.pbi_pid != process.pid:
-            raise AuditInfrastructureError("cannot authenticate macOS process start")
-        return f"macos-proc:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
-    raise AuditInfrastructureError("compiler process platform identity is invalid")
-
-
 def _launch_compiler_process(
     prepared_arguments,
     *,
@@ -507,42 +372,32 @@ def _launch_compiler_process(
     launch_options: Mapping[str, object],
     launch_context: _AuditLaunchContext | None,
     launch_purpose: CompilerLaunchPurpose | None,
-) -> tuple[subprocess.Popen[bytes], ProcessStartIdentity | None]:
-    process = subprocess.Popen(
+) -> tuple[subprocess.Popen[bytes], CompilerProcessHandleCarrier]:
+    purpose = (
+        launch_purpose
+        if launch_purpose is not None
+        else CompilerLaunchPurpose.INSPECTION
+    )
+    return launch_compiler_process(
         prepared_arguments,
-        cwd=str(configuration.working_directory),
-        env=dict(environment),
-        shell=False,
+        cwd=configuration.working_directory,
+        environment=environment,
+        containment=containment,
+        platform_kind=capability.platform_kind,
         stdin=(
             subprocess.PIPE if containment.requires_handshake else subprocess.DEVNULL
         ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        **dict(launch_options),
-        **containment.popen_arguments,
+        launch_options=launch_options,
+        purpose=purpose,
+        launch_observer=launch_context,
+        worker_index=(_WORKER_INDEX if launch_context is not None else None),
+        task_id=(launch_context.task_id if launch_context is not None else None),
+        generation=(
+            launch_context.generation if launch_context is not None else None
+        ),
     )
-    identity: ProcessStartIdentity | None = None
-    try:
-        containment.attach(process)
-        if launch_context is not None and launch_purpose is not None:
-            identity = ProcessStartIdentity(
-                capability.platform_kind,
-                process.pid,
-                _native_process_start_token(process, capability.platform_kind),
-                secrets.token_hex(32),
-            )
-            _process_handle_associations.register(identity, process)
-            launch_context.record_process_start(launch_purpose, identity)
-        containment.release(process)
-        return process, identity
-    except BaseException:
-        if identity is not None:
-            try:
-                _process_handle_associations.release(identity, process)
-            except AuditInfrastructureError:
-                pass
-        _terminate_and_reap(process, containment)
-        raise
 
 
 def run_bounded_preprocessor(
@@ -656,7 +511,7 @@ def run_bounded_preprocessor(
         raise AuditInfrastructureError("compiler launch does not consume the held capability")
     containment = _ProcessContainment()
     process: subprocess.Popen[bytes] | None = None
-    process_start_identity: ProcessStartIdentity | None = None
+    process_carrier: CompilerProcessHandleCarrier | None = None
     stdout_events: queue.Queue[bytes | BaseException | None] = queue.Queue(maxsize=2)
     stop_readers = threading.Event()
     stderr_tail = bytearray()
@@ -748,7 +603,7 @@ def run_bounded_preprocessor(
                 raise AuditInfrastructureError(
                     f"{deadline_reason} before launch"
                 )
-            process, process_start_identity = _launch_compiler_process(
+            process, process_carrier = _launch_compiler_process(
                 prepared_arguments,
                 configuration=configuration,
                 environment=environment,
@@ -987,15 +842,13 @@ def run_bounded_preprocessor(
                     stderr_tail=cleanup_stderr_tail,
                 ) from error
         finally:
-            if process is not None and process_start_identity is not None:
+            if process is not None and process_carrier is not None:
                 try:
-                    _process_handle_associations.release(
-                        process_start_identity, process
-                    )
+                    process_carrier.complete_after_exit()
                 except AuditInfrastructureError as error:
                     if active_error is not None:
                         active_error.add_note(
-                            f"process handle association cleanup also failed: {error}"
+                            f"process carrier completion also failed: {error}"
                         )
                     else:
                         raise
@@ -1111,6 +964,7 @@ class _CompactAuditDraft:
             self.dependencies,
             self.reached_production,
             self.findings,
+            reservation,
         )
 
 
@@ -1146,12 +1000,103 @@ def _compact_findings(findings) -> tuple[AuditResultFinding, ...]:
     return result
 
 
+def _json_ascii_string_bytes(value: str) -> int:
+    if not isinstance(value, str):
+        raise AuditInfrastructureError("canonical JSON string is invalid")
+    total = 2
+    for character in value:
+        codepoint = ord(character)
+        if character in {'"', "\\"} or character in "\b\f\n\r\t":
+            total += 2
+        elif codepoint < 0x20:
+            total += 6
+        elif codepoint <= 0x7f:
+            total += 1
+        elif codepoint <= 0xffff:
+            total += 6
+        else:
+            total += 12
+    return total
+
+
+def _json_member_bytes(name: str, value_bytes: int) -> int:
+    return _json_ascii_string_bytes(name) + 1 + value_bytes
+
+
+def _canonical_audit_result_json_bytes(
+    configuration_digest: str,
+    audit_engine_fingerprint: str,
+    dependencies: tuple[DependencyDigest, ...],
+    raw_findings,
+) -> int:
+    dependency_array_bytes = 2
+    for index, dependency in enumerate(dependencies):
+        identity = dependency.identity
+        values = (
+            ("canonical", _json_ascii_string_bytes(str(identity.canonical))),
+            ("device", len(str(identity.device))),
+            ("inode", 4 if identity.inode is None else len(str(identity.inode))),
+            ("line_count", len(str(identity.line_count))),
+            ("production", 4 if identity.production else 5),
+            (
+                "relative",
+                4 if identity.relative is None else _json_ascii_string_bytes(
+                    identity.relative.as_posix()
+                ),
+            ),
+            (
+                "role_relative_path",
+                _json_ascii_string_bytes(dependency.role_relative_path.as_posix()),
+            ),
+            ("sha256", _json_ascii_string_bytes(dependency.sha256)),
+            ("stable_role", _json_ascii_string_bytes(dependency.stable_role)),
+        )
+        dependency_array_bytes += (1 if index else 0) + 2 + 8 + sum(
+            _json_member_bytes(name, size) for name, size in values
+        )
+
+    reached_array_bytes = 2
+    reached_index = 0
+    for dependency in dependencies:
+        identity = dependency.identity
+        if identity.production and identity.relative is not None:
+            reached_array_bytes += (
+                (1 if reached_index else 0)
+                + _json_ascii_string_bytes(identity.relative.as_posix())
+            )
+            reached_index += 1
+
+    finding_array_bytes = 2
+    for index, finding in enumerate(raw_findings):
+        path = finding.path.as_posix()
+        line = finding.line
+        expression = finding.expression
+        reason = finding.reason
+        finding_array_bytes += (1 if index else 0) + 2 + 3 + sum((
+            _json_member_bytes("expression", _json_ascii_string_bytes(expression)),
+            _json_member_bytes("line", len(str(line))),
+            _json_member_bytes("path", _json_ascii_string_bytes(path)),
+            _json_member_bytes("reason", _json_ascii_string_bytes(reason)),
+        ))
+
+    top_values = (
+        ("audit_engine_fingerprint", _json_ascii_string_bytes(audit_engine_fingerprint)),
+        ("configuration_digest", _json_ascii_string_bytes(configuration_digest)),
+        ("dependencies", dependency_array_bytes),
+        ("findings", finding_array_bytes),
+        ("reached_production", reached_array_bytes),
+        ("schema", _json_ascii_string_bytes(AUDIT_RESULT_SCHEMA_BYTES.decode("ascii"))),
+    )
+    return 2 + 5 + sum(
+        _json_member_bytes(name, size) for name, size in top_values
+    )
+
+
 def _bounded_compact_result_draft(
     configuration_digest: str,
     audit_engine_fingerprint: str,
     dependencies: tuple[DependencyDigest, ...],
-    reached_production: tuple[PurePosixPath, ...],
-    findings: tuple[AuditResultFinding, ...],
+    raw_findings,
     task_id: str,
     generation: int,
     reservation: PerTaskCompactReservation,
@@ -1159,47 +1104,77 @@ def _bounded_compact_result_draft(
     if (
         not isinstance(dependencies, tuple)
         or any(not isinstance(item, DependencyDigest) for item in dependencies)
-        or not isinstance(reached_production, tuple)
-        or any(not isinstance(item, PurePosixPath) for item in reached_production)
-        or not isinstance(findings, tuple)
-        or any(not isinstance(item, AuditResultFinding) for item in findings)
+        or not isinstance(raw_findings, (tuple, list))
     ):
         raise AuditInfrastructureError("compact result draft is invalid")
+    reached_count = 0
+    reached_path_bytes = 0
+    for dependency in dependencies:
+        identity = dependency.identity
+        if identity.production and identity.relative is not None:
+            reached_count += 1
+            reached_path_bytes += len(
+                identity.relative.as_posix().encode("utf-8")
+            )
+    finding_count = 0
+    finding_path_bytes = 0
+    expression_bytes = 0
+    reason_bytes = 0
+    for finding in raw_findings:
+        path = getattr(finding, "path", None)
+        line = getattr(finding, "line", None)
+        expression = getattr(finding, "expression", None)
+        reason = getattr(finding, "reason", None)
+        if (
+            not isinstance(path, PurePosixPath)
+            or not isinstance(line, int)
+            or isinstance(line, bool)
+            or line <= 0
+            or not isinstance(expression, str)
+            or not isinstance(reason, str)
+        ):
+            raise AuditInfrastructureError("audit finding cannot be compacted")
+        finding_count += 1
+        finding_path_bytes += len(path.as_posix().encode("utf-8"))
+        expression_bytes += len(expression.encode("utf-8"))
+        reason_bytes += len(reason.encode("utf-8"))
     dependency_path_bytes = sum(
         len(item.role_relative_path.as_posix().encode("utf-8"))
         + len(str(item.identity.canonical).encode("utf-8"))
         for item in dependencies
     )
-    reached_path_bytes = sum(
-        len(path.as_posix().encode("utf-8")) for path in reached_production
-    )
-    finding_path_bytes = sum(
-        len(item.path.as_posix().encode("utf-8")) for item in findings
-    )
-    expression_bytes = sum(len(item.expression.encode("utf-8")) for item in findings)
-    reason_bytes = sum(len(item.reason.encode("utf-8")) for item in findings)
     bounds = CompactResultDraftBounds(
         len(dependencies),
-        len(reached_production),
-        len(findings),
+        reached_count,
+        finding_count,
         dependency_path_bytes + reached_path_bytes + finding_path_bytes,
         expression_bytes,
         reason_bytes,
     )
-    encoded_bytes = (
-        512
-        + dependency_path_bytes
-        + reached_path_bytes
-        + finding_path_bytes
-        + expression_bytes
-        + reason_bytes
-        + len(dependencies) * 512
-        + len(reached_production) * 32
-        + len(findings) * 96
+    encoded_bytes = _canonical_audit_result_json_bytes(
+        configuration_digest,
+        audit_engine_fingerprint,
+        dependencies,
+        raw_findings,
     )
+    if encoded_bytes > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES:
+        raise AuditInfrastructureError("encoded compact audit result limit exceeded")
     reservation.require_within_pre_dispatch_reservation(
         task_id, encoded_bytes, bounds, 4096
     )
+    reservation.record_exact_canonical_json(task_id, encoded_bytes)
+    reached_production = tuple(sorted(
+        (
+            dependency.identity.relative
+            for dependency in dependencies
+            if dependency.identity.production
+            and dependency.identity.relative is not None
+        ),
+        key=PurePosixPath.as_posix,
+    ))
+    if len(set(reached_production)) != len(reached_production):
+        raise AuditInfrastructureError("fresh production reachability is duplicated")
+    findings = _compact_findings(raw_findings)
     return _CompactAuditDraft(
         configuration_digest,
         audit_engine_fingerprint,
@@ -1247,6 +1222,53 @@ class _AuditLaunchContext:
         self._control_endpoint = control_endpoint
         self._task = task
         self._deadline = deadline
+
+    @property
+    def task_id(self) -> str:
+        return self._task.task_id
+
+    @property
+    def generation(self) -> int:
+        return self._task.generation
+
+    def register_compiler_process_launch(
+        self, event: CompilerLaunchEvent, carrier: CompilerProcessHandleCarrier
+    ) -> None:
+        if (
+            event.task_id != self._task.task_id
+            or event.generation != self._task.generation
+        ):
+            raise AuditInfrastructureError("compiler process carrier generation differs")
+        register = getattr(
+            self._control_endpoint, "register_compiler_process_launch", None
+        )
+        if not callable(register):
+            raise AuditInfrastructureError(
+                "parent compiler process launch observer is unavailable"
+            )
+        register(event, carrier)
+        _send_control_frame_before(self._control_endpoint, event, self._deadline)
+
+    def complete_compiler_process_launch(
+        self, event: CompilerLaunchEvent, carrier: CompilerProcessHandleCarrier
+    ) -> None:
+        complete = getattr(
+            self._control_endpoint, "complete_compiler_process_launch", None
+        )
+        if not callable(complete):
+            raise AuditInfrastructureError(
+                "parent compiler process completion observer is unavailable"
+            )
+        complete(event, carrier)
+
+    def fail_compiler_process_launch(
+        self, event: CompilerLaunchEvent, carrier: CompilerProcessHandleCarrier
+    ) -> None:
+        fail = getattr(
+            self._control_endpoint, "fail_compiler_process_launch", None
+        )
+        if callable(fail):
+            fail(event, carrier)
 
     def record_process_start(
         self, purpose: CompilerLaunchPurpose, process_start: ProcessStartIdentity
@@ -1344,6 +1366,7 @@ def audit_configuration_worker(
         reservation = _require_valid_dispatch_reservation(
             task.compact_reservation, task, _WORKER_GENERATION
         )
+        reservation.require_before_discovery(task.task_id, _WORKER_GENERATION)
         if _WORKER_CANCEL_EVENT is not None and _WORKER_CANCEL_EVENT.is_set():
             raise AuditInfrastructureError("worker cancelled before discovery")
         if (
@@ -1377,28 +1400,15 @@ def audit_configuration_worker(
         validate_production_dependency_snapshots(
             discovery.dependencies, production_snapshot
         )
-        reached = tuple(sorted(
-            (
-                dependency.identity.relative
-                for dependency in discovery.dependencies
-                if dependency.identity.production
-                and dependency.identity.relative is not None
-            ),
-            key=PurePosixPath.as_posix,
-        ))
-        if len(set(reached)) != len(reached):
-            raise AuditInfrastructureError("fresh production reachability is duplicated")
         with _stage_timer() as audit_time:
             findings = audit_preprocessed_view(
                 view, _WORKER_LIMITS, _WORKER_RSS.sample
             )
-        compact_findings = _compact_findings(findings)
         draft = _bounded_compact_result_draft(
             task.configuration.digest,
             engine,
             discovery.dependencies,
-            reached,
-            compact_findings,
+            findings,
             task.task_id,
             task.generation,
             reservation,
@@ -1437,12 +1447,24 @@ def audit_configuration_worker(
                 publication_permit,
                 deadline,
             )
+        if not isinstance(accepted, ConfigurationAuditResult):
+            raise AuditInfrastructureError("cache publication result is invalid")
+        if accepted is not result:
+            accepted = ConfigurationAuditResult(
+                accepted.configuration_digest,
+                accepted.audit_engine_fingerprint,
+                accepted.dependencies,
+                accepted.reached_production,
+                accepted.findings,
+                reservation,
+            )
         stages = WorkerStageTimings(
             preprocess_stages.discovery_seconds,
             preprocess_stages.accepted_parse_seconds,
             audit_time.elapsed_seconds,
             publish_time.elapsed_seconds,
         )
+        reservation.transfer_to_receiver_result(task.task_id, task.generation)
         return ConfigurationAuditOutcome(
             result=accepted,
             stdout_bytes=preprocess_stages.compiler_stdout_bytes,
@@ -1450,28 +1472,45 @@ def audit_configuration_worker(
         )
     finally:
         active_error = sys.exc_info()[1]
+        cleanup_error: BaseException | None = None
         if publication_permit is not None and not publication_permit.released:
             try:
                 publication_permit.release_root_publication()
-            except BaseException as cleanup_error:
+            except BaseException as error:
                 if active_error is not None:
                     active_error.add_note(
-                        f"root publication permit cleanup also failed: {cleanup_error}"
+                        f"root publication permit cleanup also failed: {error}"
                     )
                 else:
-                    raise
-        if reservation is not None and not reservation.released:
+                    cleanup_error = error
+        keep_receiver_ownership = (
+            active_error is None
+            and cleanup_error is None
+            and reservation is not None
+            and reservation.owner_phase == "receiver-retained-result"
+        )
+        if (
+            reservation is not None
+            and not reservation.released
+            and not keep_receiver_ownership
+        ):
             try:
                 reservation.release(
                     "worker-failure" if active_error is not None else "worker-return"
                 )
-            except BaseException as cleanup_error:
+            except BaseException as error:
                 if active_error is not None:
                     active_error.add_note(
-                        f"compact reservation cleanup also failed: {cleanup_error}"
+                        f"compact reservation cleanup also failed: {error}"
+                    )
+                elif cleanup_error is not None:
+                    cleanup_error.add_note(
+                        f"compact reservation cleanup also failed: {error}"
                     )
                 else:
-                    raise
+                    cleanup_error = error
+        if active_error is None and cleanup_error is not None:
+            raise cleanup_error
 
 
 class _StreamDigestConsumer:

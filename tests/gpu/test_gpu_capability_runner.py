@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import hashlib
+import inspect
 import json
 import multiprocessing
 import os
@@ -23,6 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_capability_command as capability_command  # noqa: E402
+import gpu_capability_cache as capability_cache  # noqa: E402
 import gpu_capability_model as capability_model  # noqa: E402
 import gpu_capability_runner as capability_runner  # noqa: E402
 import gpu_capability_source_audit as capability_audit  # noqa: E402
@@ -2518,6 +2520,20 @@ class WorkerAuditTests(unittest.TestCase):
             self.launch_purposes = tuple(launch_purposes)
             self.frames = []
             self.sealed = False
+            self.active_carriers = {}
+            self.completed_carriers = []
+
+        def register_compiler_process_launch(self, event, carrier):
+            self.active_carriers[event.process_start] = carrier
+
+        def complete_compiler_process_launch(self, event, carrier):
+            if self.active_carriers.pop(event.process_start, None) is not carrier:
+                raise AuditInfrastructureError("compiler process carrier differs")
+            self.completed_carriers.append((event, carrier))
+
+        def fail_compiler_process_launch(self, event, carrier):
+            if self.active_carriers.get(event.process_start) is carrier:
+                del self.active_carriers[event.process_start]
 
         def send(self, frame, deadline):
             if time.monotonic() >= deadline:
@@ -2680,6 +2696,7 @@ class WorkerAuditTests(unittest.TestCase):
         audit_error=None,
         attestation_error=None,
         stabilize_error=None,
+        stabilize_override=None,
     ):
         if task is None:
             task, _reservation = self._task()
@@ -2700,6 +2717,8 @@ class WorkerAuditTests(unittest.TestCase):
         def stabilize(*_args, launch_context=None, **_kwargs):
             if stabilize_error is not None:
                 raise stabilize_error
+            if stabilize_override is not None:
+                return stabilize_override(launch_context)
             view = self._View()
             self.live_views.add(view)
             for index, purpose in enumerate(launch_purposes):
@@ -2778,7 +2797,88 @@ class WorkerAuditTests(unittest.TestCase):
         ))
         self.assertEqual(outcome.stdout_bytes, 34)
         self.assertTrue(control.sealed)
+        self.assertFalse(reservation.released)
+        outcome.result.release_transport_ownership()
         self.assertTrue(reservation.released)
+
+    def test_inadequate_reservation_fails_before_launch_audit_or_draft(self):
+        reservation = capability_model.PerTaskCompactReservation("task-a", 7, 1)
+        task = capability_model.ConfigurationAuditTask(
+            "task-a", 7, self.configuration, self.authority, reservation
+        )
+        with mock.patch.object(
+            capability_runner, "stabilize_and_parse_configuration"
+        ) as stabilize, mock.patch.object(
+            capability_audit, "audit_preprocessed_view"
+        ) as audit, mock.patch.object(
+            capability_runner, "_bounded_compact_result_draft"
+        ) as draft, self.assertRaisesRegex(
+            AuditInfrastructureError, "pre-dispatch compact reservation"
+        ):
+            self._run_worker(task=task)
+        stabilize.assert_not_called()
+        audit.assert_not_called()
+        draft.assert_not_called()
+        self.assertTrue(reservation.released)
+
+    def test_exact_canonical_payload_is_charged_and_owned_through_receiver(self):
+        task, reservation = self._task()
+        finding = capability_audit.Finding(
+            PurePosixPath("playback/gpu/worker.cpp"),
+            2,
+            'lease.nativeHandle("雪")',
+            "quoted \\\"reason\\\"",
+        )
+        original_compact = capability_runner._compact_findings
+
+        def compact_only_after_exact_charge(findings):
+            self.assertEqual(reservation.owner_phase, "worker-bounded-draft")
+            return original_compact(findings)
+
+        with mock.patch.object(
+            capability_runner, "_compact_findings",
+            side_effect=compact_only_after_exact_charge,
+        ):
+            outcome, _control, _command, _cache = self._run_worker(
+                task=task, findings=(finding,)
+            )
+        encoded = capability_cache.encode_configuration_audit_result(outcome.result)
+        self.assertEqual(reservation.canonical_json_bytes, len(encoded))
+        self.assertEqual(reservation.owner_phase, "receiver-retained-result")
+        self.assertFalse(reservation.released)
+        outcome.result.release_transport_ownership()
+        self.assertTrue(reservation.released)
+        self.assertEqual(reservation.release_phase, "retained-result-transition")
+
+    def test_root_release_failure_still_releases_reservation(self):
+        def fail_root_release():
+            raise AuditInfrastructureError("root release failed")
+
+        task, reservation = self._task()
+        command = self._CommandEndpoint(
+            self._permit(release_callback=fail_root_release)
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "root release failed"
+        ):
+            self._run_worker(task=task, command=command)
+        self.assertTrue(reservation.released)
+
+        task, reservation = self._task()
+        command = self._CommandEndpoint(
+            self._permit(release_callback=fail_root_release)
+        )
+        cache = self._Cache(AuditInfrastructureError("primary publish failed"))
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "primary publish failed"
+        ) as raised:
+            self._run_worker(task=task, command=command, cache=cache)
+        self.assertTrue(reservation.released)
+        self.assertTrue(any(
+            "root publication permit cleanup also failed: root release failed"
+            in note
+            for note in (raised.exception.__notes__ or ())
+        ))
 
     def test_audit_count_comes_only_from_typed_parent_observed_launch_events(self):
         outcome, control, _command, _cache = self._run_worker()
@@ -2842,21 +2942,56 @@ class WorkerAuditTests(unittest.TestCase):
 
     def test_restoring_initial_bytes_cannot_hide_mixed_production_generation(self):
         initial_bytes = self.source.read_bytes()
-        self.source.write_bytes(b"int generation_b;\n")
+        generation_b_bytes = b"int generation_b;\n"
+        self.source.write_bytes(generation_b_bytes)
         generation_b = self._dependency(self._identity(
             self.source, "playback/gpu/worker.cpp", line_count=1
         ))
-        self.source.write_bytes(initial_bytes)
         mixed = tuple(sorted(
             (generation_b, self.dependencies[0]),
             key=lambda item: item.role_relative_path.as_posix(),
         ))
+        observed_generations = []
+
+        def compile_twice_then_restore(launch_context):
+            for index, purpose in enumerate((
+                capability_model.CompilerLaunchPurpose.AUDIT_DISCOVERY,
+                capability_model.CompilerLaunchPurpose.AUDIT_ACCEPTED,
+            )):
+                observed_generations.append(self.source.read_bytes())
+                launch_context.record_process_start(
+                    purpose,
+                    capability_model.ProcessStartIdentity(
+                        "windows", index + 200,
+                        f"generation-b-{index}", f"cookie-b-{index}",
+                    ),
+                )
+            self.source.write_bytes(initial_bytes)
+            view = self._View()
+            self.live_views.add(view)
+            return (
+                view,
+                capability_runner.PreprocessDiscovery(
+                    capability_runner.StreamDigest("d" * 64, 17),
+                    mixed,
+                    tuple(item.identity for item in mixed),
+                ),
+                capability_runner.PreprocessStageTimings(1.0, 2.0, 34),
+            )
+
         cache = self._Cache()
         with self.assertRaisesRegex(
             AuditInfrastructureError, "production snapshot generation"
         ):
-            self._run_worker(cache=cache, dependencies=mixed)
+            self._run_worker(
+                cache=cache,
+                dependencies=mixed,
+                stabilize_override=compile_twice_then_restore,
+            )
         self.assertEqual(cache.published, [])
+        self.assertEqual(
+            observed_generations, [generation_b_bytes, generation_b_bytes]
+        )
         self.assertEqual(self.source.read_bytes(), initial_bytes)
 
     def test_publication_permit_precedes_result_materialization_and_send(self):
@@ -2902,26 +3037,17 @@ class WorkerAuditTests(unittest.TestCase):
         self.assertTrue(reservation.released)
 
     def test_process_handle_association_freezes_start_identity_and_has_one_launcher(self):
-        source = Path(capability_runner.__file__).read_text(encoding="utf-8")
-        self.assertEqual(source.count("subprocess." + "Popen("), 1)
-        table = capability_runner._ProcessHandleAssociationTable()
-        identity = capability_model.ProcessStartIdentity(
-            "windows", 42, "creation-time", "authenticated-cookie"
+        runner_source = Path(capability_runner.__file__).read_text(encoding="utf-8")
+        command_source = Path(capability_command.__file__).read_text(encoding="utf-8")
+        self.assertEqual(runner_source.count("subprocess." + "Popen("), 0)
+        self.assertEqual(
+            inspect.getsource(capability_command.launch_compiler_process).count(
+                "subprocess." + "Popen("
+            ),
+            1,
         )
-        process = object()
-        with self.assertRaisesRegex(
-            AuditInfrastructureError, "preceded handle registration"
-        ):
-            table.require(identity)
-        table.register(identity, process)
-        self.assertIs(table.require(identity), process)
-        self.assertEqual(table.active_count, 1)
-        with self.assertRaisesRegex(AuditInfrastructureError, "cookie differs"):
-            table.release(identity, object())
-        table.release(identity, process)
-        self.assertEqual(table.active_count, 0)
-        with self.assertRaisesRegex(AuditInfrastructureError, "already closed"):
-            table.release(identity, process)
+        self.assertNotIn("_process_handle_associations", runner_source)
+        self.assertIn("complete_after_exit", command_source)
 
     def test_two_workers_cannot_overlap_the_exact_root_publication_charge(self):
         releases = []
@@ -2982,6 +3108,11 @@ class WorkerAuditTests(unittest.TestCase):
         self.assertEqual(len(outcomes), 2)
         self.assertEqual(cache.maximum_active, 1)
         self.assertEqual(releases, ["task-a", "task-a"])
+        self.assertTrue(all(
+            not task.compact_reservation.released for task in tasks
+        ))
+        for outcome in outcomes:
+            outcome.result.release_transport_ownership()
         self.assertTrue(all(task.compact_reservation.released for task in tasks))
 
     def test_missing_reservation_and_cancellation_launch_nothing(self):
@@ -3026,6 +3157,7 @@ class WorkerAuditTests(unittest.TestCase):
         outcome, _control, _command, _cache = self._run_worker(findings=(finding,))
         self.assertEqual(len(outcome.result.findings), 1)
         self.assertEqual(outcome.result.findings[0].reason, "raw native handle use")
+        outcome.result.release_transport_ownership()
 
         releases = []
         task, reservation = self._task()

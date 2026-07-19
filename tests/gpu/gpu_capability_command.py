@@ -8,6 +8,7 @@ import locale
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -29,6 +30,8 @@ from gpu_capability_model import (
     AuditLimits,
     CompilerExecutableCapability,
     CompilerFamily,
+    CompilerLaunchEvent,
+    CompilerLaunchPurpose,
     CompilerInspection,
     _FilesystemGenerationObserver,
     DependencyDigest,
@@ -36,6 +39,7 @@ from gpu_capability_model import (
     DependencyRootBinding,
     FileIdentity,
     PreprocessConfiguration,
+    ProcessStartIdentity,
     portable_compiler_inspection_key,
     validate_dependency_root_authority,
 )
@@ -144,6 +148,294 @@ _compiler_inspection_memo: dict[
     tuple[object, ...],
     CompilerInspection,
 ] = {}
+
+
+def _macos_proc_bsdinfo_type():
+    import ctypes
+
+    class ProcBsdInfo(ctypes.Structure):
+        _fields_ = (
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        )
+
+    if ctypes.sizeof(ProcBsdInfo) != 136:
+        raise AuditInfrastructureError("macOS proc_bsdinfo ABI size differs")
+    return ProcBsdInfo
+
+
+def _native_process_start_token(process: subprocess.Popen[bytes], platform_kind: str) -> str:
+    if platform_kind == "windows":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetProcessTimes.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        )
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        process_handle = getattr(process, "_handle", None)
+        if process_handle is None or not kernel32.GetProcessTimes(
+            process_handle, ctypes.byref(creation), ctypes.byref(exit_time),
+            ctypes.byref(kernel_time), ctypes.byref(user_time),
+        ):
+            raise AuditInfrastructureError("cannot authenticate Windows process start")
+        value = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+        return f"windows-filetime:{value}"
+    if platform_kind == "linux":
+        try:
+            stat_text = Path(f"/proc/{process.pid}/stat").read_text(encoding="ascii")
+            close = stat_text.rfind(")")
+            fields = stat_text[close + 2:].split()
+            start_ticks = fields[19]
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="ascii"
+            ).strip()
+        except (OSError, IndexError, ValueError) as error:
+            raise AuditInfrastructureError("cannot authenticate Linux process start") from error
+        if not boot_id or not start_ticks.isdigit():
+            raise AuditInfrastructureError("Linux process start identity is invalid")
+        return f"linux-proc:{boot_id}:{start_ticks}"
+    if platform_kind == "macos":
+        import ctypes
+
+        info_type = _macos_proc_bsdinfo_type()
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        query = libproc.proc_pidinfo
+        query.argtypes = (
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+            ctypes.c_void_p, ctypes.c_int,
+        )
+        query.restype = ctypes.c_int
+        info = info_type()
+        received = query(process.pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+        if received != ctypes.sizeof(info) or info.pbi_pid != process.pid:
+            raise AuditInfrastructureError("cannot authenticate macOS process start")
+        return f"macos-proc:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+    raise AuditInfrastructureError("compiler process platform identity is invalid")
+
+
+class CompilerProcessHandleCarrier:
+    """Generation-bound parent-observable owner of one compiler process handle."""
+
+    __slots__ = (
+        "event", "_process", "_observer", "_completed", "_linux_pidfd",
+    )
+
+    def __init__(self, event: CompilerLaunchEvent, process, observer) -> None:
+        self.event = event
+        self._process = process
+        self._observer = observer
+        self._completed = False
+        self._linux_pidfd = None
+        if event.process_start.platform_kind == "linux" and hasattr(os, "pidfd_open"):
+            try:
+                self._linux_pidfd = os.pidfd_open(process.pid)
+            except OSError as error:
+                raise AuditInfrastructureError(
+                    "cannot retain Linux compiler process identity"
+                ) from error
+
+    @property
+    def process(self):
+        return self._process
+
+    @property
+    def completed(self) -> bool:
+        return self._completed
+
+    def complete_after_exit(self) -> None:
+        if self._completed:
+            raise AuditInfrastructureError("compiler process carrier was already completed")
+        try:
+            identity = self.event.process_start
+            if self._linux_pidfd is not None:
+                try:
+                    os.fstat(self._linux_pidfd)
+                except OSError as error:
+                    raise AuditInfrastructureError(
+                        "post-exit process identity differs"
+                    ) from error
+            else:
+                observed = _native_process_start_token(
+                    self._process, identity.platform_kind
+                )
+                if observed != identity.native_start_token:
+                    raise AuditInfrastructureError(
+                        "post-exit process identity differs"
+                    )
+            complete = getattr(
+                self._observer, "complete_compiler_process_launch", None
+            )
+            if not callable(complete):
+                raise AuditInfrastructureError(
+                    "parent compiler process completion observer is invalid"
+                )
+            complete(self.event, self)
+        except BaseException as identity_error:
+            fail = getattr(
+                self._observer, "fail_compiler_process_launch", None
+            )
+            if callable(fail):
+                try:
+                    fail(self.event, self)
+                except BaseException as cleanup_error:
+                    identity_error.add_note(
+                        f"parent process carrier failure cleanup also failed: {cleanup_error}"
+                    )
+            raise
+        finally:
+            self._completed = True
+            if self._linux_pidfd is not None:
+                os.close(self._linux_pidfd)
+                self._linux_pidfd = None
+            self._process = None
+
+    def abort_before_return(self) -> None:
+        if self._completed:
+            raise AuditInfrastructureError("compiler process carrier was already completed")
+        fail = getattr(self._observer, "fail_compiler_process_launch", None)
+        if callable(fail):
+            fail(self.event, self)
+        self._completed = True
+        if self._linux_pidfd is not None:
+            os.close(self._linux_pidfd)
+            self._linux_pidfd = None
+        self._process = None
+
+
+class _ParentCompilerLaunchObserver:
+    __slots__ = ("_active", "_lock")
+
+    def __init__(self) -> None:
+        self._active = {}
+        self._lock = threading.Lock()
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._active)
+
+    def register_compiler_process_launch(self, event, carrier) -> None:
+        with self._lock:
+            if event.process_start in self._active or any(
+                identity.pid == event.process_start.pid
+                for identity in self._active
+            ):
+                raise AuditInfrastructureError("compiler process carrier is duplicated")
+            self._active[event.process_start] = carrier
+
+    def complete_compiler_process_launch(self, event, carrier) -> None:
+        with self._lock:
+            if self._active.get(event.process_start) is not carrier:
+                raise AuditInfrastructureError("compiler process carrier differs")
+            del self._active[event.process_start]
+
+    def fail_compiler_process_launch(self, event, carrier) -> None:
+        with self._lock:
+            if self._active.get(event.process_start) is carrier:
+                del self._active[event.process_start]
+
+
+_parent_compiler_launch_observer = _ParentCompilerLaunchObserver()
+
+
+def launch_compiler_process(
+    prepared_arguments,
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+    containment,
+    platform_kind: str,
+    stdin,
+    stdout,
+    stderr,
+    launch_options: Mapping[str, object],
+    purpose: CompilerLaunchPurpose,
+    launch_observer=None,
+    worker_index: int | None = None,
+    task_id: str | None = None,
+    generation: int | None = None,
+):
+    if not isinstance(purpose, CompilerLaunchPurpose):
+        raise AuditInfrastructureError("compiler launch purpose is invalid")
+    observer = (
+        _parent_compiler_launch_observer
+        if launch_observer is None else launch_observer
+    )
+    process = subprocess.Popen(
+        prepared_arguments,
+        cwd=str(cwd), env=dict(environment), shell=False,
+        stdin=stdin, stdout=stdout, stderr=stderr,
+        **dict(launch_options), **containment.popen_arguments,
+    )
+    carrier = None
+    try:
+        containment.attach(process)
+        identity = ProcessStartIdentity(
+            platform_kind, process.pid,
+            _native_process_start_token(process, platform_kind),
+            secrets.token_hex(32),
+        )
+        event = CompilerLaunchEvent(
+            purpose, identity, worker_index=worker_index,
+            task_id=task_id, generation=generation,
+        )
+        carrier = CompilerProcessHandleCarrier(event, process, observer)
+        register = getattr(observer, "register_compiler_process_launch", None)
+        if not callable(register):
+            raise AuditInfrastructureError(
+                "parent compiler process launch observer is invalid"
+            )
+        register(event, carrier)
+        containment.release(process)
+        return process, carrier
+    except BaseException as launch_error:
+        if carrier is not None and not carrier.completed:
+            try:
+                carrier.abort_before_return()
+            except BaseException as cleanup_error:
+                launch_error.add_note(
+                    f"compiler process carrier abort also failed: {cleanup_error}"
+                )
+        try:
+            containment.terminate()
+        finally:
+            try:
+                process.kill()
+            except (AttributeError, OSError):
+                pass
+            try:
+                process.wait(timeout=1.0)
+            except (AttributeError, OSError, subprocess.TimeoutExpired):
+                pass
+        raise
 
 
 def _clear_compiler_inspection_memo_for_tests() -> None:
@@ -657,6 +949,7 @@ def _probe_compiler_version(
     cwd: Path,
     environment: Mapping[str, str],
     pipeline_deadline: float | None = None,
+    launch_observer=None,
 ) -> bytes:
     compiler = capability.executable_identity.canonical
     probe_directory: tempfile.TemporaryDirectory[str] | None = None
@@ -668,7 +961,10 @@ def _probe_compiler_version(
     else:
         arguments = ("--version",)
     try:
-        return _run_probe_command(capability, arguments, cwd, environment, pipeline_deadline)
+        return _run_probe_command(
+            capability, arguments, cwd, environment, pipeline_deadline,
+            launch_observer=launch_observer,
+        )
     finally:
         if probe_directory is not None:
             probe_directory.cleanup()
@@ -680,6 +976,8 @@ def _run_probe_command(
     cwd: Path,
     environment: Mapping[str, str],
     pipeline_deadline: float | None = None,
+    *,
+    launch_observer=None,
 ) -> bytes:
     if not isinstance(capability, CompilerExecutableCapability):
         raise AuditInfrastructureError("compiler probe capability is invalid")
@@ -702,21 +1000,22 @@ def _run_probe_command(
         mode="w+b"
     ) as stderr_stream:
         process: subprocess.Popen[bytes] | None = None
+        carrier: CompilerProcessHandleCarrier | None = None
         try:
             launch_command = containment.prepare_command(command)
-            process = subprocess.Popen(
+            process, carrier = launch_compiler_process(
                 launch_command,
-                cwd=str(cwd),
-                env=dict(environment),
-                shell=False,
+                cwd=cwd,
+                environment=environment,
+                containment=containment,
+                platform_kind=capability.platform_kind,
                 stdin=(subprocess.PIPE if containment.requires_handshake else subprocess.DEVNULL),
                 stdout=stdout_stream,
                 stderr=stderr_stream,
-                **launch_options,
-                **containment.popen_arguments,
+                launch_options=launch_options,
+                purpose=CompilerLaunchPurpose.INSPECTION,
+                launch_observer=launch_observer,
             )
-            containment.attach(process)
-            containment.release(process)
         except OSError as error:
             if os.name != "nt":
                 containment.terminate()
@@ -755,12 +1054,33 @@ def _run_probe_command(
                 process.wait(timeout=1.0)
                 raise AuditInfrastructureError(failure)
             returncode = process.wait(timeout=1.0)
+            if carrier is None:
+                raise AuditInfrastructureError(
+                    "compiler probe process carrier is unavailable"
+                )
+            carrier.complete_after_exit()
         finally:
+            active_error = sys.exc_info()[1]
             # Closing the Windows job or killing the POSIX process group also
             # removes descendants after a nominally successful parent exit.
-            if os.name != "nt":
-                containment.terminate()
-            containment.close()
+            try:
+                if os.name != "nt":
+                    containment.terminate()
+                if carrier is not None and not carrier.completed:
+                    try:
+                        if process is not None and process.poll() is None:
+                            process.kill()
+                            process.wait(timeout=1.0)
+                        carrier.complete_after_exit()
+                    except AuditInfrastructureError as error:
+                        if active_error is not None:
+                            active_error.add_note(
+                                f"process carrier completion also failed: {error}"
+                            )
+                        else:
+                            raise
+            finally:
+                containment.close()
         observed = os.fstat(stdout_stream.fileno()).st_size + os.fstat(
             stderr_stream.fileno()
         ).st_size
@@ -2956,7 +3276,7 @@ def inspect_compiler(
 ) -> CompilerInspection:
     """Inspect a held compiler capability and return portable exact evidence."""
 
-    del limits, launch_accountant
+    del limits
     if not isinstance(compiler_family, CompilerFamily):
         raise AuditInfrastructureError("compiler inspection family is invalid")
     if not isinstance(launcher_environment, Mapping):
@@ -3074,6 +3394,7 @@ def inspect_compiler(
                 cwd,
                 launcher_environment,
                 deadline,
+                launch_observer=launch_accountant,
             )
             validate_compiler_executable_capability(
                 capability, authority, deadline=deadline
