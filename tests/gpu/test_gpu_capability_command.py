@@ -996,6 +996,73 @@ class ConfigurationTests(unittest.TestCase):
             for note in (raised.exception.__notes__ or ())
         ))
 
+    def test_carrier_completion_preserves_primary_when_native_close_fails(self):
+        class Process:
+            pid = 42
+
+        class Observer:
+            def complete_compiler_process_launch(self, _event, _carrier):
+                raise RuntimeError("completion primary failed")
+
+            def fail_compiler_process_launch(self, _event, _carrier):
+                self.failed = True
+
+        class MacIdentityHandle:
+            def validate_exit(self): pass
+            def close(self): raise OSError("kqueue close failed")
+
+        cases = (
+            ("linux", "linux-proc:boot:1", "pidfd close failed"),
+            ("macos", "macos-proc:1:2", "kqueue close failed"),
+        )
+        for platform_kind, native_token, cleanup_message in cases:
+            with self.subTest(platform_kind=platform_kind):
+                event = capability_command.CompilerLaunchEvent(
+                    capability_command.CompilerLaunchPurpose.INSPECTION,
+                    capability_command.ProcessStartIdentity(
+                        platform_kind, 42, native_token, "a" * 64
+                    ),
+                )
+                observer = Observer()
+                patches = [
+                    mock.patch.object(
+                        capability_command.os,
+                        "pidfd_open",
+                        return_value=91,
+                        create=True,
+                    ),
+                    mock.patch.object(
+                        capability_command.os,
+                        "close",
+                        side_effect=OSError("pidfd close failed"),
+                    ),
+                    mock.patch.object(
+                        capability_command.os, "fstat", return_value=object()
+                    ),
+                    mock.patch.object(
+                        capability_command,
+                        "_open_macos_process_identity_handle",
+                        return_value=MacIdentityHandle(),
+                    ),
+                ]
+                with (
+                    patches[0], patches[1], patches[2], patches[3],
+                    self.assertRaisesRegex(
+                    RuntimeError, "completion primary failed"
+                    ) as raised,
+                ):
+                    carrier = capability_command.CompilerProcessHandleCarrier(
+                        event, Process(), observer
+                    )
+                    carrier.complete_after_exit()
+                self.assertTrue(observer.failed)
+                self.assertTrue(carrier.completed)
+                self.assertIsNone(carrier.process)
+                self.assertTrue(any(
+                    cleanup_message in note
+                    for note in (raised.exception.__notes__ or ())
+                ))
+
     def test_launch_preserves_primary_error_when_carrier_abort_observer_fails(self):
         class Process:
             pid = 42
@@ -1064,6 +1131,183 @@ class ConfigurationTests(unittest.TestCase):
             for note in (raised.exception.__notes__ or ())
         ))
 
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows process HANDLE")
+    def test_windows_carrier_abort_closes_real_process_handle_once(self):
+        class Observer:
+            def __init__(self): self.failed = 0
+
+            def fail_compiler_process_launch(self, _event, _carrier):
+                self.failed += 1
+
+        process = subprocess.Popen(
+            (sys.executable, "-I", "-c", "raise SystemExit(0)"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        raw_handle = int(process._handle)
+        event = capability_command.CompilerLaunchEvent(
+            capability_command.CompilerLaunchPurpose.INSPECTION,
+            capability_command.ProcessStartIdentity(
+                "windows", process.pid,
+                capability_command._native_process_start_token(process, "windows"),
+                "a" * 64,
+            ),
+        )
+        observer = Observer()
+        carrier = capability_command.CompilerProcessHandleCarrier(
+            event, process, observer
+        )
+        self.assertEqual(process.wait(timeout=10.0), 0)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetProcessId.argtypes = (ctypes.c_void_p,)
+        kernel32.GetProcessId.restype = ctypes.c_ulong
+        self.assertEqual(kernel32.GetProcessId(raw_handle), process.pid)
+        handle_type = type(process._handle)
+        real_close = handle_type.Close
+        close_calls = []
+
+        def tracked_close(handle):
+            close_calls.append(int(handle))
+            return real_close(handle)
+
+        with mock.patch.object(handle_type, "Close", autospec=True) as close:
+            close.side_effect = tracked_close
+            carrier.abort_before_return()
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "already completed"
+            ):
+                carrier.abort_before_return()
+        self.assertEqual(observer.failed, 1)
+        self.assertEqual(close_calls, [raw_handle])
+        self.assertTrue(process._handle.closed)
+        ctypes.set_last_error(0)
+        self.assertEqual(kernel32.GetProcessId(raw_handle), 0)
+        self.assertEqual(ctypes.get_last_error(), 6)
+
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows process HANDLE")
+    def test_windows_carrier_completion_closes_real_process_handle_once(self):
+        class Observer:
+            def __init__(self):
+                self.completed = 0
+                self.failed = 0
+
+            def complete_compiler_process_launch(self, _event, _carrier):
+                self.completed += 1
+
+            def fail_compiler_process_launch(self, _event, _carrier):
+                self.failed += 1
+
+        process = subprocess.Popen(
+            (sys.executable, "-I", "-c", "raise SystemExit(0)"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        raw_handle = int(process._handle)
+        event = capability_command.CompilerLaunchEvent(
+            capability_command.CompilerLaunchPurpose.INSPECTION,
+            capability_command.ProcessStartIdentity(
+                "windows",
+                process.pid,
+                capability_command._native_process_start_token(process, "windows"),
+                "a" * 64,
+            ),
+        )
+        observer = Observer()
+        carrier = capability_command.CompilerProcessHandleCarrier(
+            event, process, observer
+        )
+        self.assertEqual(process.wait(timeout=10.0), 0)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetProcessId.argtypes = (ctypes.c_void_p,)
+        kernel32.GetProcessId.restype = ctypes.c_ulong
+        self.assertEqual(kernel32.GetProcessId(raw_handle), process.pid)
+        handle_type = type(process._handle)
+        real_close = handle_type.Close
+        close_calls = []
+
+        def tracked_close(handle):
+            close_calls.append(int(handle))
+            return real_close(handle)
+
+        with mock.patch.object(handle_type, "Close", autospec=True) as close:
+            close.side_effect = tracked_close
+            carrier.complete_after_exit()
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "already completed"
+            ):
+                carrier.complete_after_exit()
+        self.assertEqual(observer.completed, 1)
+        self.assertEqual(observer.failed, 0)
+        self.assertEqual(close_calls, [raw_handle])
+        self.assertTrue(process._handle.closed)
+        ctypes.set_last_error(0)
+        self.assertEqual(kernel32.GetProcessId(raw_handle), 0)
+        self.assertEqual(ctypes.get_last_error(), 6)
+
+    def test_launch_preserves_primary_when_containment_termination_fails(self):
+        class Process:
+            pid = 42
+
+            def kill(self): self.killed = True
+            def wait(self, timeout): self.wait_timeout = timeout
+
+        class Containment:
+            popen_arguments = {}
+
+            def attach(self, process): self.attached = process
+            def release(self, _process): raise ValueError("launch release failed")
+            def terminate(self):
+                self.terminated = True
+                raise OSError("containment terminate failed")
+
+        class Observer:
+            def register_compiler_process_launch(self, _event, carrier):
+                self.active = carrier
+                self.carrier = carrier
+
+            def fail_compiler_process_launch(self, _event, carrier):
+                self.failed = carrier
+                self.active = None
+
+        process = Process()
+        containment = Containment()
+        observer = Observer()
+        with mock.patch.object(
+            capability_command.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            capability_command, "_native_process_start_token",
+            return_value="linux-proc:boot:1",
+        ), mock.patch.object(
+            capability_command.os, "pidfd_open", return_value=91, create=True
+        ), mock.patch.object(
+            capability_command.os, "close"
+        ) as close, self.assertRaisesRegex(
+            ValueError, "launch release failed"
+        ) as raised:
+            capability_command.launch_compiler_process(
+                ("compiler",), cwd=self.build, environment=self.environment,
+                containment=containment, platform_kind="linux",
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, launch_options={},
+                purpose=capability_command.CompilerLaunchPurpose.INSPECTION,
+                launch_observer=observer,
+            )
+        self.assertIsNone(observer.active)
+        self.assertIs(observer.failed, observer.carrier)
+        self.assertTrue(observer.failed.completed)
+        self.assertIsNone(observer.failed.process)
+        self.assertTrue(containment.terminated)
+        self.assertTrue(process.killed)
+        self.assertEqual(process.wait_timeout, 1.0)
+        close.assert_called_once_with(91)
+        self.assertTrue(any(
+            "compiler process containment termination also failed: "
+            "containment terminate failed" in note
+            for note in (raised.exception.__notes__ or ())
+        ))
+
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS kqueue")
     def test_macos_carrier_validates_real_process_after_wait_reaps_it(self):
         class Containment:
@@ -1098,11 +1342,16 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(observer.completed, 1)
 
     def test_shared_boundary_emits_exact_inspection_discovery_accepted_events(self):
+        class Handle:
+            def Close(self):
+                self.closed = True
+
         class Process:
             stdin = None
 
             def __init__(self, pid):
                 self.pid = pid
+                self._handle = Handle()
 
         class Containment:
             requires_handshake = False
@@ -2714,7 +2963,11 @@ class ConfigurationTests(unittest.TestCase):
             returncode = 0
             pid = 4242
 
+            class Handle:
+                def Close(self): self.closed = True
+
             def __init__(self, *_args, stdout, **_kwargs):
+                self._handle = self.Handle()
                 stdout.write(b"g++ (GCC) 14.1.0\n")
                 stdout.flush()
 
@@ -2760,7 +3013,11 @@ class ConfigurationTests(unittest.TestCase):
             returncode = 0
             pid = 4242
 
+            class Handle:
+                def Close(self): self.closed = True
+
             def __init__(self, command, *, stderr, **_kwargs):
+                self._handle = self.Handle()
                 captured["command"] = tuple(command)
                 source = Path(command[-1])
                 captured["source"] = source

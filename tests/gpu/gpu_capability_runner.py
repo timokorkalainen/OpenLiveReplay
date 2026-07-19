@@ -25,6 +25,7 @@ from gpu_capability_cache import (
     _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES,
     decode_configuration_audit_result_transport,
     encode_configuration_audit_result_transport,
+    receive_configuration_audit_transport,
 )
 from gpu_capability_command import (
     CompilerProcessHandleCarrier,
@@ -50,6 +51,7 @@ from gpu_capability_model import (
     CompilerLaunchEvent,
     CompilerLaunchPurpose,
     ConfigurationAuditOutcome,
+    ConfigurationAuditOutcomeOwner,
     ConfigurationAuditResult,
     ConfigurationAuditTask,
     ConfigurationAuditTransportOutcome,
@@ -807,53 +809,71 @@ def run_bounded_preprocessor(
         )
     finally:
         active_error = sys.exc_info()[1]
+        cleanup_errors = []
+
+        def record_cleanup_error(label: str, error: BaseException) -> None:
+            cleanup_errors.append((label, error))
+
         stop_readers.set()
         if process is not None and process.poll() is None:
             try:
                 _terminate_and_reap(process, containment)
-            except AuditInfrastructureError as error:
-                if active_error is not None:
-                    active_error.add_note(f"containment cleanup also failed: {error}")
+            except BaseException as error:
+                record_cleanup_error("containment cleanup", error)
         if stdout_thread is not None:
-            stdout_thread.join(timeout=_REAP_SECONDS)
+            try:
+                stdout_thread.join(timeout=_REAP_SECONDS)
+            except BaseException as error:
+                record_cleanup_error("stdout reader join", error)
         if stderr_thread is not None:
-            stderr_thread.join(timeout=_REAP_SECONDS)
+            try:
+                stderr_thread.join(timeout=_REAP_SECONDS)
+            except BaseException as error:
+                record_cleanup_error("stderr reader join", error)
         if process is not None:
             if process.stdout is not None:
-                process.stdout.close()
+                try:
+                    process.stdout.close()
+                except BaseException as error:
+                    record_cleanup_error("compiler stdout close", error)
             if process.stderr is not None:
-                process.stderr.close()
+                try:
+                    process.stderr.close()
+                except BaseException as error:
+                    record_cleanup_error("compiler stderr close", error)
         try:
             containment.close()
-        except AuditInfrastructureError as error:
-            if active_error is not None:
-                active_error.add_note(f"containment close also failed: {error}")
-            else:
-                with stderr_lock:
-                    cleanup_stderr_tail = bytes(stderr_tail)
-                raise _diagnostic(
-                    configuration,
-                    str(error),
-                    exit_status=(
-                        process.returncode
-                        if process is not None and process.returncode is not None
-                        else "terminated"
-                    ),
-                    elapsed_seconds=time.monotonic() - started,
-                    observed_stdout_bytes=observed_stdout_bytes,
-                    stderr_tail=cleanup_stderr_tail,
-                ) from error
-        finally:
-            if process is not None and process_carrier is not None:
-                try:
-                    process_carrier.complete_after_exit()
-                except AuditInfrastructureError as error:
-                    if active_error is not None:
-                        active_error.add_note(
-                            f"process carrier completion also failed: {error}"
-                        )
-                    else:
-                        raise
+        except BaseException as error:
+            record_cleanup_error("containment close", error)
+        if process is not None and process_carrier is not None:
+            try:
+                process_carrier.complete_after_exit()
+            except BaseException as error:
+                record_cleanup_error("process carrier completion", error)
+        if active_error is not None:
+            for label, error in cleanup_errors:
+                active_error.add_note(f"{label} also failed: {error}")
+        elif cleanup_errors:
+            label, error = cleanup_errors[0]
+            with stderr_lock:
+                cleanup_stderr_tail = bytes(stderr_tail)
+            cleanup_failure = _diagnostic(
+                configuration,
+                f"{label} failed: {error}",
+                exit_status=(
+                    process.returncode
+                    if process is not None and process.returncode is not None
+                    else "terminated"
+                ),
+                elapsed_seconds=time.monotonic() - started,
+                observed_stdout_bytes=observed_stdout_bytes,
+                stderr_tail=cleanup_stderr_tail,
+            )
+            for extra_label, extra_error in cleanup_errors[1:]:
+                cleanup_failure.add_note(
+                    f"{extra_label} also failed: {extra_error}"
+                )
+            raise cleanup_failure from error
 
 
 def _source_root(
@@ -1151,6 +1171,11 @@ def _bounded_compact_result_draft(
         len(item.role_relative_path.as_posix().encode("utf-8"))
         + len(str(item.identity.canonical).encode("utf-8"))
         + len(item.stable_role.encode("ascii"))
+        + (
+            len(item.identity.relative.as_posix().encode("utf-8"))
+            if item.identity.relative is not None
+            else 0
+        )
         for item in dependencies
     )
     bounds = CompactResultDraftBounds(
@@ -1474,18 +1499,21 @@ def audit_configuration_worker(
                 accepted.findings,
                 rebound,
             )
-        transport = encode_configuration_audit_result_transport(
-            accepted, reservation.worker_transport_capability
-        )
-        del accepted
-        del result
-        del draft
         stages = WorkerStageTimings(
             preprocess_stages.discovery_seconds,
             preprocess_stages.accepted_parse_seconds,
             audit_time.elapsed_seconds,
             publish_time.elapsed_seconds,
         )
+        transport = encode_configuration_audit_result_transport(
+            accepted,
+            reservation.worker_transport_capability,
+            preprocess_stages.compiler_stdout_bytes,
+            stages,
+        )
+        del accepted
+        del result
+        del draft
         return ConfigurationAuditTransportOutcome(
             transport=transport,
             stdout_bytes=preprocess_stages.compiler_stdout_bytes,
@@ -1534,23 +1562,107 @@ def audit_configuration_worker(
             raise cleanup_error
 
 
+def _release_rejected_worker_transport(
+    reservation: PerTaskCompactReservation,
+    capability: CompactResultTransportCapability,
+    error: BaseException,
+    context: str,
+) -> None:
+    if (
+        reservation.released
+        or reservation.owner_phase != "worker-transport-dispatched"
+    ):
+        return
+    try:
+        reservation.release_worker_transport_capability(
+            capability, "receiver-transport-rejected"
+        )
+        return
+    except BaseException as capability_error:
+        error.add_note(f"{context} capability cleanup also failed: {capability_error}")
+    if reservation.released:
+        return
+    try:
+        reservation.release("receiver-transport-rejected")
+    except BaseException as fallback_error:
+        error.add_note(f"{context} fallback cleanup also failed: {fallback_error}")
+
+
 def receive_configuration_audit_outcome(
     reservation: PerTaskCompactReservation,
     capability: CompactResultTransportCapability,
     worker_outcome: ConfigurationAuditTransportOutcome,
-) -> ConfigurationAuditOutcome:
+) -> ConfigurationAuditOutcomeOwner:
     if (
         not isinstance(reservation, PerTaskCompactReservation)
         or not isinstance(capability, CompactResultTransportCapability)
-        or not isinstance(worker_outcome, ConfigurationAuditTransportOutcome)
     ):
         raise AuditInfrastructureError("worker audit transport outcome is invalid")
-    result = decode_configuration_audit_result_transport(
-        worker_outcome.transport, reservation, capability
-    )
-    return ConfigurationAuditOutcome(
-        result, worker_outcome.stdout_bytes, worker_outcome.stages
-    )
+    try:
+        if not isinstance(worker_outcome, ConfigurationAuditTransportOutcome):
+            raise AuditInfrastructureError(
+                "worker audit transport outcome is invalid"
+            )
+        result = decode_configuration_audit_result_transport(
+            worker_outcome.transport, reservation, capability
+        )
+        try:
+            return ConfigurationAuditOutcomeOwner(ConfigurationAuditOutcome(
+                result, worker_outcome.stdout_bytes, worker_outcome.stages
+            ))
+        except BaseException as error:
+            ownership = result._transport_ownership
+            if (
+                ownership is not None
+                and ownership.active
+                and ownership.phase == "receiver-retained-result"
+            ):
+                try:
+                    result.release_transport_ownership()
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "received outcome construction cleanup also failed: "
+                        f"{cleanup_error}"
+                    )
+            raise
+    except BaseException as error:
+        _release_rejected_worker_transport(
+            reservation, capability, error, "worker transport rejection"
+        )
+        raise
+
+
+def receive_configuration_audit_outcome_from_pipe(
+    reservation: PerTaskCompactReservation,
+    capability: CompactResultTransportCapability,
+    connection,
+    deadline: float,
+    *,
+    cancel_event=None,
+    worker_alive=None,
+) -> ConfigurationAuditOutcomeOwner:
+    """Receive, authenticate, decode, and retain one worker result linearly."""
+    if (
+        not isinstance(reservation, PerTaskCompactReservation)
+        or not isinstance(capability, CompactResultTransportCapability)
+    ):
+        raise AuditInfrastructureError("worker audit transport owner is invalid")
+    try:
+        worker_outcome = receive_configuration_audit_transport(
+            connection,
+            capability,
+            deadline,
+            cancel_event=cancel_event,
+            worker_alive=worker_alive,
+        )
+        return receive_configuration_audit_outcome(
+            reservation, capability, worker_outcome
+        )
+    except BaseException as error:
+        _release_rejected_worker_transport(
+            reservation, capability, error, "worker transport pipe"
+        )
+        raise
 
 
 class _StreamDigestConsumer:

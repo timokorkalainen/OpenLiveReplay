@@ -302,7 +302,7 @@ class CompilerProcessHandleCarrier:
 
     __slots__ = (
         "event", "_process", "_observer", "_completed", "_linux_pidfd",
-        "_macos_identity_handle",
+        "_macos_identity_handle", "_windows_process_handle",
     )
 
     def __init__(self, event: CompilerLaunchEvent, process, observer) -> None:
@@ -312,6 +312,11 @@ class CompilerProcessHandleCarrier:
         self._completed = False
         self._linux_pidfd = None
         self._macos_identity_handle = None
+        self._windows_process_handle = (
+            getattr(process, "_handle", None)
+            if event.process_start.platform_kind == "windows"
+            else None
+        )
         if event.process_start.platform_kind == "linux" and hasattr(os, "pidfd_open"):
             try:
                 self._linux_pidfd = os.pidfd_open(process.pid)
@@ -335,6 +340,7 @@ class CompilerProcessHandleCarrier:
     def complete_after_exit(self) -> None:
         if self._completed:
             raise AuditInfrastructureError("compiler process carrier was already completed")
+        primary_error: BaseException | None = None
         try:
             identity = self.event.process_start
             if self._linux_pidfd is not None:
@@ -363,6 +369,7 @@ class CompilerProcessHandleCarrier:
                 )
             complete(self.event, self)
         except BaseException as identity_error:
+            primary_error = identity_error
             fail = getattr(
                 self._observer, "fail_compiler_process_launch", None
             )
@@ -373,16 +380,50 @@ class CompilerProcessHandleCarrier:
                     identity_error.add_note(
                         f"parent process carrier failure cleanup also failed: {cleanup_error}"
                     )
-            raise
-        finally:
-            self._completed = True
-            if self._linux_pidfd is not None:
-                os.close(self._linux_pidfd)
-                self._linux_pidfd = None
-            if self._macos_identity_handle is not None:
-                self._macos_identity_handle.close()
-                self._macos_identity_handle = None
-            self._process = None
+        self._completed = True
+        cleanup_errors = []
+        if self._linux_pidfd is not None:
+            descriptor = self._linux_pidfd
+            self._linux_pidfd = None
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if self._macos_identity_handle is not None:
+            identity_handle = self._macos_identity_handle
+            self._macos_identity_handle = None
+            try:
+                identity_handle.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if self.event.process_start.platform_kind == "windows":
+            process_handle = self._windows_process_handle
+            self._windows_process_handle = None
+            close_process_handle = getattr(process_handle, "Close", None)
+            try:
+                if not callable(close_process_handle):
+                    raise AuditInfrastructureError(
+                        "Windows compiler process handle is unavailable"
+                    )
+                close_process_handle()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        self._process = None
+        if primary_error is not None:
+            for cleanup_error in cleanup_errors:
+                primary_error.add_note(
+                    f"carrier resource cleanup also failed: {cleanup_error}"
+                )
+            raise primary_error
+        if cleanup_errors:
+            cleanup_error = AuditInfrastructureError(
+                "compiler process carrier resource cleanup failed"
+            )
+            for error in cleanup_errors[1:]:
+                cleanup_error.add_note(
+                    f"additional carrier resource cleanup failed: {error}"
+                )
+            raise cleanup_error from cleanup_errors[0]
 
     def abort_before_return(self) -> None:
         if self._completed:
@@ -396,6 +437,18 @@ class CompilerProcessHandleCarrier:
             primary_error = error
         self._completed = True
         cleanup_errors = []
+        if self.event.process_start.platform_kind == "windows":
+            process_handle = self._windows_process_handle
+            self._windows_process_handle = None
+            close_process_handle = getattr(process_handle, "Close", None)
+            try:
+                if not callable(close_process_handle):
+                    raise AuditInfrastructureError(
+                        "Windows compiler process handle is unavailable"
+                    )
+                close_process_handle()
+            except BaseException as error:
+                cleanup_errors.append(error)
         if self._linux_pidfd is not None:
             descriptor = self._linux_pidfd
             self._linux_pidfd = None
@@ -515,6 +568,21 @@ def launch_compiler_process(
         containment.release(process)
         return process, carrier
     except BaseException as launch_error:
+        try:
+            containment.terminate()
+        except BaseException as cleanup_error:
+            launch_error.add_note(
+                "compiler process containment termination also failed: "
+                f"{cleanup_error}"
+            )
+        try:
+            process.kill()
+        except (AttributeError, OSError):
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except (AttributeError, OSError, subprocess.TimeoutExpired):
+            pass
         if carrier is not None and not carrier.completed:
             try:
                 carrier.abort_before_return()
@@ -526,17 +594,6 @@ def launch_compiler_process(
                     launch_error.add_note(
                         f"compiler process carrier abort detail: {cleanup_note}"
                     )
-        try:
-            containment.terminate()
-        finally:
-            try:
-                process.kill()
-            except (AttributeError, OSError):
-                pass
-            try:
-                process.wait(timeout=1.0)
-            except (AttributeError, OSError, subprocess.TimeoutExpired):
-                pass
         raise
 
 

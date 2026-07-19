@@ -11,11 +11,13 @@ import json
 import multiprocessing
 import os
 import stat
+import struct
 import sys
 import tempfile
 import threading
 import time
 import traceback
+import tracemalloc
 import unittest
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +29,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_capability_cache as capability_cache  # noqa: E402
+import gpu_capability_runner as capability_runner  # noqa: E402
 import gpu_capability_source_audit as capability_audit  # noqa: E402
 from gpu_capability_cache import (  # noqa: E402
     CompilerInspectionCache,
@@ -55,10 +58,12 @@ from gpu_capability_model import (  # noqa: E402
     FileIdentity,
     ConfigurationAuditPublicationPermit,
     ConfigurationAuditResult,
+    ConfigurationAuditTransportOutcome,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
     PerTaskCompactReservation,
     StreamingResultAggregator,
+    WorkerStageTimings,
     encode_canonical_summary,
     build_dependency_root_authority,
     encode_compiler_inspection,
@@ -123,6 +128,11 @@ def _send_owned_audit_transport_from_spawned_worker(
             len(item.stable_role.encode("ascii"))
             + len(item.role_relative_path.as_posix().encode("utf-8"))
             + len(str(item.identity.canonical).encode("utf-8"))
+            + (
+                len(item.identity.relative.as_posix().encode("utf-8"))
+                if item.identity.relative is not None
+                else 0
+            )
             for item in result.dependencies
         ) + sum(
             len(path.as_posix().encode("utf-8"))
@@ -147,15 +157,60 @@ def _send_owned_audit_transport_from_spawned_worker(
             capability.task_id, capability.generation
         )
         owned = dataclasses.replace(result, _transport_ownership=ownership)
+        stages = WorkerStageTimings(1.0, 2.0, 3.0, 4.0)
         transport = capability_cache.encode_configuration_audit_result_transport(
-            owned, capability
+            owned, capability, 17, stages
         )
+        if mode.startswith("forge-"):
+            changes = {
+                "forge-task": {"task_id": capability.task_id + "-forged"},
+                "forge-generation": {"generation": capability.generation + 1},
+                "forge-nonce": {"nonce": "0" * 64},
+                "forge-serial": {"serial": capability.serial + 1},
+                "forge-hash": {"payload_sha256": "0" * 64},
+                "forge-undercharge": {
+                    "charged_bytes": transport.receipt.charged_bytes - 1
+                },
+                "forge-overcharge": {
+                    "charged_bytes": transport.receipt.charged_bytes + 1
+                },
+            }
+            forged_receipt = dataclasses.replace(
+                transport.receipt, **changes[mode]
+            )
+            transport = dataclasses.replace(
+                transport, receipt=forged_receipt
+            )
+        outcome = ConfigurationAuditTransportOutcome(transport, 17, stages)
         if mode == "worker-death":
             os._exit(19)
         try:
-            connection.send(transport)
-        except OSError:
+            capability_cache.send_configuration_audit_transport(
+                connection, outcome
+            )
+        except AuditInfrastructureError:
             os._exit(17)
+    finally:
+        connection.close()
+
+
+def _write_partial_audit_frame_from_spawned_worker(
+    connection,
+    frame: bytes,
+    wire_bytes: int,
+    mode: str,
+    ready_event,
+    prefix_frame: bytes | None = None,
+) -> None:
+    if prefix_frame is not None:
+        connection.send_bytes(prefix_frame)
+    wire = struct.pack("!i", len(frame)) + frame
+    os.write(connection.fileno(), wire[:wire_bytes])
+    ready_event.set()
+    if mode == "exit":
+        os._exit(23)
+    try:
+        time.sleep(30.0)
     finally:
         connection.close()
 
@@ -3953,6 +4008,75 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
     def tearDown(self) -> None:
         _PreprocessCacheFixture.tearDown(self)
 
+    def _transport_outcome(
+        self,
+        task_id: str,
+        generation: int,
+        *,
+        worker_slot: int = 2,
+        result: ConfigurationAuditResult | None = None,
+        stdout_bytes: int = 17,
+        stages: WorkerStageTimings | None = None,
+        return_owned: bool = False,
+    ):
+        result = self.result if result is None else result
+        stages = stages or WorkerStageTimings(1.0, 2.0, 3.0, 4.0)
+        parent = PerTaskCompactReservation(task_id, generation, 32 << 20)
+        capability = parent.issue_worker_transport_capability(
+            task_id,
+            generation,
+            result.configuration_digest,
+            result.audit_engine_fingerprint,
+            worker_slot,
+        )
+        worker = PerTaskCompactReservation.for_worker_transport(capability)
+        worker.require_before_discovery(task_id, generation)
+        payload = capability_cache.encode_configuration_audit_result(result)
+        bounds = CompactResultDraftBounds(
+            len(result.dependencies),
+            len(result.reached_production),
+            len(result.findings),
+            sum(
+                len(item.stable_role.encode("ascii"))
+                + len(item.role_relative_path.as_posix().encode("utf-8"))
+                + len(str(item.identity.canonical).encode("utf-8"))
+                + (
+                    len(item.identity.relative.as_posix().encode("utf-8"))
+                    if item.identity.relative is not None
+                    else 0
+                )
+                for item in result.dependencies
+            )
+            + sum(
+                len(path.as_posix().encode("utf-8"))
+                for path in result.reached_production
+            )
+            + sum(
+                len(item.path.as_posix().encode("utf-8"))
+                for item in result.findings
+            ),
+            sum(len(item.expression.encode("utf-8")) for item in result.findings),
+            sum(len(item.reason.encode("utf-8")) for item in result.findings),
+        )
+        worker.require_within_pre_dispatch_reservation(
+            task_id, len(payload), bounds, 4096
+        )
+        worker.record_exact_canonical_json(task_id, len(payload))
+        ownership = worker.begin_result_ownership(task_id, generation)
+        owned = dataclasses.replace(result, _transport_ownership=ownership)
+        if return_owned:
+            return parent, capability, owned
+        transport = capability_cache.encode_configuration_audit_result_transport(
+            owned, capability, stdout_bytes, stages
+        )
+        return (
+            parent,
+            capability,
+            ConfigurationAuditTransportOutcome(
+                transport, stdout_bytes, stages
+            ),
+        )
+
     def test_result_cache_round_trips_without_token_payload(self):
         cache = ConfigurationAuditCache(self.cache_root)
         cache.publish(
@@ -3996,15 +4120,391 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             )
         loads.assert_not_called()
 
+    def test_raw_transport_rejects_empty_truncated_oversize_and_malformed_headers(self):
+        cases = (
+            ("empty", None),
+            ("truncated", b"x"),
+            (
+                "oversize",
+                b"x" * (capability_cache._AUDIT_TRANSPORT_HEADER_BYTES + 1),
+            ),
+            (
+                "malformed",
+                b"\0" * capability_cache._AUDIT_TRANSPORT_HEADER_BYTES,
+            ),
+        )
+        for name, frame in cases:
+            with self.subTest(name=name):
+                reservation, capability, _outcome = self._transport_outcome(
+                    f"raw-{name}", 11
+                )
+                receiving, sending = multiprocessing.Pipe(duplex=False)
+                if frame is not None:
+                    sending.send_bytes(frame)
+                sending.close()
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError,
+                    "transport.*(truncated|limit|malformed|authentication)",
+                ):
+                    capability_runner.receive_configuration_audit_outcome_from_pipe(
+                        reservation,
+                        capability,
+                        receiving,
+                        time.monotonic() + 2.0,
+                    )
+                receiving.close()
+                self.assertTrue(reservation.released)
+                self.assertEqual(
+                    reservation.release_phase, "receiver-transport-rejected"
+                )
+
+    def test_raw_transport_observes_deadline_exit_and_each_cancel_boundary(self):
+        reservation, capability, _outcome = self._transport_outcome(
+            "raw-stall", 12
+        )
+        receiving, sending = multiprocessing.Pipe(duplex=False)
+        started = time.monotonic()
+        with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
+            capability_runner.receive_configuration_audit_outcome_from_pipe(
+                reservation,
+                capability,
+                receiving,
+                started + 0.08,
+                worker_alive=lambda: True,
+            )
+        self.assertLess(time.monotonic() - started, 0.5)
+        sending.close()
+        receiving.close()
+        self.assertTrue(reservation.released)
+
+        reservation, capability, outcome = self._transport_outcome(
+            "raw-exit", 13
+        )
+        receiving, sending = multiprocessing.Pipe(duplex=False)
+        sending.send_bytes(
+            capability_cache._encode_configuration_audit_transport_header(outcome)
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "worker exited"):
+            capability_runner.receive_configuration_audit_outcome_from_pipe(
+                reservation,
+                capability,
+                receiving,
+                time.monotonic() + 2.0,
+                worker_alive=lambda: False,
+            )
+        sending.close()
+        receiving.close()
+        self.assertTrue(reservation.released)
+
+        class SequencedCancellation:
+            def __init__(self, trigger: int) -> None:
+                self.calls = 0
+                self.trigger = trigger
+
+            def is_set(self) -> bool:
+                self.calls += 1
+                return self.calls >= self.trigger
+
+        for label, trigger in (("before", 1), ("during", 2), ("after", 3)):
+            with self.subTest(cancel=label):
+                reservation, capability, outcome = self._transport_outcome(
+                    f"raw-cancel-{label}", 14
+                )
+                receiving, sending = multiprocessing.Pipe(duplex=False)
+                sending.send_bytes(
+                    capability_cache._encode_configuration_audit_transport_header(
+                        outcome
+                    )
+                )
+                sending.send_bytes(outcome.transport.payload)
+                cancellation = SequencedCancellation(trigger)
+                with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+                    capability_runner.receive_configuration_audit_outcome_from_pipe(
+                        reservation,
+                        capability,
+                        receiving,
+                        time.monotonic() + 2.0,
+                        cancel_event=cancellation,
+                    )
+                sending.close()
+                receiving.close()
+                self.assertTrue(reservation.released)
+
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows message-mode pipe writes expose only complete messages",
+    )
+    def test_raw_transport_mid_frame_stall_and_exit_are_deadline_safe(self):
+        context = multiprocessing.get_context("spawn")
+        for boundary, mode in (
+            ("header", "stall"),
+            ("header", "exit"),
+            ("payload", "stall"),
+            ("payload", "exit"),
+        ):
+            with self.subTest(boundary=boundary, mode=mode):
+                reservation, capability, outcome = self._transport_outcome(
+                    f"partial-{boundary}-{mode}", 21
+                )
+                header = (
+                    capability_cache._encode_configuration_audit_transport_header(
+                        outcome
+                    )
+                )
+                frame = (
+                    header if boundary == "header" else outcome.transport.payload
+                )
+                prefix_frame = header if boundary == "payload" else None
+                wire_bytes = 2 if boundary == "header" else 4 + len(frame) // 2
+                receiving, sending = context.Pipe(duplex=False)
+                ready_event = context.Event()
+                process = context.Process(
+                    target=_write_partial_audit_frame_from_spawned_worker,
+                    args=(
+                        sending,
+                        frame,
+                        wire_bytes,
+                        mode,
+                        ready_event,
+                        prefix_frame,
+                    ),
+                )
+                process.start()
+                sending.close()
+                self.assertTrue(ready_event.wait(timeout=10.0))
+                started = time.monotonic()
+                expected = "deadline" if mode == "stall" else "truncated|worker exited"
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, expected
+                ):
+                    capability_runner.receive_configuration_audit_outcome_from_pipe(
+                        reservation,
+                        capability,
+                        receiving,
+                        started + 0.25,
+                        worker_alive=process.is_alive,
+                    )
+                self.assertLess(time.monotonic() - started, 1.0)
+                receiving.close()
+                if mode == "stall":
+                    process.terminate()
+                process.join(timeout=5.0)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, -15 if mode == "stall" else 23)
+                process.close()
+                self.assertTrue(reservation.released)
+                self.assertEqual(
+                    reservation.release_phase, "receiver-transport-rejected"
+                )
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "already released"
+                ):
+                    reservation.release_worker_transport_capability(
+                        capability, "duplicate-partial-frame-release"
+                    )
+
+    def test_raw_transport_rejects_declared_length_and_digest_before_decode(self):
+        for label, changes in (
+            ("length", {"encoded_bytes": 1}),
+            ("digest", {"payload_sha256": "0" * 64}),
+        ):
+            with self.subTest(label=label):
+                reservation, capability, outcome = self._transport_outcome(
+                    f"raw-{label}", 15
+                )
+                receipt = dataclasses.replace(
+                    outcome.transport.receipt, **changes
+                )
+                forged_transport = dataclasses.replace(
+                    outcome.transport, receipt=receipt
+                )
+                forged = ConfigurationAuditTransportOutcome(
+                    forged_transport, outcome.stdout_bytes, outcome.stages
+                )
+                receiving, sending = multiprocessing.Pipe(duplex=False)
+                capability_cache.send_configuration_audit_transport(
+                    sending, forged
+                )
+                sending.close()
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "payload authentication"
+                ):
+                    capability_runner.receive_configuration_audit_outcome_from_pipe(
+                        reservation,
+                        capability,
+                        receiving,
+                        time.monotonic() + 2.0,
+                    )
+                receiving.close()
+                self.assertTrue(reservation.released)
+
+    def test_raw_transport_accepts_exact_four_mib_frame_with_bounded_peak(self):
+        reservation, capability, outcome = self._transport_outcome(
+            "raw-near-limit", 16
+        )
+        payload = b"x" * (4 << 20)
+        receipt = dataclasses.replace(
+            outcome.transport.receipt,
+            encoded_bytes=len(payload),
+            payload_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        transport = dataclasses.replace(
+            outcome.transport, payload=payload, receipt=receipt
+        )
+        outbound = ConfigurationAuditTransportOutcome(
+            transport, outcome.stdout_bytes, outcome.stages
+        )
+        receiving, sending = multiprocessing.Pipe(duplex=False)
+        sender = threading.Thread(
+            target=capability_cache.send_configuration_audit_transport,
+            args=(sending, outbound),
+        )
+        tracemalloc.start()
+        started = time.monotonic()
+        try:
+            sender.start()
+            inbound = capability_cache.receive_configuration_audit_transport(
+                receiving, capability, time.monotonic() + 10.0
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+            sender.join(timeout=10.0)
+            sending.close()
+            receiving.close()
+        self.assertFalse(sender.is_alive())
+        self.assertEqual(inbound.transport.payload, payload)
+        self.assertLess(peak, 24 << 20)
+        self.assertLess(time.monotonic() - started, 5.0)
+        reservation.release_worker_transport_capability(
+            capability, "raw-receive-test-complete"
+        )
+
+    def test_crossed_task_configuration_engine_slot_and_pipe_frames_reject(self):
+        alternate = dataclasses.replace(
+            self.result,
+            configuration_digest="d" * 64,
+            audit_engine_fingerprint="f" * 64,
+        )
+        first = self._transport_outcome(
+            "cross-a", 17, worker_slot=1, stdout_bytes=101
+        )
+        second = self._transport_outcome(
+            "cross-b",
+            18,
+            worker_slot=7,
+            result=alternate,
+            stdout_bytes=202,
+            stages=WorkerStageTimings(4.0, 3.0, 2.0, 1.0),
+        )
+        first_receiving, first_sending = multiprocessing.Pipe(duplex=False)
+        second_receiving, second_sending = multiprocessing.Pipe(duplex=False)
+        capability_cache.send_configuration_audit_transport(
+            first_sending, second[2]
+        )
+        capability_cache.send_configuration_audit_transport(
+            second_sending, first[2]
+        )
+        first_sending.close()
+        second_sending.close()
+
+        def reject(item, connection):
+            reservation, capability, _outcome = item
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "header authentication"
+            ):
+                capability_runner.receive_configuration_audit_outcome_from_pipe(
+                    reservation,
+                    capability,
+                    connection,
+                    time.monotonic() + 2.0,
+                )
+            return reservation.released
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            rejected = tuple(pool.map(
+                lambda pair: reject(*pair),
+                ((first, first_receiving), (second, second_receiving)),
+            ))
+        first_receiving.close()
+        second_receiving.close()
+        self.assertEqual(rejected, (True, True))
+        self.assertNotEqual(first[1].pipe_nonce, second[1].pipe_nonce)
+
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "transport outcome"
+        ):
+            ConfigurationAuditTransportOutcome(
+                first[2].transport,
+                second[2].stdout_bytes,
+                second[2].stages,
+            )
+
+        third = self._transport_outcome("cross-c", 19, worker_slot=3)
+        fourth = self._transport_outcome("cross-d", 20, worker_slot=4)
+        receiving, sending = multiprocessing.Pipe(duplex=False)
+        capability_cache.send_configuration_audit_transport(sending, third[2])
+        sending.close()
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "header authentication"
+        ) as rejected_capability:
+            capability_runner.receive_configuration_audit_outcome_from_pipe(
+                third[0],
+                fourth[1],
+                receiving,
+                time.monotonic() + 2.0,
+            )
+        receiving.close()
+        self.assertTrue(third[0].released)
+        self.assertTrue(any(
+            "capability cleanup also failed" in note
+            for note in getattr(rejected_capability.exception, "__notes__", ())
+        ))
+        fourth[0].release_worker_transport_capability(
+            fourth[1], "crossed-capability-test-complete"
+        )
+
     def test_transport_codec_moves_one_reservation_into_decoded_result(self):
         reservation = PerTaskCompactReservation("task-a", 7, 32 << 20)
-        capability = reservation.issue_worker_transport_capability("task-a", 7)
+        capability = reservation.issue_worker_transport_capability(
+            "task-a", 7, self.result.configuration_digest, self.engine, 2
+        )
         worker_reservation = PerTaskCompactReservation.for_worker_transport(
             capability
         )
         worker_reservation.require_before_discovery("task-a", 7)
-        bounds = CompactResultDraftBounds(1, 1, 1, 256, 64, 64)
         payload = capability_cache.encode_configuration_audit_result(self.result)
+        path_bytes = sum(
+            len(item.stable_role.encode("ascii"))
+            + len(item.role_relative_path.as_posix().encode("utf-8"))
+            + len(str(item.identity.canonical).encode("utf-8"))
+            + (
+                len(item.identity.relative.as_posix().encode("utf-8"))
+                if item.identity.relative is not None
+                else 0
+            )
+            for item in self.result.dependencies
+        ) + sum(
+            len(path.as_posix().encode("utf-8"))
+            for path in self.result.reached_production
+        ) + sum(
+            len(item.path.as_posix().encode("utf-8"))
+            for item in self.result.findings
+        )
+        bounds = CompactResultDraftBounds(
+            len(self.result.dependencies),
+            len(self.result.reached_production),
+            len(self.result.findings),
+            path_bytes,
+            sum(
+                len(item.expression.encode("utf-8"))
+                for item in self.result.findings
+            ),
+            sum(
+                len(item.reason.encode("utf-8"))
+                for item in self.result.findings
+            ),
+        )
         worker_reservation.require_within_pre_dispatch_reservation(
             "task-a", len(payload), bounds, 4096
         )
@@ -4013,7 +4513,7 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         owned = dataclasses.replace(self.result, _transport_ownership=ownership)
 
         transport = capability_cache.encode_configuration_audit_result_transport(
-            owned, capability
+            owned, capability, 17, WorkerStageTimings(1.0, 2.0, 3.0, 4.0)
         )
         with self.assertRaisesRegex(AuditInfrastructureError, "ownership.*transferred"):
             owned.release_transport_ownership()
@@ -4030,13 +4530,76 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         decoded.release_transport_ownership()
         self.assertTrue(reservation.released)
 
+    def test_transport_encode_cleanup_preserves_primary_error(self):
+        parent, capability, owned = self._transport_outcome(
+            "encode-cleanup", 22, return_owned=True
+        )
+        worker = owned._transport_ownership.reservation
+        with mock.patch.object(
+            PerTaskCompactReservation,
+            "complete_worker_transport",
+            side_effect=ValueError("encode primary"),
+        ), mock.patch.object(
+            PerTaskCompactReservation,
+            "_release_result_ownership",
+            side_effect=RuntimeError("encode cleanup secondary"),
+        ), self.assertRaisesRegex(ValueError, "encode primary") as raised:
+            capability_cache.encode_configuration_audit_result_transport(
+                owned,
+                capability,
+                17,
+                WorkerStageTimings(1.0, 2.0, 3.0, 4.0),
+            )
+        self.assertTrue(any(
+            "encode cleanup secondary" in note
+            for note in getattr(raised.exception, "__notes__", ())
+        ))
+        worker.release("encode-cleanup-test-complete")
+        parent.release_worker_transport_capability(
+            capability, "encode-cleanup-test-complete"
+        )
+
+    def test_transport_decode_triple_fault_preserves_primary_error(self):
+        reservation, capability, outcome = self._transport_outcome(
+            "decode-cleanup", 23
+        )
+        with mock.patch.object(
+            capability_cache,
+            "_decode_audit_result_payload",
+            side_effect=AuditInfrastructureError("decode primary"),
+        ), mock.patch.object(
+            PerTaskCompactReservation,
+            "release_worker_transport_capability",
+            side_effect=RuntimeError("decode capability cleanup secondary"),
+        ) as capability_release, mock.patch.object(
+            PerTaskCompactReservation,
+            "release",
+            side_effect=OSError("decode fallback cleanup tertiary"),
+        ) as fallback_release, self.assertRaisesRegex(
+            AuditInfrastructureError, "decode primary"
+        ) as raised:
+            capability_cache.decode_configuration_audit_result_transport(
+                outcome.transport, reservation, capability
+            )
+        capability_release.assert_called_once()
+        fallback_release.assert_called_once()
+        notes = getattr(raised.exception, "__notes__", ())
+        self.assertTrue(any(
+            "decode capability cleanup secondary" in note for note in notes
+        ))
+        self.assertTrue(any(
+            "decode fallback cleanup tertiary" in note for note in notes
+        ))
+        self.assertFalse(reservation.released)
+        reservation.release("decode-cleanup-test-complete")
+
     def test_spawn_pipe_moves_receipt_into_parent_owned_decoded_result(self):
         identity_semantics_before_spawn = (
             capability_audit._marshal_live_semantic_object(FileIdentity)
         )
         reservation = PerTaskCompactReservation("spawn-task", 9, 32 << 20)
         capability = reservation.issue_worker_transport_capability(
-            "spawn-task", 9
+            "spawn-task", 9, self.result.configuration_digest, self.engine, 2
         )
         context = multiprocessing.get_context("spawn")
         receiving, sending = context.Pipe(duplex=False)
@@ -4046,11 +4609,17 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         )
         process.start()
         sending.close()
-        transport = receiving.recv()
-        receiving.close()
         process.join(timeout=20.0)
         self.assertFalse(process.is_alive())
         self.assertEqual(process.exitcode, 0)
+        transport = capability_cache.receive_configuration_audit_transport(
+            receiving,
+            capability,
+            time.monotonic() + 20.0,
+            worker_alive=lambda: False,
+        ).transport
+        receiving.close()
+        process.close()
         self.assertEqual(
             capability_audit._marshal_live_semantic_object(FileIdentity),
             identity_semantics_before_spawn,
@@ -4068,7 +4637,9 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
     def test_parent_releases_once_for_decode_send_cancel_and_worker_death(self):
         def issued(task_id):
             reservation = PerTaskCompactReservation(task_id, 4, 32 << 20)
-            capability = reservation.issue_worker_transport_capability(task_id, 4)
+            capability = reservation.issue_worker_transport_capability(
+                task_id, 4, self.result.configuration_digest, self.engine, 2
+            )
             return reservation, capability
 
         cancelled, cancelled_capability = issued("cancelled")
@@ -4090,7 +4661,12 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         )
         process.start()
         sending.close()
-        transport = receiving.recv()
+        transport = capability_cache.receive_configuration_audit_transport(
+            receiving,
+            rejected_capability,
+            time.monotonic() + 20.0,
+            worker_alive=process.is_alive,
+        ).transport
         receiving.close()
         process.join(timeout=20.0)
         self.assertEqual(process.exitcode, 0)
@@ -4134,6 +4710,231 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 reservation.release_worker_transport_capability(
                     capability, "duplicate-failure"
                 )
+
+    def test_spawn_pipe_rejects_forged_exact_charge_before_decode_ownership(self):
+        context = multiprocessing.get_context("spawn")
+        for mode in ("forge-undercharge", "forge-overcharge"):
+            with self.subTest(mode=mode):
+                reservation = PerTaskCompactReservation(mode, 5, 32 << 20)
+                capability = reservation.issue_worker_transport_capability(
+                    mode, 5, self.result.configuration_digest, self.engine, 2
+                )
+                receiving, sending = context.Pipe(duplex=False)
+                process = context.Process(
+                    target=_send_owned_audit_transport_from_spawned_worker,
+                    args=(sending, capability, self.result, mode),
+                )
+                process.start()
+                sending.close()
+                transport = capability_cache.receive_configuration_audit_transport(
+                    receiving,
+                    capability,
+                    time.monotonic() + 20.0,
+                    worker_alive=process.is_alive,
+                ).transport
+                receiving.close()
+                process.join(timeout=20.0)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, 0)
+                self.assertEqual(
+                    reservation.owner_phase, "worker-transport-dispatched"
+                )
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "transport.*charge"
+                ):
+                    capability_cache.decode_configuration_audit_result_transport(
+                        transport, reservation, capability
+                    )
+                self.assertTrue(reservation.released)
+                self.assertEqual(
+                    reservation.release_phase, "receiver-transport-rejected"
+                )
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "already released"
+                ):
+                    reservation.release_worker_transport_capability(
+                        capability, "duplicate-forged-charge"
+                    )
+
+    def test_spawn_pipe_rejects_forged_receipt_envelope_bindings(self):
+        context = multiprocessing.get_context("spawn")
+        for mode in (
+            "forge-task",
+            "forge-generation",
+            "forge-nonce",
+            "forge-serial",
+            "forge-hash",
+        ):
+            with self.subTest(mode=mode):
+                reservation = PerTaskCompactReservation(mode, 6, 32 << 20)
+                capability = reservation.issue_worker_transport_capability(
+                    mode, 6, self.result.configuration_digest, self.engine, 2
+                )
+                receiving, sending = context.Pipe(duplex=False)
+                process = context.Process(
+                    target=_send_owned_audit_transport_from_spawned_worker,
+                    args=(sending, capability, self.result, mode),
+                )
+                process.start()
+                sending.close()
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError,
+                    "transport.*(authentication|malformed|limit)",
+                ):
+                    capability_cache.receive_configuration_audit_transport(
+                        receiving,
+                        capability,
+                        time.monotonic() + 20.0,
+                        worker_alive=process.is_alive,
+                    )
+                receiving.close()
+                process.join(timeout=20.0)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, 0)
+                reservation.release_worker_transport_capability(
+                    capability, "receiver-transport-rejected"
+                )
+                self.assertTrue(reservation.released)
+                self.assertEqual(
+                    reservation.release_phase, "receiver-transport-rejected"
+                )
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "already released"
+                ):
+                    reservation.release_worker_transport_capability(
+                        capability, "duplicate-forged-envelope"
+                    )
+
+    def test_spawn_pipe_rejects_canonical_cross_configuration_and_engine(self):
+        context = multiprocessing.get_context("spawn")
+        for mode in ("substitute-configuration", "substitute-engine"):
+            with self.subTest(mode=mode):
+                reservation = PerTaskCompactReservation(mode, 8, 32 << 20)
+                capability = reservation.issue_worker_transport_capability(
+                    mode, 8, self.result.configuration_digest, self.engine, 2
+                )
+                substituted = dataclasses.replace(
+                    self.result,
+                    configuration_digest=(
+                        "d" * 64
+                        if mode == "substitute-configuration"
+                        else self.result.configuration_digest
+                    ),
+                    audit_engine_fingerprint=(
+                        "f" * 64
+                        if mode == "substitute-engine"
+                        else self.result.audit_engine_fingerprint
+                    ),
+                )
+                receiving, sending = context.Pipe(duplex=False)
+                process = context.Process(
+                    target=_send_owned_audit_transport_from_spawned_worker,
+                    args=(sending, capability, substituted, "send"),
+                )
+                process.start()
+                sending.close()
+                transport = capability_cache.receive_configuration_audit_transport(
+                    receiving,
+                    capability,
+                    time.monotonic() + 20.0,
+                    worker_alive=process.is_alive,
+                ).transport
+                receiving.close()
+                process.join(timeout=20.0)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, 0)
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError,
+                    "(configuration|engine|transport|payload)",
+                ):
+                    capability_cache.decode_configuration_audit_result_transport(
+                        transport, reservation, capability
+                    )
+                self.assertTrue(reservation.released)
+                self.assertEqual(
+                    reservation.release_phase, "receiver-transport-rejected"
+                )
+
+    def test_large_valid_transport_decode_peak_is_covered_by_reservation(self):
+        findings = tuple(
+            AuditResultFinding(
+                PurePosixPath(f"playback/g/{index:05d}.h"),
+                1,
+                "x",
+                "r",
+            )
+            for index in range(45_000)
+        )
+        large_result = dataclasses.replace(self.result, findings=findings)
+        reservation = PerTaskCompactReservation("large-decode", 10, 32 << 20)
+        capability = reservation.issue_worker_transport_capability(
+            "large-decode", 10, self.result.configuration_digest, self.engine, 2
+        )
+        worker_reservation = PerTaskCompactReservation.for_worker_transport(
+            capability
+        )
+        worker_reservation.require_before_discovery("large-decode", 10)
+        payload = capability_cache.encode_configuration_audit_result(large_result)
+        path_bytes = sum(
+            len(item.stable_role.encode("ascii"))
+            + len(item.role_relative_path.as_posix().encode("utf-8"))
+            + len(str(item.identity.canonical).encode("utf-8"))
+            + (
+                len(item.identity.relative.as_posix().encode("utf-8"))
+                if item.identity.relative is not None
+                else 0
+            )
+            for item in large_result.dependencies
+        ) + sum(
+            len(path.as_posix().encode("utf-8"))
+            for path in large_result.reached_production
+        ) + sum(
+            len(item.path.as_posix().encode("utf-8"))
+            for item in large_result.findings
+        )
+        bounds = CompactResultDraftBounds(
+            len(large_result.dependencies),
+            len(large_result.reached_production),
+            len(large_result.findings),
+            path_bytes,
+            sum(
+                len(item.expression.encode("utf-8"))
+                for item in large_result.findings
+            ),
+            sum(
+                len(item.reason.encode("utf-8"))
+                for item in large_result.findings
+            ),
+        )
+        worker_reservation.require_within_pre_dispatch_reservation(
+            "large-decode", len(payload), bounds, 4096
+        )
+        worker_reservation.record_exact_canonical_json(
+            "large-decode", len(payload)
+        )
+        ownership = worker_reservation.begin_result_ownership(
+            "large-decode", 10
+        )
+        owned = dataclasses.replace(
+            large_result, _transport_ownership=ownership
+        )
+        transport = capability_cache.encode_configuration_audit_result_transport(
+            owned, capability, 17, WorkerStageTimings(1.0, 2.0, 3.0, 4.0)
+        )
+        del owned, ownership, large_result, findings
+        gc.collect()
+        tracemalloc.start()
+        try:
+            decoded = capability_cache.decode_configuration_audit_result_transport(
+                transport, reservation, capability
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(decoded.findings), 45_000)
+        self.assertLessEqual(peak, transport.receipt.charged_bytes)
+        self.assertLessEqual(peak, reservation.maximum_bytes)
+        decoded.release_transport_ownership()
 
     def test_combined_key_is_used_for_path_lane_and_manifest(self):
         cache = ConfigurationAuditCache(self.cache_root)

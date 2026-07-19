@@ -850,8 +850,14 @@ class ModelTests(unittest.TestCase):
         envelope = CompactResultDraftBounds(
             0, 0, maximum_valid_findings, 0, 0, 0
         )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "reservation limit"
+        ):
+            reservation.require_within_pre_dispatch_reservation(
+                "task-a", 4 << 20, envelope, 4096
+            )
         envelope_charge = reservation.require_within_pre_dispatch_reservation(
-            "task-a", 4 << 20, envelope, 4096
+            "task-a", (4 << 20) - 3072, envelope, 4096
         )
         self.assertLessEqual(envelope_charge, 32 << 20)
         bounds = CompactResultDraftBounds(1, 1, 1, 64, 32, 48)
@@ -909,6 +915,11 @@ class ModelTests(unittest.TestCase):
             ("result", "stdout_bytes", "stages"),
         )
         self.assertFalse(hasattr(outcome, "view"))
+        for invalid in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(invalid_timing=invalid), self.assertRaisesRegex(
+                AuditInfrastructureError, "timing"
+            ):
+                WorkerStageTimings(invalid, 0.0, 0.0, 0.0)
 
         identity = ProcessStartIdentity("windows", 42, "start-token", "cookie")
         event = CompilerLaunchEvent(

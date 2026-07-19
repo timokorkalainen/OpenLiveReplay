@@ -25,13 +25,16 @@ from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
     CompactResultColdSlot,
+    CompactResultDraftBounds,
     CompactResultTransportCapability,
+    CompactResultTransportReceipt,
     CompactResultReservationOwnership,
     CompactResultMemoryBudget,
     CompactResultOwnership,
     ConfigurationAuditPublicationPermit,
     ConfigurationAuditResult,
     ConfigurationAuditResultTransport,
+    ConfigurationAuditTransportOutcome,
     CompactTokenSequence,
     CompilerFamily,
     CompilerInspection,
@@ -40,7 +43,9 @@ from gpu_capability_model import (
     FileIdentity,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
+    PerTaskCompactReservation,
     StreamingResultAggregator,
+    WorkerStageTimings,
     compact_result_retained_bytes,
     decode_local_dependency_digest,
     encode_local_dependency_digest,
@@ -67,6 +72,9 @@ _AUDIT_CACHE_MAXIMUM_ENTRIES = 1024
 _INSPECTION_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 _CACHE_ROOT_OVERHEAD_RESERVE = 8 * 1024 * 1024
 _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES = 4 * 1024 * 1024
+_AUDIT_TRANSPORT_HEADER_FORMAT = "<8s32s32s32sQQ32sI32sIQ32sQdddd"
+_AUDIT_TRANSPORT_HEADER_BYTES = struct.calcsize(_AUDIT_TRANSPORT_HEADER_FORMAT)
+_AUDIT_TRANSPORT_MAGIC = b"OLRATR01"
 _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES = 16 * 1024
 _AUDIT_RESULTS_DIRECTORY = "results"
 _AUDIT_ROOT_MARKER = ".audit-result-cache-v1"
@@ -601,7 +609,7 @@ def _open_lock_carrier_pair(
             path, stream, anchor_stream, allowed_sizes
         )
         return stream, anchor_stream
-    except BaseException:
+    except BaseException as error:
         if stream is not None:
             stream.close()
         if anchor_stream is not None:
@@ -2256,84 +2264,142 @@ def _decode_audit_result_payload(
         or len(payload) > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
     ):
         raise ValueError("encoded compact audit result limit exceeded")
-    document = _strict_json_document(payload)
-    if tuple(sorted(document)) != (
-        "audit_engine_fingerprint",
-        "configuration_digest",
-        "dependencies",
-        "findings",
-        "reached_production",
-        "schema",
-    ):
-        raise ValueError("compact audit result schema is invalid")
-    if (
-        document["schema"] != AUDIT_RESULT_SCHEMA_BYTES.decode("ascii")
-        or document["configuration_digest"] != configuration_digest
-        or document["audit_engine_fingerprint"] != engine
-    ):
-        raise ValueError("compact audit result identity differs")
-    dependencies_document = document["dependencies"]
-    reached_document = document["reached_production"]
-    findings_document = document["findings"]
+    cursor = _CanonicalAuditResultCursor(payload)
     limits = AuditLimits()
-    if (
-        not isinstance(dependencies_document, list)
-        or len(dependencies_document) > limits.compact_result_dependencies
-        or not isinstance(reached_document, list)
-        or len(reached_document) > limits.compact_result_reached
-        or not isinstance(findings_document, list)
-        or len(findings_document) > limits.compact_result_findings
-    ):
-        raise AuditInfrastructureError("audit result limit exceeded")
-    dependency_fields = (
-        "stable_role", "role_relative_path", "canonical", "relative",
-        "device", "inode", "line_count", "production", "sha256",
-    )
-    decoded_dependencies: list[DependencyDigest] = []
-    for item in dependencies_document:
-        if not isinstance(item, dict) or set(item) != set(dependency_fields):
-            raise ValueError("compact audit dependency schema is invalid")
-        ordered = {field: item[field] for field in dependency_fields}
-        decoded_dependencies.append(
-            decode_local_dependency_digest(
-                json.dumps(
-                    ordered, ensure_ascii=True, separators=(",", ":")
-                ).encode("ascii")
+    cursor.expect(b'{"audit_engine_fingerprint":')
+    if cursor.string() != engine:
+        raise ValueError("compact audit result engine differs")
+    cursor.expect(b',"configuration_digest":')
+    if cursor.string() != configuration_digest:
+        raise ValueError("compact audit result configuration differs")
+    cursor.expect(b',"dependencies":[')
+    dependencies: list[DependencyDigest] = []
+    previous_dependency_key: tuple[str, str, str] | None = None
+    while cursor.payload[cursor.offset:cursor.offset + 1] != b"]":
+        if dependencies:
+            cursor.expect(b",")
+        if len(dependencies) >= limits.compact_result_dependencies:
+            raise AuditInfrastructureError(
+                "audit result limit exceeded for dependencies"
             )
+        cursor.expect(b'{"canonical":')
+        canonical = cursor.string(limits.compact_result_path_bytes)
+        cursor.expect(b',"device":')
+        device = cursor.integer_or_null()
+        cursor.expect(b',"inode":')
+        inode = cursor.integer_or_null()
+        cursor.expect(b',"line_count":')
+        line_count = cursor.integer_or_null()
+        cursor.expect(b',"production":')
+        production = cursor.boolean()
+        cursor.expect(b',"relative":')
+        if cursor.payload[cursor.offset:cursor.offset + 4] == b"null":
+            cursor.offset += 4
+            relative = None
+        else:
+            relative = _bounded_relative_path(
+                cursor.string(limits.compact_result_path_bytes),
+                limits.compact_result_path_bytes,
+            )
+        cursor.expect(b',"role_relative_path":')
+        role_relative = _bounded_relative_path(
+            cursor.string(limits.compact_result_path_bytes),
+            limits.compact_result_path_bytes,
         )
-    dependencies = tuple(decoded_dependencies)
-    reached: list[PurePosixPath] = []
-    for value in reached_document:
-        if not isinstance(value, str):
-            raise ValueError("compact audit reached path is invalid")
-        reached.append(PurePosixPath(value))
-    findings: list[AuditResultFinding] = []
-    for value in findings_document:
-        if not isinstance(value, dict) or tuple(sorted(value)) != (
-            "expression", "line", "path", "reason"
+        cursor.expect(b',"sha256":')
+        sha256 = cursor.string()
+        cursor.expect(b',"stable_role":')
+        stable_role = cursor.string()
+        cursor.expect(b"}")
+        dependency = DependencyDigest(
+            stable_role,
+            role_relative,
+            FileIdentity(
+                Path(canonical), relative, device, inode, line_count, production
+            ),
+            sha256,
+        )
+        dependency_key = (
+            dependency.stable_role,
+            dependency.role_relative_path.as_posix(),
+            dependency.sha256,
+        )
+        if (
+            previous_dependency_key is not None
+            and dependency_key <= previous_dependency_key
         ):
-            raise ValueError("compact audit finding schema is invalid")
-        path = value["path"]
-        if not isinstance(path, str):
-            raise ValueError("compact audit finding path is invalid")
-        findings.append(
-            AuditResultFinding(
-                PurePosixPath(path),
-                value["line"],
-                value["expression"],
-                value["reason"],
+            raise AuditInfrastructureError(
+                "audit result dependencies are not unique and sorted"
             )
+        previous_dependency_key = dependency_key
+        dependencies.append(dependency)
+    cursor.expect(b"]")
+    cursor.expect(b',"findings":[')
+    findings: list[AuditResultFinding] = []
+    previous_finding_key: tuple[str, int, str, str] | None = None
+    while cursor.payload[cursor.offset:cursor.offset + 1] != b"]":
+        if findings:
+            cursor.expect(b",")
+        if len(findings) >= limits.compact_result_findings:
+            raise AuditInfrastructureError(
+                "audit result limit exceeded for findings"
+            )
+        cursor.expect(b'{"expression":')
+        expression = cursor.string(limits.compact_result_expression_bytes)
+        cursor.expect(b',"line":')
+        line = cursor.integer_or_null()
+        cursor.expect(b',"path":')
+        path = _bounded_relative_path(
+            cursor.string(limits.compact_result_path_bytes),
+            limits.compact_result_path_bytes,
         )
-    result = ConfigurationAuditResult(
+        cursor.expect(b',"reason":')
+        reason = cursor.string(limits.compact_result_reason_bytes)
+        cursor.expect(b"}")
+        finding = AuditResultFinding(path, line, expression, reason)
+        finding_key = (path.as_posix(), finding.line, expression, reason)
+        if previous_finding_key is not None and finding_key <= previous_finding_key:
+            raise AuditInfrastructureError(
+                "audit result findings are not unique and sorted"
+            )
+        previous_finding_key = finding_key
+        findings.append(finding)
+    cursor.expect(b"]")
+    cursor.expect(b',"reached_production":[')
+    reached: list[PurePosixPath] = []
+    previous_reached: str | None = None
+    while cursor.payload[cursor.offset:cursor.offset + 1] != b"]":
+        if reached:
+            cursor.expect(b",")
+        if len(reached) >= limits.compact_result_reached:
+            raise AuditInfrastructureError(
+                "audit result limit exceeded for reached paths"
+            )
+        reached_path = _bounded_relative_path(
+            cursor.string(limits.compact_result_path_bytes),
+            limits.compact_result_path_bytes,
+        )
+        reached_key = reached_path.as_posix()
+        if previous_reached is not None and reached_key <= previous_reached:
+            raise AuditInfrastructureError(
+                "audit result reached-production paths are not unique and sorted"
+            )
+        previous_reached = reached_key
+        reached.append(reached_path)
+    cursor.expect(b"]")
+    cursor.expect(b',"schema":')
+    if cursor.string() != AUDIT_RESULT_SCHEMA_BYTES.decode("ascii"):
+        raise ValueError("compact audit result schema differs")
+    cursor.expect(b"}")
+    if cursor.offset != len(payload):
+        raise ValueError("compact audit result has trailing data")
+    return ConfigurationAuditResult(
         configuration_digest,
         engine,
-        dependencies,
+        tuple(dependencies),
         tuple(reached),
         tuple(findings),
     )
-    if _encode_audit_result_payload(result) != payload:
-        raise ValueError("canonical compact audit result payload differs")
-    return result
 
 
 class _CanonicalAuditResultCursor:
@@ -2606,11 +2672,11 @@ def decode_configuration_audit_result(payload: bytes) -> ConfigurationAuditResul
     ):
         raise AuditInfrastructureError("encoded compact audit result limit exceeded")
     try:
-        document = _strict_json_document(payload)
-        configuration_digest = document.get("configuration_digest")
-        engine = document.get("audit_engine_fingerprint")
-        if not isinstance(configuration_digest, str) or not isinstance(engine, str):
-            raise ValueError("compact audit result identity is invalid")
+        cursor = _CanonicalAuditResultCursor(payload)
+        cursor.expect(b'{"audit_engine_fingerprint":')
+        engine = cursor.string()
+        cursor.expect(b',"configuration_digest":')
+        configuration_digest = cursor.string()
         return _decode_audit_result_payload(
             payload,
             configuration_digest=configuration_digest,
@@ -2632,6 +2698,8 @@ def decode_configuration_audit_result(payload: bytes) -> ConfigurationAuditResul
 def encode_configuration_audit_result_transport(
     result: ConfigurationAuditResult,
     capability: CompactResultTransportCapability,
+    stdout_bytes: int,
+    stages: WorkerStageTimings,
 ) -> ConfigurationAuditResultTransport:
     ownership = result._transport_ownership
     if (
@@ -2646,30 +2714,360 @@ def encode_configuration_audit_result_transport(
     serialized = ownership.transfer("serialized-pipe")
     try:
         receipt = serialized.reservation.complete_worker_transport(
-            capability, payload
+            capability, payload, stdout_bytes, stages
         )
         return ConfigurationAuditResultTransport(payload, receipt)
-    except BaseException:
+    except BaseException as error:
         if serialized.active and not serialized.reservation.released:
-            serialized.release("transport-carrier-failure")
+            try:
+                serialized.release("transport-carrier-failure")
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "transport carrier cleanup also failed: "
+                    f"{cleanup_error}"
+                )
         raise
+
+
+def _encode_configuration_audit_transport_header(
+    outcome: ConfigurationAuditTransportOutcome,
+) -> bytes:
+    if not isinstance(outcome, ConfigurationAuditTransportOutcome):
+        raise AuditInfrastructureError("worker audit transport outcome is invalid")
+    receipt = outcome.transport.receipt
+    stages = receipt.stages
+    try:
+        return struct.pack(
+            _AUDIT_TRANSPORT_HEADER_FORMAT,
+            _AUDIT_TRANSPORT_MAGIC,
+            hashlib.sha256(receipt.task_id.encode("utf-8")).digest(),
+            bytes.fromhex(receipt.configuration_digest),
+            bytes.fromhex(receipt.audit_engine_fingerprint),
+            receipt.generation,
+            receipt.serial,
+            bytes.fromhex(receipt.nonce),
+            receipt.worker_slot,
+            bytes.fromhex(receipt.pipe_nonce),
+            receipt.encoded_bytes,
+            receipt.charged_bytes,
+            bytes.fromhex(receipt.payload_sha256),
+            receipt.stdout_bytes,
+            float(stages.discovery_seconds),
+            float(stages.accepted_parse_seconds),
+            float(stages.audit_seconds),
+            float(stages.publish_seconds),
+        )
+    except (OverflowError, struct.error, ValueError) as error:
+        raise AuditInfrastructureError(
+            "worker audit transport header is invalid"
+        ) from error
+
+
+def send_configuration_audit_transport(
+    connection,
+    outcome: ConfigurationAuditTransportOutcome,
+) -> None:
+    header = _encode_configuration_audit_transport_header(outcome)
+    try:
+        connection.send_bytes(header)
+        connection.send_bytes(outcome.transport.payload)
+    except (AttributeError, EOFError, OSError, ValueError) as error:
+        raise AuditInfrastructureError(
+            "cannot send worker audit transport"
+        ) from error
+
+
+def _receive_audit_transport_frame(
+    connection,
+    maximum_bytes: int,
+    deadline: float,
+    cancel_event,
+    worker_alive,
+) -> bytes:
+    def wait_quantum() -> float:
+        if cancel_event is not None and cancel_event.is_set():
+            raise AuditInfrastructureError("worker audit transport was cancelled")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AuditInfrastructureError(
+                "worker audit transport deadline exceeded"
+            )
+        return min(0.05, remaining)
+
+    def require_worker_after_stall() -> None:
+        if worker_alive is not None and not worker_alive():
+            raise AuditInfrastructureError(
+                "worker exited before audit transport completed"
+            )
+
+    if os.name == "nt":
+        import _winapi
+
+        try:
+            handle = connection.fileno()
+        except (AttributeError, OSError, ValueError) as error:
+            raise AuditInfrastructureError(
+                "worker audit transport pipe is invalid"
+            ) from error
+        while True:
+            try:
+                if not connection.poll(wait_quantum()):
+                    require_worker_after_stall()
+                    continue
+                _available_bytes, message_bytes = _winapi.PeekNamedPipe(
+                    handle, 0
+                )
+                if message_bytes > maximum_bytes:
+                    raise AuditInfrastructureError(
+                        "worker audit transport frame is malformed or over limit"
+                    )
+                if message_bytes <= 0:
+                    raise AuditInfrastructureError(
+                        "worker audit transport frame is truncated or over limit"
+                    )
+                payload, error_code = _winapi.ReadFile(handle, message_bytes)
+            except (AttributeError, EOFError, OSError, ValueError) as error:
+                raise AuditInfrastructureError(
+                    "worker audit transport frame is truncated or over limit"
+                ) from error
+            if error_code != 0 or len(payload) != message_bytes:
+                raise AuditInfrastructureError(
+                    "worker audit transport frame is truncated or over limit"
+                )
+            return payload
+
+    try:
+        descriptor = connection.fileno()
+        was_blocking = os.get_blocking(descriptor)
+        os.set_blocking(descriptor, False)
+    except (AttributeError, OSError, ValueError) as error:
+        raise AuditInfrastructureError(
+            "worker audit transport pipe is invalid"
+        ) from error
+    framing = bytearray()
+    payload = bytearray()
+    expected_bytes = None
+    try:
+        while True:
+            quantum = wait_quantum()
+            target = framing if expected_bytes is None else payload
+            remaining = (
+                4 - len(framing)
+                if expected_bytes is None
+                else expected_bytes - len(payload)
+            )
+            if remaining == 0:
+                if expected_bytes is None:
+                    expected_bytes = struct.unpack("!i", framing)[0]
+                    if expected_bytes < 0 or expected_bytes > maximum_bytes:
+                        raise AuditInfrastructureError(
+                            "worker audit transport frame is malformed or over limit"
+                        )
+                    if expected_bytes == 0:
+                        return b""
+                    continue
+                return bytes(payload)
+            try:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+            except BlockingIOError:
+                chunk = None
+            except OSError as error:
+                raise AuditInfrastructureError(
+                    "worker audit transport frame is truncated or over limit"
+                ) from error
+            if chunk:
+                target.extend(chunk)
+                continue
+            if chunk == b"":
+                raise AuditInfrastructureError(
+                    "worker audit transport frame is truncated or over limit"
+                )
+            try:
+                ready = connection.poll(quantum)
+            except (AttributeError, EOFError, OSError, ValueError) as error:
+                raise AuditInfrastructureError(
+                    "worker audit transport frame is truncated or over limit"
+                ) from error
+            if not ready:
+                require_worker_after_stall()
+    finally:
+        try:
+            os.set_blocking(descriptor, was_blocking)
+        except OSError:
+            pass
+
+
+def receive_configuration_audit_transport(
+    connection,
+    capability: CompactResultTransportCapability,
+    deadline: float,
+    *,
+    cancel_event=None,
+    worker_alive=None,
+) -> ConfigurationAuditTransportOutcome:
+    if (
+        not isinstance(capability, CompactResultTransportCapability)
+        or not isinstance(deadline, (int, float))
+        or isinstance(deadline, bool)
+        or not math.isfinite(deadline)
+        or (worker_alive is not None and not callable(worker_alive))
+        or (
+            cancel_event is not None
+            and not callable(getattr(cancel_event, "is_set", None))
+        )
+    ):
+        raise AuditInfrastructureError("worker audit transport receive is invalid")
+    header = _receive_audit_transport_frame(
+        connection,
+        _AUDIT_TRANSPORT_HEADER_BYTES,
+        float(deadline),
+        cancel_event,
+        worker_alive,
+    )
+    if len(header) != _AUDIT_TRANSPORT_HEADER_BYTES:
+        raise AuditInfrastructureError("worker audit transport header is malformed")
+    try:
+        (
+            magic,
+            task_hash,
+            configuration_digest,
+            audit_engine_fingerprint,
+            generation,
+            serial,
+            nonce,
+            worker_slot,
+            pipe_nonce,
+            encoded_bytes,
+            charged_bytes,
+            payload_sha256,
+            stdout_bytes,
+            discovery_seconds,
+            accepted_parse_seconds,
+            audit_seconds,
+            publish_seconds,
+        ) = struct.unpack(_AUDIT_TRANSPORT_HEADER_FORMAT, header)
+    except struct.error as error:
+        raise AuditInfrastructureError(
+            "worker audit transport header is malformed"
+        ) from error
+    expected_header = (
+        magic == _AUDIT_TRANSPORT_MAGIC
+        and task_hash == hashlib.sha256(capability.task_id.encode("utf-8")).digest()
+        and configuration_digest.hex() == capability.configuration_digest
+        and audit_engine_fingerprint.hex()
+        == capability.audit_engine_fingerprint
+        and generation == capability.generation
+        and serial == capability.serial
+        and nonce.hex() == capability.nonce
+        and worker_slot == capability.worker_slot
+        and pipe_nonce.hex() == capability.pipe_nonce
+        and 0 < encoded_bytes <= _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+        and 0 < charged_bytes <= capability.maximum_bytes
+    )
+    if not expected_header:
+        raise AuditInfrastructureError(
+            "worker audit transport header authentication failed"
+        )
+    stages = WorkerStageTimings(
+        discovery_seconds,
+        accepted_parse_seconds,
+        audit_seconds,
+        publish_seconds,
+    )
+    payload = _receive_audit_transport_frame(
+        connection,
+        _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES,
+        float(deadline),
+        cancel_event,
+        worker_alive,
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        raise AuditInfrastructureError("worker audit transport was cancelled")
+    if (
+        len(payload) != encoded_bytes
+        or hashlib.sha256(payload).digest() != payload_sha256
+    ):
+        raise AuditInfrastructureError(
+            "worker audit transport payload authentication failed"
+        )
+    receipt = CompactResultTransportReceipt(
+        capability.task_id,
+        generation,
+        configuration_digest.hex(),
+        audit_engine_fingerprint.hex(),
+        worker_slot,
+        pipe_nonce.hex(),
+        serial,
+        nonce.hex(),
+        encoded_bytes,
+        charged_bytes,
+        payload_sha256.hex(),
+        stdout_bytes,
+        stages,
+    )
+    transport = ConfigurationAuditResultTransport(payload, receipt)
+    return ConfigurationAuditTransportOutcome(
+        transport, receipt.stdout_bytes, receipt.stages
+    )
 
 
 def decode_configuration_audit_result_transport(
     transport: ConfigurationAuditResultTransport,
-    reservation,
+    reservation: PerTaskCompactReservation,
     capability: CompactResultTransportCapability,
 ) -> ConfigurationAuditResult:
     if (
         not isinstance(transport, ConfigurationAuditResultTransport)
     ):
         raise AuditInfrastructureError("compact audit result transport is invalid")
-    decoding = reservation.begin_receiver_transport_decode(
-        capability, transport.receipt, transport.payload
-    )
+    decoding = None
     retained = None
     try:
-        decoded = decode_configuration_audit_result(transport.payload)
+        reservation.authenticate_worker_transport_envelope(
+            capability, transport.receipt, transport.payload
+        )
+        decoded = _decode_audit_result_payload(
+            transport.payload,
+            configuration_digest=capability.configuration_digest,
+            engine=capability.audit_engine_fingerprint,
+        )
+        path_bytes = sum(
+            len(item.stable_role.encode("ascii"))
+            + len(item.role_relative_path.as_posix().encode("utf-8"))
+            + len(str(item.identity.canonical).encode("utf-8"))
+            + (
+                len(item.identity.relative.as_posix().encode("utf-8"))
+                if item.identity.relative is not None
+                else 0
+            )
+            for item in decoded.dependencies
+        ) + sum(
+            len(path.as_posix().encode("utf-8"))
+            for path in decoded.reached_production
+        ) + sum(
+            len(item.path.as_posix().encode("utf-8"))
+            for item in decoded.findings
+        )
+        bounds = CompactResultDraftBounds(
+            len(decoded.dependencies),
+            len(decoded.reached_production),
+            len(decoded.findings),
+            path_bytes,
+            sum(
+                len(item.expression.encode("utf-8"))
+                for item in decoded.findings
+            ),
+            sum(len(item.reason.encode("utf-8")) for item in decoded.findings),
+        )
+        authenticated_charge = PerTaskCompactReservation.exact_transport_charge(
+            len(transport.payload), bounds, 4096
+        )
+        decoding = reservation.begin_receiver_transport_decode(
+            capability,
+            transport.receipt,
+            transport.payload,
+            authenticated_charge,
+        )
         retained = decoding.transfer("receiver-retained-result")
         return ConfigurationAuditResult(
             decoded.configuration_digest,
@@ -2679,10 +3077,46 @@ def decode_configuration_audit_result_transport(
             decoded.findings,
             retained,
         )
-    except BaseException:
+    except BaseException as error:
         active = retained if retained is not None else decoding
-        if active.active:
-            active.release("receiver-decode-failure")
+        if active is not None and active.active:
+            try:
+                active.release("receiver-decode-failure")
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "receiver decode ownership cleanup also failed: "
+                    f"{cleanup_error}"
+                )
+        elif (
+            not reservation.released
+            and reservation.owner_phase == "worker-transport-dispatched"
+        ):
+            try:
+                reservation.release_worker_transport_capability(
+                    capability, "receiver-transport-rejected"
+                )
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "receiver transport rejection cleanup also failed: "
+                    f"{cleanup_error}"
+                )
+                if not reservation.released:
+                    try:
+                        reservation.release("receiver-transport-rejected")
+                    except BaseException as fallback_error:
+                        error.add_note(
+                            "receiver transport fallback cleanup also failed: "
+                            f"{fallback_error}"
+                        )
+        if isinstance(error, AuditInfrastructureError):
+            raise
+        if isinstance(
+            error,
+            (UnicodeError, ValueError, TypeError, KeyError, RecursionError),
+        ):
+            raise AuditInfrastructureError(
+                "compact audit result transport payload is invalid"
+            ) from error
         raise
 
 

@@ -7,7 +7,6 @@ import inspect
 import json
 import multiprocessing
 import os
-import pickle
 import shutil
 import subprocess
 import struct
@@ -640,6 +639,62 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 for name in vars(result)
             )
         )
+
+    def test_pipe_close_and_join_failures_still_finalize_process_carrier(self):
+        real_launch = capability_runner._launch_compiler_process
+        real_join = threading.Thread.join
+        for failure_kind in ("join", "pipe-close"):
+            with self.subTest(failure_kind=failure_kind):
+                carriers = []
+                processes = []
+                original_streams = []
+                stdout_joins = 0
+
+                def capture_launch(*args, **kwargs):
+                    process, carrier = real_launch(*args, **kwargs)
+                    carriers.append(carrier)
+                    processes.append(process)
+                    original_streams.extend((process.stdout, process.stderr))
+                    if failure_kind == "pipe-close":
+                        original_stdout = process.stdout
+
+                        class FailingCloseStream:
+                            def read(self, size): return original_stdout.read(size)
+                            def close(self): raise OSError("stdout close failed")
+
+                        process.stdout = FailingCloseStream()
+                    return process, carrier
+
+                def injected_join(thread, timeout=None):
+                    nonlocal stdout_joins
+                    if thread.name == "gpu-audit-stdout":
+                        stdout_joins += 1
+                        if failure_kind == "join" and stdout_joins == 2:
+                            raise RuntimeError("reader join failed")
+                    return real_join(thread, timeout=timeout)
+
+                try:
+                    with mock.patch.object(
+                        capability_runner,
+                        "_launch_compiler_process",
+                        side_effect=capture_launch,
+                    ), mock.patch.object(
+                        threading.Thread, "join", new=injected_join
+                    ), self.assertRaisesRegex(
+                        (AuditInfrastructureError, OSError, RuntimeError),
+                        "(join|close)",
+                    ):
+                        self.run_direct("success")
+                    self.assertEqual(len(carriers), 1)
+                    self.assertTrue(carriers[0].completed)
+                    self.assertIsNone(carriers[0].process)
+                finally:
+                    for carrier in carriers:
+                        if not carrier.completed:
+                            carrier.complete_after_exit()
+                    for stream in original_streams:
+                        if stream is not None and not stream.closed:
+                            stream.close()
 
     def test_past_global_deadline_fails_without_starting_process(self):
         with mock.patch("gpu_capability_runner.subprocess.Popen") as popen:
@@ -2714,6 +2769,7 @@ class WorkerAuditTests(unittest.TestCase):
         stabilize_error=None,
         stabilize_override=None,
         worker_outcomes=None,
+        return_owner=False,
     ):
         if task is None:
             task, _reservation = self._task()
@@ -2724,7 +2780,11 @@ class WorkerAuditTests(unittest.TestCase):
         ):
             try:
                 capability = parent_reservation.issue_worker_transport_capability(
-                    task.task_id, task.generation
+                    task.task_id,
+                    task.generation,
+                    task.configuration.digest,
+                    self.engine,
+                    3,
                 )
                 task = dataclasses.replace(
                     task,
@@ -2823,10 +2883,10 @@ class WorkerAuditTests(unittest.TestCase):
                 )
             if worker_outcomes is not None:
                 worker_outcomes.append(worker_outcome)
-            worker_outcome = pickle.loads(pickle.dumps(worker_outcome))
-            outcome = capability_runner.receive_configuration_audit_outcome(
+            owner = capability_runner.receive_configuration_audit_outcome(
                 parent_reservation, capability, worker_outcome
             )
+            outcome = owner if return_owner else owner.transfer()
         except BaseException:
             if (
                 capability is not None
@@ -2839,6 +2899,99 @@ class WorkerAuditTests(unittest.TestCase):
             raise
         return outcome, control, command, cache
 
+    def test_received_outcome_owner_closes_on_scope_failure(self):
+        task, reservation = self._task()
+        owner, _control, _command, _cache = self._run_worker(
+            task=task, return_owner=True
+        )
+        self.assertIsInstance(
+            owner, capability_model.ConfigurationAuditOutcomeOwner
+        )
+        self.assertTrue(owner.active)
+        with self.assertRaisesRegex(RuntimeError, "downstream failed"):
+            with owner:
+                self.assertEqual(owner.outcome.stdout_bytes, 34)
+                raise RuntimeError("downstream failed")
+        self.assertFalse(owner.active)
+        self.assertTrue(reservation.released)
+        with self.assertRaisesRegex(AuditInfrastructureError, "transferred"):
+            owner.close()
+
+    def test_outcome_owner_cleanup_fault_preserves_scope_primary(self):
+        task, reservation = self._task()
+        owner, _control, _command, _cache = self._run_worker(
+            task=task, return_owner=True
+        )
+        with mock.patch.object(
+            capability_model.ConfigurationAuditResult,
+            "release_transport_ownership",
+            side_effect=RuntimeError("owner cleanup secondary"),
+        ), self.assertRaisesRegex(ValueError, "scope primary") as raised:
+            with owner:
+                raise ValueError("scope primary")
+        self.assertTrue(any(
+            "owner cleanup secondary" in note
+            for note in getattr(raised.exception, "__notes__", ())
+        ))
+        self.assertTrue(owner.active)
+        self.assertFalse(reservation.released)
+        owner.close()
+        self.assertTrue(reservation.released)
+
+    def test_received_outcome_owner_transfers_exactly_once(self):
+        task, reservation = self._task()
+        owner, _control, _command, _cache = self._run_worker(
+            task=task, return_owner=True
+        )
+        outcome = owner.transfer()
+        self.assertFalse(owner.active)
+        self.assertFalse(reservation.released)
+        with self.assertRaisesRegex(AuditInfrastructureError, "transferred"):
+            owner.transfer()
+        outcome.result.release_transport_ownership()
+        self.assertTrue(reservation.released)
+
+    def test_owner_construction_failure_releases_received_result(self):
+        task, reservation = self._task()
+        with mock.patch.object(
+            capability_runner,
+            "ConfigurationAuditOutcomeOwner",
+            side_effect=MemoryError("owner construction primary"),
+        ), self.assertRaisesRegex(MemoryError, "owner construction primary"):
+            self._run_worker(task=task)
+        self.assertTrue(reservation.released)
+        self.assertEqual(
+            reservation.release_phase, "retained-result-transition"
+        )
+
+    def test_aggregation_acceptor_failure_keeps_owner_closeable(self):
+        task, reservation = self._task()
+        owner, _control, _command, _cache = self._run_worker(
+            task=task, return_owner=True
+        )
+
+        def reject(_outcome):
+            raise ValueError("aggregation rejected outcome")
+
+        with self.assertRaisesRegex(ValueError, "aggregation rejected"):
+            with owner:
+                owner.transfer_to(reject)
+        self.assertTrue(reservation.released)
+
+        task, reservation = self._task()
+        owner, _control, _command, _cache = self._run_worker(
+            task=task, return_owner=True
+        )
+        retained = []
+        accepted = owner.transfer_to(
+            lambda outcome: retained.append(outcome) or "accepted"
+        )
+        self.assertEqual(accepted, "accepted")
+        self.assertFalse(owner.active)
+        self.assertFalse(reservation.released)
+        retained.pop().result.release_transport_ownership()
+        self.assertTrue(reservation.released)
+
     def test_worker_returns_only_compact_outcome_drops_view_and_never_loads(self):
         task, reservation = self._task()
         worker_outcomes = []
@@ -2849,7 +3002,6 @@ class WorkerAuditTests(unittest.TestCase):
         self.assertIsInstance(
             worker_outcomes[0], capability_model.ConfigurationAuditTransportOutcome
         )
-        pickle.dumps(worker_outcomes[0])
         self.assertFalse(hasattr(worker_outcomes[0], "result"))
         self.assertIsInstance(outcome, capability_model.ConfigurationAuditOutcome)
         self.assertFalse(hasattr(outcome, "view"))

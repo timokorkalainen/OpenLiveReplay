@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import math
 import os
 import stat
 import struct
@@ -401,6 +402,7 @@ class WorkerStageTimings:
             not isinstance(value, (int, float))
             or isinstance(value, bool)
             or value < 0
+            or not math.isfinite(value)
             for value in (
                 self.discovery_seconds,
                 self.accepted_parse_seconds,
@@ -447,6 +449,10 @@ class CompactResultDraftBounds:
 class CompactResultTransportCapability:
     task_id: str
     generation: int
+    configuration_digest: str
+    audit_engine_fingerprint: str
+    worker_slot: int
+    pipe_nonce: str
     maximum_bytes: int
     serial: int
     nonce: str
@@ -458,14 +464,27 @@ class CompactResultTransportCapability:
             or not isinstance(self.generation, int)
             or isinstance(self.generation, bool)
             or self.generation < 0
+            or self.generation > (1 << 64) - 1
+            or not isinstance(self.worker_slot, int)
+            or isinstance(self.worker_slot, bool)
+            or self.worker_slot < 0
+            or self.worker_slot > (1 << 32) - 1
             or not isinstance(self.maximum_bytes, int)
             or isinstance(self.maximum_bytes, bool)
             or self.maximum_bytes < (32 << 20)
             or not isinstance(self.serial, int)
             or isinstance(self.serial, bool)
             or self.serial <= 0
+            or self.serial > (1 << 64) - 1
         ):
             raise AuditInfrastructureError("worker transport capability is invalid")
+        _validate_digest(
+            self.configuration_digest, "worker transport configuration"
+        )
+        _validate_digest(
+            self.audit_engine_fingerprint, "worker transport audit engine"
+        )
+        _validate_digest(self.pipe_nonce, "worker transport pipe association")
         _validate_digest(self.nonce, "worker transport capability nonce")
 
 
@@ -473,11 +492,17 @@ class CompactResultTransportCapability:
 class CompactResultTransportReceipt:
     task_id: str
     generation: int
+    configuration_digest: str
+    audit_engine_fingerprint: str
+    worker_slot: int
+    pipe_nonce: str
     serial: int
     nonce: str
     encoded_bytes: int
     charged_bytes: int
     payload_sha256: str
+    stdout_bytes: int
+    stages: WorkerStageTimings
 
     def __post_init__(self) -> None:
         if (
@@ -486,17 +511,35 @@ class CompactResultTransportReceipt:
             or not isinstance(self.generation, int)
             or isinstance(self.generation, bool)
             or self.generation < 0
+            or self.generation > (1 << 64) - 1
+            or not isinstance(self.worker_slot, int)
+            or isinstance(self.worker_slot, bool)
+            or self.worker_slot < 0
+            or self.worker_slot > (1 << 32) - 1
             or not isinstance(self.serial, int)
             or isinstance(self.serial, bool)
             or self.serial <= 0
+            or self.serial > (1 << 64) - 1
             or not isinstance(self.encoded_bytes, int)
             or isinstance(self.encoded_bytes, bool)
             or self.encoded_bytes <= 0
+            or self.encoded_bytes > (1 << 64) - 1
             or not isinstance(self.charged_bytes, int)
             or isinstance(self.charged_bytes, bool)
             or self.charged_bytes <= 0
+            or self.charged_bytes > (1 << 64) - 1
+            or not isinstance(self.stdout_bytes, int)
+            or isinstance(self.stdout_bytes, bool)
+            or self.stdout_bytes < 0
+            or self.stdout_bytes > (1 << 64) - 1
+            or not isinstance(self.stages, WorkerStageTimings)
         ):
             raise AuditInfrastructureError("worker transport receipt is invalid")
+        _validate_digest(self.configuration_digest, "worker transport configuration")
+        _validate_digest(
+            self.audit_engine_fingerprint, "worker transport audit engine"
+        )
+        _validate_digest(self.pipe_nonce, "worker transport pipe association")
         _validate_digest(self.nonce, "worker transport receipt nonce")
         _validate_digest(self.payload_sha256, "worker transport receipt payload")
 
@@ -520,11 +563,14 @@ class PerTaskCompactReservation:
     _RETAINED_ENVELOPE_BYTES = 16 << 20
     _COUNTING_WORKSPACE_BYTES = 4096
     _TRANSPORT_OVERHEAD_BYTES = 8192
+    _RECEIVER_DECODE_ENCODED_MULTIPLIER = 3
 
     __slots__ = (
         "task_id", "generation", "maximum_bytes", "_charged_bytes",
         "_peak_bytes", "_reserved_encoded_bytes", "_canonical_json_bytes", "_owner_phase",
         "_owner_serial", "_worker_transport_nonce", "_worker_transport_serial",
+        "_worker_transport_configuration_digest", "_worker_transport_engine",
+        "_worker_transport_worker_slot", "_worker_transport_pipe_nonce",
         "_worker_transport_mirror", "_released", "_release_phase", "_lock",
     )
 
@@ -552,6 +598,10 @@ class PerTaskCompactReservation:
         self._owner_serial = 0
         self._worker_transport_nonce: str | None = None
         self._worker_transport_serial = 0
+        self._worker_transport_configuration_digest: str | None = None
+        self._worker_transport_engine: str | None = None
+        self._worker_transport_worker_slot: int | None = None
+        self._worker_transport_pipe_nonce: str | None = None
         self._worker_transport_mirror = False
         self._released = False
         self._release_phase: str | None = None
@@ -594,6 +644,10 @@ class PerTaskCompactReservation:
                 not self._worker_transport_mirror
                 or self._worker_transport_nonce is None
                 or self._worker_transport_serial <= 0
+                or self._worker_transport_configuration_digest is None
+                or self._worker_transport_engine is None
+                or self._worker_transport_worker_slot is None
+                or self._worker_transport_pipe_nonce is None
             ):
                 raise AuditInfrastructureError(
                     "worker transport capability is unavailable"
@@ -601,14 +655,34 @@ class PerTaskCompactReservation:
             return CompactResultTransportCapability(
                 self.task_id,
                 self.generation,
+                self._worker_transport_configuration_digest,
+                self._worker_transport_engine,
+                self._worker_transport_worker_slot,
+                self._worker_transport_pipe_nonce,
                 self.maximum_bytes,
                 self._worker_transport_serial,
                 self._worker_transport_nonce,
             )
 
     def issue_worker_transport_capability(
-        self, task_id: str, generation: int
+        self,
+        task_id: str,
+        generation: int,
+        configuration_digest: str,
+        audit_engine_fingerprint: str,
+        worker_slot: int,
     ) -> CompactResultTransportCapability:
+        _validate_digest(configuration_digest, "worker transport configuration")
+        _validate_digest(
+            audit_engine_fingerprint, "worker transport audit engine"
+        )
+        if (
+            not isinstance(worker_slot, int)
+            or isinstance(worker_slot, bool)
+            or worker_slot < 0
+            or worker_slot > (1 << 32) - 1
+        ):
+            raise AuditInfrastructureError("worker transport slot is invalid")
         valid_envelope_bytes = (
             self._TRANSPORT_OVERHEAD_BYTES
             + self._ENCODED_ENVELOPE_BYTES
@@ -630,11 +704,23 @@ class PerTaskCompactReservation:
                 )
             self._worker_transport_serial += 1
             self._worker_transport_nonce = os.urandom(32).hex()
+            self._worker_transport_configuration_digest = configuration_digest
+            self._worker_transport_engine = audit_engine_fingerprint
+            self._worker_transport_worker_slot = worker_slot
+            self._worker_transport_pipe_nonce = os.urandom(32).hex()
             self._owner_phase = "worker-transport-dispatched"
             serial = self._worker_transport_serial
             nonce = self._worker_transport_nonce
         return CompactResultTransportCapability(
-            task_id, generation, self.maximum_bytes, serial, nonce
+            task_id,
+            generation,
+            configuration_digest,
+            audit_engine_fingerprint,
+            worker_slot,
+            self._worker_transport_pipe_nonce,
+            self.maximum_bytes,
+            serial,
+            nonce,
         )
 
     @classmethod
@@ -648,6 +734,12 @@ class PerTaskCompactReservation:
         )
         reservation._worker_transport_nonce = capability.nonce
         reservation._worker_transport_serial = capability.serial
+        reservation._worker_transport_configuration_digest = (
+            capability.configuration_digest
+        )
+        reservation._worker_transport_engine = capability.audit_engine_fingerprint
+        reservation._worker_transport_worker_slot = capability.worker_slot
+        reservation._worker_transport_pipe_nonce = capability.pipe_nonce
         reservation._worker_transport_mirror = True
         return reservation
 
@@ -655,9 +747,16 @@ class PerTaskCompactReservation:
         self,
         capability: CompactResultTransportCapability,
         payload: bytes,
+        stdout_bytes: int,
+        stages: WorkerStageTimings,
     ) -> CompactResultTransportReceipt:
-        if not isinstance(capability, CompactResultTransportCapability) or not isinstance(
-            payload, bytes
+        if (
+            not isinstance(capability, CompactResultTransportCapability)
+            or not isinstance(payload, bytes)
+            or not isinstance(stdout_bytes, int)
+            or isinstance(stdout_bytes, bool)
+            or stdout_bytes < 0
+            or not isinstance(stages, WorkerStageTimings)
         ):
             raise AuditInfrastructureError("worker transport completion is invalid")
         with self._lock:
@@ -667,6 +766,12 @@ class PerTaskCompactReservation:
                 or capability.task_id != self.task_id
                 or capability.generation != self.generation
                 or capability.maximum_bytes != self.maximum_bytes
+                or capability.configuration_digest
+                != self._worker_transport_configuration_digest
+                or capability.audit_engine_fingerprint
+                != self._worker_transport_engine
+                or capability.worker_slot != self._worker_transport_worker_slot
+                or capability.pipe_nonce != self._worker_transport_pipe_nonce
                 or capability.serial != self._worker_transport_serial
                 or capability.nonce != self._worker_transport_nonce
                 or self._owner_phase != "serialized-pipe"
@@ -677,11 +782,17 @@ class PerTaskCompactReservation:
             receipt = CompactResultTransportReceipt(
                 self.task_id,
                 self.generation,
+                capability.configuration_digest,
+                capability.audit_engine_fingerprint,
+                capability.worker_slot,
+                capability.pipe_nonce,
                 capability.serial,
                 capability.nonce,
                 len(payload),
                 self._charged_bytes,
                 hashlib.sha256(payload).hexdigest(),
+                stdout_bytes,
+                stages,
             )
             self._released = True
             self._owner_phase = "released"
@@ -693,7 +804,57 @@ class PerTaskCompactReservation:
         capability: CompactResultTransportCapability,
         receipt: CompactResultTransportReceipt,
         payload: bytes,
+        authenticated_charge_bytes: int,
     ) -> "CompactResultReservationOwnership":
+        if (
+            not isinstance(capability, CompactResultTransportCapability)
+            or not isinstance(receipt, CompactResultTransportReceipt)
+            or not isinstance(payload, bytes)
+            or not isinstance(authenticated_charge_bytes, int)
+            or isinstance(authenticated_charge_bytes, bool)
+            or authenticated_charge_bytes <= 0
+        ):
+            raise AuditInfrastructureError("worker transport authentication failed")
+        with self._lock:
+            if self._released:
+                raise AuditInfrastructureError("compact reservation was already released")
+            if self._owner_phase != "worker-transport-dispatched":
+                raise AuditInfrastructureError("compact audit result transport was already consumed")
+            authentic = self._worker_transport_envelope_matches(
+                capability, receipt, payload
+            )
+            if not authentic:
+                self._released = True
+                self._owner_phase = "released"
+                self._release_phase = "receiver-transport-rejected"
+                raise AuditInfrastructureError(
+                    "compact audit result transport authentication failed"
+                )
+            if (
+                receipt.charged_bytes != authenticated_charge_bytes
+                or authenticated_charge_bytes > self.maximum_bytes
+            ):
+                self._released = True
+                self._owner_phase = "released"
+                self._release_phase = "receiver-transport-rejected"
+                raise AuditInfrastructureError(
+                    "compact audit result transport charge authentication failed"
+                )
+            self._charged_bytes = receipt.charged_bytes
+            self._peak_bytes = max(self._peak_bytes, receipt.charged_bytes)
+            self._reserved_encoded_bytes = receipt.encoded_bytes
+            self._canonical_json_bytes = receipt.encoded_bytes
+            self._owner_serial += 1
+            self._owner_phase = "receiver-decode"
+            serial = self._owner_serial
+        return CompactResultReservationOwnership(self, serial, "receiver-decode")
+
+    def authenticate_worker_transport_envelope(
+        self,
+        capability: CompactResultTransportCapability,
+        receipt: CompactResultTransportReceipt,
+        payload: bytes,
+    ) -> None:
         if (
             not isinstance(capability, CompactResultTransportCapability)
             or not isinstance(receipt, CompactResultTransportReceipt)
@@ -704,38 +865,51 @@ class PerTaskCompactReservation:
             if self._released:
                 raise AuditInfrastructureError("compact reservation was already released")
             if self._owner_phase != "worker-transport-dispatched":
-                raise AuditInfrastructureError("compact audit result transport was already consumed")
-            authentic = (
-                not self._worker_transport_mirror
-                and capability.task_id == self.task_id
-                and capability.generation == self.generation
-                and capability.maximum_bytes == self.maximum_bytes
-                and capability.serial == self._worker_transport_serial
-                and capability.nonce == self._worker_transport_nonce
-                and receipt.task_id == capability.task_id
-                and receipt.generation == capability.generation
-                and receipt.serial == capability.serial
-                and receipt.nonce == capability.nonce
-                and receipt.encoded_bytes == len(payload)
-                and receipt.encoded_bytes <= self._ENCODED_ENVELOPE_BYTES
-                and receipt.charged_bytes <= self.maximum_bytes
-                and receipt.payload_sha256 == hashlib.sha256(payload).hexdigest()
-            )
-            if not authentic:
+                raise AuditInfrastructureError(
+                    "compact audit result transport was already consumed"
+                )
+            if not self._worker_transport_envelope_matches(
+                capability, receipt, payload
+            ):
                 self._released = True
                 self._owner_phase = "released"
                 self._release_phase = "receiver-transport-rejected"
                 raise AuditInfrastructureError(
                     "compact audit result transport authentication failed"
                 )
-            self._charged_bytes = receipt.charged_bytes
-            self._peak_bytes = max(self._peak_bytes, receipt.charged_bytes)
-            self._reserved_encoded_bytes = receipt.encoded_bytes
-            self._canonical_json_bytes = receipt.encoded_bytes
-            self._owner_serial += 1
-            self._owner_phase = "receiver-decode"
-            serial = self._owner_serial
-        return CompactResultReservationOwnership(self, serial, "receiver-decode")
+
+    def _worker_transport_envelope_matches(
+        self,
+        capability: CompactResultTransportCapability,
+        receipt: CompactResultTransportReceipt,
+        payload: bytes,
+    ) -> bool:
+        return (
+            not self._worker_transport_mirror
+            and capability.task_id == self.task_id
+            and capability.generation == self.generation
+            and capability.maximum_bytes == self.maximum_bytes
+            and capability.configuration_digest
+            == self._worker_transport_configuration_digest
+            and capability.audit_engine_fingerprint
+            == self._worker_transport_engine
+            and capability.worker_slot == self._worker_transport_worker_slot
+            and capability.pipe_nonce == self._worker_transport_pipe_nonce
+            and capability.serial == self._worker_transport_serial
+            and capability.nonce == self._worker_transport_nonce
+            and receipt.task_id == capability.task_id
+            and receipt.generation == capability.generation
+            and receipt.configuration_digest == capability.configuration_digest
+            and receipt.audit_engine_fingerprint
+            == capability.audit_engine_fingerprint
+            and receipt.worker_slot == capability.worker_slot
+            and receipt.pipe_nonce == capability.pipe_nonce
+            and receipt.serial == capability.serial
+            and receipt.nonce == capability.nonce
+            and receipt.encoded_bytes == len(payload)
+            and receipt.encoded_bytes <= self._ENCODED_ENVELOPE_BYTES
+            and receipt.payload_sha256 == hashlib.sha256(payload).hexdigest()
+        )
 
     def release_worker_transport_capability(
         self, capability: CompactResultTransportCapability, phase: str
@@ -753,6 +927,12 @@ class PerTaskCompactReservation:
                 or capability.task_id != self.task_id
                 or capability.generation != self.generation
                 or capability.maximum_bytes != self.maximum_bytes
+                or capability.configuration_digest
+                != self._worker_transport_configuration_digest
+                or capability.audit_engine_fingerprint
+                != self._worker_transport_engine
+                or capability.worker_slot != self._worker_transport_worker_slot
+                or capability.pipe_nonce != self._worker_transport_pipe_nonce
                 or capability.serial != self._worker_transport_serial
                 or capability.nonce != self._worker_transport_nonce
             ):
@@ -809,6 +989,41 @@ class PerTaskCompactReservation:
             or counting_pass_peak_bytes < 0
         ):
             raise AuditInfrastructureError("pre-dispatch compact reservation differs")
+        charged = self.exact_transport_charge(
+            encoded_bytes, bounds, counting_pass_peak_bytes
+        )
+        with self._lock:
+            if (
+                self._released
+                or charged > self.maximum_bytes
+            ):
+                raise AuditInfrastructureError(
+                    "pre-dispatch compact reservation limit exceeded"
+                )
+            self._charged_bytes = max(self._charged_bytes, charged)
+            self._peak_bytes = max(self._peak_bytes, self._charged_bytes)
+            self._reserved_encoded_bytes = encoded_bytes
+        return charged
+
+    @classmethod
+    def exact_transport_charge(
+        cls,
+        encoded_bytes: int,
+        bounds: CompactResultDraftBounds,
+        counting_pass_peak_bytes: int,
+    ) -> int:
+        if (
+            not isinstance(encoded_bytes, int)
+            or isinstance(encoded_bytes, bool)
+            or encoded_bytes < 0
+            or not isinstance(bounds, CompactResultDraftBounds)
+            or not isinstance(counting_pass_peak_bytes, int)
+            or isinstance(counting_pass_peak_bytes, bool)
+            or counting_pass_peak_bytes < 0
+        ):
+            raise AuditInfrastructureError(
+                "compact result transport charge input is invalid"
+            )
         retained_bytes = sum((
             1024,
             bounds.dependency_count * 384,
@@ -818,36 +1033,30 @@ class PerTaskCompactReservation:
             bounds.expression_utf8_bytes,
             bounds.reason_utf8_bytes,
         ))
-        terms = (
-            self._TRANSPORT_OVERHEAD_BYTES,
+        charged = sum((
+            cls._TRANSPORT_OVERHEAD_BYTES,
             encoded_bytes,
             counting_pass_peak_bytes,
             retained_bytes,
-        )
-        charged = sum(terms)
+            cls._RECEIVER_DECODE_ENCODED_MULTIPLIER * encoded_bytes,
+        ))
         if charged > (1 << 63) - 1:
             raise AuditInfrastructureError(
                 "pre-dispatch compact reservation arithmetic overflow"
             )
-        with self._lock:
-            if (
-                self._released
-                or encoded_bytes > self._ENCODED_ENVELOPE_BYTES
-                or counting_pass_peak_bytes > self._COUNTING_WORKSPACE_BYTES
-                or retained_bytes > self._RETAINED_ENVELOPE_BYTES
-                or (
-                    bounds.path_utf8_bytes
-                    + bounds.expression_utf8_bytes
-                    + bounds.reason_utf8_bytes
-                ) > encoded_bytes
-                or charged > self.maximum_bytes
-            ):
-                raise AuditInfrastructureError(
-                    "pre-dispatch compact reservation limit exceeded"
-                )
-            self._charged_bytes = max(self._charged_bytes, charged)
-            self._peak_bytes = max(self._peak_bytes, self._charged_bytes)
-            self._reserved_encoded_bytes = encoded_bytes
+        if (
+            encoded_bytes > cls._ENCODED_ENVELOPE_BYTES
+            or counting_pass_peak_bytes > cls._COUNTING_WORKSPACE_BYTES
+            or retained_bytes > cls._RETAINED_ENVELOPE_BYTES
+            or (
+                bounds.path_utf8_bytes
+                + bounds.expression_utf8_bytes
+                + bounds.reason_utf8_bytes
+            ) > encoded_bytes
+        ):
+            raise AuditInfrastructureError(
+                "pre-dispatch compact reservation limit exceeded"
+            )
         return charged
 
     def record_exact_canonical_json(self, task_id: str, encoded_bytes: int) -> None:
@@ -2894,8 +3103,17 @@ class ConfigurationAuditResult:
             raise AuditInfrastructureError("audit result dependencies are invalid")
         if len(self.dependencies) > limits.compact_result_dependencies:
             raise AuditInfrastructureError("audit result limit exceeded for dependencies")
-        dependency_keys = tuple(_dependency_sort_key(item) for item in self.dependencies)
+        previous_dependency_key: tuple[str, str, str] | None = None
         for dependency in self.dependencies:
+            dependency_key = _dependency_sort_key(dependency)
+            if (
+                previous_dependency_key is not None
+                and dependency_key <= previous_dependency_key
+            ):
+                raise AuditInfrastructureError(
+                    "audit result dependencies are not unique and sorted"
+                )
+            previous_dependency_key = dependency_key
             if (
                 len(dependency.role_relative_path.as_posix().encode("utf-8"))
                 > limits.compact_result_path_bytes
@@ -2903,27 +3121,35 @@ class ConfigurationAuditResult:
                 > limits.compact_result_path_bytes
             ):
                 raise AuditInfrastructureError("audit result limit exceeded for dependency path")
-        if dependency_keys != tuple(sorted(dependency_keys)) or len(set(dependency_keys)) != len(dependency_keys):
-            raise AuditInfrastructureError("audit result dependencies are not unique and sorted")
         if not isinstance(self.reached_production, tuple):
             raise AuditInfrastructureError("audit result reached-production paths are invalid")
         if len(self.reached_production) > limits.compact_result_reached:
             raise AuditInfrastructureError("audit result limit exceeded for reached paths")
-        reached_keys: list[str] = []
+        previous_reached_key: str | None = None
         for path in self.reached_production:
             _stable_role, validated = _validate_role_relative_path("production", path)
             if len(validated.as_posix().encode("utf-8")) > limits.compact_result_path_bytes:
                 raise AuditInfrastructureError("audit result limit exceeded for path")
-            reached_keys.append(validated.as_posix())
-        if tuple(reached_keys) != tuple(sorted(reached_keys)) or len(set(reached_keys)) != len(reached_keys):
-            raise AuditInfrastructureError("audit result reached-production paths are not unique and sorted")
+            reached_key = validated.as_posix()
+            if previous_reached_key is not None and reached_key <= previous_reached_key:
+                raise AuditInfrastructureError(
+                    "audit result reached-production paths are not unique and sorted"
+                )
+            previous_reached_key = reached_key
         if not isinstance(self.findings, tuple) or any(
             not isinstance(item, AuditResultFinding) for item in self.findings
         ):
             raise AuditInfrastructureError("audit result findings are invalid")
         if len(self.findings) > limits.compact_result_findings:
             raise AuditInfrastructureError("audit result limit exceeded for findings")
+        previous_finding_key: tuple[str, int, str, str] | None = None
         for finding in self.findings:
+            finding_key = _audit_finding_key(finding)
+            if previous_finding_key is not None and finding_key <= previous_finding_key:
+                raise AuditInfrastructureError(
+                    "audit result findings are not unique and sorted"
+                )
+            previous_finding_key = finding_key
             if (
                 len(finding.path.as_posix().encode("utf-8"))
                 > limits.compact_result_path_bytes
@@ -2933,9 +3159,6 @@ class ConfigurationAuditResult:
                 > limits.compact_result_reason_bytes
             ):
                 raise AuditInfrastructureError("audit result limit exceeded for finding text")
-        finding_keys = tuple(_audit_finding_key(item) for item in self.findings)
-        if finding_keys != tuple(sorted(finding_keys)) or len(set(finding_keys)) != len(finding_keys):
-            raise AuditInfrastructureError("audit result findings are not unique and sorted")
         if (
             self._transport_ownership is not None
             and not isinstance(
@@ -3069,6 +3292,97 @@ class ConfigurationAuditOutcome:
             raise AuditInfrastructureError("configuration audit outcome is invalid")
 
 
+class ConfigurationAuditOutcomeOwner:
+    """Closeable parent owner for one receiver-retained audit outcome."""
+
+    __slots__ = ("_outcome", "_active", "_lock")
+
+    def __init__(self, outcome: ConfigurationAuditOutcome) -> None:
+        if (
+            not isinstance(outcome, ConfigurationAuditOutcome)
+            or outcome.result._transport_ownership is None
+            or outcome.result._transport_ownership.phase
+            != "receiver-retained-result"
+        ):
+            raise AuditInfrastructureError("configuration audit outcome owner is invalid")
+        self._outcome = outcome
+        self._active = True
+        self._lock = threading.Lock()
+
+    @property
+    def outcome(self) -> ConfigurationAuditOutcome:
+        with self._lock:
+            if not self._active:
+                raise AuditInfrastructureError(
+                    "configuration audit outcome owner was transferred"
+                )
+            return self._outcome
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._active
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._active:
+                raise AuditInfrastructureError(
+                    "configuration audit outcome owner was transferred"
+                )
+            outcome = self._outcome
+            outcome.result.release_transport_ownership()
+            self._active = False
+
+    def transfer(self) -> ConfigurationAuditOutcome:
+        with self._lock:
+            if not self._active:
+                raise AuditInfrastructureError(
+                    "configuration audit outcome owner was transferred"
+                )
+            self._active = False
+            return self._outcome
+
+    def transfer_to(self, acceptor) -> object:
+        if not callable(acceptor):
+            raise AuditInfrastructureError("audit outcome acceptor is invalid")
+        outcome = self.outcome
+        accepted = acceptor(outcome)
+        with self._lock:
+            if not self._active:
+                raise AuditInfrastructureError(
+                    "configuration audit outcome owner was transferred"
+                )
+            self._active = False
+        return accepted
+
+    def __enter__(self) -> "ConfigurationAuditOutcomeOwner":
+        if not self.active:
+            raise AuditInfrastructureError(
+                "configuration audit outcome owner was transferred"
+            )
+        return self
+
+    def __exit__(self, _type, value, _traceback) -> None:
+        if not self.active:
+            return
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if value is None:
+                raise
+            value.add_note(
+                "configuration audit outcome owner cleanup also failed: "
+                f"{cleanup_error}"
+            )
+
+    def __del__(self) -> None:
+        try:
+            if self.active:
+                self.close()
+        except BaseException:
+            pass
+
+
 @dataclass(frozen=True, slots=True)
 class ConfigurationAuditTransportOutcome:
     transport: ConfigurationAuditResultTransport
@@ -3082,6 +3396,8 @@ class ConfigurationAuditTransportOutcome:
             or isinstance(self.stdout_bytes, bool)
             or self.stdout_bytes < 0
             or not isinstance(self.stages, WorkerStageTimings)
+            or self.transport.receipt.stdout_bytes != self.stdout_bytes
+            or self.transport.receipt.stages != self.stages
         ):
             raise AuditInfrastructureError(
                 "configuration audit transport outcome is invalid"
