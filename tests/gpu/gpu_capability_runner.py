@@ -44,6 +44,7 @@ from gpu_capability_model import (
     AuditLimits,
     CachePublicationPermit,
     CachePublicationRequested,
+    CompactResultTransportCapability,
     CompactResultDraftBounds,
     CompilerFamily,
     CompilerLaunchEvent,
@@ -51,6 +52,7 @@ from gpu_capability_model import (
     ConfigurationAuditOutcome,
     ConfigurationAuditResult,
     ConfigurationAuditTask,
+    ConfigurationAuditTransportOutcome,
     CoverageReport,
     DependencyDigest,
     DependencyRootAuthority,
@@ -1472,19 +1474,20 @@ def audit_configuration_worker(
                 accepted.findings,
                 rebound,
             )
-        transport = encode_configuration_audit_result_transport(accepted)
+        transport = encode_configuration_audit_result_transport(
+            accepted, reservation.worker_transport_capability
+        )
         del accepted
         del result
         del draft
-        accepted = decode_configuration_audit_result_transport(transport)
         stages = WorkerStageTimings(
             preprocess_stages.discovery_seconds,
             preprocess_stages.accepted_parse_seconds,
             audit_time.elapsed_seconds,
             publish_time.elapsed_seconds,
         )
-        return ConfigurationAuditOutcome(
-            result=accepted,
+        return ConfigurationAuditTransportOutcome(
+            transport=transport,
             stdout_bytes=preprocess_stages.compiler_stdout_bytes,
             stages=stages,
         )
@@ -1529,6 +1532,25 @@ def audit_configuration_worker(
                     cleanup_error = error
         if active_error is None and cleanup_error is not None:
             raise cleanup_error
+
+
+def receive_configuration_audit_outcome(
+    reservation: PerTaskCompactReservation,
+    capability: CompactResultTransportCapability,
+    worker_outcome: ConfigurationAuditTransportOutcome,
+) -> ConfigurationAuditOutcome:
+    if (
+        not isinstance(reservation, PerTaskCompactReservation)
+        or not isinstance(capability, CompactResultTransportCapability)
+        or not isinstance(worker_outcome, ConfigurationAuditTransportOutcome)
+    ):
+        raise AuditInfrastructureError("worker audit transport outcome is invalid")
+    result = decode_configuration_audit_result_transport(
+        worker_outcome.transport, reservation, capability
+    )
+    return ConfigurationAuditOutcome(
+        result, worker_outcome.stdout_bytes, worker_outcome.stages
+    )
 
 
 class _StreamDigestConsumer:

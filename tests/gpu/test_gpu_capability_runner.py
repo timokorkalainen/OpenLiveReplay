@@ -7,6 +7,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import pickle
 import shutil
 import subprocess
 import struct
@@ -2712,9 +2713,31 @@ class WorkerAuditTests(unittest.TestCase):
         attestation_error=None,
         stabilize_error=None,
         stabilize_override=None,
+        worker_outcomes=None,
     ):
         if task is None:
             task, _reservation = self._task()
+        parent_reservation = task.compact_reservation
+        capability = None
+        if isinstance(
+            parent_reservation, capability_model.PerTaskCompactReservation
+        ):
+            try:
+                capability = parent_reservation.issue_worker_transport_capability(
+                    task.task_id, task.generation
+                )
+                task = dataclasses.replace(
+                    task,
+                    compact_reservation=(
+                        capability_model.PerTaskCompactReservation.for_worker_transport(
+                            capability
+                        )
+                    ),
+                )
+            except BaseException:
+                if not parent_reservation.released:
+                    parent_reservation.release("worker-dispatch-failure")
+                raise
         if launch_purposes is None:
             launch_purposes = (
                 capability_model.CompilerLaunchPurpose.AUDIT_DISCOVERY,
@@ -2759,8 +2782,9 @@ class WorkerAuditTests(unittest.TestCase):
             return list(findings)
 
         rss = SimpleNamespace(sample=lambda: 0)
-        with (
-            mock.patch.multiple(
+        try:
+            with (
+                mock.patch.multiple(
                 capability_runner,
                 _WORKER_INDEX=3,
                 _WORKER_GENERATION=7,
@@ -2774,34 +2798,59 @@ class WorkerAuditTests(unittest.TestCase):
                 _WORKER_CACHE=cache,
                 _WORKER_RSS=rss,
             ),
-            mock.patch.object(
+                mock.patch.object(
                 capability_runner,
                 "stabilize_and_parse_configuration",
                 new=stabilize,
             ),
-            mock.patch.object(
+                mock.patch.object(
                 capability_audit, "audit_preprocessed_view", new=audit
-            ),
-            mock.patch.object(
+                ),
+                mock.patch.object(
                 capability_audit,
                 "_attest_loaded_audit_engine",
                 return_value=(self.engine if attestation_error is None else mock.DEFAULT),
                 side_effect=attestation_error,
-            ),
-        ):
-            outcome = capability_runner.audit_configuration_worker(
-                task,
-                self.authority,
-                self.production_snapshot,
-                control,
-                command,
-                time.monotonic() + 30.0,
+                ),
+            ):
+                worker_outcome = capability_runner.audit_configuration_worker(
+                    task,
+                    self.authority,
+                    self.production_snapshot,
+                    control,
+                    command,
+                    time.monotonic() + 30.0,
+                )
+            if worker_outcomes is not None:
+                worker_outcomes.append(worker_outcome)
+            worker_outcome = pickle.loads(pickle.dumps(worker_outcome))
+            outcome = capability_runner.receive_configuration_audit_outcome(
+                parent_reservation, capability, worker_outcome
             )
+        except BaseException:
+            if (
+                capability is not None
+                and parent_reservation is not None
+                and not parent_reservation.released
+            ):
+                parent_reservation.release_worker_transport_capability(
+                    capability, "worker-failure"
+                )
+            raise
         return outcome, control, command, cache
 
     def test_worker_returns_only_compact_outcome_drops_view_and_never_loads(self):
         task, reservation = self._task()
-        outcome, control, _command, cache = self._run_worker(task=task)
+        worker_outcomes = []
+        outcome, control, _command, cache = self._run_worker(
+            task=task, worker_outcomes=worker_outcomes
+        )
+        self.assertEqual(len(worker_outcomes), 1)
+        self.assertIsInstance(
+            worker_outcomes[0], capability_model.ConfigurationAuditTransportOutcome
+        )
+        pickle.dumps(worker_outcomes[0])
+        self.assertFalse(hasattr(worker_outcomes[0], "result"))
         self.assertIsInstance(outcome, capability_model.ConfigurationAuditOutcome)
         self.assertFalse(hasattr(outcome, "view"))
         self.assertEqual(len(self.live_views), 0)
@@ -2849,7 +2898,9 @@ class WorkerAuditTests(unittest.TestCase):
         original_compact = capability_runner._compact_findings
 
         def compact_only_after_exact_charge(findings):
-            self.assertEqual(reservation.owner_phase, "worker-bounded-draft")
+            self.assertEqual(
+                reservation.owner_phase, "worker-transport-dispatched"
+            )
             return original_compact(findings)
 
         with mock.patch.object(

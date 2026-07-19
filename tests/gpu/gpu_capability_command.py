@@ -387,17 +387,45 @@ class CompilerProcessHandleCarrier:
     def abort_before_return(self) -> None:
         if self._completed:
             raise AuditInfrastructureError("compiler process carrier was already completed")
+        primary_error: BaseException | None = None
         fail = getattr(self._observer, "fail_compiler_process_launch", None)
-        if callable(fail):
-            fail(self.event, self)
+        try:
+            if callable(fail):
+                fail(self.event, self)
+        except BaseException as error:
+            primary_error = error
         self._completed = True
+        cleanup_errors = []
         if self._linux_pidfd is not None:
-            os.close(self._linux_pidfd)
+            descriptor = self._linux_pidfd
             self._linux_pidfd = None
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
         if self._macos_identity_handle is not None:
-            self._macos_identity_handle.close()
+            identity_handle = self._macos_identity_handle
             self._macos_identity_handle = None
+            try:
+                identity_handle.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
         self._process = None
+        if primary_error is not None:
+            for cleanup_error in cleanup_errors:
+                primary_error.add_note(
+                    f"carrier resource cleanup also failed: {cleanup_error}"
+                )
+            raise primary_error
+        if cleanup_errors:
+            cleanup_error = AuditInfrastructureError(
+                "compiler process carrier resource cleanup failed"
+            )
+            for error in cleanup_errors[1:]:
+                cleanup_error.add_note(
+                    f"additional carrier resource cleanup failed: {error}"
+                )
+            raise cleanup_error from cleanup_errors[0]
 
 
 class _ParentCompilerLaunchObserver:
@@ -494,6 +522,10 @@ def launch_compiler_process(
                 launch_error.add_note(
                     f"compiler process carrier abort also failed: {cleanup_error}"
                 )
+                for cleanup_note in getattr(cleanup_error, "__notes__", ()):
+                    launch_error.add_note(
+                        f"compiler process carrier abort detail: {cleanup_note}"
+                    )
         try:
             containment.terminate()
         finally:

@@ -957,6 +957,113 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(retained.validations, 1)
         self.assertTrue(retained.closed)
 
+    def test_carrier_abort_closes_resources_when_observer_and_close_fail(self):
+        class Process:
+            pid = 42
+
+        class Observer:
+            def __init__(self):
+                self.active = True
+
+            def fail_compiler_process_launch(self, _event, _carrier):
+                self.active = False
+                raise RuntimeError("observer abort failed")
+
+        event = capability_command.CompilerLaunchEvent(
+            capability_command.CompilerLaunchPurpose.INSPECTION,
+            capability_command.ProcessStartIdentity(
+                "linux", 42, "linux-proc:boot:1", "a" * 64
+            ),
+        )
+        observer = Observer()
+        with mock.patch.object(
+            capability_command.os, "pidfd_open", return_value=91, create=True
+        ), mock.patch.object(
+            capability_command.os, "close", side_effect=OSError("pidfd close failed")
+        ) as close, self.assertRaisesRegex(
+            RuntimeError, "observer abort failed"
+        ) as raised:
+            carrier = capability_command.CompilerProcessHandleCarrier(
+                event, Process(), observer
+            )
+            carrier.abort_before_return()
+        self.assertTrue(carrier.completed)
+        self.assertIsNone(carrier.process)
+        self.assertFalse(observer.active)
+        close.assert_called_once_with(91)
+        self.assertTrue(any(
+            "carrier resource cleanup also failed: pidfd close failed" in note
+            for note in (raised.exception.__notes__ or ())
+        ))
+
+    def test_launch_preserves_primary_error_when_carrier_abort_observer_fails(self):
+        class Process:
+            pid = 42
+
+            def kill(self): pass
+            def wait(self, timeout): self.wait_timeout = timeout
+
+        class Containment:
+            popen_arguments = {}
+
+            def attach(self, process): self.attached = process
+            def release(self, _process): raise ValueError("launch release failed")
+            def terminate(self): self.terminated = True
+
+        class Observer:
+            def __init__(self):
+                self.active = None
+                self.carrier = None
+
+            def register_compiler_process_launch(self, _event, carrier):
+                self.active = carrier
+                self.carrier = carrier
+
+            def fail_compiler_process_launch(self, _event, carrier):
+                self.asserted_carrier = carrier
+                self.active = None
+                raise RuntimeError("observer abort failed")
+
+        process = Process()
+        containment = Containment()
+        observer = Observer()
+        with mock.patch.object(
+            capability_command.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            capability_command, "_native_process_start_token",
+            return_value="linux-proc:boot:1",
+        ), mock.patch.object(
+            capability_command.os, "pidfd_open", return_value=91, create=True
+        ), mock.patch.object(
+            capability_command.os, "close", side_effect=OSError("pidfd close failed")
+        ) as close, self.assertRaisesRegex(
+            ValueError, "launch release failed"
+        ) as raised:
+            capability_command.launch_compiler_process(
+                ("compiler",), cwd=self.build, environment=self.environment,
+                containment=containment, platform_kind="linux",
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, launch_options={},
+                purpose=capability_command.CompilerLaunchPurpose.INSPECTION,
+                launch_observer=observer,
+            )
+        self.assertIsNone(observer.active)
+        self.assertIs(observer.asserted_carrier, observer.carrier)
+        self.assertTrue(observer.carrier.completed)
+        self.assertIsNone(observer.carrier.process)
+        self.assertTrue(containment.terminated)
+        self.assertEqual(process.wait_timeout, 1.0)
+        close.assert_called_once_with(91)
+        self.assertTrue(any(
+            "compiler process carrier abort also failed: observer abort failed" in note
+            for note in (raised.exception.__notes__ or ())
+        ))
+        self.assertTrue(any(
+            "compiler process carrier abort detail: "
+            "carrier resource cleanup also failed: pidfd close failed" in note
+            for note in (raised.exception.__notes__ or ())
+        ))
+
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS kqueue")
     def test_macos_carrier_validates_real_process_after_wait_reaps_it(self):
         class Containment:

@@ -8086,6 +8086,7 @@ _CLASS_STRUCTURAL_MEMBER_EXCLUSIONS = frozenset({
     "__doc__",
     "__module__",
     "__qualname__",
+    "__slotnames__",
     "__weakref__",
 })
 _DATACLASS_GENERATED_MEMBER_EXCLUSIONS = frozenset({

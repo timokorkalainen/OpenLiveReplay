@@ -25,11 +25,13 @@ from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
     CompactResultColdSlot,
+    CompactResultTransportCapability,
     CompactResultReservationOwnership,
     CompactResultMemoryBudget,
     CompactResultOwnership,
     ConfigurationAuditPublicationPermit,
     ConfigurationAuditResult,
+    ConfigurationAuditResultTransport,
     CompactTokenSequence,
     CompilerFamily,
     CompilerInspection,
@@ -2627,17 +2629,9 @@ def decode_configuration_audit_result(payload: bytes) -> ConfigurationAuditResul
         raise AuditInfrastructureError("compact audit result payload is invalid") from error
 
 
-@dataclass(frozen=True, slots=True)
-class ConfigurationAuditResultTransport:
-    """One-shot serialized carrier for a linearly owned compact result."""
-
-    payload: bytes
-    ownership: CompactResultReservationOwnership
-    consumed: bool = False
-
-
 def encode_configuration_audit_result_transport(
     result: ConfigurationAuditResult,
+    capability: CompactResultTransportCapability,
 ) -> ConfigurationAuditResultTransport:
     ownership = result._transport_ownership
     if (
@@ -2651,26 +2645,28 @@ def encode_configuration_audit_result_transport(
     payload = encode_configuration_audit_result(result)
     serialized = ownership.transfer("serialized-pipe")
     try:
-        return ConfigurationAuditResultTransport(payload, serialized)
+        receipt = serialized.reservation.complete_worker_transport(
+            capability, payload
+        )
+        return ConfigurationAuditResultTransport(payload, receipt)
     except BaseException:
-        serialized.release("transport-carrier-failure")
+        if serialized.active and not serialized.reservation.released:
+            serialized.release("transport-carrier-failure")
         raise
 
 
 def decode_configuration_audit_result_transport(
     transport: ConfigurationAuditResultTransport,
+    reservation,
+    capability: CompactResultTransportCapability,
 ) -> ConfigurationAuditResult:
     if (
         not isinstance(transport, ConfigurationAuditResultTransport)
-        or transport.consumed
-        or not transport.ownership.active
-        or transport.ownership.phase != "serialized-pipe"
     ):
-        raise AuditInfrastructureError(
-            "compact audit result transport was already consumed"
-        )
-    object.__setattr__(transport, "consumed", True)
-    decoding = transport.ownership.transfer("receiver-decode")
+        raise AuditInfrastructureError("compact audit result transport is invalid")
+    decoding = reservation.begin_receiver_transport_decode(
+        capability, transport.receipt, transport.payload
+    )
     retained = None
     try:
         decoded = decode_configuration_audit_result(transport.payload)
