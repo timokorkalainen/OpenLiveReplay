@@ -339,26 +339,69 @@ def _delete_verified_windows_lock_carrier_temporary(
             )
     except BaseException as error:
         primary_error = error
+        error = None
         raise
     finally:
-        if not kernel32.CloseHandle(handle):
-            close_error = OSError(
-                ctypes.get_last_error(),
-                "cannot close cache lock carrier quarantine handle",
-                str(path),
-            )
-            close_failure = AuditInfrastructureError(
-                "cannot close cache lock carrier quarantine handle"
-            )
-            close_failure.__cause__ = close_error
-            close_failure.__suppress_context__ = True
-            if primary_error is None:
-                raise close_failure
-            primary_error.secondary_close_error = close_failure
-            primary_error.add_note(
-                "Secondary CloseHandle failure: "
-                f"{type(close_error).__name__}: {close_error}"
-            )
+        preserved_primary = primary_error
+        primary_error = None
+        close_error = None
+        close_failure = None
+        diagnostic_note = None
+        diagnostic_notes = None
+        try:
+            if not kernel32.CloseHandle(handle):
+                close_error = OSError(
+                    ctypes.get_last_error(),
+                    "cannot close cache lock carrier quarantine handle",
+                    str(path),
+                )
+                close_failure = AuditInfrastructureError(
+                    "cannot close cache lock carrier quarantine handle"
+                )
+                close_failure.__cause__ = close_error
+                close_failure.__suppress_context__ = True
+                if preserved_primary is None:
+                    try:
+                        raise close_failure
+                    finally:
+                        close_failure = None
+                # BaseException descriptors bypass ordinary subclass hooks.
+                # add_note() assigns through the subtype, so install a copied
+                # note list separately and keep both diagnostics best-effort.
+                try:
+                    BaseException.__setattr__(
+                        preserved_primary,
+                        "secondary_close_error",
+                        close_failure,
+                    )
+                except BaseException:
+                    pass
+                diagnostic_note = (
+                    "Secondary CloseHandle failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+                try:
+                    try:
+                        diagnostic_notes = list.copy(
+                            BaseException.__getattribute__(
+                                preserved_primary, "__notes__"
+                            )
+                        )
+                    except AttributeError:
+                        diagnostic_notes = []
+                    list.append(diagnostic_notes, diagnostic_note)
+                    BaseException.__setattr__(
+                        preserved_primary, "__notes__", diagnostic_notes
+                    )
+                except BaseException:
+                    pass
+        finally:
+            preserved_primary = None
+            close_error = None
+            close_failure = None
+            diagnostic_note = None
+            diagnostic_notes = None
+            original_error = None
 
 
 def _cleanup_owned_lock_carrier_temporary(

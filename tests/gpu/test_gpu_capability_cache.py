@@ -2072,6 +2072,161 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                     quarantine.unlink(missing_ok=True)
 
     @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_preserves_hostile_primary_and_traceback(self):
+        import ctypes
+
+        class HostilePrimary(AuditInfrastructureError):
+            def __setattr__(self, name, value):
+                if name in {
+                    "__cause__",
+                    "__context__",
+                    "__suppress_context__",
+                    "__traceback__",
+                }:
+                    BaseException.__setattr__(self, name, value)
+                    return
+                raise RuntimeError("attribute blocked")
+
+            def add_note(self, _note):
+                raise RuntimeError("note blocked")
+
+        quarantine = self.cache.root / ".quarantine-lock-hostile-primary"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        real_close = kernel32.CloseHandle
+        primary = HostilePrimary("hostile primary failure")
+
+        def raise_primary(_path):
+            raise primary
+
+        def close_then_report_failure(handle):
+            self.assertTrue(real_close(handle))
+            ctypes.set_last_error(6)
+            return False
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch(
+                "gpu_capability_cache._before_windows_lock_carrier_temporary_delete",
+                side_effect=raise_primary,
+            ), mock.patch.object(
+                kernel32,
+                "CloseHandle",
+                side_effect=close_then_report_failure,
+            ) as close_handle:
+                try:
+                    capability_cache._delete_verified_windows_lock_carrier_temporary(
+                        quarantine,
+                        expected_identity,
+                        primary,
+                    )
+                except HostilePrimary as raised:
+                    self.assertIs(raised, primary)
+                    traceback_frames = []
+                    current = raised.__traceback__
+                    while current is not None:
+                        traceback_frames.append(current.tb_frame)
+                        current = current.tb_next
+                    self.assertIn(raise_primary.__code__, [
+                        frame.f_code for frame in traceback_frames
+                    ])
+                    helper_frames = [
+                        frame
+                        for frame in traceback_frames
+                        if frame.f_code
+                        is capability_cache._delete_verified_windows_lock_carrier_temporary.__code__
+                    ]
+                    self.assertEqual(len(helper_frames), 1)
+                    for name, value in helper_frames[0].f_locals.items():
+                        self.assertIsNot(value, primary, name)
+                    secondary = BaseException.__getattribute__(
+                        primary, "secondary_close_error"
+                    )
+                    self.assertIsInstance(
+                        secondary, AuditInfrastructureError
+                    )
+                    self.assertIsInstance(secondary.__cause__, OSError)
+                    rendered = "".join(traceback.format_exception(primary))
+                    self.assertIn("Secondary CloseHandle failure", rendered)
+                    self.assertIn("hostile primary failure", rendered)
+                else:
+                    self.fail("hostile primary did not propagate")
+            close_handle.assert_called_once()
+        finally:
+            quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
+    def test_lock_carrier_cleanup_ignores_hostile_attachment_failures(self):
+        import ctypes
+
+        class HostileAttachmentPrimary(AuditInfrastructureError):
+            @property
+            def secondary_close_error(self):
+                raise RuntimeError("secondary diagnostic blocked")
+
+            @property
+            def __notes__(self):
+                raise RuntimeError("notes blocked")
+
+            def __setattr__(self, name, value):
+                if name in {
+                    "__cause__",
+                    "__context__",
+                    "__suppress_context__",
+                    "__traceback__",
+                }:
+                    BaseException.__setattr__(self, name, value)
+                    return
+                raise RuntimeError("attribute blocked")
+
+            def add_note(self, _note):
+                raise RuntimeError("note blocked")
+
+        quarantine = self.cache.root / ".quarantine-lock-hostile-notes"
+        quarantine.write_bytes(b"owned lock carrier temporary")
+        expected_identity = capability_cache._file_ownership_identity(
+            quarantine.stat()
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        real_close = kernel32.CloseHandle
+        primary = HostileAttachmentPrimary("hostile attachment failure")
+
+        def raise_primary(_path):
+            raise primary
+
+        def close_then_report_failure(handle):
+            self.assertTrue(real_close(handle))
+            ctypes.set_last_error(6)
+            return False
+
+        try:
+            with mock.patch(
+                "ctypes.WinDLL", return_value=kernel32
+            ), mock.patch(
+                "gpu_capability_cache._before_windows_lock_carrier_temporary_delete",
+                side_effect=raise_primary,
+            ), mock.patch.object(
+                kernel32,
+                "CloseHandle",
+                side_effect=close_then_report_failure,
+            ) as close_handle, self.assertRaises(
+                HostileAttachmentPrimary
+            ) as raised:
+                capability_cache._delete_verified_windows_lock_carrier_temporary(
+                    quarantine,
+                    expected_identity,
+                    OSError("deterministic initialization failure"),
+                )
+            self.assertIs(raised.exception, primary)
+            close_handle.assert_called_once()
+        finally:
+            quarantine.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows verified-handle deletion")
     def test_lock_carrier_cleanup_reports_windows_information_query_failure(self):
         import ctypes
 
