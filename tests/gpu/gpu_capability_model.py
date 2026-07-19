@@ -2303,6 +2303,12 @@ class _StreamingAggregateMutation:
     growth_ownership: CompactResultOwnership
 
 
+@dataclass(frozen=True, slots=True)
+class _StreamingAggregateCheckpoint:
+    mutation_count: int
+    cold_ownership: CompactResultOwnership | None
+
+
 def encode_canonical_summary(summary: StreamingAuditSummary) -> bytes:
     if not isinstance(summary, StreamingAuditSummary):
         raise AuditInfrastructureError("streaming audit summary is invalid")
@@ -2458,6 +2464,25 @@ class StreamingResultAggregator:
         configuration: PreprocessConfiguration,
         result: ConfigurationAuditResult,
         ownership: CompactResultOwnership,
+        *,
+        caller_retains_ownership: bool = False,
+    ) -> None:
+        if not isinstance(caller_retains_ownership, bool):
+            raise AuditInfrastructureError("streaming result ownership is invalid")
+        try:
+            self._accept_validated_result_impl(
+                configuration, result, ownership
+            )
+        finally:
+            result = None
+        if not caller_retains_ownership:
+            ownership.release()
+
+    def _accept_validated_result_impl(
+        self,
+        configuration: PreprocessConfiguration,
+        result: ConfigurationAuditResult,
+        ownership: CompactResultOwnership,
     ) -> None:
         if self._finished:
             raise AuditInfrastructureError("streaming result aggregate is already finished")
@@ -2548,7 +2573,6 @@ class StreamingResultAggregator:
             self._mutation_journals.append(journal)
             journal_appended = True
             _after_streaming_aggregate_mutation("ownership")
-            ownership.release()
         except BaseException:
             if journal_appended:
                 popped_journal = self._mutation_journals.pop()
@@ -2582,25 +2606,33 @@ class StreamingResultAggregator:
                 growth_ownership.release()
             raise
 
-    def _checkpoint(self) -> int:
+    def _checkpoint(self) -> _StreamingAggregateCheckpoint:
         if self._finished:
             raise AuditInfrastructureError(
                 "streaming result aggregate is already finished"
             )
-        return len(self._mutation_journals)
+        cold_ownership = self._cold_ownership
+        if cold_ownership is not None and cold_ownership.released:
+            cold_ownership = None
+        return _StreamingAggregateCheckpoint(
+            len(self._mutation_journals), cold_ownership
+        )
 
-    def _rollback_to(self, checkpoint: int) -> None:
+    def _rollback_to(self, checkpoint: _StreamingAggregateCheckpoint) -> None:
         if (
             self._finished
-            or not isinstance(checkpoint, int)
-            or isinstance(checkpoint, bool)
-            or checkpoint < 0
-            or checkpoint > len(self._mutation_journals)
+            or not isinstance(checkpoint, _StreamingAggregateCheckpoint)
+            or checkpoint.mutation_count < 0
+            or checkpoint.mutation_count > len(self._mutation_journals)
+            or (
+                checkpoint.cold_ownership is not None
+                and checkpoint.cold_ownership.released
+            )
         ):
             raise AuditInfrastructureError(
                 "streaming aggregate rollback checkpoint is invalid"
             )
-        while len(self._mutation_journals) > checkpoint:
+        while len(self._mutation_journals) > checkpoint.mutation_count:
             journal = self._mutation_journals.pop()
             growth = self._growth_ownerships.pop()
             if growth is not journal.growth_ownership:
@@ -2626,6 +2658,11 @@ class StreamingResultAggregator:
                 self._reached.pop(key)
             self._accepted.remove(journal.configuration_digest)
             growth.release()
+        current_cold = self._cold_ownership
+        if current_cold is not checkpoint.cold_ownership:
+            if current_cold is not None and not current_cold.released:
+                current_cold.release()
+            self._cold_ownership = checkpoint.cold_ownership
 
     def finish(self) -> StreamingAuditSummary:
         if self._finished:

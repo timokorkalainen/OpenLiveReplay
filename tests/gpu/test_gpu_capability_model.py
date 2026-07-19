@@ -23,6 +23,7 @@ from gpu_capability_model import (  # noqa: E402
     AuditResultFinding,
     AuditInfrastructureError,
     AuditLimits,
+    CompactResultColdSlot,
     CompactResultMemoryBudget,
     CompactTokenSequence,
     CompilerExecutableCapability,
@@ -452,6 +453,57 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(budget.committed_bytes, 0)
         summary.release()
         self.assertEqual(budget.live_bytes, 0)
+
+    def test_streaming_checkpoint_restores_only_new_cold_ownership(self):
+        configuration = self.configuration(digest="1" * 64)
+        cold_slot = CompactResultColdSlot(1 << 20)
+
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        baseline = budget.live_bytes
+        checkpoint = aggregator._checkpoint()
+        aggregator.reserve_cold_slot(cold_slot)
+        aggregator._rollback_to(checkpoint)
+        self.assertEqual(aggregator.cold_slot_reserved_bytes, 0)
+        self.assertEqual(budget.live_bytes, baseline)
+
+        aggregator.reserve_cold_slot(cold_slot)
+        preexisting = aggregator._cold_ownership
+        checkpoint = aggregator._checkpoint()
+        aggregator.reserve_cold_slot(cold_slot)
+        aggregator._rollback_to(checkpoint)
+        self.assertIs(aggregator._cold_ownership, preexisting)
+        self.assertEqual(
+            aggregator.cold_slot_reserved_bytes, cold_slot.worst_case_live_bytes
+        )
+
+    def test_caller_can_retain_result_charge_until_aliases_are_cleared(self):
+        configuration = self.configuration(digest="1" * 64)
+        result = ConfigurationAuditResult(
+            configuration.digest,
+            "a" * 64,
+            (self.dependency(),),
+            (),
+            (),
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        ownership = budget.reserve(
+            compact_result_retained_bytes(result)
+        ).commit()
+        aggregator.accept_validated_result(
+            configuration,
+            result,
+            ownership,
+            caller_retains_ownership=True,
+        )
+        self.assertTrue(ownership.committed)
+        ownership.release()
+        self.assertTrue(ownership.released)
 
     def test_finish_reserves_immutable_copy_before_marking_finished(self):
         configuration = self.configuration(digest="1" * 64)

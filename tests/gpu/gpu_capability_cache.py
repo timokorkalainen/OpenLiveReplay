@@ -3001,6 +3001,11 @@ class ConfigurationAuditCache:
         engine: str,
     ) -> tuple[_AuditCacheCandidate, ConfigurationAuditResult] | None:
         entry = self._entry_path(key)
+        manifest_payload = None
+        manifest = None
+        payload = None
+        result = None
+        candidate = None
         try:
             with _HeldDirectory(entry) as held_directory:
                 names = frozenset(os.listdir(entry))
@@ -3079,6 +3084,12 @@ class ConfigurationAuditCache:
             return None
         except OSError as error:
             raise AuditInfrastructureError("audit cache namespace is unsafe") from error
+        finally:
+            candidate = None
+            result = None
+            payload = None
+            manifest = None
+            manifest_payload = None
 
     def _read_authenticated_candidate_metadata(
         self,
@@ -3092,6 +3103,11 @@ class ConfigurationAuditCache:
         manifest_scratch: CompactResultOwnership | None = None
         scratch: CompactResultOwnership | None = None
         metadata_ownership: CompactResultOwnership | None = None
+        manifest_payload = None
+        manifest = None
+        payload = None
+        metadata = None
+        candidate = None
         try:
             with _HeldDirectory(entry) as held_directory:
                 if frozenset(os.listdir(entry)) != frozenset(
@@ -3216,6 +3232,11 @@ class ConfigurationAuditCache:
         except OSError as error:
             raise AuditInfrastructureError("audit cache namespace is unsafe") from error
         finally:
+            candidate = None
+            metadata = None
+            payload = None
+            manifest = None
+            manifest_payload = None
             if scratch is not None and not scratch.released:
                 scratch.release()
             if manifest_scratch is not None and not manifest_scratch.released:
@@ -3522,77 +3543,89 @@ class ConfigurationAuditCache:
                         candidate.decoded_result_bytes,
                         label="batch retained result limit",
                     ).commit()
+                    decode_workspace: CompactResultOwnership | None = None
+                    decoded = None
+                    decoded_candidate = None
+                    result = None
+                    accepted = False
+                    release_result_ownership = False
                     try:
                         decode_workspace = result_budget.reserve(
                             8192 + 9 * candidate.payload_identity[2],
                             label="compact result decode workspace",
                         ).commit()
-                    except BaseException:
-                        result_ownership.release()
-                        raise
-                    try:
                         with self._key_lock(candidate.key, deadline):
                             decoded = self._read_authenticated_entry(
                                 configuration, candidate.key, engine
                             )
-                    except BaseException:
                         decode_workspace.release()
-                        result_ownership.release()
-                        raise
-                    decode_workspace.release()
-                    if decoded is None:
-                        result_ownership.release()
-                        misses.add(configuration.digest)
-                        if aggregator.cold_slot_reserved_bytes == 0:
-                            aggregator.reserve_cold_slot(maximum_cold_slot)
-                        continue
-                    decoded_candidate, result = decoded
-                    if (
-                        decoded_candidate.entry_identity != candidate.entry_identity
-                        or decoded_candidate.manifest_identity is None
-                        or candidate.manifest_identity is None
-                        or decoded_candidate.manifest_identity[:2]
-                        != candidate.manifest_identity[:2]
-                        or decoded_candidate.payload_identity[:2]
-                        != candidate.payload_identity[:2]
-                        or decoded_candidate.payload_identity[2]
-                        != candidate.payload_identity[2]
-                        or decoded_candidate.payload_sha256
-                        != candidate.payload_sha256
-                        or decoded_candidate.dependencies != candidate.dependencies
-                        or decoded_candidate.decoded_result_bytes
-                        != candidate.decoded_result_bytes
-                    ):
-                        result_ownership.release()
-                        raise AuditInfrastructureError(
-                            "audit cache payload generation was replaced during batch load"
-                        )
-                    try:
+                        decode_workspace = None
+                        if decoded is None:
+                            misses.add(configuration.digest)
+                            if aggregator.cold_slot_reserved_bytes == 0:
+                                aggregator.reserve_cold_slot(maximum_cold_slot)
+                            release_result_ownership = True
+                            continue
+                        decoded_candidate, result = decoded
+                        if (
+                            decoded_candidate.entry_identity != candidate.entry_identity
+                            or decoded_candidate.manifest_identity is None
+                            or candidate.manifest_identity is None
+                            or decoded_candidate.manifest_identity[:2]
+                            != candidate.manifest_identity[:2]
+                            or decoded_candidate.payload_identity[:2]
+                            != candidate.payload_identity[:2]
+                            or decoded_candidate.payload_identity[2]
+                            != candidate.payload_identity[2]
+                            or decoded_candidate.payload_sha256
+                            != candidate.payload_sha256
+                            or decoded_candidate.dependencies != candidate.dependencies
+                            or decoded_candidate.decoded_result_bytes
+                            != candidate.decoded_result_bytes
+                        ):
+                            raise AuditInfrastructureError(
+                                "audit cache payload generation was replaced during batch load"
+                            )
                         self._validate_dependency_authority(
                             result.dependencies, authority
                         )
                         production_matches = self._production_matches(
                             result.dependencies, snapshot
                         )
-                    except BaseException:
-                        result_ownership.release()
-                        raise
-                    if not production_matches:
-                        result_ownership.release()
-                        misses.add(configuration.digest)
-                        if aggregator.cold_slot_reserved_bytes == 0:
-                            aggregator.reserve_cold_slot(maximum_cold_slot)
-                        continue
-                    try:
+                        if not production_matches:
+                            misses.add(configuration.digest)
+                            if aggregator.cold_slot_reserved_bytes == 0:
+                                aggregator.reserve_cold_slot(maximum_cold_slot)
+                            release_result_ownership = True
+                            continue
                         aggregator.accept_validated_result(
-                            configuration, result, result_ownership
+                            configuration,
+                            result,
+                            result_ownership,
+                            caller_retains_ownership=True,
                         )
-                    except BaseException:
-                        if not result_ownership.released:
+                        accepted = True
+                        release_result_ownership = True
+                    finally:
+                        # The aggregate copies every retained field.  Destroy all
+                        # decoded-result aliases before releasing their exact
+                        # charge; loop reassignment is not a lifetime boundary.
+                        result = None
+                        decoded_candidate = None
+                        decoded = None
+                        if (
+                            decode_workspace is not None
+                            and not decode_workspace.released
+                        ):
+                            decode_workspace.release()
+                        if (
+                            release_result_ownership
+                            and not result_ownership.released
+                        ):
                             result_ownership.release()
-                        raise
-                    accepted_digests.append(configuration.digest)
-                    hit_count += 1
+                    if accepted:
+                        accepted_digests.append(configuration.digest)
+                        hit_count += 1
 
                 final: dict[str, str] = {}
                 try:

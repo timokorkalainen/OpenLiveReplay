@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import base64
 import contextlib
+import gc
 import hashlib
 import inspect
 import json
@@ -15,6 +16,7 @@ import threading
 import time
 import traceback
 import unittest
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from array import array
 from pathlib import Path, PurePosixPath
@@ -4453,6 +4455,282 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             )
         self.assertEqual((batch.hit_count, batch.misses), (1, ()))
         self.assertEqual(decoded.call_count, 1)
+
+    def test_decoded_result_charge_outlives_every_cache_reference(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        configurations = tuple(
+            dataclasses.replace(self.configuration, digest=f"{index + 1:064x}")
+            for index in range(2)
+        )
+        for configuration in configurations:
+            result = dataclasses.replace(
+                self.result, configuration_digest=configuration.digest
+            )
+            cache.publish(
+                configuration,
+                self.dependency_roots,
+                result,
+                dataclasses.replace(
+                    self.publication_permit,
+                    configuration_digest=configuration.digest,
+                ),
+                self.pipeline_deadline,
+            )
+
+        calibration_budget = CompactResultMemoryBudget()
+        calibration_aggregator = StreamingResultAggregator(
+            configurations, calibration_budget, capability_cache.AuditLimits()
+        )
+        calibration = cache.load_many(
+            configurations,
+            self.dependency_roots,
+            self.engine,
+            self.production_snapshot,
+            calibration_budget,
+            calibration_aggregator,
+            CompactResultColdSlot(1 << 20),
+            self.pipeline_deadline,
+        )
+        self.assertEqual((calibration.hit_count, calibration.misses), (2, ()))
+
+        class TrackedResult(ConfigurationAuditResult):
+            __slots__ = ("__weakref__",)
+
+        budget = CompactResultMemoryBudget(calibration_budget.peak_live_bytes)
+        aggregator = StreamingResultAggregator(
+            configurations, budget, capability_cache.AuditLimits()
+        )
+        original_read = cache._read_authenticated_entry
+        original_reserve = budget.reserve
+        original_hash = capability_cache._hash_held_dependency
+        result_references = []
+        admitted_results = 0
+        hash_calls = 0
+
+        def track_result_lifetime(*arguments, **keywords):
+            candidate, result = original_read(*arguments, **keywords)
+            tracked = TrackedResult(
+                result.configuration_digest,
+                result.audit_engine_fingerprint,
+                result.dependencies,
+                result.reached_production,
+                result.findings,
+            )
+            result_references.append(weakref.ref(tracked))
+            return candidate, tracked
+
+        def enforce_admission_lifetime(byte_count, *, label="compact result"):
+            nonlocal admitted_results
+            if label == "batch retained result limit":
+                admitted_results += 1
+                if admitted_results == 2 and result_references:
+                    gc.collect()
+                    self.assertIsNone(
+                        result_references[-1](),
+                        "the previous decoded result reached the next admission",
+                    )
+            return original_reserve(byte_count, label=label)
+
+        def enforce_final_hash_lifetime(handle):
+            nonlocal hash_calls
+            hash_calls += 1
+            if hash_calls == 2:
+                gc.collect()
+                self.assertTrue(
+                    all(reference() is None for reference in result_references),
+                    "decoded results reached final dependency classification",
+                )
+            return original_hash(handle)
+
+        with mock.patch.object(
+            cache,
+            "_read_authenticated_entry",
+            side_effect=track_result_lifetime,
+        ), mock.patch.object(
+            budget,
+            "reserve",
+            side_effect=enforce_admission_lifetime,
+        ), mock.patch(
+            "gpu_capability_cache._hash_held_dependency",
+            side_effect=enforce_final_hash_lifetime,
+        ):
+            batch = cache.load_many(
+                configurations,
+                self.dependency_roots,
+                self.engine,
+                self.production_snapshot,
+                budget,
+                aggregator,
+                CompactResultColdSlot(1 << 20),
+                self.pipeline_deadline,
+            )
+        gc.collect()
+        self.assertEqual((batch.hit_count, batch.misses), (2, ()))
+        self.assertEqual(budget.peak_live_bytes, calibration_budget.peak_live_bytes)
+        self.assertEqual((admitted_results, hash_calls), (2, 2))
+        self.assertTrue(all(reference() is None for reference in result_references))
+
+    def test_failed_load_many_restores_only_its_own_cold_slot(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        configurations = (
+            dataclasses.replace(self.configuration, digest="1" * 64),
+            dataclasses.replace(self.configuration, digest="2" * 64),
+        )
+        hit_result = dataclasses.replace(
+            self.result, configuration_digest=configurations[1].digest
+        )
+        cache.publish(
+            configurations[1],
+            self.dependency_roots,
+            hit_result,
+            dataclasses.replace(
+                self.publication_permit,
+                configuration_digest=configurations[1].digest,
+            ),
+            self.pipeline_deadline,
+        )
+        cold_slot = CompactResultColdSlot(1 << 20)
+
+        def phase_patch(cache_under_test, phase):
+            if phase == "decode":
+                return mock.patch.object(
+                    cache_under_test,
+                    "_read_authenticated_entry",
+                    side_effect=AuditInfrastructureError("forced decode failure"),
+                )
+            if phase == "aggregate":
+                return mock.patch(
+                    "gpu_capability_model._after_streaming_aggregate_mutation",
+                    side_effect=AuditInfrastructureError("forced aggregate failure"),
+                )
+            if phase == "final_hash":
+                original_hash = capability_cache._hash_held_dependency
+                calls = 0
+
+                def fail_final_hash(handle):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise AuditInfrastructureError("forced final hash failure")
+                    return original_hash(handle)
+
+                return mock.patch(
+                    "gpu_capability_cache._hash_held_dependency",
+                    side_effect=fail_final_hash,
+                )
+            return mock.patch.object(
+                cache_under_test,
+                "_record_access",
+                side_effect=AuditInfrastructureError("forced access failure"),
+            )
+
+        for phase in ("decode", "aggregate", "final_hash", "access"):
+            for preexisting in (False, True):
+                with self.subTest(phase=phase, preexisting=preexisting):
+                    budget = CompactResultMemoryBudget()
+                    aggregator = StreamingResultAggregator(
+                        configurations, budget, capability_cache.AuditLimits()
+                    )
+                    if preexisting:
+                        aggregator.reserve_cold_slot(cold_slot)
+                    baseline_live = budget.live_bytes
+                    baseline_cold = aggregator.cold_slot_reserved_bytes
+                    with phase_patch(cache, phase), self.assertRaisesRegex(
+                        AuditInfrastructureError, f"forced {phase.replace('_', ' ')}"
+                    ):
+                        cache.load_many(
+                            configurations,
+                            self.dependency_roots,
+                            self.engine,
+                            self.production_snapshot,
+                            budget,
+                            aggregator,
+                            cold_slot,
+                            self.pipeline_deadline,
+                        )
+                    self.assertEqual(aggregator.accepted_count, 0)
+                    self.assertEqual(budget.live_bytes, baseline_live)
+                    self.assertEqual(
+                        aggregator.cold_slot_reserved_bytes, baseline_cold
+                    )
+
+    def test_exception_traceback_retains_exact_decoded_result_charge(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (self.configuration,), budget, capability_cache.AuditLimits()
+        )
+        baseline = budget.live_bytes
+        retained_result_bytes = capability_cache.compact_result_retained_bytes(
+            self.result
+        )
+
+        class TrackedResult(ConfigurationAuditResult):
+            __slots__ = ("__weakref__",)
+
+        original_read = cache._read_authenticated_entry
+        original_reserve = budget.reserve
+        result_reference = None
+
+        def track_result(*arguments, **keywords):
+            nonlocal result_reference
+            candidate, result = original_read(*arguments, **keywords)
+            tracked = TrackedResult(
+                result.configuration_digest,
+                result.audit_engine_fingerprint,
+                result.dependencies,
+                result.reached_production,
+                result.findings,
+            )
+            result_reference = weakref.ref(tracked)
+            return candidate, tracked
+
+        def fail_growth_reservation(byte_count, *, label="compact result"):
+            if label == "aggregate growth 128 MiB limit":
+                raise AuditInfrastructureError("forced growth reservation failure")
+            return original_reserve(byte_count, label=label)
+
+        retained_error = None
+        try:
+            with mock.patch.object(
+                cache, "_read_authenticated_entry", side_effect=track_result
+            ), mock.patch.object(
+                budget, "reserve", side_effect=fail_growth_reservation
+            ):
+                cache.load_many(
+                    (self.configuration,),
+                    self.dependency_roots,
+                    self.engine,
+                    self.production_snapshot,
+                    budget,
+                    aggregator,
+                    CompactResultColdSlot(1 << 20),
+                    self.pipeline_deadline,
+                )
+        except AuditInfrastructureError as error:
+            retained_error = error
+        else:
+            self.fail("forced aggregate growth failure did not propagate")
+
+        gc.collect()
+        self.assertIsNotNone(result_reference)
+        self.assertIsNotNone(result_reference())
+        self.assertEqual(budget.live_bytes, baseline + retained_result_bytes)
+        self.assertEqual(aggregator.accepted_count, 0)
+
+        traceback.clear_frames(retained_error.__traceback__)
+        retained_error = retained_error.with_traceback(None)
+        del retained_error
+        gc.collect()
+        self.assertIsNone(result_reference())
+        self.assertEqual(budget.live_bytes, baseline)
 
     def test_in_place_payload_and_manifest_replacement_cannot_become_a_hit(self):
         cache = ConfigurationAuditCache(self.cache_root)
