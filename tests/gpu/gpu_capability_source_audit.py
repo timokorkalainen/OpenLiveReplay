@@ -297,6 +297,27 @@ def conservative_allocation_schema() -> ConservativeAllocationSchema:
     return _CONSERVATIVE_ALLOCATION_SCHEMA
 
 
+def audit_measurement_scratch_bound(
+    schema: ConservativeAllocationSchema | None = None,
+) -> int:
+    """Bound the fixed live workspace used before the scalable plan exists."""
+
+    if schema is None:
+        return _AUDIT_MEASUREMENT_SCRATCH_BYTES
+    return schema.checked_add(
+        # Measurement frame, range iterator, fixed helper-call frames and refs.
+        schema.checked_multiply(4, schema.object_bound(40)),
+        # Simultaneously live packed indices/count results and arithmetic values.
+        schema.checked_multiply(
+            24, schema.pylong_bound(_gpu_capability_model.UINT32_MAX)
+        ),
+        # The two frozen result records and their fixed field-reference storage.
+        schema.object_bound(2),
+        schema.object_bound(len(AuditAllocationShape.__dataclass_fields__)),
+        schema.tuple_bound(16),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AuditAllocationShape:
     text_character_count: int
@@ -324,8 +345,14 @@ class AuditAllocationShape:
     scope_declaration_count: int | None = None
 
 
+_AUDIT_MEASUREMENT_SCRATCH_BYTES = audit_measurement_scratch_bound(
+    _CONSERVATIVE_ALLOCATION_SCHEMA
+)
+
+
 @dataclass(frozen=True, slots=True)
 class AuditAllocationPlan:
+    measurement_scratch: int
     input_chunks_and_containers: int
     joined_input_and_join_transient: int
     final_text: int
@@ -339,6 +366,7 @@ class AuditAllocationPlan:
     @property
     def phase_charges(self) -> tuple[int, ...]:
         return (
+            self.measurement_scratch,
             self.input_chunks_and_containers,
             self.joined_input_and_join_transient,
             self.final_text,
@@ -563,7 +591,9 @@ def audit_allocation_plan(
         schema.string_bound(shape.production_raw_bytes),
         schema.dict_bound(shape.json_dict_entries),
     )
+    measurement_scratch = audit_measurement_scratch_bound(schema)
     charges = (
+        measurement_scratch,
         input_chunks, joined_input, final_text, mapping_arrays, duplicate_keys,
         analysis, json_objects, production_decode,
     )
@@ -659,6 +689,25 @@ class _MeasuredAuditBufferLayout:
     retained_bytes: int
 
 
+def _packed_spelling_occurrences(spellings, spelling_ids, target: bytes) -> int:
+    try:
+        spelling_id = spellings.index(target)
+    except ValueError:
+        return 0
+    return spelling_ids.count(spelling_id)
+
+
+_MEMBER_CALL_OPERATOR_SPELLINGS = (b".", b"->", b"::")
+_SCOPE_MEMBER_METHOD_SPELLINGS = (b"read", b"withRead", b"complete")
+_MEMBER_CALL_METHOD_SPELLINGS = (
+    *_SCOPE_MEMBER_METHOD_SPELLINGS,
+    b"nativeHandle",
+)
+_SCOPE_MEMBER_METHODS = frozenset(
+    spelling.decode("ascii") for spelling in _SCOPE_MEMBER_METHOD_SPELLINGS
+)
+
+
 def _measure_audit_buffer_layout(tokens) -> _MeasuredAuditBufferLayout:
     schema = conservative_allocation_schema()
     spelling_ids = object.__getattribute__(tokens, "_spelling_ids")
@@ -674,28 +723,22 @@ def _measure_audit_buffer_layout(tokens) -> _MeasuredAuditBufferLayout:
     analysis_required = False
     previous_identity_id = previous_inclusion_id = previous_original_line = None
     token_count = len(tokens)
-    for token_index in range(token_count):
-        identity_id = identity_ids[token_index]
-        inclusion_id = inclusion_ids[token_index]
-        original_line = original_lines[token_index]
-        new_run = (
-            token_index == 0
+    for identity_id, inclusion_id, original_line in zip(
+        identity_ids, inclusion_ids, original_lines
+    ):
+        if (
+            previous_identity_id is None
             or identity_id != previous_identity_id
             or inclusion_id != previous_inclusion_id
             or original_line != previous_original_line
-        )
-        if new_run:
+        ):
             run_count += 1
-            if token_index:
-                character_count += 1
-                maximum_code_point = max(maximum_code_point, 10)
-        else:
-            character_count += 1
-            maximum_code_point = max(maximum_code_point, 32)
         previous_identity_id = identity_id
         previous_inclusion_id = inclusion_id
         previous_original_line = original_line
-        spelling = spellings[spelling_ids[token_index]]
+
+    for spelling_id in spelling_ids:
+        spelling = spellings[spelling_id]
         if not analysis_required and spelling in candidate_spellings:
             analysis_required = True
         if spelling and spelling[0] in (ord('"'), ord("'")):
@@ -713,31 +756,36 @@ def _measure_audit_buffer_layout(tokens) -> _MeasuredAuditBufferLayout:
         character_count += piece_length
         maximum_code_point = max(maximum_code_point, piece_maximum)
     if token_count:
-        character_count += 1
-        maximum_code_point = max(maximum_code_point, 10)
-
-    def spelling_occurrences(target: bytes) -> int:
-        try:
-            spelling_id = spellings.index(target)
-        except ValueError:
-            return 0
-        return spelling_ids.count(spelling_id)
+        # Each provenance run ends with one newline; tokens within a run are
+        # separated by one space. Both totals follow from the packed shape.
+        character_count += token_count
+        maximum_code_point = max(
+            maximum_code_point,
+            32 if token_count > run_count else 10,
+        )
 
     opening_delimiters = (
-        spelling_occurrences(b"{") + spelling_occurrences(b"<%")
+        _packed_spelling_occurrences(spellings, spelling_ids, b"{")
+        + _packed_spelling_occurrences(spellings, spelling_ids, b"<%")
     )
     closing_delimiters = (
-        spelling_occurrences(b"}") + spelling_occurrences(b"%>")
+        _packed_spelling_occurrences(spellings, spelling_ids, b"}")
+        + _packed_spelling_occurrences(spellings, spelling_ids, b"%>")
     )
     delimiter_pair_count = min(opening_delimiters, closing_delimiters)
-    member_call_count = (
-        spelling_occurrences(b"read")
-        + spelling_occurrences(b"withRead")
-        + spelling_occurrences(b"complete")
+    member_call_count = sum(
+        _packed_spelling_occurrences(spellings, spelling_ids, method)
+        for method in _MEMBER_CALL_METHOD_SPELLINGS
     )
-    scope_declaration_count = spelling_occurrences(b"GpuSyncReadScope")
+    scope_member_call_count = sum(
+        _packed_spelling_occurrences(spellings, spelling_ids, method)
+        for method in _SCOPE_MEMBER_METHOD_SPELLINGS
+    )
+    scope_declaration_count = _packed_spelling_occurrences(
+        spellings, spelling_ids, b"GpuSyncReadScope"
+    )
     scope_analysis_required = bool(
-        member_call_count or scope_declaration_count
+        scope_member_call_count or scope_declaration_count
     )
     # Python integers do not wrap.  Validate every accumulated term once before
     # any allocation formula consumes it, instead of paying checked arithmetic
@@ -852,6 +900,12 @@ class AuditBuffer:
         spelling_ids_packed = object.__getattribute__(tokens, "_spelling_ids")
         spellings = object.__getattribute__(tokens, "_spellings")
         identities = object.__getattribute__(tokens, "_identities")
+        measurement_scratch = audit_measurement_scratch_bound()
+        measurement_reservation = reserve_before_allocation(measurement_scratch)
+        peak_rss = cls._sample_rss(
+            rss_reader, limits.rss_bytes, 0, reserve=measurement_scratch
+        )
+        measurement_reservation.require_before_allocation(measurement_scratch)
         measured = _measure_audit_buffer_layout(tokens)
         layout = measured.shape
         if _allocation_observer is not None:
@@ -861,7 +915,10 @@ class AuditBuffer:
         plan = audit_allocation_plan(layout)
         reservation = reserve_before_allocation(plan.pre_reserved_bytes)
         peak_rss = cls._sample_rss(
-            rss_reader, limits.rss_bytes, 0, reserve=plan.pre_reserved_bytes
+            rss_reader,
+            limits.rss_bytes,
+            peak_rss,
+            reserve=plan.pre_reserved_bytes,
         )
         if _allocation_observer is not None:
             _allocation_observer.events.append("reserve-all-allocations")
@@ -1532,7 +1589,18 @@ def declaration_block(masked: str, pairs: list[tuple[int, int]],
     return enclosing_block(pairs, declaration.position)
 
 
-MEMBER_CALL = re.compile(r"(?:\.|->|::)\s*(read|withRead|complete|nativeHandle)\s*\(")
+_MEMBER_CALL_OPERATOR_PATTERN = "|".join(
+    re.escape(spelling.decode("ascii"))
+    for spelling in _MEMBER_CALL_OPERATOR_SPELLINGS
+)
+_MEMBER_CALL_METHOD_PATTERN = "|".join(
+    re.escape(spelling.decode("ascii"))
+    for spelling in _MEMBER_CALL_METHOD_SPELLINGS
+)
+MEMBER_CALL = re.compile(
+    rf"(?:{_MEMBER_CALL_OPERATOR_PATTERN})\s*"
+    rf"({_MEMBER_CALL_METHOD_PATTERN})\s*\("
+)
 
 
 def preprocessor_capability_findings(path: PurePosixPath,
@@ -3619,7 +3687,7 @@ class CompilerAuditAnalysis:
         pairs = tuple(brace_pairs(masked))
         member_calls = tuple(MEMBER_CALL.finditer(masked))
         has_scope_grammar = (
-            any(call.group(1) in {"read", "withRead", "complete"} for call in member_calls)
+            any(call.group(1) in _SCOPE_MEMBER_METHODS for call in member_calls)
             or any(token.value == "GpuSyncReadScope" for token in tokens)
         )
         if has_scope_grammar:
@@ -4309,13 +4377,15 @@ _CAPABILITY_RULES = (
     ),
 )
 
+_CAPABILITY_TRIGGER_SPELLINGS = frozenset(
+    spelling
+    for rule in _CAPABILITY_RULES
+    for spelling in rule.trigger_spellings
+)
+
 
 def capability_candidate_spellings() -> frozenset[bytes]:
-    return frozenset(
-        spelling
-        for rule in _CAPABILITY_RULES
-        for spelling in rule.trigger_spellings
-    )
+    return _CAPABILITY_TRIGGER_SPELLINGS
 
 
 def view_has_capability_spelling(view: PreprocessedTranslationUnitView) -> bool:

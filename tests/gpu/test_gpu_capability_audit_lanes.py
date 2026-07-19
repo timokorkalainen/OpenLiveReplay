@@ -987,6 +987,33 @@ class CompilerAuditLaneTests(unittest.TestCase):
         self.assertEqual(len(analysis.tokens), 50_004)
         self.assertGreaterEqual(plan.analysis_objects, peak)
 
+    def test_analysis_plan_covers_native_handle_member_match_allocations(self):
+        identity = self.identity("playback/gpu/example.cpp")
+        source = b"surface . nativeHandle ( ) ; " * 50_000
+        view = self.view(((identity, 1, 1, source),))
+        limits = dataclasses.replace(self.limits, rss_bytes=1024 * 1024 * 1024)
+        buffer = AuditBuffer.from_preprocessed(view, limits, lambda: 0)
+        shape = capability_audit._measure_audit_buffer_layout(view.tokens).shape
+        plan = audit_allocation_plan(shape)
+        translated = capability_audit.TranslationText(
+            buffer.text,
+            buffer.text,
+            buffer.text,
+            (),
+            (),
+            buffer._line_starts,
+        )
+        tracemalloc.start()
+        try:
+            analysis = CompilerAuditAnalysis.from_translation(translated)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(shape.member_call_count, 50_000)
+        self.assertFalse(shape.scope_analysis_required)
+        self.assertEqual(len(analysis.member_calls), 50_000)
+        self.assertGreaterEqual(plan.analysis_objects, peak)
+
     def test_filtered_and_forced_unfiltered_results_match_owned_corpus(self):
         fixtures = (
             ("empty", self.view((self.production("playback/gpu/empty.cpp", 1, b""),))),
@@ -1025,23 +1052,38 @@ class CompilerAuditLaneTests(unittest.TestCase):
                     self.assertFalse(derived.isdisjoint(spellings))
 
     def test_prefilter_matches_forced_oracle_over_mutation_and_live_corpora(self):
-        captured: dict[tuple[PurePosixPath, str], None] = {}
+        captured: list[tuple[str, str, PurePosixPath, str]] = []
         original_capability = capability_audit.audit_capability_uses
         original_source_only = capability_audit.audit_source_only
         original_raw = capability_audit.audit_raw_sources
 
         def record_capability(path, source, *args, **kwargs):
             if not kwargs.get("compiler_view", False):
-                captured.setdefault((path, source), None)
+                captured.append((
+                    "mutation-authoritative",
+                    f"authoritative-{sum(item[0] == 'mutation-authoritative' for item in captured):03d}",
+                    path,
+                    source,
+                ))
             return original_capability(path, source, *args, **kwargs)
 
         def record_source_only(path, source):
-            captured.setdefault((path, source), None)
+            captured.append((
+                "mutation-source-only",
+                f"source-only-{sum(item[0] == 'mutation-source-only' for item in captured):03d}",
+                path,
+                source,
+            ))
             return original_source_only(path, source)
 
         def record_raw(sources):
             for path, source in sources.items():
-                captured.setdefault((path, source), None)
+                captured.append((
+                    "mutation-raw",
+                    f"raw-{sum(item[0] == 'mutation-raw' for item in captured):03d}",
+                    path,
+                    source,
+                ))
             return original_raw(sources)
 
         with (
@@ -1070,17 +1112,47 @@ class CompilerAuditLaneTests(unittest.TestCase):
         )
 
         for name, output in FORBIDDEN_OUTPUT_ORACLES.items():
-            captured.setdefault(
-                (FIXTURE_PATH, output.decode("ascii") + ";"), None
-            )
+            captured.append((
+                "live-forbidden", name, FIXTURE_PATH,
+                output.decode("ascii") + ";",
+            ))
         for name, (_source, output) in SAFE_FIXTURES.items():
-            captured.setdefault(
-                (FIXTURE_PATH, output.decode("ascii") + ";"), None
+            captured.append((
+                "live-safe", name, FIXTURE_PATH,
+                output.decode("ascii") + ";",
+            ))
+
+        expected_counts = {
+            "mutation-authoritative": 181,
+            "mutation-source-only": 31,
+            "mutation-raw": 33,
+            "live-forbidden": 6,
+            "live-safe": 7,
+        }
+
+        def require_exact_inventory(entries):
+            observed_counts = {
+                category: sum(item[0] == category for item in entries)
+                for category in expected_counts
+            }
+            self.assertEqual(observed_counts, expected_counts)
+            self.assertEqual(len(entries), 258)
+            self.assertEqual(len({(item[2], item[3]) for item in entries}), 186)
+            self.assertEqual(
+                {item[1] for item in entries if item[0] == "live-forbidden"},
+                set(FORBIDDEN_OUTPUT_ORACLES),
             )
-        self.assertGreaterEqual(len(captured), 100)
+            self.assertEqual(
+                {item[1] for item in entries if item[0] == "live-safe"},
+                set(SAFE_FIXTURES),
+            )
+
+        require_exact_inventory(captured)
+        with self.assertRaises(AssertionError):
+            require_exact_inventory(captured[:-1])
 
         derived = capability_candidate_spellings()
-        for index, ((path, source), _unused) in enumerate(captured.items()):
+        for index, (category, name, path, source) in enumerate(captured):
             try:
                 encoded = source.encode("ascii")
             except UnicodeEncodeError as error:
@@ -1090,7 +1162,9 @@ class CompilerAuditLaneTests(unittest.TestCase):
             forced = _audit_preprocessed_view_unfiltered(
                 view, self.limits, lambda: 0
             )
-            with self.subTest(path=path, corpus_index=index):
+            with self.subTest(
+                category=category, name=name, path=path, corpus_index=index
+            ):
                 self.assertEqual(filtered, forced)
                 if forced:
                     spellings = set(
@@ -1287,6 +1361,49 @@ class CompilerAuditLaneTests(unittest.TestCase):
             ["measure-layout", "reserve-all-allocations"],
         )
         self.assertTrue(observations.final_str.reserved_before_allocation)
+
+    def test_measurement_scratch_is_reserved_before_layout_measurement(self):
+        view = self.view((self.production(
+            "playback/gpu/example.cpp", 1, b"surface . nativeHandle ( ) ;"
+        ),))
+        reservations = []
+        original_reserve = capability_audit.reserve_before_allocation
+        original_measure = capability_audit._measure_audit_buffer_layout
+
+        def record_reserve(amount):
+            reservations.append(amount)
+            return original_reserve(amount)
+
+        def guarded_measure(tokens):
+            self.assertTrue(reservations, "layout measurement preceded reservation")
+            return original_measure(tokens)
+
+        with (
+            mock.patch.object(
+                capability_audit,
+                "reserve_before_allocation",
+                side_effect=record_reserve,
+            ),
+            mock.patch.object(
+                capability_audit,
+                "_measure_audit_buffer_layout",
+                side_effect=guarded_measure,
+            ),
+        ):
+            AuditBuffer.from_preprocessed(view, self.limits, lambda: 0)
+        self.assertEqual(
+            reservations[0], capability_audit.audit_measurement_scratch_bound()
+        )
+        tracemalloc.start()
+        try:
+            measured = original_measure(view.tokens)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertGreater(measured.shape.token_count, 0)
+        self.assertLessEqual(
+            peak, capability_audit.audit_measurement_scratch_bound()
+        )
 
     def test_production_buffer_never_uses_private_cpython_probe(self):
         view = self.view((self.production(

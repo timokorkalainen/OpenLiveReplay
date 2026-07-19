@@ -44,6 +44,7 @@ _DEPENDENCY_FILE_BYTES = 256 * 1024 * 1024
 _DEPENDENCY_DOCUMENT_ENTRIES = 65_536
 _DEPENDENCY_DOCUMENT_METADATA_BYTES = 32 * 1024 * 1024
 _DEPENDENCY_PATH_METADATA_BYTES = 256
+_TOKEN_BUDGET_POLL_BYTES = 64 * 1024
 
 
 def _check_dependency_io_budget(
@@ -671,8 +672,6 @@ class PreprocessedStreamBuilder:
             return Path(decoded), False
         if _is_windows_path(decoded) or Path(decoded).is_absolute():
             return Path(_display_normalized(decoded)), False
-        if _is_windows_path(decoded) or Path(decoded).is_absolute():
-            return Path(_display_normalized(decoded)), False
         bases: list[Path] = [self._configuration.working_directory]
         if self._stack:
             current = self._marker_paths[
@@ -882,6 +881,7 @@ class PreprocessedStreamBuilder:
             byte = content[index]
             if self._in_block_comment:
                 close = content.find(b"*/", index)
+                self._check_budget()
                 if close < 0:
                     return
                 self._in_block_comment = False
@@ -899,28 +899,43 @@ class PreprocessedStreamBuilder:
             start = index
             if self._identifier_start(byte):
                 index += 1
+                next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
                 while index < len(content) and self._identifier_continue(content[index]):
                     index += 1
+                    if index >= next_budget_poll:
+                        self._check_budget()
+                        next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
             elif ord("0") <= byte <= ord("9") or (
                 byte == ord(".") and index + 1 < len(content) and content[index + 1 : index + 2].isdigit()
             ):
                 index += 1
+                next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
                 while index < len(content):
                     current = content[index]
                     if self._identifier_continue(current) or current in b".'":
                         index += 1
+                        if index >= next_budget_poll:
+                            self._check_budget()
+                            next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
                         continue
                     if current in b"+-" and index > start and content[index - 1] in b"eEpP":
                         index += 1
+                        if index >= next_budget_poll:
+                            self._check_budget()
+                            next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
                         continue
                     break
             elif byte in (ord('"'), ord("'")):
                 quote = byte
                 index += 1
                 escaped = False
+                next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
                 while index < len(content):
                     current = content[index]
                     index += 1
+                    if index >= next_budget_poll:
+                        self._check_budget()
+                        next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
                     if escaped:
                         escaped = False
                     elif current == ord("\\"):
@@ -959,6 +974,7 @@ class PreprocessedStreamBuilder:
         while True:
             self._check_budget()
             newline = chunk.find(b"\n", offset)
+            self._check_budget()
             if newline < 0:
                 self._check_retained(len(chunk) - offset)
                 self._line_buffer.extend(chunk[offset:])
@@ -969,7 +985,9 @@ class PreprocessedStreamBuilder:
                     and not _MARKER_PREFIX.match(self._line_buffer)
                     and not any(value in self._line_buffer for value in (b'"', b"'", b"/", b"\\"))
                 ):
+                    self._check_budget()
                     split = max(self._line_buffer.rfind(b" "), self._line_buffer.rfind(b"\t"))
+                    self._check_budget()
                     if split >= 0:
                         prefix = bytes(self._line_buffer[: split + 1])
                         del self._line_buffer[: split + 1]

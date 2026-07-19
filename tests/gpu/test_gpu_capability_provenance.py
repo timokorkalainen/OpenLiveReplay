@@ -266,6 +266,19 @@ class ProvenanceTests(unittest.TestCase):
             builder.feed(stream)
         self.assertLess(calls, 1_000)
 
+    def test_absolute_marker_resolution_is_normalized_for_native_and_windows_paths(self):
+        builder = PreprocessedStreamBuilder(
+            self.configuration(), self.production, AuditLimits(), lambda: 0
+        )
+        for marker in (str(Path(__file__).resolve()), "D:\\repo\\playback\\a.cpp"):
+            with self.subTest(marker=marker):
+                resolved, relative = builder._resolve_marker_path(marker)
+                self.assertEqual(
+                    resolved,
+                    Path(provenance._display_normalized(marker)),
+                )
+                self.assertFalse(relative)
+
     def test_stream_builder_enforces_deadline_during_tokenization(self):
         builder = PreprocessedStreamBuilder(
             self.configuration(),
@@ -283,6 +296,27 @@ class ProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
             builder.feed(stream)
         self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_stream_builder_polls_deadline_inside_long_token_scans(self):
+        cases = (
+            ("identifier", b"identifier" * (4 * 1024 * 1024)),
+            ("number", b"1" * (4 * 1024 * 1024)),
+            ("literal", b'"' + b"x" * (4 * 1024 * 1024) + b'"'),
+        )
+        for name, token in cases:
+            with self.subTest(name=name):
+                builder = PreprocessedStreamBuilder(
+                    self.configuration(),
+                    self.production,
+                    AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+                    lambda: 0,
+                    deadline=time.monotonic() + 0.01,
+                )
+                builder.feed(b'# 1 "D:/repo/playback/a.cpp"\n')
+                started = time.monotonic()
+                with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
+                    builder.feed(token + b"\n")
+                self.assertLess(time.monotonic() - started, 1.0)
 
     def test_retained_accounting_uses_incremental_intern_totals(self):
         slots = set(PreprocessedStreamBuilder.__slots__)
