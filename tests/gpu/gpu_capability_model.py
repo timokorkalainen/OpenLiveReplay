@@ -9,6 +9,7 @@ import os
 import stat
 import struct
 import sys
+import threading
 import time
 from array import array
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -302,7 +303,197 @@ class AuditLimits:
     unique_generation_guard_directories: int = 65_536
     generation_guard_metadata_bytes: int = 64 * 1024 * 1024
     dependency_handle_metadata_bytes: int = 32 * 1024 * 1024
+    compact_result_bytes: int = 16 * 1024 * 1024
+    compact_batch_bytes: int = 128 * 1024 * 1024
+    compact_aggregate_bytes: int = 128 * 1024 * 1024
+    compact_result_dependencies: int = 16_384
+    compact_result_reached: int = 4_096
+    compact_result_findings: int = 65_536
+    compact_result_path_bytes: int = 16 * 1024
+    compact_result_expression_bytes: int = 64 * 1024
+    compact_result_reason_bytes: int = 64 * 1024
     workers: int = field(default_factory=_default_worker_count)
+
+
+_COMPACT_RESULT_MAXIMUM_LIVE_BYTES = 128 * 1024 * 1024
+
+
+class CompactResultMemoryBudget:
+    """Exact single-owner accounting for compact audit objects and indices."""
+
+    def __init__(self, maximum_bytes: int = _COMPACT_RESULT_MAXIMUM_LIVE_BYTES) -> None:
+        if (
+            not isinstance(maximum_bytes, int)
+            or isinstance(maximum_bytes, bool)
+            or maximum_bytes < 0
+            or maximum_bytes > _COMPACT_RESULT_MAXIMUM_LIVE_BYTES
+        ):
+            raise AuditInfrastructureError("compact result memory limit is invalid")
+        self.maximum_bytes = maximum_bytes
+        self._reserved_bytes = 0
+        self._committed_bytes = 0
+        self._peak_live_bytes = 0
+        self._lock = threading.Lock()
+
+    @property
+    def reserved_bytes(self) -> int:
+        with self._lock:
+            return self._reserved_bytes
+
+    @property
+    def committed_bytes(self) -> int:
+        with self._lock:
+            return self._committed_bytes
+
+    @property
+    def live_bytes(self) -> int:
+        with self._lock:
+            return self._reserved_bytes + self._committed_bytes
+
+    @property
+    def peak_live_bytes(self) -> int:
+        with self._lock:
+            return self._peak_live_bytes
+
+    def reserve(self, byte_count: int, *, label: str = "compact result") -> "CompactResultOwnership":
+        if (
+            not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+            or not isinstance(label, str)
+            or not label
+        ):
+            raise AuditInfrastructureError("compact result reservation is invalid")
+        with self._lock:
+            live = self._reserved_bytes + self._committed_bytes
+            if byte_count > self.maximum_bytes - live:
+                raise AuditInfrastructureError(
+                    f"{label} exceeds aggregate 128 MiB compact result limit"
+                )
+            self._reserved_bytes += byte_count
+            self._peak_live_bytes = max(
+                self._peak_live_bytes,
+                self._reserved_bytes + self._committed_bytes,
+            )
+        return CompactResultOwnership(self, byte_count, "reserved", label)
+
+    def _commit(self, byte_count: int) -> None:
+        with self._lock:
+            if byte_count > self._reserved_bytes:
+                raise AuditInfrastructureError("compact result reservation accounting underflow")
+            self._reserved_bytes -= byte_count
+            self._committed_bytes += byte_count
+
+    def _release(self, byte_count: int, state: str) -> None:
+        with self._lock:
+            if state == "reserved":
+                if byte_count > self._reserved_bytes:
+                    raise AuditInfrastructureError(
+                        "compact result reservation accounting underflow"
+                    )
+                self._reserved_bytes -= byte_count
+            elif state == "committed":
+                if byte_count > self._committed_bytes:
+                    raise AuditInfrastructureError(
+                        "compact result ownership accounting underflow"
+                    )
+                self._committed_bytes -= byte_count
+            else:
+                raise AuditInfrastructureError("compact result ownership state is invalid")
+
+
+class CompactResultOwnership:
+    """Linear ownership token; commit and release are each permitted once."""
+
+    __slots__ = ("_budget", "byte_count", "_state", "label")
+
+    def __init__(
+        self,
+        budget: CompactResultMemoryBudget,
+        byte_count: int,
+        state: str,
+        label: str,
+    ) -> None:
+        self._budget = budget
+        self.byte_count = byte_count
+        self._state = state
+        self.label = label
+
+    @property
+    def budget(self) -> CompactResultMemoryBudget:
+        return self._budget
+
+    @property
+    def committed(self) -> bool:
+        return self._state == "committed"
+
+    @property
+    def released(self) -> bool:
+        return self._state == "released"
+
+    def commit(self) -> "CompactResultOwnership":
+        if self._state != "reserved":
+            raise AuditInfrastructureError("compact result ownership cannot be committed")
+        self._budget._commit(self.byte_count)
+        self._state = "committed"
+        return self
+
+    def release(self) -> None:
+        if self._state == "released":
+            raise AuditInfrastructureError("compact result ownership was already released")
+        self._budget._release(self.byte_count, self._state)
+        self._state = "released"
+
+    def __del__(self) -> None:
+        try:
+            if self._state != "released":
+                self._budget._release(self.byte_count, self._state)
+                self._state = "released"
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True, slots=True)
+class CompactResultColdSlot:
+    worst_case_live_bytes: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.worst_case_live_bytes, int)
+            or isinstance(self.worst_case_live_bytes, bool)
+            or self.worst_case_live_bytes < 0
+            or self.worst_case_live_bytes > _COMPACT_RESULT_MAXIMUM_LIVE_BYTES
+        ):
+            raise AuditInfrastructureError("compact result cold slot is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CompactResultGrowth:
+    configuration_index_bytes: int
+    coverage_index_bytes: int
+    finding_index_bytes: int
+    digest_state_bytes: int
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (
+                self.configuration_index_bytes,
+                self.coverage_index_bytes,
+                self.finding_index_bytes,
+                self.digest_state_bytes,
+            )
+        ):
+            raise AuditInfrastructureError("compact result aggregate growth is invalid")
+
+    @property
+    def total_bytes(self) -> int:
+        return (
+            self.configuration_index_bytes
+            + self.coverage_index_bytes
+            + self.finding_index_bytes
+            + self.digest_state_bytes
+        )
 
 
 @dataclass(frozen=True)
@@ -1930,20 +2121,35 @@ class ConfigurationAuditResult:
     findings: tuple[AuditResultFinding, ...]
 
     def __post_init__(self) -> None:
+        limits = AuditLimits()
         _validate_digest(self.configuration_digest, "configuration")
         _validate_digest(self.audit_engine_fingerprint, "audit engine fingerprint")
         if not isinstance(self.dependencies, tuple) or any(
             not isinstance(item, DependencyDigest) for item in self.dependencies
         ):
             raise AuditInfrastructureError("audit result dependencies are invalid")
+        if len(self.dependencies) > limits.compact_result_dependencies:
+            raise AuditInfrastructureError("audit result limit exceeded for dependencies")
         dependency_keys = tuple(_dependency_sort_key(item) for item in self.dependencies)
+        for dependency in self.dependencies:
+            if (
+                len(dependency.role_relative_path.as_posix().encode("utf-8"))
+                > limits.compact_result_path_bytes
+                or len(str(dependency.identity.canonical).encode("utf-8"))
+                > limits.compact_result_path_bytes
+            ):
+                raise AuditInfrastructureError("audit result limit exceeded for dependency path")
         if dependency_keys != tuple(sorted(dependency_keys)) or len(set(dependency_keys)) != len(dependency_keys):
             raise AuditInfrastructureError("audit result dependencies are not unique and sorted")
         if not isinstance(self.reached_production, tuple):
             raise AuditInfrastructureError("audit result reached-production paths are invalid")
+        if len(self.reached_production) > limits.compact_result_reached:
+            raise AuditInfrastructureError("audit result limit exceeded for reached paths")
         reached_keys: list[str] = []
         for path in self.reached_production:
             _stable_role, validated = _validate_role_relative_path("production", path)
+            if len(validated.as_posix().encode("utf-8")) > limits.compact_result_path_bytes:
+                raise AuditInfrastructureError("audit result limit exceeded for path")
             reached_keys.append(validated.as_posix())
         if tuple(reached_keys) != tuple(sorted(reached_keys)) or len(set(reached_keys)) != len(reached_keys):
             raise AuditInfrastructureError("audit result reached-production paths are not unique and sorted")
@@ -1951,9 +2157,331 @@ class ConfigurationAuditResult:
             not isinstance(item, AuditResultFinding) for item in self.findings
         ):
             raise AuditInfrastructureError("audit result findings are invalid")
+        if len(self.findings) > limits.compact_result_findings:
+            raise AuditInfrastructureError("audit result limit exceeded for findings")
+        for finding in self.findings:
+            if (
+                len(finding.path.as_posix().encode("utf-8"))
+                > limits.compact_result_path_bytes
+                or len(finding.expression.encode("utf-8"))
+                > limits.compact_result_expression_bytes
+                or len(finding.reason.encode("utf-8"))
+                > limits.compact_result_reason_bytes
+            ):
+                raise AuditInfrastructureError("audit result limit exceeded for finding text")
         finding_keys = tuple(_audit_finding_key(item) for item in self.findings)
         if finding_keys != tuple(sorted(finding_keys)) or len(set(finding_keys)) != len(finding_keys):
             raise AuditInfrastructureError("audit result findings are not unique and sorted")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationAuditPublicationPermit:
+    configuration_digest: str
+    audit_engine_fingerprint: str
+    dependencies: tuple[DependencyDigest, ...]
+
+    def __post_init__(self) -> None:
+        _validate_digest(self.configuration_digest, "configuration publication permit")
+        _validate_digest(self.audit_engine_fingerprint, "audit publication permit engine")
+        if not isinstance(self.dependencies, tuple) or any(
+            not isinstance(item, DependencyDigest) for item in self.dependencies
+        ):
+            raise AuditInfrastructureError("audit publication permit dependencies are invalid")
+        keys = tuple(_dependency_sort_key(item) for item in self.dependencies)
+        if keys != tuple(sorted(keys)) or len(set(keys)) != len(keys):
+            raise AuditInfrastructureError(
+                "audit publication permit dependencies are not unique and sorted"
+            )
+
+
+def compact_result_retained_bytes(result: ConfigurationAuditResult) -> int:
+    """Conservative retained allocation charge for one decoded compact result."""
+    if not isinstance(result, ConfigurationAuditResult):
+        raise AuditInfrastructureError("compact audit result is invalid")
+    total = 1024
+    for dependency in result.dependencies:
+        total += (
+            384
+            + len(dependency.stable_role.encode("ascii"))
+            + len(dependency.role_relative_path.as_posix().encode("utf-8"))
+            + len(str(dependency.identity.canonical).encode("utf-8"))
+            + (
+                len(dependency.identity.relative.as_posix().encode("utf-8"))
+                if dependency.identity.relative is not None
+                else 0
+            )
+        )
+    total += sum(
+        128 + len(path.as_posix().encode("utf-8"))
+        for path in result.reached_production
+    )
+    total += sum(
+        320
+        + len(finding.path.as_posix().encode("utf-8"))
+        + len(finding.expression.encode("utf-8"))
+        + len(finding.reason.encode("utf-8"))
+        for finding in result.findings
+    )
+    if total > AuditLimits().compact_result_bytes:
+        raise AuditInfrastructureError("per-entry decoded result limit exceeded")
+    return total
+
+
+@dataclass(frozen=True, slots=True)
+class AggregatedAuditResultFinding:
+    finding: AuditResultFinding
+    configurations: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingAuditSummary:
+    configurations: tuple[str, ...]
+    reached_production: tuple[PurePosixPath, ...]
+    findings: tuple[AggregatedAuditResultFinding, ...]
+    dependency_digests: tuple[tuple[str, str, str], ...]
+    _ownerships: tuple[CompactResultOwnership, ...] = field(
+        compare=False, repr=False
+    )
+
+    @property
+    def authoritative(self) -> frozenset[PurePosixPath]:
+        return frozenset(self.reached_production)
+
+    def release(self) -> None:
+        for ownership in self._ownerships:
+            if not ownership.released:
+                ownership.release()
+
+
+def encode_canonical_summary(summary: StreamingAuditSummary) -> bytes:
+    if not isinstance(summary, StreamingAuditSummary):
+        raise AuditInfrastructureError("streaming audit summary is invalid")
+    document = {
+        "configurations": list(summary.configurations),
+        "reached_production": [path.as_posix() for path in summary.reached_production],
+        "findings": [
+            {
+                "path": item.finding.path.as_posix(),
+                "line": item.finding.line,
+                "expression": item.finding.expression,
+                "reason": item.finding.reason,
+                "configurations": list(item.configurations),
+            }
+            for item in summary.findings
+        ],
+        "dependency_digests": [list(item) for item in summary.dependency_digests],
+    }
+    return json.dumps(
+        document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+
+
+class StreamingResultAggregator:
+    """Consumes compact results in configuration order with charged index growth."""
+
+    def __init__(
+        self,
+        configurations: tuple[PreprocessConfiguration, ...],
+        budget: CompactResultMemoryBudget,
+        limits: AuditLimits,
+    ) -> None:
+        if not isinstance(configurations, tuple) or any(
+            not isinstance(item, PreprocessConfiguration) for item in configurations
+        ):
+            raise AuditInfrastructureError("streaming result configurations are invalid")
+        if not isinstance(budget, CompactResultMemoryBudget) or not isinstance(
+            limits, AuditLimits
+        ):
+            raise AuditInfrastructureError("streaming result aggregate inputs are invalid")
+        digests = tuple(item.digest for item in configurations)
+        if len(set(digests)) != len(digests):
+            raise AuditInfrastructureError("streaming result configurations are not unique")
+        self._expected = configurations
+        self._expected_index = {
+            configuration.digest: index
+            for index, configuration in enumerate(configurations)
+        }
+        self._budget = budget
+        self._limits = limits
+        self._accepted: set[str] = set()
+        self._reached: dict[str, PurePosixPath] = {}
+        self._findings: dict[
+            tuple[str, int, str, str], tuple[AuditResultFinding, list[str]]
+        ] = {}
+        self._digests: dict[tuple[str, str, str], None] = {}
+        self._growth_ownerships: list[CompactResultOwnership] = []
+        self._cold_ownership: CompactResultOwnership | None = None
+        self._finished = False
+
+    @property
+    def accepted_count(self) -> int:
+        return len(self._accepted)
+
+    @property
+    def budget(self) -> CompactResultMemoryBudget:
+        return self._budget
+
+    @property
+    def cold_slot_reserved_bytes(self) -> int:
+        ownership = self._cold_ownership
+        return 0 if ownership is None or ownership.released else ownership.byte_count
+
+    def reserve_cold_slot(self, slot: CompactResultColdSlot) -> int:
+        if not isinstance(slot, CompactResultColdSlot):
+            raise AuditInfrastructureError("compact result cold slot is invalid")
+        if self._cold_ownership is not None and not self._cold_ownership.released:
+            if self._cold_ownership.byte_count != slot.worst_case_live_bytes:
+                raise AuditInfrastructureError("compact result cold slot differs")
+            return self._cold_ownership.byte_count
+        self._cold_ownership = self._budget.reserve(
+            slot.worst_case_live_bytes,
+            label="batch retained result limit cold slot",
+        ).commit()
+        return slot.worst_case_live_bytes
+
+    def ownership_for_cold_result(
+        self, result: ConfigurationAuditResult
+    ) -> CompactResultOwnership:
+        byte_count = compact_result_retained_bytes(result)
+        if self._cold_ownership is None or self._cold_ownership.released:
+            return self._budget.reserve(
+                byte_count, label="batch retained result limit"
+            ).commit()
+        if byte_count > self._cold_ownership.byte_count:
+            raise AuditInfrastructureError("cold result exceeds reserved cold slot")
+        self._cold_ownership.release()
+        return self._budget.reserve(
+            byte_count, label="batch retained result limit"
+        ).commit()
+
+    def _growth_for(self, result: ConfigurationAuditResult) -> CompactResultGrowth:
+        new_paths = tuple(
+            path for path in result.reached_production
+            if path.as_posix() not in self._reached
+        )
+        finding_bytes = 0
+        for finding in result.findings:
+            key = _audit_finding_key(finding)
+            finding_bytes += 96
+            if key not in self._findings:
+                finding_bytes += (
+                    320
+                    + len(finding.path.as_posix().encode("utf-8"))
+                    + len(finding.expression.encode("utf-8"))
+                    + len(finding.reason.encode("utf-8"))
+                )
+        new_digests = tuple(
+            (
+                dependency.stable_role,
+                dependency.role_relative_path.as_posix(),
+                dependency.sha256,
+            )
+            for dependency in result.dependencies
+            if (
+                dependency.stable_role,
+                dependency.role_relative_path.as_posix(),
+                dependency.sha256,
+            ) not in self._digests
+        )
+        return CompactResultGrowth(
+            configuration_index_bytes=192,
+            coverage_index_bytes=sum(
+                160 + len(path.as_posix().encode("utf-8")) for path in new_paths
+            ),
+            finding_index_bytes=finding_bytes,
+            digest_state_bytes=sum(
+                256
+                + len(role.encode("ascii"))
+                + len(path.encode("utf-8"))
+                + len(digest)
+                for role, path, digest in new_digests
+            ),
+        )
+
+    def accept_validated_result(
+        self,
+        configuration: PreprocessConfiguration,
+        result: ConfigurationAuditResult,
+        ownership: CompactResultOwnership,
+    ) -> None:
+        if self._finished:
+            raise AuditInfrastructureError("streaming result aggregate is already finished")
+        index = self._expected_index.get(configuration.digest)
+        if (
+            index is None
+            or configuration != self._expected[index]
+            or configuration.digest in self._accepted
+        ):
+            raise AuditInfrastructureError("streaming result configuration is unexpected")
+        if (
+            not isinstance(result, ConfigurationAuditResult)
+            or result.configuration_digest != configuration.digest
+        ):
+            raise AuditInfrastructureError("streaming result configuration digest differs")
+        if (
+            not isinstance(ownership, CompactResultOwnership)
+            or ownership.budget is not self._budget
+            or not ownership.committed
+            or ownership.byte_count < compact_result_retained_bytes(result)
+        ):
+            raise AuditInfrastructureError("streaming result ownership is invalid")
+        growth = self._growth_for(result)
+        if growth.total_bytes > self._limits.compact_aggregate_bytes:
+            raise AuditInfrastructureError("aggregate growth exceeds 128 MiB limit")
+        try:
+            growth_ownership = self._budget.reserve(
+                growth.total_bytes, label="aggregate growth 128 MiB limit"
+            ).commit()
+        except AuditInfrastructureError as error:
+            raise AuditInfrastructureError(
+                "aggregate growth exceeds 128 MiB limit before insert"
+            ) from error
+
+        self._accepted.add(configuration.digest)
+        for path in result.reached_production:
+            self._reached.setdefault(path.as_posix(), path)
+        for finding in result.findings:
+            key = _audit_finding_key(finding)
+            existing = self._findings.get(key)
+            if existing is None:
+                self._findings[key] = (finding, [configuration.digest])
+            else:
+                existing[1].append(configuration.digest)
+        for dependency in result.dependencies:
+            self._digests.setdefault(
+                (
+                    dependency.stable_role,
+                    dependency.role_relative_path.as_posix(),
+                    dependency.sha256,
+                ),
+                None,
+            )
+        self._growth_ownerships.append(growth_ownership)
+        ownership.release()
+
+    def finish(self) -> StreamingAuditSummary:
+        if self._finished:
+            raise AuditInfrastructureError("streaming result aggregate is already finished")
+        self._finished = True
+        if self._cold_ownership is not None and not self._cold_ownership.released:
+            self._cold_ownership.release()
+        findings = tuple(
+            AggregatedAuditResultFinding(
+                finding,
+                tuple(sorted(configurations, key=self._expected_index.__getitem__)),
+            )
+            for _key, (finding, configurations) in sorted(self._findings.items())
+        )
+        return StreamingAuditSummary(
+            tuple(
+                configuration.digest for configuration in self._expected
+                if configuration.digest in self._accepted
+            ),
+            tuple(self._reached[key] for key in sorted(self._reached)),
+            findings,
+            tuple(sorted(self._digests)),
+            tuple(self._growth_ownerships),
+        )
 
 
 def encode_local_dependency_digest(dependency: DependencyDigest) -> bytes:

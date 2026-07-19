@@ -25,7 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gpu_capability_cache as capability_cache  # noqa: E402
 from gpu_capability_cache import (  # noqa: E402
     CompilerInspectionCache,
+    ConfigurationAuditCache,
     PreprocessCache,
+    audit_cache_key,
     _directory_identity,
     _hash_cache,
     _hash_lock,
@@ -34,15 +36,23 @@ from gpu_capability_cache import (  # noqa: E402
     compiler_inspection_cache_key,
 )
 from gpu_capability_model import (  # noqa: E402
+    AuditResultFinding,
     AuditInfrastructureError,
+    CompactResultColdSlot,
+    CompactResultMemoryBudget,
     CompactTokenSequence,
     CompilerExecutableCapability,
     CompilerFamily,
     CompilerInspection,
     DependencyRootBinding,
+    DependencyDigest,
     FileIdentity,
+    ConfigurationAuditPublicationPermit,
+    ConfigurationAuditResult,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
+    StreamingResultAggregator,
+    encode_canonical_summary,
     build_dependency_root_authority,
     encode_compiler_inspection,
 )
@@ -3810,6 +3820,481 @@ class PreprocessCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             AuditInfrastructureError, "namespace|alias|ordinary"
         ):
             cache.load(self.configuration)
+
+
+class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
+    def setUp(self) -> None:
+        _PreprocessCacheFixture.setUp(self)
+        dependency = DependencyDigest(
+            "production",
+            PurePosixPath("playback/a.cpp"),
+            self.main,
+            hashlib.sha256(self.main_path.read_bytes()).hexdigest(),
+        )
+        self.engine = "e" * 64
+        self.configuration = dataclasses.replace(
+            self.configuration, digest="c" * 64
+        )
+        self.result = ConfigurationAuditResult(
+            self.configuration.digest,
+            self.engine,
+            (dependency,),
+            (PurePosixPath("playback/a.cpp"),),
+            (
+                AuditResultFinding(
+                    PurePosixPath("playback/a.cpp"),
+                    1,
+                    "lease.nativeHandle()",
+                    "outside lease",
+                ),
+            ),
+        )
+        self.production_snapshot = {dependency.role_relative_path: dependency}
+        self.publication_permit = ConfigurationAuditPublicationPermit(
+            self.result.configuration_digest,
+            self.result.audit_engine_fingerprint,
+            self.result.dependencies,
+        )
+        self.pipeline_deadline = time.monotonic() + 30.0
+
+    def tearDown(self) -> None:
+        _PreprocessCacheFixture.tearDown(self)
+
+    def test_result_cache_round_trips_without_token_payload(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        loaded = cache.load(
+            self.configuration,
+            self.dependency_roots,
+            self.engine,
+            self.production_snapshot,
+            self.pipeline_deadline,
+        )
+        self.assertEqual(loaded, self.result)
+        self.assertFalse(
+            any(path.suffix == ".bin" for path in self.cache_root.rglob("*"))
+        )
+
+    def test_combined_key_is_length_framed(self):
+        first = audit_cache_key("a" * 64, "bc" + "0" * 62)
+        second = audit_cache_key("ab" + "0" * 62, "c" + "0" * 63)
+        self.assertNotEqual(first, second)
+
+    def test_compact_result_codec_is_canonical_bounded_and_rejects_duplicates(self):
+        payload = capability_cache.encode_configuration_audit_result(self.result)
+        self.assertEqual(
+            capability_cache.decode_configuration_audit_result(payload),
+            self.result,
+        )
+        duplicate = b'{"schema":"duplicate",' + payload[1:]
+        with self.assertRaisesRegex(AuditInfrastructureError, "payload"):
+            capability_cache.decode_configuration_audit_result(duplicate)
+        with mock.patch("gpu_capability_cache.json.loads") as loads, self.assertRaises(
+            AuditInfrastructureError
+        ):
+            capability_cache.decode_configuration_audit_result(
+                b"{" + b"x" * ((4 << 20) + 1)
+            )
+        loads.assert_not_called()
+
+    def test_combined_key_is_used_for_path_lane_and_manifest(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        expected = audit_cache_key(self.configuration.digest, self.engine)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        self.assertEqual(cache.observed_entry_key, expected)
+        self.assertEqual(
+            cache.observed_lane,
+            hashlib.sha256(f"preprocess:{expected}".encode()).digest()[0] % 8,
+        )
+        self.assertEqual(cache.observed_manifest_key, expected)
+
+    def test_same_configuration_different_engines_coexist(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        for engine in ("d" * 64, "e" * 64):
+            result = dataclasses.replace(
+                self.result, audit_engine_fingerprint=engine
+            )
+            permit = dataclasses.replace(
+                self.publication_permit, audit_engine_fingerprint=engine
+            )
+            cache.publish(
+                self.configuration,
+                self.dependency_roots,
+                result,
+                permit,
+                self.pipeline_deadline,
+            )
+            self.assertEqual(
+                cache.load(
+                    self.configuration,
+                    self.dependency_roots,
+                    engine,
+                    self.production_snapshot,
+                    self.pipeline_deadline,
+                ),
+                result,
+            )
+
+    def test_cached_production_identity_must_match_initial_snapshot(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        dependency = self.result.dependencies[0]
+        mismatched = dataclasses.replace(
+            dependency,
+            identity=dataclasses.replace(dependency.identity, inode=999999),
+        )
+        self.assertIsNone(
+            cache.load(
+                self.configuration,
+                self.dependency_roots,
+                self.engine,
+                {dependency.role_relative_path: mismatched},
+                self.pipeline_deadline,
+            )
+        )
+
+    def test_authentic_corruption_is_miss_but_linked_entry_is_fatal(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        key = audit_cache_key(self.configuration.digest, self.engine)
+        entry = cache._entry_path(key)
+        (entry / "payload.json").write_bytes(b"{truncated")
+        self.assertIsNone(
+            cache.load(
+                self.configuration,
+                self.dependency_roots,
+                self.engine,
+                self.production_snapshot,
+                self.pipeline_deadline,
+            )
+        )
+        self.assertTrue(capability_cache._remove_held_flat_directory(entry))
+        target = self.root / "linked-result"
+        target.mkdir()
+        try:
+            entry.symlink_to(target, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"directory symlinks unavailable: {error}")
+        with self.assertRaisesRegex(AuditInfrastructureError, "namespace|linked"):
+            cache.load(
+                self.configuration,
+                self.dependency_roots,
+                self.engine,
+                self.production_snapshot,
+                self.pipeline_deadline,
+            )
+
+    def test_prepare_rejects_legacy_full_view_partition(self):
+        self.cache_root.mkdir()
+        (self.cache_root / ("a" * 64)).mkdir()
+        cache = ConfigurationAuditCache(self.cache_root)
+        with self.assertRaisesRegex(AuditInfrastructureError, "full-view partition"):
+            cache.prepare(self.pipeline_deadline)
+
+    def test_cleanup_uses_access_time_and_enforces_entry_capacity(self):
+        cache = ConfigurationAuditCache(self.cache_root, maximum_entries=2)
+        configurations = tuple(
+            dataclasses.replace(self.configuration, digest=f"{index + 1:064x}")
+            for index in range(3)
+        )
+        now = time.time()
+        for index, configuration in enumerate(configurations):
+            result = dataclasses.replace(
+                self.result, configuration_digest=configuration.digest
+            )
+            cache.publish(
+                configuration,
+                self.dependency_roots,
+                result,
+                dataclasses.replace(
+                    self.publication_permit,
+                    configuration_digest=configuration.digest,
+                ),
+                self.pipeline_deadline,
+            )
+            key = audit_cache_key(configuration.digest, self.engine)
+            os.utime(cache._access_path(key), (now + index, now + index))
+        cache.cleanup(now + 3, self.pipeline_deadline)
+        present = tuple(
+            cache._entry_path(audit_cache_key(item.digest, self.engine)).exists()
+            for item in configurations
+        )
+        self.assertEqual(present, (False, True, True))
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-sharing contract")
+    def test_windows_held_dependency_denies_write_and_delete(self):
+        dependency = self.result.dependencies[0]
+        with capability_cache._open_dependency_handle(dependency):
+            with self.assertRaises(OSError):
+                self.main_path.write_bytes(b"replacement")
+            with self.assertRaises(OSError):
+                self.main_path.unlink()
+        self.assertTrue(self.main_path.exists())
+
+    def test_dependency_hashing_stops_at_caller_deadline(self):
+        with capability_cache._open_dependency_handle(
+            self.result.dependencies[0]
+        ) as held:
+            held.deadline = time.monotonic() - 1.0
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "hashing deadline"
+            ):
+                capability_cache._hash_held_dependency(held)
+
+    def test_noncanonical_authentic_manifest_is_a_cache_miss(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        entry = cache._entry_path(
+            audit_cache_key(self.configuration.digest, self.engine)
+        )
+        manifest = json.loads((entry / "manifest.json").read_text("ascii"))
+        (entry / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="ascii"
+        )
+        self.assertIsNone(
+            cache.load(
+                self.configuration,
+                self.dependency_roots,
+                self.engine,
+                self.production_snapshot,
+                self.pipeline_deadline,
+            )
+        )
+
+    def test_load_many_rejects_mismatched_budget_before_cache_access(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        caller_budget = CompactResultMemoryBudget()
+        aggregator_budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (self.configuration,),
+            aggregator_budget,
+            capability_cache.AuditLimits(),
+        )
+        with mock.patch.object(cache, "_prepare_for_operation") as prepare, \
+             self.assertRaisesRegex(AuditInfrastructureError, "ownership"):
+            cache.load_many(
+                (self.configuration,), self.dependency_roots, self.engine,
+                self.production_snapshot, caller_budget, aggregator,
+                CompactResultColdSlot(1 << 20), self.pipeline_deadline,
+            )
+        prepare.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX held-handle mutation semantics")
+    def test_final_held_rehash_detects_changed_bytes_without_reopen(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        original_hash = capability_cache._hash_held_dependency
+        calls = 0
+
+        def mutate_after_initial(handle):
+            nonlocal calls
+            digest = original_hash(handle)
+            calls += 1
+            if calls == 1:
+                self.main_path.write_bytes(b"changed dependency bytes")
+            return digest
+
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (self.configuration,), budget, capability_cache.AuditLimits()
+        )
+        with mock.patch(
+            "gpu_capability_cache._hash_held_dependency",
+            side_effect=mutate_after_initial,
+        ), mock.patch(
+            "gpu_capability_cache._open_dependency_handle",
+            wraps=capability_cache._open_dependency_handle,
+        ) as opened:
+            batch = cache.load_many(
+                (self.configuration,), self.dependency_roots, self.engine,
+                self.production_snapshot, budget, aggregator,
+                CompactResultColdSlot(1 << 20), self.pipeline_deadline,
+            )
+        self.assertEqual((batch.hit_count, batch.misses), (0, (self.configuration,)))
+        self.assertEqual(opened.call_count, 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX held-handle restoration semantics")
+    def test_exact_restoration_before_final_held_rehash_is_equivalent(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        original = self.main_path.read_bytes()
+        original_hash = capability_cache._hash_held_dependency
+        calls = 0
+
+        def mutate_and_restore(handle):
+            nonlocal calls
+            digest = original_hash(handle)
+            calls += 1
+            if calls == 1:
+                self.main_path.write_bytes(b"x" * len(original))
+                self.main_path.write_bytes(original)
+            return digest
+
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (self.configuration,), budget, capability_cache.AuditLimits()
+        )
+        with mock.patch(
+            "gpu_capability_cache._hash_held_dependency",
+            side_effect=mutate_and_restore,
+        ):
+            batch = cache.load_many(
+                (self.configuration,), self.dependency_roots, self.engine,
+                self.production_snapshot, budget, aggregator,
+                CompactResultColdSlot(1 << 20), self.pipeline_deadline,
+            )
+        self.assertEqual((batch.hit_count, len(batch.misses)), (1, 0))
+
+    def test_memory_budget_ownership_commits_and_releases_exactly(self):
+        budget = CompactResultMemoryBudget(128 << 20)
+        ownership = budget.reserve(4096)
+        self.assertEqual(budget.reserved_bytes, 4096)
+        ownership.commit()
+        self.assertEqual((budget.reserved_bytes, budget.committed_bytes), (0, 4096))
+        ownership.release()
+        self.assertEqual(budget.live_bytes, 0)
+
+    def test_all_251_results_survive_unchanged_warm_load(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        configurations = tuple(
+            dataclasses.replace(self.configuration, digest=f"{index:064x}")
+            for index in range(251)
+        )
+        for configuration in configurations:
+            result = dataclasses.replace(
+                self.result, configuration_digest=configuration.digest
+            )
+            permit = dataclasses.replace(
+                self.publication_permit,
+                configuration_digest=configuration.digest,
+            )
+            cache.publish(
+                configuration,
+                self.dependency_roots,
+                result,
+                permit,
+                self.pipeline_deadline,
+            )
+        budget = CompactResultMemoryBudget(128 << 20)
+        aggregator = StreamingResultAggregator(
+            configurations, budget, capability_cache.AuditLimits()
+        )
+        with mock.patch(
+            "gpu_capability_cache._open_dependency_handle",
+            wraps=capability_cache._open_dependency_handle,
+        ) as opened, mock.patch(
+            "gpu_capability_cache._hash_held_dependency",
+            wraps=capability_cache._hash_held_dependency,
+        ) as reads:
+            batch = cache.load_many(
+                configurations,
+                self.dependency_roots,
+                self.engine,
+                self.production_snapshot,
+                budget,
+                aggregator,
+                CompactResultColdSlot(1024 * 1024),
+                self.pipeline_deadline,
+            )
+        self.assertEqual((batch.hit_count, len(batch.misses)), (251, 0))
+        self.assertEqual((opened.call_count, reads.call_count), (1, 2))
+        summary = aggregator.finish()
+        self.assertEqual(summary.configurations, tuple(item.digest for item in configurations))
+        self.assertEqual(encode_canonical_summary(summary), encode_canonical_summary(summary))
+
+    def test_250_hits_reserve_one_cold_slot_and_finish_with_one_rebuild(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        configurations = tuple(
+            dataclasses.replace(self.configuration, digest=f"{index:064x}")
+            for index in range(251)
+        )
+        for configuration in configurations[:250]:
+            result = dataclasses.replace(
+                self.result, configuration_digest=configuration.digest
+            )
+            cache.publish(
+                configuration,
+                self.dependency_roots,
+                result,
+                dataclasses.replace(
+                    self.publication_permit,
+                    configuration_digest=configuration.digest,
+                ),
+                self.pipeline_deadline,
+            )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            configurations, budget, capability_cache.AuditLimits()
+        )
+        cold_slot = CompactResultColdSlot(16 << 20)
+        batch = cache.load_many(
+            configurations,
+            self.dependency_roots,
+            self.engine,
+            self.production_snapshot,
+            budget,
+            aggregator,
+            cold_slot,
+            self.pipeline_deadline,
+        )
+        self.assertEqual((batch.hit_count, len(batch.misses)), (250, 1))
+        self.assertEqual(batch.cold_slot_reserved_bytes, 16 << 20)
+        rebuilt = dataclasses.replace(
+            self.result, configuration_digest=configurations[250].digest
+        )
+        aggregator.accept_validated_result(
+            configurations[250],
+            rebuilt,
+            aggregator.ownership_for_cold_result(rebuilt),
+        )
+        summary = aggregator.finish()
+        self.assertEqual(
+            summary.configurations,
+            tuple(configuration.digest for configuration in configurations),
+        )
+        self.assertLessEqual(budget.peak_live_bytes, 128 << 20)
 
 
 if __name__ == "__main__":

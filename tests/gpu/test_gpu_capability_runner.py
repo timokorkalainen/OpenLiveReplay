@@ -29,16 +29,19 @@ from gpu_capability_command import (  # noqa: E402
     _environment_digest,
     open_compiler_executable_capability,
 )
-from gpu_capability_cache import PreprocessCache  # noqa: E402
+from gpu_capability_cache import ConfigurationAuditLoadBatch, PreprocessCache  # noqa: E402
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
+    CompactResultColdSlot,
+    CompactResultMemoryBudget,
     CompactTokenSequence,
     CompilerFamily,
     DependencyDigest,
     FileIdentity,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
+    StreamingResultAggregator,
     build_dependency_root_authority,
     _FilesystemGenerationObserver,
 )
@@ -1301,6 +1304,40 @@ class OrchestrationTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
         return path.resolve()
+
+    def test_compact_result_batch_contract_keeps_cold_slot_inside_128_mib(self):
+        budget = CompactResultMemoryBudget()
+        slot = CompactResultColdSlot(AuditLimits().compact_result_bytes)
+        configuration = PreprocessConfiguration(
+            entry_id="compact-result-contract",
+            family=CompilerFamily.GCC,
+            compiler=self.compiler_capability.executable_identity.canonical,
+            working_directory=self.root,
+            source=FileIdentity(
+                self.root / "playback" / "contract.cpp",
+                PurePosixPath("playback/contract.cpp"),
+                1,
+                2,
+                1,
+                True,
+            ),
+            arguments=("contract.cpp",),
+            environment_digest="contract",
+            digest="1" * 64,
+            dependency_root_authority_digest=(
+                self.dependency_roots.portable_authority_digest
+            ),
+            compiler_capability_digest=self.compiler_capability.capability_digest,
+            compiler_capability=self.compiler_capability,
+        )
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        self.assertEqual(aggregator.reserve_cold_slot(slot), 16 << 20)
+        batch = ConfigurationAuditLoadBatch(0, (configuration,), 16 << 20)
+        self.assertEqual(batch.cold_slot_reserved_bytes, 16 << 20)
+        self.assertLessEqual(budget.peak_live_bytes, 128 << 20)
+        aggregator.finish().release()
 
     def test_dependency_guard_prevents_or_observes_write_then_restore(self):
         path = self.write_source("playback/guarded.h", "original\n")

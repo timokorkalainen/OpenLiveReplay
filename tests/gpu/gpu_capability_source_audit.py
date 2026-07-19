@@ -7014,7 +7014,7 @@ def run_live_only(
 
 
 AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v2"
-AUDIT_ENGINE_STAGE_BYTES = b"task-2-capability-stabilization"
+AUDIT_ENGINE_STAGE_BYTES = b"task-3-compact-result-streaming"
 _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "gpu_capability_command.py": 1,
     "test_gpu_capability_audit_lanes.py": 1,
@@ -7022,7 +7022,7 @@ _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "test_gpu_capability_command.py": 1,
     "test_gpu_capability_model.py": 1,
     "test_gpu_capability_provenance.py": 1,
-    "test_gpu_capability_runner.py": 2,
+    "test_gpu_capability_runner.py": 3,
 })
 _AUDIT_ENGINE_TARGET_MODULES = (
     _gpu_capability_model,

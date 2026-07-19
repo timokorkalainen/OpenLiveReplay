@@ -55,7 +55,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
                 "test_gpu_capability_command.py": 1,
                 "test_gpu_capability_model.py": 1,
                 "test_gpu_capability_provenance.py": 1,
-                "test_gpu_capability_runner.py": 2,
+                "test_gpu_capability_runner.py": 3,
             },
         )
         source_directory = Path(__file__).resolve().parent
@@ -353,12 +353,20 @@ class AuditEngineFingerprintTests(unittest.TestCase):
         self.assertEqual(names, tuple(sorted(names)))
         self.assertEqual(len(names), len(set(names)))
         for expected in (
+            "gpu_capability_cache.ConfigurationAuditCache",
+            "gpu_capability_cache.audit_cache_key",
+            "gpu_capability_model.CompactResultMemoryBudget",
             "gpu_capability_model.ConfigurationAuditResult",
             "gpu_capability_model.DependencyDigest",
+            "gpu_capability_model.StreamingResultAggregator",
             "gpu_capability_source_audit.cpp_tokens",
             "gpu_capability_source_audit._header_operand_after_leading_comments",
         ):
             self.assertIn(expected, names)
+        self.assertEqual(
+            capability_audit.AUDIT_ENGINE_STAGE_BYTES,
+            b"task-3-compact-result-streaming",
+        )
 
         marshaled = tuple(
             (name, capability_audit._marshal_live_semantic_object(loaded_object))
@@ -581,13 +589,13 @@ print(recomputed)
             self.assertEqual(fingerprint(first), fingerprint(second))
             mutated = (second / "gpu_capability_source_audit.py").read_text(encoding="utf-8")
             self.assertIn(
-                'AUDIT_ENGINE_STAGE_BYTES = b"task-2-capability-stabilization"',
+                'AUDIT_ENGINE_STAGE_BYTES = b"task-3-compact-result-streaming"',
                 mutated,
             )
             (second / "gpu_capability_source_audit.py").write_text(
                 mutated.replace(
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-2-capability-stabilization"',
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-2-capability-stabilization-mutated"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-3-compact-result-streaming"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-3-compact-result-streaming-mutated"',
                     1,
                 ),
                 encoding="utf-8",

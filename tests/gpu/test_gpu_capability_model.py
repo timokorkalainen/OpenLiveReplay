@@ -23,12 +23,14 @@ from gpu_capability_model import (  # noqa: E402
     AuditResultFinding,
     AuditInfrastructureError,
     AuditLimits,
+    CompactResultMemoryBudget,
     CompactTokenSequence,
     CompilerExecutableCapability,
     CompilerInspection,
     CompilerFamily,
     CoverageReport,
     ConfigurationAuditResult,
+    ConfigurationAuditPublicationPermit,
     DependencyDigest,
     DependencyRootAuthority,
     DependencyRootBinding,
@@ -38,6 +40,9 @@ from gpu_capability_model import (  # noqa: E402
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
     SourceLocation,
+    StreamingResultAggregator,
+    compact_result_retained_bytes,
+    encode_canonical_summary,
     _check_casefold_collision,
     _FilesystemGenerationObserver,
     _validate_native_canonical_text,
@@ -405,6 +410,164 @@ class ModelTests(unittest.TestCase):
                     bad_finding = AuditResultFinding(**invalid["findings"][0])
                     invalid = {**invalid, "findings": (bad_finding,)}
                 ConfigurationAuditResult(**invalid)
+
+    def test_streaming_aggregate_is_ordered_and_releases_result_ownership(self):
+        configurations = (
+            self.configuration(digest="1" * 64),
+            self.configuration(digest="2" * 64),
+        )
+        finding = AuditResultFinding(
+            PurePosixPath("playback/gpu/example.cpp"),
+            7,
+            "nativeHandle()",
+            "outside lease",
+        )
+        results = tuple(
+            ConfigurationAuditResult(
+                configuration.digest,
+                "a" * 64,
+                (self.dependency(),),
+                (PurePosixPath("playback/gpu/example.cpp"),),
+                (finding,),
+            )
+            for configuration in configurations
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(configurations, budget, AuditLimits())
+        for index in (1, 0):
+            ownership = budget.reserve(
+                compact_result_retained_bytes(results[index])
+            ).commit()
+            aggregator.accept_validated_result(
+                configurations[index], results[index], ownership
+            )
+            self.assertTrue(ownership.released)
+        summary = aggregator.finish()
+        self.assertEqual(summary.configurations, ("1" * 64, "2" * 64))
+        self.assertEqual(
+            summary.findings[0].configurations, ("1" * 64, "2" * 64)
+        )
+        self.assertEqual(
+            encode_canonical_summary(summary), encode_canonical_summary(summary)
+        )
+
+    def test_aggregate_growth_failure_occurs_before_insert(self):
+        configuration = self.configuration(digest="1" * 64)
+        result = ConfigurationAuditResult(
+            configuration.digest,
+            "a" * 64,
+            (self.dependency(),),
+            (),
+            (),
+        )
+        retained = compact_result_retained_bytes(result)
+        budget = CompactResultMemoryBudget(retained)
+        ownership = budget.reserve(retained).commit()
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "before insert"):
+            aggregator.accept_validated_result(configuration, result, ownership)
+        self.assertEqual(aggregator.accepted_count, 0)
+        ownership.release()
+
+    def test_251_disjoint_growth_fails_before_final_insert(self):
+        configurations = tuple(
+            self.configuration(digest=f"{index:064x}")
+            for index in range(251)
+        )
+        results = []
+        for index, configuration in enumerate(configurations):
+            relative = PurePosixPath(f"playback/disjoint/{index:04d}.h")
+            identity = FileIdentity(
+                Path("D:/repo") / Path(relative.as_posix()),
+                relative,
+                3,
+                index + 100,
+                1,
+                True,
+            )
+            dependency = DependencyDigest(
+                "production", relative, identity, f"{index + 1:064x}"
+            )
+            finding = AuditResultFinding(
+                relative,
+                1,
+                f"surface{index}.nativeHandle()",
+                f"disjoint lease {index}",
+            )
+            results.append(
+                ConfigurationAuditResult(
+                    configuration.digest,
+                    "a" * 64,
+                    (dependency,),
+                    (relative,),
+                    (finding,),
+                )
+            )
+        results = tuple(results)
+
+        calibration_budget = CompactResultMemoryBudget()
+        calibration = StreamingResultAggregator(
+            configurations, calibration_budget, AuditLimits()
+        )
+        for configuration, result in zip(
+            configurations[:250], results[:250], strict=True
+        ):
+            calibration.accept_validated_result(
+                configuration,
+                result,
+                calibration_budget.reserve(
+                    compact_result_retained_bytes(result)
+                ).commit(),
+            )
+        exact_limit = (
+            calibration_budget.committed_bytes
+            + compact_result_retained_bytes(results[250])
+        )
+        budget = CompactResultMemoryBudget(exact_limit)
+        aggregator = StreamingResultAggregator(configurations, budget, AuditLimits())
+        for configuration, result in zip(
+            configurations[:250], results[:250], strict=True
+        ):
+            aggregator.accept_validated_result(
+                configuration,
+                result,
+                budget.reserve(compact_result_retained_bytes(result)).commit(),
+            )
+        before = (
+            aggregator.accepted_count,
+            len(aggregator._reached),
+            len(aggregator._findings),
+            len(aggregator._digests),
+        )
+        ownership = budget.reserve(
+            compact_result_retained_bytes(results[250])
+        ).commit()
+        with self.assertRaisesRegex(AuditInfrastructureError, "before insert"):
+            aggregator.accept_validated_result(
+                configurations[250], results[250], ownership
+            )
+        self.assertEqual(
+            (
+                aggregator.accepted_count,
+                len(aggregator._reached),
+                len(aggregator._findings),
+                len(aggregator._digests),
+            ),
+            before,
+        )
+        ownership.release()
+        self.assertLessEqual(budget.peak_live_bytes, 128 << 20)
+
+    def test_publication_permit_binds_complete_result_generation(self):
+        dependency = self.dependency()
+        permit = ConfigurationAuditPublicationPermit(
+            "c" * 64, "a" * 64, (dependency,)
+        )
+        self.assertEqual(permit.dependencies, (dependency,))
+        with self.assertRaises(AuditInfrastructureError):
+            dataclasses.replace(permit, dependencies=(dependency, dependency))
 
     def test_dependency_digest_portable_key_and_exact_local_codec_are_separate(self):
         digest = self.dependency()

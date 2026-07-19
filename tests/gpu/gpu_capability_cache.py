@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import contextlib
 import json
 import os
 import stat
@@ -18,15 +19,26 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from gpu_capability_model import (
+    AUDIT_RESULT_SCHEMA_BYTES,
+    AuditResultFinding,
     AuditInfrastructureError,
     AuditLimits,
+    CompactResultColdSlot,
+    CompactResultMemoryBudget,
+    ConfigurationAuditPublicationPermit,
+    ConfigurationAuditResult,
     CompactTokenSequence,
     CompilerFamily,
     CompilerInspection,
     DependencyRootAuthority,
+    DependencyDigest,
     FileIdentity,
     PreprocessedTranslationUnitView,
     PreprocessConfiguration,
+    StreamingResultAggregator,
+    compact_result_retained_bytes,
+    decode_local_dependency_digest,
+    encode_local_dependency_digest,
     _current_process_rss_bytes,
     _preprocessed_view_semantic_digest,
     decode_compiler_inspection,
@@ -44,6 +56,15 @@ _IO_BLOCK_BYTES = 64 * 1024
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _MAX_RECORD_BYTES = 16 * 1024 * 1024
 _DEFAULT_CACHE_OPERATION_SECONDS = 240.0
+AUDIT_CACHE_SCHEMA_BYTES = b"olr-gpu-capability-audit-cache-v1"
+_AUDIT_CACHE_MAXIMUM_BYTES = 472 * 1024 * 1024
+_AUDIT_CACHE_MAXIMUM_ENTRIES = 1024
+_INSPECTION_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+_CACHE_ROOT_OVERHEAD_RESERVE = 8 * 1024 * 1024
+_AUDIT_RESULT_MAXIMUM_ENCODED_BYTES = 4 * 1024 * 1024
+_AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES = 16 * 1024
+_AUDIT_RESULTS_DIRECTORY = "results"
+_AUDIT_ROOT_MARKER = ".audit-result-cache-v1"
 _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _LOCK_NAMESPACE_MAGIC = b"OLRLN001"
 _LOCK_NAMESPACE_LANE_COUNT = 8
@@ -65,6 +86,20 @@ _LOCK_NAMESPACE_BYTES = (
 # authority replacement rather than claiming protection across that event.
 _hash_cache: dict[tuple[object, ...], str] = {}
 _hash_lock = threading.Lock()
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise AuditInfrastructureError(message)
+
+
+_require(
+    _AUDIT_CACHE_MAXIMUM_BYTES
+    + _INSPECTION_MAX_TOTAL_BYTES
+    + _CACHE_ROOT_OVERHEAD_RESERVE
+    == 512 * 1024 * 1024,
+    "cache partition total is not 512 MiB",
+)
 
 
 class _UnsafeCacheNamespaceError(OSError):
@@ -1481,7 +1516,9 @@ def _write_json_fsynced(path: Path, document: object) -> None:
         os.fsync(stream.fileno())
 
 
-_CACHE_ENTRY_FILES = frozenset({"active.lock", "manifest.json", "payload.bin"})
+_CACHE_ENTRY_FILES = frozenset(
+    {"active.lock", "manifest.json", "payload.bin", "payload.json"}
+)
 
 
 class _HeldDirectory:
@@ -2120,6 +2157,1208 @@ class CompilerInspectionCache:
                     raise
                 raise AuditInfrastructureError("cannot publish compiler inspection") from error
         return inspection
+
+
+def audit_cache_key(configuration_digest: str, engine: str) -> str:
+    for label, value in (
+        ("configuration", configuration_digest),
+        ("audit engine", engine),
+    ):
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise AuditInfrastructureError(f"{label} digest is invalid")
+    digest = hashlib.sha256()
+    for value in (
+        AUDIT_CACHE_SCHEMA_BYTES,
+        configuration_digest.encode("ascii"),
+        engine.encode("ascii"),
+    ):
+        digest.update(struct.pack("<Q", len(value)))
+        digest.update(value)
+    return digest.hexdigest()
+
+
+def _strict_json_document(payload: bytes) -> dict[str, object]:
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    document = json.loads(
+        payload.decode("ascii"),
+        object_pairs_hook=unique_object,
+        parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+    )
+    if not isinstance(document, dict):
+        raise ValueError("audit result document is not an object")
+    return document
+
+
+def _encode_audit_result_payload(result: ConfigurationAuditResult) -> bytes:
+    if not isinstance(result, ConfigurationAuditResult):
+        raise AuditInfrastructureError("compact audit result is invalid")
+    compact_result_retained_bytes(result)
+    dependencies = [
+        json.loads(encode_local_dependency_digest(item).decode("ascii"))
+        for item in result.dependencies
+    ]
+    document = {
+        "schema": AUDIT_RESULT_SCHEMA_BYTES.decode("ascii"),
+        "configuration_digest": result.configuration_digest,
+        "audit_engine_fingerprint": result.audit_engine_fingerprint,
+        "dependencies": dependencies,
+        "reached_production": [
+            path.as_posix() for path in result.reached_production
+        ],
+        "findings": [
+            {
+                "path": finding.path.as_posix(),
+                "line": finding.line,
+                "expression": finding.expression,
+                "reason": finding.reason,
+            }
+            for finding in result.findings
+        ],
+    }
+    payload = json.dumps(
+        document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    if len(payload) > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES:
+        raise AuditInfrastructureError("encoded compact audit result limit exceeded")
+    return payload
+
+
+def _decode_audit_result_payload(
+    payload: bytes,
+    *,
+    configuration_digest: str,
+    engine: str,
+) -> ConfigurationAuditResult:
+    if (
+        not isinstance(payload, bytes)
+        or len(payload) > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+    ):
+        raise ValueError("encoded compact audit result limit exceeded")
+    document = _strict_json_document(payload)
+    if tuple(sorted(document)) != (
+        "audit_engine_fingerprint",
+        "configuration_digest",
+        "dependencies",
+        "findings",
+        "reached_production",
+        "schema",
+    ):
+        raise ValueError("compact audit result schema is invalid")
+    if (
+        document["schema"] != AUDIT_RESULT_SCHEMA_BYTES.decode("ascii")
+        or document["configuration_digest"] != configuration_digest
+        or document["audit_engine_fingerprint"] != engine
+    ):
+        raise ValueError("compact audit result identity differs")
+    dependencies_document = document["dependencies"]
+    reached_document = document["reached_production"]
+    findings_document = document["findings"]
+    limits = AuditLimits()
+    if (
+        not isinstance(dependencies_document, list)
+        or len(dependencies_document) > limits.compact_result_dependencies
+        or not isinstance(reached_document, list)
+        or len(reached_document) > limits.compact_result_reached
+        or not isinstance(findings_document, list)
+        or len(findings_document) > limits.compact_result_findings
+    ):
+        raise AuditInfrastructureError("audit result limit exceeded")
+    dependency_fields = (
+        "stable_role", "role_relative_path", "canonical", "relative",
+        "device", "inode", "line_count", "production", "sha256",
+    )
+    decoded_dependencies: list[DependencyDigest] = []
+    for item in dependencies_document:
+        if not isinstance(item, dict) or set(item) != set(dependency_fields):
+            raise ValueError("compact audit dependency schema is invalid")
+        ordered = {field: item[field] for field in dependency_fields}
+        decoded_dependencies.append(
+            decode_local_dependency_digest(
+                json.dumps(
+                    ordered, ensure_ascii=True, separators=(",", ":")
+                ).encode("ascii")
+            )
+        )
+    dependencies = tuple(decoded_dependencies)
+    reached: list[PurePosixPath] = []
+    for value in reached_document:
+        if not isinstance(value, str):
+            raise ValueError("compact audit reached path is invalid")
+        reached.append(PurePosixPath(value))
+    findings: list[AuditResultFinding] = []
+    for value in findings_document:
+        if not isinstance(value, dict) or tuple(sorted(value)) != (
+            "expression", "line", "path", "reason"
+        ):
+            raise ValueError("compact audit finding schema is invalid")
+        path = value["path"]
+        if not isinstance(path, str):
+            raise ValueError("compact audit finding path is invalid")
+        findings.append(
+            AuditResultFinding(
+                PurePosixPath(path),
+                value["line"],
+                value["expression"],
+                value["reason"],
+            )
+        )
+    result = ConfigurationAuditResult(
+        configuration_digest,
+        engine,
+        dependencies,
+        tuple(reached),
+        tuple(findings),
+    )
+    if _encode_audit_result_payload(result) != payload:
+        raise ValueError("canonical compact audit result payload differs")
+    return result
+
+
+def encode_configuration_audit_result(result: ConfigurationAuditResult) -> bytes:
+    return _encode_audit_result_payload(result)
+
+
+def decode_configuration_audit_result(payload: bytes) -> ConfigurationAuditResult:
+    if (
+        not isinstance(payload, bytes)
+        or len(payload) > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+    ):
+        raise AuditInfrastructureError("encoded compact audit result limit exceeded")
+    try:
+        document = _strict_json_document(payload)
+        configuration_digest = document.get("configuration_digest")
+        engine = document.get("audit_engine_fingerprint")
+        if not isinstance(configuration_digest, str) or not isinstance(engine, str):
+            raise ValueError("compact audit result identity is invalid")
+        return _decode_audit_result_payload(
+            payload,
+            configuration_digest=configuration_digest,
+            engine=engine,
+        )
+    except AuditInfrastructureError:
+        raise
+    except (
+        UnicodeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        RecursionError,
+        json.JSONDecodeError,
+    ) as error:
+        raise AuditInfrastructureError("compact audit result payload is invalid") from error
+
+
+encode_compact_audit_result = encode_configuration_audit_result
+decode_compact_audit_result = decode_configuration_audit_result
+
+
+def _held_dependency_stat(metadata: os.stat_result) -> tuple[int, int | None, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(getattr(metadata, "st_ctime_ns", 0)),
+        int(getattr(metadata, "st_nlink", 1)),
+    )
+
+
+class _HeldDependencyHandle:
+    def __init__(self, dependency: DependencyDigest) -> None:
+        self.dependency = dependency
+        self.stream = None
+        self.opened_stat: tuple[int, int | None, int, int, int, int] | None = None
+        self.hash_count = 0
+        self.deadline: float | None = None
+
+    def __enter__(self) -> "_HeldDependencyHandle":
+        path = self.dependency.identity.canonical
+        before = path.lstat()
+        if (
+            _is_link(before)
+            or not stat.S_ISREG(before.st_mode)
+            or int(getattr(before, "st_nlink", 1)) != 1
+        ):
+            raise _UnsafeCacheNamespaceError("dependency path is linked or unsafe")
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.argtypes = (
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                wintypes.HANDLE,
+            )
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            handle = kernel32.CreateFileW(
+                str(path), 0x80000000, 0x00000001, None, 3,
+                0x00000080 | 0x00200000, None,
+            )
+            invalid = ctypes.c_void_p(-1).value
+            if handle in (None, invalid):
+                raise OSError(ctypes.get_last_error(), "cannot hold dependency")
+            try:
+                descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
+                self.stream = os.fdopen(descriptor, "rb", closefd=True)
+            except BaseException:
+                kernel32.CloseHandle(handle)
+                raise
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            self.stream = os.fdopen(os.open(path, flags), "rb", closefd=True)
+        opened = os.fstat(self.stream.fileno())
+        expected = self.dependency.identity
+        opened_generation = _held_dependency_stat(opened)
+        path_generation = _held_dependency_stat(before)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(getattr(opened, "st_nlink", 1)) != 1
+            or opened_generation[:4] != path_generation[:4]
+            or opened_generation[5] != path_generation[5]
+            or (expected.device is not None and int(opened.st_dev) != expected.device)
+            or (
+                expected.inode is not None
+                and int(opened.st_ino) != expected.inode
+            )
+        ):
+            self.stream.close()
+            self.stream = None
+            raise OSError("dependency identity changed while opening")
+        self.opened_stat = opened_generation
+        return self
+
+    def verify_path(self) -> None:
+        assert self.stream is not None and self.opened_stat is not None
+        current = self.dependency.identity.canonical.lstat()
+        opened = os.fstat(self.stream.fileno())
+        if (
+            _is_link(current)
+            or not stat.S_ISREG(current.st_mode)
+            or _held_dependency_stat(opened)[:2] != self.opened_stat[:2]
+            or _held_dependency_stat(opened)[5] != 1
+            or _held_dependency_stat(current)[:2] != self.opened_stat[:2]
+        ):
+            raise OSError("dependency path no longer names held identity")
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+
+
+def _open_dependency_handle(dependency: DependencyDigest) -> _HeldDependencyHandle:
+    return _HeldDependencyHandle(dependency)
+
+
+def _hash_held_dependency(held: _HeldDependencyHandle) -> str:
+    if not isinstance(held, _HeldDependencyHandle) or held.stream is None:
+        raise AuditInfrastructureError("held dependency handle is invalid")
+    before = _held_dependency_stat(os.fstat(held.stream.fileno()))
+    held.stream.seek(0)
+    digest = hashlib.sha256()
+    while block := held.stream.read(_IO_BLOCK_BYTES):
+        if held.deadline is not None and time.monotonic() >= held.deadline:
+            raise AuditInfrastructureError("dependency hashing deadline exceeded")
+        digest.update(block)
+    after = _held_dependency_stat(os.fstat(held.stream.fileno()))
+    if (
+        before != after
+        or before[:2] != held.opened_stat[:2]
+        or before[5] != 1
+        or (held.hash_count == 0 and before != held.opened_stat)
+    ):
+        raise AuditInfrastructureError("dependency is unstable while hashing")
+    held.verify_path()
+    if held.deadline is not None and time.monotonic() >= held.deadline:
+        raise AuditInfrastructureError("dependency hashing deadline exceeded")
+    held.hash_count += 1
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationAuditLoadBatch:
+    hit_count: int
+    misses: tuple[PreprocessConfiguration, ...]
+    cold_slot_reserved_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _AuditCacheCandidate:
+    configuration: PreprocessConfiguration
+    key: str
+    entry_identity: tuple[int, int | None]
+    payload_identity: tuple[int, int | None, int, int]
+    dependencies: tuple[DependencyDigest, ...]
+
+
+class ConfigurationAuditCache:
+    """Atomic compact-result cache with held-handle dependency validation."""
+
+    def __init__(
+        self,
+        root: Path,
+        maximum_bytes: int = _AUDIT_CACHE_MAXIMUM_BYTES,
+        maximum_entries: int = _AUDIT_CACHE_MAXIMUM_ENTRIES,
+    ) -> None:
+        if not isinstance(root, Path) or not root.is_absolute():
+            raise AuditInfrastructureError("audit cache root must be absolute")
+        if (
+            not isinstance(maximum_bytes, int)
+            or isinstance(maximum_bytes, bool)
+            or maximum_bytes < 0
+            or maximum_bytes > _AUDIT_CACHE_MAXIMUM_BYTES
+            or not isinstance(maximum_entries, int)
+            or isinstance(maximum_entries, bool)
+            or maximum_entries < 0
+            or maximum_entries > _AUDIT_CACHE_MAXIMUM_ENTRIES
+        ):
+            raise AuditInfrastructureError("audit cache bounds are invalid")
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            metadata = _ordinary_directory(root)
+        except OSError as error:
+            raise AuditInfrastructureError("audit cache root is unavailable") from error
+        self.root = root
+        self.maximum_bytes = maximum_bytes
+        self.maximum_entries = maximum_entries
+        self._root_identity = _directory_identity(metadata)
+        self._publication_lock = threading.Lock()
+        self.observed_entry_key: str | None = None
+        self.observed_lane: int | None = None
+        self.observed_manifest_key: str | None = None
+
+    @staticmethod
+    def _operation_deadline(pipeline_deadline: float) -> float:
+        if (
+            not isinstance(pipeline_deadline, (int, float))
+            or isinstance(pipeline_deadline, bool)
+        ):
+            raise AuditInfrastructureError("audit cache deadline is invalid")
+        started = time.monotonic()
+        deadline = min(float(pipeline_deadline), started + _DEFAULT_CACHE_OPERATION_SECONDS)
+        if started >= deadline:
+            raise AuditInfrastructureError("audit cache deadline exceeded")
+        return deadline
+
+    def _assert_root(self) -> None:
+        try:
+            metadata = _ordinary_directory(self.root)
+        except OSError as error:
+            raise AuditInfrastructureError("audit cache root was replaced") from error
+        if _directory_identity(metadata) != self._root_identity:
+            raise AuditInfrastructureError("audit cache root was replaced")
+
+    def _root_lock(self, deadline: float) -> _SharedCacheFileLock:
+        return _SharedCacheFileLock(
+            self.root / ".preprocess-root.lock",
+            self.root,
+            self._root_identity,
+            deadline,
+        )
+
+    def _key_lock(self, key: str, deadline: float) -> _SharedCacheFileLock:
+        lane = hashlib.sha256(
+            f"preprocess:{key}".encode("utf-8")
+        ).digest()[0] % _LOCK_NAMESPACE_LANE_COUNT
+        self.observed_lane = lane
+        return _SharedCacheFileLock(
+            self.root / f".preprocess-key-{lane}.lock",
+            self.root,
+            self._root_identity,
+            deadline,
+            namespace_path=self.root / ".preprocess-root.lock",
+        )
+
+    @property
+    def _results_root(self) -> Path:
+        return self.root / _AUDIT_RESULTS_DIRECTORY
+
+    def _entry_path(self, key: str) -> Path:
+        self.observed_entry_key = key
+        return self._results_root / key[:2] / key
+
+    def _access_path(self, key: str) -> Path:
+        return self._results_root / key[:2] / f".access-{key}"
+
+    def _assert_no_full_view_partition(self) -> None:
+        with os.scandir(self.root) as entries:
+            for entry in entries:
+                if (
+                    len(entry.name) == 64
+                    and all(character in "0123456789abcdef" for character in entry.name)
+                ):
+                    raise AuditInfrastructureError(
+                        "legacy full-view partition is present in compact audit cache root"
+                    )
+
+    def _prepare_locked(self) -> None:
+        self._assert_root()
+        self._assert_no_full_view_partition()
+        marker = self.root / _AUDIT_ROOT_MARKER
+        marker_payload: bytes | None = None
+        try:
+            with _HeldCacheFile(marker) as held:
+                assert held.stream is not None
+                payload = held.stream.read(len(AUDIT_CACHE_SCHEMA_BYTES) + 1)
+                held.verify()
+            marker_payload = payload
+            if marker_payload != AUDIT_CACHE_SCHEMA_BYTES:
+                raise AuditInfrastructureError("audit cache root marker is invalid")
+        except FileNotFoundError:
+            temporary = self.root / f".tmp-audit-marker-{uuid.uuid4().hex}"
+            temporary_identity: tuple[int, int] | None = None
+            try:
+                with temporary.open("xb") as stream:
+                    temporary_identity = _file_ownership_identity(
+                        os.fstat(stream.fileno())
+                    )
+                    stream.write(AUDIT_CACHE_SCHEMA_BYTES)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                try:
+                    os.link(temporary, marker)
+                except FileExistsError:
+                    pass
+                temporary.unlink()
+            except BaseException as error:
+                _cleanup_owned_temporary_file(
+                    temporary,
+                    temporary_identity,
+                    "audit cache root marker temporary",
+                    error,
+                )
+                raise
+        except _UnsafeCacheNamespaceError as error:
+            raise AuditInfrastructureError("audit cache root marker is unsafe") from error
+        if marker_payload is None:
+            try:
+                with _HeldCacheFile(marker) as held:
+                    assert held.stream is not None
+                    marker_payload = held.stream.read(
+                        len(AUDIT_CACHE_SCHEMA_BYTES) + 1
+                    )
+                    held.verify()
+            except OSError as error:
+                raise AuditInfrastructureError("audit cache root marker is unsafe") from error
+        if marker_payload != AUDIT_CACHE_SCHEMA_BYTES:
+            raise AuditInfrastructureError("audit cache root marker is invalid")
+        try:
+            self._results_root.mkdir(exist_ok=True)
+            _ordinary_directory(self._results_root)
+        except OSError as error:
+            raise AuditInfrastructureError("audit cache results namespace is unsafe") from error
+        now = time.time()
+        with os.scandir(self._results_root) as bucket_entries:
+            for bucket_entry in bucket_entries:
+                bucket = Path(bucket_entry.path)
+                metadata = bucket_entry.stat(follow_symlinks=False)
+                if _is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                    raise AuditInfrastructureError("audit cache result bucket is unsafe")
+                with os.scandir(bucket) as raw_entries:
+                    for raw in raw_entries:
+                        if not raw.name.startswith(".tmp-"):
+                            continue
+                        temporary = Path(raw.path)
+                        temporary_metadata = raw.stat(follow_symlinks=False)
+                        if (
+                            _is_link(temporary_metadata)
+                            or not stat.S_ISDIR(temporary_metadata.st_mode)
+                        ):
+                            raise AuditInfrastructureError(
+                                "audit cache crash temporary is unsafe"
+                            )
+                        if now - temporary_metadata.st_mtime > _INCOMPLETE_SECONDS:
+                            if _temporary_publication_is_active(temporary):
+                                continue
+                            if not _remove_held_flat_directory(temporary):
+                                raise AuditInfrastructureError(
+                                    "cannot clean audit cache crash temporary"
+                                )
+
+    def prepare(self, pipeline_deadline: float) -> None:
+        deadline = self._operation_deadline(pipeline_deadline)
+        try:
+            with self._root_lock(deadline):
+                self._prepare_locked()
+        except AuditInfrastructureError:
+            raise
+        except OSError as error:
+            raise AuditInfrastructureError("audit cache namespace is unsafe") from error
+
+    def _prepare_for_operation(self, deadline: float) -> None:
+        try:
+            with self._root_lock(deadline):
+                self._prepare_locked()
+        except AuditInfrastructureError:
+            raise
+        except OSError as error:
+            raise AuditInfrastructureError("audit cache namespace is unsafe") from error
+
+    def _ensure_bucket(self, key: str) -> Path:
+        bucket = self._results_root / key[:2]
+        try:
+            bucket.mkdir(exist_ok=True)
+            _ordinary_directory(bucket)
+        except OSError as error:
+            raise AuditInfrastructureError("audit cache result bucket is unsafe") from error
+        return bucket
+
+    def _manifest_bytes(self, key: str, payload: bytes) -> bytes:
+        self.observed_manifest_key = key
+        document = {
+            "schema": AUDIT_CACHE_SCHEMA_BYTES.decode("ascii"),
+            "key": key,
+            "payload_bytes": len(payload),
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        return json.dumps(
+            document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+
+    def _read_authenticated_entry(
+        self,
+        configuration: PreprocessConfiguration,
+        key: str,
+        engine: str,
+    ) -> tuple[_AuditCacheCandidate, ConfigurationAuditResult] | None:
+        entry = self._entry_path(key)
+        try:
+            with _HeldDirectory(entry) as held_directory:
+                names = frozenset(os.listdir(entry))
+                if names != frozenset({"manifest.json", "payload.json"}):
+                    raise _UnsafeCacheNamespaceError(
+                        "audit cache entry carrier set is invalid"
+                    )
+                manifest_path = entry / "manifest.json"
+                payload_path = entry / "payload.json"
+                with _HeldCacheFile(manifest_path) as manifest_held:
+                    assert manifest_held.stream is not None
+                    manifest_payload = manifest_held.stream.read(
+                        _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES + 1
+                    )
+                    manifest_held.verify()
+                if len(manifest_payload) > _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES:
+                    raise ValueError("audit result manifest is too large")
+                manifest = _strict_json_document(manifest_payload)
+                if tuple(sorted(manifest)) != (
+                    "key", "payload_bytes", "payload_sha256", "schema"
+                ):
+                    raise ValueError("audit result manifest schema is invalid")
+                with _HeldCacheFile(payload_path) as payload_held:
+                    assert payload_held.stream is not None
+                    payload = payload_held.stream.read(
+                        _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES + 1
+                    )
+                    payload_held.verify()
+                    payload_identity = payload_held.identity
+                if (
+                    manifest["schema"] != AUDIT_CACHE_SCHEMA_BYTES.decode("ascii")
+                    or manifest["key"] != key
+                    or not isinstance(manifest["payload_bytes"], int)
+                    or isinstance(manifest["payload_bytes"], bool)
+                    or manifest["payload_bytes"] != len(payload)
+                    or not isinstance(manifest["payload_sha256"], str)
+                    or manifest["payload_sha256"]
+                    != hashlib.sha256(payload).hexdigest()
+                    or self._manifest_bytes(key, payload) != manifest_payload
+                ):
+                    raise ValueError("audit result manifest authentication failed")
+                try:
+                    result = _decode_audit_result_payload(
+                        payload,
+                        configuration_digest=configuration.digest,
+                        engine=engine,
+                    )
+                except AuditInfrastructureError:
+                    return None
+                assert held_directory.identity is not None
+                assert payload_identity is not None
+                candidate = _AuditCacheCandidate(
+                    configuration,
+                    key,
+                    held_directory.identity,
+                    payload_identity,
+                    result.dependencies,
+                )
+                return candidate, result
+        except FileNotFoundError:
+            return None
+        except _UnsafeCacheNamespaceError as error:
+            raise AuditInfrastructureError("audit cache namespace is unsafe or linked") from error
+        except (
+            UnicodeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            RecursionError,
+            json.JSONDecodeError,
+        ):
+            return None
+        except OSError as error:
+            raise AuditInfrastructureError("audit cache namespace is unsafe") from error
+
+    def _record_access(self, key: str) -> None:
+        path = self._access_path(key)
+        temporary = path.with_name(f".tmp-access-{key}-{uuid.uuid4().hex}")
+        identity: tuple[int, int] | None = None
+        try:
+            with temporary.open("xb") as stream:
+                identity = _file_ownership_identity(os.fstat(stream.fileno()))
+                stream.write(b"1")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except OSError as error:
+            _cleanup_owned_temporary_file(
+                temporary, identity, "audit result access temporary", error
+            )
+
+    @staticmethod
+    def _snapshot_map(production_snapshot) -> dict[str, DependencyDigest]:
+        if not hasattr(production_snapshot, "items"):
+            raise AuditInfrastructureError("production snapshot map is invalid")
+        result: dict[str, DependencyDigest] = {}
+        for raw_path, value in production_snapshot.items():
+            if not isinstance(value, DependencyDigest):
+                raise AuditInfrastructureError("production snapshot entry is invalid")
+            key = (
+                raw_path.as_posix()
+                if isinstance(raw_path, PurePosixPath)
+                else str(raw_path).replace("\\", "/")
+            )
+            if key in result:
+                raise AuditInfrastructureError("production snapshot is ambiguous")
+            result[key] = value
+        return result
+
+    @staticmethod
+    def _production_matches(
+        dependencies: tuple[DependencyDigest, ...],
+        snapshot: dict[str, DependencyDigest],
+    ) -> bool:
+        for dependency in dependencies:
+            if dependency.stable_role != "production":
+                continue
+            current = snapshot.get(dependency.role_relative_path.as_posix())
+            if current is None or current != dependency:
+                return False
+        return True
+
+    @staticmethod
+    def _validate_dependency_authority(
+        dependencies: tuple[DependencyDigest, ...],
+        authority: DependencyRootAuthority,
+    ) -> None:
+        roots = {
+            authority.source_root.stable_role: authority.source_root.resolved_root,
+            **{
+                binding.stable_role: binding.resolved_root
+                for binding in authority.external_roots
+            },
+        }
+        for dependency in dependencies:
+            root = roots.get(dependency.stable_role)
+            if root is None:
+                raise AuditInfrastructureError("audit result dependency authority differs")
+            expected = root / Path(dependency.role_relative_path.as_posix())
+            if _path_key(expected) != _path_key(dependency.identity.canonical):
+                raise AuditInfrastructureError("audit result dependency path is outside authority")
+
+    def load(
+        self,
+        configuration: PreprocessConfiguration,
+        dependency_roots: DependencyRootAuthority,
+        engine: str,
+        production_snapshot,
+        pipeline_deadline: float,
+    ) -> ConfigurationAuditResult | None:
+        if not isinstance(configuration, PreprocessConfiguration):
+            raise AuditInfrastructureError("audit cache configuration is invalid")
+        deadline = self._operation_deadline(pipeline_deadline)
+        authority = validate_dependency_root_authority(dependency_roots)
+        snapshot = self._snapshot_map(production_snapshot)
+        self._prepare_for_operation(deadline)
+        key = audit_cache_key(configuration.digest, engine)
+        with self._key_lock(key, deadline):
+            loaded = self._read_authenticated_entry(configuration, key, engine)
+        if loaded is None:
+            return None
+        candidate, result = loaded
+        self._validate_dependency_authority(candidate.dependencies, authority)
+        if not self._production_matches(candidate.dependencies, snapshot):
+            return None
+        handles: list[_HeldDependencyHandle] = []
+        try:
+            with contextlib.ExitStack() as stack:
+                for dependency in candidate.dependencies:
+                    handle = stack.enter_context(_open_dependency_handle(dependency))
+                    handle.deadline = deadline
+                    handles.append(handle)
+                if any(
+                    _hash_held_dependency(handle) != handle.dependency.sha256
+                    for handle in handles
+                ):
+                    return None
+                if any(
+                    _hash_held_dependency(handle) != handle.dependency.sha256
+                    for handle in handles
+                ):
+                    return None
+        except _UnsafeCacheNamespaceError as error:
+            raise AuditInfrastructureError("dependency namespace is linked or unsafe") from error
+        except OSError:
+            return None
+        self._record_access(key)
+        return result
+
+    def load_many(
+        self,
+        configurations: tuple[PreprocessConfiguration, ...],
+        dependency_roots: DependencyRootAuthority,
+        engine: str,
+        production_snapshot,
+        result_budget: CompactResultMemoryBudget,
+        aggregator: StreamingResultAggregator,
+        maximum_cold_slot: CompactResultColdSlot,
+        pipeline_deadline: float,
+    ) -> ConfigurationAuditLoadBatch:
+        if (
+            not isinstance(configurations, tuple)
+            or len(configurations) > _AUDIT_CACHE_MAXIMUM_ENTRIES
+            or any(not isinstance(item, PreprocessConfiguration) for item in configurations)
+            or len({item.digest for item in configurations}) != len(configurations)
+        ):
+            raise AuditInfrastructureError("audit cache batch configurations are invalid")
+        if (
+            not isinstance(result_budget, CompactResultMemoryBudget)
+            or not isinstance(aggregator, StreamingResultAggregator)
+            or aggregator.budget is not result_budget
+        ):
+            raise AuditInfrastructureError("audit cache batch ownership is invalid")
+        deadline = self._operation_deadline(pipeline_deadline)
+        authority = validate_dependency_root_authority(dependency_roots)
+        snapshot = self._snapshot_map(production_snapshot)
+        self._prepare_for_operation(deadline)
+        candidates: dict[str, _AuditCacheCandidate] = {}
+        misses: set[str] = set()
+        for configuration in configurations:
+            if time.monotonic() >= deadline:
+                raise AuditInfrastructureError("audit cache deadline exceeded")
+            key = audit_cache_key(configuration.digest, engine)
+            with self._key_lock(key, deadline):
+                loaded = self._read_authenticated_entry(configuration, key, engine)
+            if loaded is None:
+                misses.add(configuration.digest)
+                continue
+            candidate, preparsed = loaded
+            self._validate_dependency_authority(candidate.dependencies, authority)
+            if not self._production_matches(candidate.dependencies, snapshot):
+                misses.add(configuration.digest)
+                continue
+            candidates[configuration.digest] = candidate
+            # The preparse authenticates and validates limits, but the decoded
+            # object is deliberately not retained across the batch.
+            preparsed = None
+
+        dependency_users: dict[str, list[_AuditCacheCandidate]] = {}
+        dependency_representatives: dict[str, DependencyDigest] = {}
+        expected_dependency_digests: dict[tuple[str, str], str] = {}
+        limits = AuditLimits()
+        metadata_bytes = 0
+        for candidate in candidates.values():
+            candidate_paths: set[str] = set()
+            for dependency in candidate.dependencies:
+                path_key = _path_key(dependency.identity.canonical)
+                if path_key in candidate_paths:
+                    raise AuditInfrastructureError(
+                        "audit result dependency paths are ambiguous"
+                    )
+                candidate_paths.add(path_key)
+                if path_key not in dependency_representatives:
+                    metadata_bytes += 512 + len(
+                        str(dependency.identity.canonical).encode("utf-8")
+                    )
+                metadata_bytes += 32
+                if (
+                    len(dependency_representatives)
+                    + int(path_key not in dependency_representatives)
+                    > limits.unique_dependency_handles
+                    or metadata_bytes > limits.dependency_handle_metadata_bytes
+                ):
+                    raise AuditInfrastructureError(
+                        "dependency handle or metadata ceiling exceeded before open"
+                    )
+                dependency_users.setdefault(path_key, []).append(candidate)
+                dependency_representatives.setdefault(path_key, dependency)
+                expected_dependency_digests[
+                    (candidate.configuration.digest, path_key)
+                ] = dependency.sha256
+        initial: dict[str, str] = {}
+        final: dict[str, str] = {}
+        try:
+            with contextlib.ExitStack() as stack:
+                held = {
+                    path_key: stack.enter_context(_open_dependency_handle(dependency))
+                    for path_key, dependency in dependency_representatives.items()
+                }
+                for handle in held.values():
+                    handle.deadline = deadline
+                for path_key, handle in held.items():
+                    initial[path_key] = _hash_held_dependency(handle)
+                for path_key, handle in held.items():
+                    final[path_key] = _hash_held_dependency(handle)
+        except _UnsafeCacheNamespaceError as error:
+            raise AuditInfrastructureError("dependency namespace is linked or unsafe") from error
+        except AuditInfrastructureError:
+            raise
+        except OSError:
+            for users in dependency_users.values():
+                misses.update(candidate.configuration.digest for candidate in users)
+
+        for path_key, users in dependency_users.items():
+            for candidate in users:
+                expected = expected_dependency_digests[
+                    (candidate.configuration.digest, path_key)
+                ]
+                if initial.get(path_key) != expected or final.get(path_key) != expected:
+                    misses.add(candidate.configuration.digest)
+
+        if misses:
+            aggregator.reserve_cold_slot(maximum_cold_slot)
+        hit_count = 0
+        for configuration in configurations:
+            if configuration.digest in misses:
+                continue
+            candidate = candidates[configuration.digest]
+            with self._key_lock(candidate.key, deadline):
+                decoded = self._read_authenticated_entry(
+                    configuration, candidate.key, engine
+                )
+            if decoded is None:
+                misses.add(configuration.digest)
+                if aggregator.cold_slot_reserved_bytes == 0:
+                    aggregator.reserve_cold_slot(maximum_cold_slot)
+                continue
+            decoded_candidate, result = decoded
+            if (
+                decoded_candidate.entry_identity != candidate.entry_identity
+                or decoded_candidate.payload_identity[:2]
+                != candidate.payload_identity[:2]
+            ):
+                raise AuditInfrastructureError(
+                    "audit cache entry was replaced during batch load"
+                )
+            ownership = result_budget.reserve(
+                compact_result_retained_bytes(result),
+                label="batch retained result limit",
+            ).commit()
+            try:
+                aggregator.accept_validated_result(configuration, result, ownership)
+            except BaseException:
+                if not ownership.released:
+                    ownership.release()
+                raise
+            hit_count += 1
+            self._record_access(candidates[configuration.digest].key)
+        ordered_misses = tuple(
+            configuration for configuration in configurations
+            if configuration.digest in misses
+        )
+        return ConfigurationAuditLoadBatch(
+            hit_count,
+            ordered_misses,
+            aggregator.cold_slot_reserved_bytes,
+        )
+
+    def _remove_audit_entry(self, entry: Path, key: str) -> bool:
+        quarantine = entry.with_name(f".quarantine-{key}-{uuid.uuid4().hex}")
+        try:
+            identity = _directory_identity(_ordinary_directory(entry))
+            os.rename(entry, quarantine)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        removed = _remove_held_flat_directory(
+            quarantine, expected_identity=identity
+        )
+        if removed:
+            try:
+                self._access_path(key).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+        return removed
+
+    def cleanup(self, now: float, pipeline_deadline: float) -> None:
+        if not isinstance(now, (int, float)) or isinstance(now, bool):
+            raise AuditInfrastructureError("audit cache cleanup time is invalid")
+        deadline = self._operation_deadline(pipeline_deadline)
+        self._prepare_for_operation(deadline)
+        complete: list[tuple[float, int, str, Path]] = []
+        for raw_bucket in os.scandir(self._results_root):
+            if (
+                len(raw_bucket.name) != 2
+                or any(character not in "0123456789abcdef" for character in raw_bucket.name)
+            ):
+                raise AuditInfrastructureError("audit cache result bucket name is invalid")
+            bucket = Path(raw_bucket.path)
+            metadata = raw_bucket.stat(follow_symlinks=False)
+            if _is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                raise AuditInfrastructureError("audit cache result bucket is unsafe")
+            for raw_entry in os.scandir(bucket):
+                name = raw_entry.name
+                if name.startswith((".access-", ".tmp-", ".quarantine-")):
+                    continue
+                entry = Path(raw_entry.path)
+                metadata = raw_entry.stat(follow_symlinks=False)
+                if (
+                    len(name) != 64
+                    or any(character not in "0123456789abcdef" for character in name)
+                    or name[:2] != raw_bucket.name
+                    or _is_link(metadata)
+                    or not stat.S_ISDIR(metadata.st_mode)
+                ):
+                    raise AuditInfrastructureError("audit cache entry namespace is unsafe")
+                size = 0
+                authentic = False
+                try:
+                    names = frozenset(os.listdir(entry))
+                    if names != frozenset({"manifest.json", "payload.json"}):
+                        raise ValueError("carrier set")
+                    manifest_path = entry / "manifest.json"
+                    payload_path = entry / "payload.json"
+                    manifest_metadata = _regular_unlinked_file(manifest_path)
+                    payload_metadata = _regular_unlinked_file(payload_path)
+                    if (
+                        manifest_metadata.st_size
+                        > _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES
+                        or payload_metadata.st_size
+                        > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+                    ):
+                        raise ValueError("entry size")
+                    manifest_payload = manifest_path.read_bytes()
+                    payload = payload_path.read_bytes()
+                    manifest = _strict_json_document(manifest_payload)
+                    authentic = (
+                        manifest.get("schema")
+                        == AUDIT_CACHE_SCHEMA_BYTES.decode("ascii")
+                        and manifest.get("key") == name
+                        and manifest.get("payload_bytes") == len(payload)
+                        and manifest.get("payload_sha256")
+                        == hashlib.sha256(payload).hexdigest()
+                    )
+                    size = int(manifest_metadata.st_size + payload_metadata.st_size)
+                except _UnsafeCacheNamespaceError as error:
+                    raise AuditInfrastructureError(
+                        "audit cache entry namespace is unsafe"
+                    ) from error
+                except (OSError, ValueError, TypeError, UnicodeError):
+                    authentic = False
+                if not authentic:
+                    if now - metadata.st_mtime > _INCOMPLETE_SECONDS:
+                        with self._key_lock(name, deadline):
+                            if not self._remove_audit_entry(entry, name):
+                                raise AuditInfrastructureError(
+                                    "cannot remove incomplete audit cache entry"
+                                )
+                    continue
+                try:
+                    last_access = _regular_unlinked_file(
+                        self._access_path(name)
+                    ).st_mtime
+                    size += 1
+                except FileNotFoundError:
+                    last_access = metadata.st_mtime
+                except OSError as error:
+                    raise AuditInfrastructureError(
+                        "audit cache access namespace is unsafe"
+                    ) from error
+                if now - last_access > _COMPLETE_SECONDS:
+                    with self._key_lock(name, deadline):
+                        if not self._remove_audit_entry(entry, name):
+                            raise AuditInfrastructureError(
+                                "cannot remove expired audit cache entry"
+                            )
+                    continue
+                complete.append((last_access, size, name, entry))
+        total_bytes = sum(item[1] for item in complete)
+        total_entries = len(complete)
+        for _access, size, key, entry in sorted(complete):
+            if total_bytes <= self.maximum_bytes and total_entries <= self.maximum_entries:
+                break
+            with self._key_lock(key, deadline):
+                if self._remove_audit_entry(entry, key):
+                    total_bytes -= size
+                    total_entries -= 1
+
+    def publish(
+        self,
+        configuration: PreprocessConfiguration,
+        dependency_roots: DependencyRootAuthority,
+        result: ConfigurationAuditResult,
+        publication_permit: ConfigurationAuditPublicationPermit,
+        pipeline_deadline: float,
+    ) -> ConfigurationAuditResult:
+        if not isinstance(configuration, PreprocessConfiguration) or not isinstance(
+            result, ConfigurationAuditResult
+        ):
+            raise AuditInfrastructureError("audit result publication is invalid")
+        deadline = self._operation_deadline(pipeline_deadline)
+        authority = validate_dependency_root_authority(dependency_roots)
+        if (
+            not isinstance(publication_permit, ConfigurationAuditPublicationPermit)
+            or publication_permit.configuration_digest != configuration.digest
+            or publication_permit.audit_engine_fingerprint
+            != result.audit_engine_fingerprint
+            or publication_permit.dependencies != result.dependencies
+            or result.configuration_digest != configuration.digest
+        ):
+            raise AuditInfrastructureError("audit result publication generation permit differs")
+        self._validate_dependency_authority(result.dependencies, authority)
+        payload = _encode_audit_result_payload(result)
+        key = audit_cache_key(configuration.digest, result.audit_engine_fingerprint)
+        manifest = self._manifest_bytes(key, payload)
+        self._prepare_for_operation(deadline)
+        bucket = self._ensure_bucket(key)
+        temporary = bucket / f".tmp-{key}-{uuid.uuid4().hex}"
+        entry = self._entry_path(key)
+        temporary_identity: tuple[int, int | None] | None = None
+        try:
+            with contextlib.ExitStack() as stack:
+                held = [
+                    stack.enter_context(_open_dependency_handle(dependency))
+                    for dependency in result.dependencies
+                ]
+                for handle in held:
+                    handle.deadline = deadline
+                if any(
+                    _hash_held_dependency(handle) != handle.dependency.sha256
+                    for handle in held
+                ):
+                    raise AuditInfrastructureError(
+                        "audit result publication generation permit content differs"
+                    )
+                temporary.mkdir()
+                temporary_identity = _directory_identity(_ordinary_directory(temporary))
+                with _PublicationGuard(temporary / "active.lock", deadline):
+                    with (temporary / "payload.json").open("xb") as stream:
+                        stream.write(payload)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    with (temporary / "manifest.json").open("xb") as stream:
+                        stream.write(manifest)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if any(
+                        _hash_held_dependency(handle) != handle.dependency.sha256
+                        for handle in held
+                    ):
+                        raise AuditInfrastructureError(
+                            "audit result publication generation changed"
+                        )
+            (temporary / "active.lock").unlink()
+            with self._key_lock(key, deadline):
+                with self._publication_lock:
+                    existing = self._read_authenticated_entry(
+                        configuration, key, result.audit_engine_fingerprint
+                    )
+                    if existing is not None:
+                        _candidate, winner = existing
+                        if winner != result:
+                            raise AuditInfrastructureError(
+                                "concurrent audit result winner differs"
+                            )
+                        if not _remove_held_flat_directory(
+                            temporary, expected_identity=temporary_identity
+                        ):
+                            raise AuditInfrastructureError(
+                                "cannot remove losing audit result temporary"
+                            )
+                        self._record_access(key)
+                        return winner
+                    stale: Path | None = None
+                    stale_identity: tuple[int, int | None] | None = None
+                    try:
+                        stale_identity = _directory_identity(
+                            _ordinary_directory(entry)
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except OSError as error:
+                        raise AuditInfrastructureError(
+                            "audit result namespace is unsafe"
+                        ) from error
+                    else:
+                        stale = bucket / f".quarantine-{key}-{uuid.uuid4().hex}"
+                        os.rename(entry, stale)
+                    try:
+                        os.rename(temporary, entry)
+                    except FileExistsError:
+                        existing = self._read_authenticated_entry(
+                            configuration, key, result.audit_engine_fingerprint
+                        )
+                        if existing is None or existing[1] != result:
+                            raise AuditInfrastructureError(
+                                "concurrent audit result winner differs"
+                            )
+                        if not _remove_held_flat_directory(
+                            temporary, expected_identity=temporary_identity
+                        ):
+                            raise AuditInfrastructureError(
+                                "cannot remove losing audit result temporary"
+                            )
+                        return existing[1]
+                    finally:
+                        if stale is not None and not _remove_held_flat_directory(
+                            stale, expected_identity=stale_identity
+                        ):
+                            raise AuditInfrastructureError(
+                                "cannot remove stale audit result entry"
+                            )
+            self._record_access(key)
+            return result
+        except _UnsafeCacheNamespaceError as error:
+            raise AuditInfrastructureError("audit result namespace is unsafe") from error
+        except BaseException as error:
+            if temporary_identity is not None:
+                try:
+                    removed = _remove_held_flat_directory(
+                        temporary, expected_identity=temporary_identity
+                    )
+                except OSError:
+                    removed = False
+                if not removed:
+                    try:
+                        current = _ordinary_directory(temporary)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as cleanup_error:
+                        raise AuditInfrastructureError(
+                            "audit result publication temporary was replaced"
+                        ) from cleanup_error
+                    else:
+                        if _directory_identity(current) == temporary_identity:
+                            raise AuditInfrastructureError(
+                                "cannot remove audit result publication temporary"
+                            ) from error
+            if isinstance(error, AuditInfrastructureError):
+                raise
+            raise AuditInfrastructureError("cannot publish compact audit result") from error
 
 
 class PreprocessCache:
