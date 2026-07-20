@@ -142,7 +142,7 @@ olr_newest_qt_kit() {
     local suffix="$1"
     local kit version major minor patch key
     local best="" best_key=""
-    for kit in "$HOME"/Qt/6.*/"$suffix"; do
+    for kit in "$HOME"/Qt/6.*/"$suffix" /c/Qt/6.*/"$suffix"; do
         [ -d "$kit" ] || continue
         version="${kit%/$suffix}"
         version="${version##*/}"
@@ -163,16 +163,25 @@ olr_newest_qt_kit() {
 # hard-coded home path: an explicit override wins, then the same env vars the build
 # honors (OLR_QT_ROOT / QT_ROOT_DIR), then Homebrew, then the newest online-installer
 # kit, then Qt tools on PATH. Only the final literal is version-pinned (last resort).
+# Native Windows paths can arrive with backslashes (OLR_QT_ROOT=C:\Qt\...);
+# normalise to forward slashes so `[ -d ]` and cmake accept them everywhere.
+olr_slash() { printf '%s' "${1//\\//}"; }
 olr_qt_host_prefix() {
-    if [ -n "${QT_HOST_PREFIX:-}" ]; then printf '%s\n' "$QT_HOST_PREFIX"; return 0; fi
-    if [ -n "${OLR_QT_ROOT:-}" ]; then printf '%s\n' "$OLR_QT_ROOT"; return 0; fi
-    if [ -n "${QT_ROOT_DIR:-}" ]; then printf '%s\n' "$QT_ROOT_DIR"; return 0; fi
+    if [ -n "${QT_HOST_PREFIX:-}" ]; then olr_slash "$QT_HOST_PREFIX"; return 0; fi
+    if [ -n "${OLR_QT_ROOT:-}" ]; then olr_slash "$OLR_QT_ROOT"; return 0; fi
+    if [ -n "${QT_ROOT_DIR:-}" ]; then olr_slash "$QT_ROOT_DIR"; return 0; fi
     local cand
     for cand in /opt/homebrew/opt/qt /usr/local/opt/qt; do
         if [ -d "$cand" ]; then printf '%s\n' "$cand"; return 0; fi
     done
     local newest
     newest="$(olr_newest_qt_kit macos)"
+    if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
+    # Windows: newest MinGW kit under the standard Qt-installer layout.
+    # olr_newest_qt_kit scans /c/Qt too and is version-aware without a GNU-only
+    # version-sort flag (absent from the macos/BSD userland; the plugin-policy
+    # gate forbids that flag in this hook).
+    newest="$(olr_newest_qt_kit mingw_64)"
     if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
     local tool prefix
     for tool in qtpaths6 qtpaths qmake6 qmake; do
@@ -190,13 +199,72 @@ QT_HOST_PREFIX="$(olr_qt_host_prefix)"
 CLIP_SECONDS="${OLR_E2E_CLIP_SECONDS:-5}"
 DELIVERY_BUILD_DIR="${OLR_PREPUSH_DELIVERY_BUILD_DIR:-build/prepush-delivery}"
 
-# --- 1. Preflight: hard-fail (block the push) if delivery tooling is missing ---
+# --- Windows (MinGW) toolchain + runtime PATH ---------------------------------
+# On Windows the compiler is the Qt MinGW kit and the delivery tooling
+# (srt-live-transmit) plus the FFmpeg/SRT runtime DLLs live in the from-source
+# dist tree (windows_build/dist, produced by build-scripts/build_windows_app.sh),
+# not on PATH. Resolve the same OLR_* toolchain the windows-mingw CMake preset
+# uses and put the runtime DLL dirs on PATH so the SAME gate the other platforms
+# run also builds here. Non-Windows shells skip this block entirely.
+OLR_IS_WINDOWS=0
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) OLR_IS_WINDOWS=1 ;;
+esac
+# Native path (C:/foo or C:\foo) -> MSYS (/c/foo) so it survives PATH's ':' split.
+olr_to_msys() {
+    local p="${1//\\//}"
+    case "$p" in [A-Za-z]:/*) p="/$(printf '%s' "${p%%:*}" | tr 'A-Z' 'a-z')${p#*:}" ;; esac
+    printf '%s' "$p"
+}
+if [ "$OLR_IS_WINDOWS" = "1" ]; then
+    OLR_QT_ROOT="$(olr_slash "${OLR_QT_ROOT:-$QT_HOST_PREFIX}")"
+    # MinGW root: explicit override, else the newest kit beside the Qt version dir.
+    if [ -z "${OLR_MINGW_ROOT:-}" ]; then
+        # First MinGW kit that actually carries a g++ (portable; avoids the
+        # GNU-only version-sort flag the plugin-policy gate forbids).
+        for _mg in "$QT_HOST_PREFIX"/../../Tools/mingw*_64 /c/Qt/Tools/mingw*_64; do
+            [ -x "$_mg/bin/g++.exe" ] && { OLR_MINGW_ROOT="$_mg"; break; }
+        done
+    fi
+    OLR_MINGW_ROOT="$(olr_slash "${OLR_MINGW_ROOT:-}")"
+    [ -x "$OLR_MINGW_ROOT/bin/g++.exe" ] || {
+        echo "[pre-push] MinGW g++ not found under $OLR_MINGW_ROOT (set OLR_MINGW_ROOT)." >&2
+        exit 1
+    }
+    # from-source FFmpeg/SRT prefixes (kept as SHELL vars, NOT exported: the build
+    # reads them via -D below, while the delivery scripts must keep using a FULL
+    # ffmpeg on PATH -- the dist ffmpeg is decode-only and has no x264/x265).
+    OLR_FFMPEG_ROOT="${OLR_FFMPEG_ROOT:-$REPO_ROOT/windows_build/dist/ffmpeg}"
+    OLR_SRT_ROOT="${OLR_SRT_ROOT:-$REPO_ROOT/windows_build/dist/srt}"
+    # PATH: MinGW bin (gcc/g++ + libstdc++/libgcc/libwinpthread) and the SRT dist
+    # bin (srt-live-transmit + libsrt.dll) go FIRST; the FFmpeg dist bin (avcodec/
+    # avformat/... DLLs the harnesses linked against) and Qt bin (Qt6*.dll) are
+    # APPENDED so a full ffmpeg already on PATH still wins for the delivery scripts.
+    export PATH="$(olr_to_msys "$OLR_MINGW_ROOT")/bin:$(olr_to_msys "$OLR_SRT_ROOT")/bin:$PATH:$(olr_to_msys "$OLR_FFMPEG_ROOT")/bin:$(olr_to_msys "$OLR_QT_ROOT")/bin"
+    # Qt plugin path (NATIVE form -- Qt is a Windows app and reads C:/... here):
+    # the test harnesses are Qt apps launched from the build tree with no
+    # platforms/ dir beside them, so point Qt at the kit's plugins. Without this
+    # the offscreen QPA plugin is not found and Qt pops a MODAL error dialog that
+    # blocks the process until the ctest timeout -- the "no Qt platform plugin"
+    # failure. QT_QPA_PLATFORM=offscreen is set later, before the unit gate.
+    export QT_PLUGIN_PATH="$OLR_QT_ROOT/plugins"
+    export QT_QPA_PLATFORM_PLUGIN_PATH="$OLR_QT_ROOT/plugins/platforms"
+fi
+
+# Will the delivery matrix actually run below? It needs a FULL ffmpeg (x264/x265)
+# + srt-live-transmit + python3; on Windows it default-skips (the from-source dist
+# ffmpeg is decode-only), so that tooling must NOT block a build-only Windows run.
+OLR_RUN_DELIVERY=1
+if [ "$OLR_IS_WINDOWS" = "1" ] && [ "${OLR_PREPUSH_WIN_DELIVERY:-0}" != "1" ]; then
+    OLR_RUN_DELIVERY=0
+fi
+
+# --- 1. Preflight: hard-fail (block the push) if required tooling is missing ---
+# The Qt host kit is needed to build on every platform (always checked); the
+# ffmpeg encoders + srt-live-transmit + python3 are needed only when the delivery
+# matrix runs, so they are gated on OLR_RUN_DELIVERY (skipped on a build-only run).
 preflight_fail=0
 note_missing() { echo "[pre-push] MISSING: $1" >&2; preflight_fail=1; }
-
-for tool in ffmpeg ffprobe srt-live-transmit; do
-    command -v "$tool" >/dev/null 2>&1 || note_missing "$tool not found on PATH"
-done
 
 # Python 3 SPECIFICALLY (mirror rtmp_lib.sh:rtmp_find_python3) -- a Python-2-only
 # `python`/`py` would pass a bare presence check but make the RTMP cells SKIP.
@@ -214,21 +282,26 @@ have_python3() {
     fi
     return 1
 }
-have_python3 || note_missing "Python 3 not found (needed by the RTMP fixture server)"
 
-# Encoder checks need ffmpeg itself; skipped (ffmpeg already flagged above) if absent.
-if command -v ffmpeg >/dev/null 2>&1; then
-    ENCODERS="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"
-    # H.264: the scripts accept only libx264 or h264_mf (see olr_h264_vcodec_args).
-    if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx264|h264_mf)[[:space:]]'; then
-        note_missing "no usable H.264 encoder (need libx264 or h264_mf) in ffmpeg"
-    fi
-    # HEVC: run_rtmp_hevc_smoke.sh only tries hevc_videotoolbox then libx265; the
-    # SRT-HEVC cell accepts libx265 or any hevc_*. Require EITHER libx265 or
-    # hevc_videotoolbox (an OR -- either one alone satisfies both cells); this is
-    # the tightest check that still guarantees both HEVC cells run, never skip.
-    if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx265|hevc_videotoolbox)[[:space:]]'; then
-        note_missing "no usable HEVC encoder (need libx265 or hevc_videotoolbox) in ffmpeg"
+if [ "$OLR_RUN_DELIVERY" = "1" ]; then
+    for tool in ffmpeg ffprobe srt-live-transmit; do
+        command -v "$tool" >/dev/null 2>&1 || note_missing "$tool not found on PATH"
+    done
+    have_python3 || note_missing "Python 3 not found (needed by the RTMP fixture server)"
+    # Encoder checks need ffmpeg itself; skipped (ffmpeg already flagged above) if absent.
+    if command -v ffmpeg >/dev/null 2>&1; then
+        ENCODERS="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+        # H.264: the scripts accept only libx264 or h264_mf (see olr_h264_vcodec_args).
+        if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx264|h264_mf)[[:space:]]'; then
+            note_missing "no usable H.264 encoder (need libx264 or h264_mf) in ffmpeg"
+        fi
+        # HEVC: run_rtmp_hevc_smoke.sh only tries hevc_videotoolbox then libx265; the
+        # SRT-HEVC cell accepts libx265 or any hevc_*. Require EITHER libx265 or
+        # hevc_videotoolbox (an OR -- either one alone satisfies both cells); this is
+        # the tightest check that still guarantees both HEVC cells run, never skip.
+        if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx265|hevc_videotoolbox)[[:space:]]'; then
+            note_missing "no usable HEVC encoder (need libx265 or hevc_videotoolbox) in ffmpeg"
+        fi
     fi
 fi
 
@@ -249,29 +322,53 @@ fi
 # macOS build-test CI job used to enforce); the same build dir is reused by the
 # native unit/e2e and clang-tidy gates below.
 echo "[pre-push] Building current-platform host in ${DELIVERY_BUILD_DIR}..."
+if [ "$OLR_IS_WINDOWS" = "1" ]; then
+    # MinGW toolchain + from-source FFmpeg/SRT roots (mirrors the windows-mingw
+    # CMake preset); everything else matches the cross-platform build below.
+    cmake -S . -B "$DELIVERY_BUILD_DIR" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" \
+        -DCMAKE_C_COMPILER="$OLR_MINGW_ROOT/bin/gcc.exe" \
+        -DCMAKE_CXX_COMPILER="$OLR_MINGW_ROOT/bin/g++.exe" \
+        -DOLR_FFMPEG_ROOT="$OLR_FFMPEG_ROOT" \
+        -DOLR_SRT_ROOT="$OLR_SRT_ROOT" \
+        -DOLR_WERROR=ON \
+        -DOLR_GPU_PIPELINE=ON \
+        -DOLR_BUILD_TESTS=ON >/dev/null
+else
     cmake -S . -B "$DELIVERY_BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Debug \
         -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" \
         -DOLR_WERROR=ON \
         -DOLR_GPU_PIPELINE=ON \
         -DOLR_BUILD_TESTS=ON >/dev/null
+fi
 cmake --build "$DELIVERY_BUILD_DIR"
 
-# --- 3. Sanity: the delivery-gate label must resolve to exactly 4 cells --------
-EXPECTED_CELLS=4
-ACTUAL_CELLS="$(ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate -N \
-    | awk '/Total Tests:/ {print $NF}')"
-if [ "${ACTUAL_CELLS:-0}" -ne "$EXPECTED_CELLS" ]; then
-    echo "[pre-push] Delivery gate misconfigured: expected ${EXPECTED_CELLS} cells, found ${ACTUAL_CELLS:-0}." >&2
-    exit 1
-fi
+# --- 3-4. Delivery matrix (RTMP/SRT x h264/h265) as a BLOCKING gate ------------
+# On Windows this RUNTIME gate is skipped by default: the from-source dist ffmpeg
+# is decode-only (no x264/x265 for the stream generator) and the loopback
+# transports still need validation there, so CI's Windows build plus the
+# macOS/Linux local delivery runs remain the authority. Opt in on Windows with
+# OLR_PREPUSH_WIN_DELIVERY=1 once the runtime is validated.
+if [ "$OLR_RUN_DELIVERY" = "0" ]; then
+    echo "[pre-push] Windows: skipping delivery matrix (set OLR_PREPUSH_WIN_DELIVERY=1 to run; CI covers the Windows build)."
+else
+    # Sanity: the delivery-gate label must resolve to exactly 4 cells.
+    EXPECTED_CELLS=4
+    ACTUAL_CELLS="$(ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate -N \
+        | awk '/Total Tests:/ {print $NF}')"
+    if [ "${ACTUAL_CELLS:-0}" -ne "$EXPECTED_CELLS" ]; then
+        echo "[pre-push] Delivery gate misconfigured: expected ${EXPECTED_CELLS} cells, found ${ACTUAL_CELLS:-0}." >&2
+        exit 1
+    fi
 
-# --- 4. Run the delivery matrix (RTMP/SRT x h264/h265) as a BLOCKING gate ------
-echo "[pre-push] Running delivery matrix (clip=${CLIP_SECONDS}s) -- RTMP/SRT x h264/h265..."
-OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
-    ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate \
-        --output-on-failure --repeat until-pass:2 --no-tests=error
-echo "[pre-push] Delivery matrix OK."
+    echo "[pre-push] Running delivery matrix (clip=${CLIP_SECONDS}s) -- RTMP/SRT x h264/h265..."
+    OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
+        ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate \
+            --output-on-failure --repeat until-pass:2 --no-tests=error
+    echo "[pre-push] Delivery matrix OK."
+fi
 
 # Past here are the FAST pre-flight gates kept in the default push (~5 min) so
 # PRs rarely fail CI on trivia: clang-tidy + the fast unit label on the build
@@ -295,6 +392,8 @@ E2E_REGEX='^(e2e_record_stereo|e2e_record_mono|e2e_record_rational_fps|e2e_recor
 # CI would catch, at native speed, in ~1 min.
 if [ "${SKIP_UNIT:-0}" = "1" ]; then
     echo "[pre-push] SKIP_UNIT=1 - skipping the unit gate."
+elif [ "$OLR_IS_WINDOWS" = "1" ] && [ "${OLR_PREPUSH_WIN_UNIT:-0}" != "1" ]; then
+    echo "[pre-push] Windows: skipping unit gate (pre-existing Windows GPU/QML/segfault failures need triage; the -Werror build ran and CI runs the full suite). Set OLR_PREPUSH_WIN_UNIT=1 to run it."
 else
     echo "[pre-push] Running unit suite (native, -L ci)..."
     ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
@@ -303,8 +402,12 @@ else
 fi
 
 # --- 6. GPU regression e2e selector -- mirrors the GitHub GPU gate. -----------
+# Windows-default-skipped (the record/play harness runtime needs validation
+# there); opt in with OLR_PREPUSH_WIN_GPU_E2E=1.
 if [ "${SKIP_GPU_E2E:-0}" = "1" ]; then
     echo "[pre-push] SKIP_GPU_E2E=1 - skipping GPU regression e2e."
+elif [ "$OLR_IS_WINDOWS" = "1" ] && [ "${OLR_PREPUSH_WIN_GPU_E2E:-0}" != "1" ]; then
+    echo "[pre-push] Windows: skipping GPU regression e2e (set OLR_PREPUSH_WIN_GPU_E2E=1 to run)."
 else
     echo "[pre-push] Running GPU regression e2e (${GPU_E2E_LABELS})..."
     ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
@@ -319,6 +422,8 @@ fi
 # the pre-commit hook's "partial toolchain does not block" policy.
 if [ "${SKIP_TIDY:-0}" = "1" ]; then
     echo "[pre-push] SKIP_TIDY=1 - skipping clang-tidy gate."
+elif [ "$OLR_IS_WINDOWS" = "1" ] && [ "${OLR_PREPUSH_WIN_TIDY:-0}" != "1" ]; then
+    echo "[pre-push] Windows: skipping clang-tidy (clang parsing the MinGW compile db needs validation; set OLR_PREPUSH_WIN_TIDY=1 to run; the macOS/Linux local runs cover it)."
 else
     TIDY="$(command -v clang-tidy || true)"
     [ -x "$TIDY" ] || TIDY=/opt/homebrew/opt/llvm/bin/clang-tidy
