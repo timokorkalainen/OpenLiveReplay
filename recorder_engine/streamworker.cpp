@@ -418,6 +418,9 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     AVFrame* pulled = nullptr;
     int64_t pulledTimecode100ns = -1;
+    int64_t pulledTcFrames = -1;
+    int32_t pulledRateNum = 0;
+    int32_t pulledRateDen = 0;
     bool pulledAnyFrame = false;
 #ifdef OLR_GPU_PIPELINE_BUILD
     FrameHandle pulledGpuFrame;
@@ -455,6 +458,9 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             if (pulled) av_frame_free(&pulled);
             pulled = top.frame;
             pulledTimecode100ns = top.sourceTimecode100ns;
+            pulledTcFrames = top.sourceTcFrames;
+            pulledRateNum = top.sourceFrameRateNum;
+            pulledRateDen = top.sourceFrameRateDen;
             pulledAnyFrame = true;
 #ifdef OLR_GPU_PIPELINE_BUILD
             pulledGpuFrame = top.gpuFrame;
@@ -477,10 +483,16 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         }
         // A blue-painted frame carries no source timecode.
         m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
+        m_latestFrameTcFrames.store(-1, std::memory_order_release);
+        m_latestFrameRateNum.store(0, std::memory_order_release);
+        m_latestFrameRateDen.store(0, std::memory_order_release);
 #ifdef OLR_GPU_PIPELINE_BUILD
         m_latestGpuFrame = FrameHandle{};
         m_latestGpuFenceValue = 0;
         m_latestGpuFrameTimecode100ns.store(-1, std::memory_order_release);
+        m_latestGpuFrameTcFrames.store(-1, std::memory_order_release);
+        m_latestGpuFrameRateNum.store(0, std::memory_order_release);
+        m_latestGpuFrameRateDen.store(0, std::memory_order_release);
 #endif
     }
     if (pulledAnyFrame) {
@@ -489,6 +501,9 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             av_frame_move_ref(m_latestFrame, pulled);
             // The TC travels with the frame now held in m_latestFrame.
             m_latestFrameTimecode100ns.store(pulledTimecode100ns, std::memory_order_release);
+            m_latestFrameTcFrames.store(pulledTcFrames, std::memory_order_release);
+            m_latestFrameRateNum.store(pulledRateNum, std::memory_order_release);
+            m_latestFrameRateDen.store(pulledRateDen, std::memory_order_release);
         }
         if (pulled) av_frame_free(&pulled);
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -496,6 +511,12 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         m_latestGpuFenceValue = pulledGpuFenceValue;
         m_latestGpuFrameTimecode100ns.store(m_latestGpuFrame.isNull() ? -1 : pulledTimecode100ns,
                                             std::memory_order_release);
+        m_latestGpuFrameTcFrames.store(m_latestGpuFrame.isNull() ? -1 : pulledTcFrames,
+                                       std::memory_order_release);
+        m_latestGpuFrameRateNum.store(m_latestGpuFrame.isNull() ? 0 : pulledRateNum,
+                                      std::memory_order_release);
+        m_latestGpuFrameRateDen.store(m_latestGpuFrame.isNull() ? 0 : pulledRateDen,
+                                      std::memory_order_release);
 #endif
     }
 
@@ -545,6 +566,9 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             AVStream* st = m_muxer->getStream(track);
             const int64_t sourceTimecode100ns =
                 m_latestGpuFrameTimecode100ns.load(std::memory_order_acquire);
+            const int64_t sourceTcFrames = m_latestGpuFrameTcFrames.load(std::memory_order_acquire);
+            const int sourceRateNum = m_latestGpuFrameRateNum.load(std::memory_order_acquire);
+            const int sourceRateDen = m_latestGpuFrameRateDen.load(std::memory_order_acquire);
             const int64_t sessionFrameIndex = m_internalFrameCount;
             const QString startTimecodeCandidate = [sourceTimecode100ns] {
                 if (sourceTimecode100ns < 0) return QString();
@@ -569,19 +593,29 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                             if (!startTimecodeCandidate.isEmpty())
                                 m_muxer->setStartTimecodeCandidate(startTimecodeCandidate);
                         },
-                        [this, track, streamTimeMs, sourceTimecode100ns, sessionFrameIndex,
-                         metaJson, emittedSidecars](bool written) {
+                        [this, track, streamTimeMs, sourceTimecode100ns, sourceTcFrames,
+                         sourceRateNum, sourceRateDen, sessionFrameIndex, metaJson,
+                         emittedSidecars](bool written) {
                             if (!written) {
                                 latchGpuEncodeCpuFallback();
                                 return;
                             }
                             if (emittedSidecars->exchange(true, std::memory_order_acq_rel)) return;
-                            if (sourceTimecode100ns >= 0) {
-                                emit frameTimecode(m_sourceIndex, sourceTimecode100ns,
-                                                   sessionFrameIndex);
+                            if (sourceTcFrames >= 0) {
+                                emit frameTimecode(m_sourceIndex, sourceTcFrames, sourceRateNum,
+                                                   sourceRateDen, sessionFrameIndex);
+                                // One-shot clear, but ONLY if this callback's frame is
+                                // still the latest: a newer tick may have already
+                                // published its own TC/rate. Gate the rate/tcFrames
+                                // clears on the SAME CAS that guards the timecode so a
+                                // late callback cannot zero a newer frame's observation.
                                 int64_t expected = sourceTimecode100ns;
-                                m_latestGpuFrameTimecode100ns.compare_exchange_strong(
-                                    expected, -1, std::memory_order_acq_rel);
+                                if (m_latestGpuFrameTimecode100ns.compare_exchange_strong(
+                                        expected, -1, std::memory_order_acq_rel)) {
+                                    m_latestGpuFrameTcFrames.store(-1, std::memory_order_release);
+                                    m_latestGpuFrameRateNum.store(0, std::memory_order_release);
+                                    m_latestGpuFrameRateDen.store(0, std::memory_order_release);
+                                }
                             }
                             if (!metaJson.isEmpty())
                                 m_muxer->writeMetadataPacket(track, streamTimeMs, metaJson);
@@ -632,14 +666,19 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         // keyed by the session frame index it was muxed on. Purely additive: only
         // when the frame actually carried a valid TC (>= 0), so sources without TC
         // never emit and behavior is unchanged when TC is absent.
-        const int64_t emittedTimecode100ns =
-            m_latestFrameTimecode100ns.load(std::memory_order_acquire);
-        if (emittedTimecode100ns >= 0) {
-            emit frameTimecode(m_sourceIndex, emittedTimecode100ns, m_internalFrameCount);
+        const int64_t emittedTcFrames = m_latestFrameTcFrames.load(std::memory_order_acquire);
+        if (emittedTcFrames >= 0) {
+            emit frameTimecode(m_sourceIndex, emittedTcFrames,
+                               m_latestFrameRateNum.load(std::memory_order_acquire),
+                               m_latestFrameRateDen.load(std::memory_order_acquire),
+                               m_internalFrameCount);
             // One-shot: a TC belongs to a single fresh frame. Clear it so a held /
             // repeat CFR tick (which re-muxes m_latestFrame without a new pull) does
             // not re-emit the same TC paired with a different session frame index.
             m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
+            m_latestFrameTcFrames.store(-1, std::memory_order_release);
+            m_latestFrameRateNum.store(0, std::memory_order_release);
+            m_latestFrameRateDen.store(0, std::memory_order_release);
         }
 
         // Write the per-frame source metadata to the paired subtitle track
@@ -734,6 +773,9 @@ void StreamWorker::captureLoop() {
             qf.frame = decoded.frame;
             qf.sourcePts = decoded.sourcePtsMs;
             qf.sourceTimecode100ns = decoded.sourceTimecode100ns;
+            qf.sourceTcFrames = decoded.sourceTcFrames;
+            qf.sourceFrameRateNum = decoded.sourceFrameRateNum;
+            qf.sourceFrameRateDen = decoded.sourceFrameRateDen;
 #if defined(OLR_GPU_PIPELINE_BUILD)
             qf.gpuFrame = decoded.gpuFrame;
             qf.gpuFenceValue = decoded.gpuFenceValue;

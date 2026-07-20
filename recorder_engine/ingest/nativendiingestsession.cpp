@@ -1,4 +1,5 @@
 #include "nativendiingestsession.h"
+#include "recorder_engine/timing/smpte12m.h"
 
 #include <QByteArray>
 #include <QLibrary>
@@ -131,6 +132,8 @@ public:
             video->data = m_lastVideo.p_data;
             video->timestamp100ns = m_lastVideo.timestamp;
             video->timecode100ns = m_lastVideo.timecode;
+            video->frameRateNum = m_lastVideo.frame_rate_N;
+            video->frameRateDen = m_lastVideo.frame_rate_D;
             return Capture::Video;
         }
         if (type == FrameTypeAudio && audio) {
@@ -389,6 +392,21 @@ void NativeNdiIngestSession::run() {
                 decoded.sourcePtsMs = sourcePtsMs;
                 decoded.sourceTimecode100ns =
                     video.timecode100ns == kTimecodeSynthesize ? -1 : video.timecode100ns;
+                // NDI delivers a REAL-TIME 100 ns timecode (no SMPTE drop-frame
+                // labels), so anchor it at the INTEGER label rate and report THAT same
+                // rate to the aligner: usFor() then divides the count by the exact rate
+                // it was formed with and recovers wall time. Pairing the naive integer
+                // count with the true fractional rate (e.g. 60000/1001) would leave a
+                // rate-proportional skew that grows with anchor separation — the error
+                // class this change removes.
+                const int ndiLabelRate =
+                    Smpte12m::labelRate(video.frameRateNum, video.frameRateDen);
+                decoded.sourceTcFrames = Smpte12m::labelFrameCountFrom100ns(
+                    decoded.sourceTimecode100ns, video.frameRateNum, video.frameRateDen);
+                if (decoded.sourceTcFrames >= 0) {
+                    decoded.sourceFrameRateNum = ndiLabelRate;
+                    decoded.sourceFrameRateDen = 1;
+                }
                 m_callbacks.onVideoFrame(decoded);
             } else if (frame) {
                 av_frame_free(&frame);

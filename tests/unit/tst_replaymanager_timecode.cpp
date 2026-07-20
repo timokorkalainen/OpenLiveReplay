@@ -45,17 +45,16 @@ private slots:
     void referenceTierDefaultsToLocalMonotonic();
 
 private:
-    static int64_t tc100ns(int h, int m, int s, int f) {
-        // Producers (SRT/RTMP) encode each frame's TC to 100 ns with the shared
-        // nominal fps; the aligner decodes it back with the same constant.
-        return Smpte12m::to100ns(Smpte12mTimecode{h, m, s, f, /*drop*/ false, /*valid*/ true},
-                                 Smpte12m::kTimecodeNominalFps);
+    static int64_t tcFrames(int h, int m, int s, int f) {
+        return Smpte12m::toFrameCount(Smpte12mTimecode{h, m, s, f, /*drop*/ false, /*valid*/ true},
+                                      30);
     }
 
-    static bool feedFrameTimecode(ReplayManager& m, int src, int64_t tc100, int64_t frame) {
+    static bool feedFrameTimecode(ReplayManager& m, int src, int64_t tc, int64_t frame,
+                                  int rateNum = 30, int rateDen = 1) {
         return QMetaObject::invokeMethod(&m, "onFrameTimecode", Qt::DirectConnection,
-                                         Q_ARG(int, src), Q_ARG(int64_t, tc100),
-                                         Q_ARG(int64_t, frame));
+                                         Q_ARG(int, src), Q_ARG(int64_t, tc), Q_ARG(int, rateNum),
+                                         Q_ARG(int, rateDen), Q_ARG(int64_t, frame));
     }
 
     // Drives the production seam ReplayManager::onSourceStatsUpdated exactly as the
@@ -78,8 +77,8 @@ private:
 void TestReplayManagerTimecode::jamSyncedSourcesReportAligned() {
     ReplayManager manager;
     // Two jam-synced sources: 01:00:00:00 lands on the SAME session frame 100.
-    QVERIFY(feedFrameTimecode(manager, 0, tc100ns(1, 0, 0, 0), 100));
-    QVERIFY(feedFrameTimecode(manager, 1, tc100ns(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 0, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 1, tcFrames(1, 0, 0, 0), 100));
 
     QVERIFY(manager.sourcesFrameAligned(0, 1));
     QCOMPARE(manager.sourceFrameOffset(0, 1), int64_t(0));
@@ -88,8 +87,8 @@ void TestReplayManagerTimecode::jamSyncedSourcesReportAligned() {
 void TestReplayManagerTimecode::offsetSourcesReportNotAlignedAndFrameOffset() {
     ReplayManager manager;
     // Same TC, but source 1's TC arrived 3 session frames LATER than source 0's.
-    QVERIFY(feedFrameTimecode(manager, 0, tc100ns(1, 0, 0, 0), 100));
-    QVERIFY(feedFrameTimecode(manager, 1, tc100ns(1, 0, 0, 0), 103));
+    QVERIFY(feedFrameTimecode(manager, 0, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 1, tcFrames(1, 0, 0, 0), 103));
 
     QVERIFY(!manager.sourcesFrameAligned(0, 1));
     QCOMPARE(manager.sourceFrameOffset(0, 1), int64_t(-3)); // pull B back 3 frames
@@ -98,7 +97,7 @@ void TestReplayManagerTimecode::offsetSourcesReportNotAlignedAndFrameOffset() {
 void TestReplayManagerTimecode::noTimecodeSourcesAreNotAligned() {
     ReplayManager manager;
     // Only source 0 ever carried TC; -1 timecodes are ignored by the aligner.
-    QVERIFY(feedFrameTimecode(manager, 0, tc100ns(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 0, tcFrames(1, 0, 0, 0), 100));
     QVERIFY(feedFrameTimecode(manager, 1, int64_t(-1), 100));
 
     QVERIFY(!manager.sourcesFrameAligned(0, 1));
@@ -122,8 +121,8 @@ void TestReplayManagerTimecode::timecodeAlignedSourceGradesFrameAccurate() {
     // so give source 0 the higher quality to make it the reference). A jam-synced TC
     // pair (equal TC lands on the same session frame) makes source 1 TC-aligned to the
     // reference → FrameAccurate.
-    QVERIFY(feedFrameTimecode(manager, 0, tc100ns(1, 0, 0, 0), 100));
-    QVERIFY(feedFrameTimecode(manager, 1, tc100ns(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 0, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 1, tcFrames(1, 0, 0, 0), 100));
     QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
     QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 5000000)));
     QCOMPARE(manager.referenceSource(), 0);
@@ -261,8 +260,8 @@ void TestReplayManagerTimecode::servoUsesExactTcOffsetWhenCommonTimecode() {
     // Its CLOCK offset implies only -4 ms. The servo must lock to the EXACT TC offset
     // (drive toward -66, capped at -80), NOT ride the coarse clock signal (-4). Ramp
     // many pulses: a clock-driven servo would stall at -4; a TC-driven one keeps going.
-    QVERIFY(feedFrameTimecode(manager, 0, tc100ns(1, 0, 0, 0), 100));
-    QVERIFY(feedFrameTimecode(manager, 1, tc100ns(1, 0, 0, 0), 102));
+    QVERIFY(feedFrameTimecode(manager, 0, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 1, tcFrames(1, 0, 0, 0), 102));
     for (int i = 0; i < 40; ++i) {
         QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
         QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 4000000))); // clock +4ms

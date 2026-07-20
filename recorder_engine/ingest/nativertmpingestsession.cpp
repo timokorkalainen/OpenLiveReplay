@@ -1,6 +1,8 @@
 #include "nativertmpingestsession.h"
 
 #include "gpudecodedframe.h"
+#include "spsframerate.h"
+#include "recorder_engine/timing/smpte12m.h"
 
 #include <QAbstractSocket>
 #include <QDateTime>
@@ -12,6 +14,8 @@
 #include <QThread>
 
 #include <utility>
+#include <cmath>
+#include <cstring>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -285,6 +289,23 @@ bool amf0DataMessageTimecode(const QByteArray& payload, QString* out) {
         }
     }
     return false;
+}
+
+bool amf0DataMessageNumber(const QByteArray& payload, const QByteArray& key, double* out) {
+    if (!out || key.size() > 0xffff) return false;
+    QByteArray needle;
+    needle.append(char((key.size() >> 8) & 0xff));
+    needle.append(char(key.size() & 0xff));
+    needle.append(key);
+    needle.append(char(0x00));
+    const qsizetype at = payload.indexOf(needle);
+    const qsizetype valueAt = at + needle.size();
+    if (at < 0 || valueAt + 8 > payload.size()) return false;
+    uint64_t bits = 0;
+    for (int i = 0; i < 8; ++i)
+        bits = (bits << 8) | uint8_t(payload[valueAt + i]);
+    std::memcpy(out, &bits, sizeof(bits));
+    return std::isfinite(*out);
 }
 
 } // namespace
@@ -915,6 +936,13 @@ void NativeRtmpIngestSession::processMessage(const RtmpMessage& message) {
         if (amf0DataMessageTimecode(amf0, &timecode)) {
             applyAmfTimecodeString(timecode);
         }
+        double fps = 0.0;
+        if ((amf0DataMessageNumber(amf0, QByteArrayLiteral("framerate"), &fps) ||
+             amf0DataMessageNumber(amf0, QByteArrayLiteral("fps"), &fps)) &&
+            fps >= 12.0 && fps <= 240.0) {
+            m_amfFrameRateNum = int32_t(std::lround(fps * 1000.0));
+            m_amfFrameRateDen = 1000;
+        }
         return;
     }
     if (message.type == kMessageVideo) {
@@ -1075,6 +1103,9 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     // THIS access unit's TC even if m_pendingVideoTimecode100ns is overwritten by a
     // later AU before the callback fires.
     const int64_t timecode100ns = m_pendingVideoTimecode100ns;
+    const int64_t tcFrames = m_pendingVideoTcFrames;
+    const int32_t rateNum = m_pendingVideoRateNum;
+    const int32_t rateDen = m_pendingVideoRateDen;
 #if defined(OLR_GPU_PIPELINE_BUILD)
     const bool preferGpuVideoFrames =
         ingestPrefersGpuVideoFrames(m_callbacks) && m_callbacks.onVideoFrame;
@@ -1084,8 +1115,8 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         bool gpuSurfaceRejected = false;
         const bool decodedGpu = m_videoDecoder->decodeKeepSurface(
             unit,
-            [this, &unit, sourcePtsMs, timecode100ns, &gpuSurfaceRejected](void* nativeDecodedImage,
-                                                                           qint64) {
+            [this, &unit, sourcePtsMs, timecode100ns, tcFrames, rateNum, rateDen,
+             &gpuSurfaceRejected](void* nativeDecodedImage, qint64) {
                 const FrameMetadata meta =
                     gpuDecodedFrameMetadata(unit, m_outputWidth, m_outputHeight, sourcePtsMs);
                 ImportedGpuVideoFrame imported;
@@ -1104,6 +1135,9 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
                 DecodedVideoFrame decodedFrame;
                 decodedFrame.sourcePtsMs = sourcePtsMs;
                 decodedFrame.sourceTimecode100ns = timecode100ns;
+                decodedFrame.sourceTcFrames = tcFrames;
+                decodedFrame.sourceFrameRateNum = rateNum;
+                decodedFrame.sourceFrameRateDen = rateDen;
                 decodedFrame.gpuFrame = std::move(gpuFrame);
                 decodedFrame.gpuFenceValue = imported.fenceValue;
                 m_callbacks.onVideoFrame(std::move(decodedFrame));
@@ -1125,7 +1159,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     QString error;
     const bool decoded = m_videoDecoder->decode(
         unit,
-        [this, sourcePtsMs, timecode100ns](AVFrame* frame) {
+        [this, sourcePtsMs, timecode100ns, tcFrames, rateNum, rateDen](AVFrame* frame) {
             if (!frame) return;
             if (!m_callbacks.onVideoFrame) {
                 av_frame_free(&frame);
@@ -1135,6 +1169,9 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
             decodedFrame.frame = frame;
             decodedFrame.sourcePtsMs = sourcePtsMs;
             decodedFrame.sourceTimecode100ns = timecode100ns;
+            decodedFrame.sourceTcFrames = tcFrames;
+            decodedFrame.sourceFrameRateNum = rateNum;
+            decodedFrame.sourceFrameRateDen = rateDen;
             m_callbacks.onVideoFrame(decodedFrame);
         },
         &error);
@@ -1275,9 +1312,29 @@ void NativeRtmpIngestSession::updatePendingVideoTimecode(const QByteArray& annex
     // Extraction is best-effort and bounds-checked — a garbled/truncated SEI returns
     // {valid=false}, so a bad timecode never disturbs recording.
     m_pendingVideoTimecode100ns = m_amfTimecode100ns;
+    m_pendingVideoTcFrames = -1;
+    m_pendingVideoRateNum = 0;
+    m_pendingVideoRateDen = 0;
     const Smpte12mTimecode tc = extractH26xSeiTimecode(annexB, codec);
     if (tc.valid) {
         m_pendingVideoTimecode100ns = Smpte12m::to100ns(tc, kTimecodeNominalFps);
+    }
+    // Recover the true source rate for rate-aware alignment: SPS VUI timing_info
+    // (H.264 only) first, then the FLV onMetaData framerate as a fallback. tcFrames
+    // is computed ONLY from a faithful per-frame SEI timecode; an onMetaData-only
+    // timecode string is encoded at nominal 30 (sawtooth-lossy above 30 fps) and so
+    // cannot be re-aligned to the true rate — those sources stay Incomparable.
+    SpsFrameRate rate;
+    if (codec == NativeVideoCodec::H264 && !m_avcConfig.parameterSets.h264Sps.isEmpty())
+        rate = parseSpsFrameRate(codec, m_avcConfig.parameterSets.h264Sps.constFirst());
+    if (!rate.valid() && m_amfFrameRateNum > 0 && m_amfFrameRateDen > 0)
+        rate = {m_amfFrameRateNum, m_amfFrameRateDen};
+    if (tc.valid && rate.valid()) {
+        m_pendingVideoTcFrames = Smpte12m::labelFrameCount(tc, rate.num, rate.den);
+        if (m_pendingVideoTcFrames >= 0) {
+            m_pendingVideoRateNum = rate.num;
+            m_pendingVideoRateDen = rate.den;
+        }
     }
 }
 

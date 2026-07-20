@@ -102,6 +102,37 @@ int64_t toFrameCount(const Smpte12mTimecode& tc, int nominalFps) {
     return frame;
 }
 
+int labelRate(int rateNum, int rateDen) {
+    if (rateNum <= 0 || rateDen <= 0) return 0;
+    constexpr int64_t kMinSupportedFps = 12;
+    constexpr int64_t kMaxSupportedFps = 240;
+    const int64_t numerator = rateNum;
+    const int64_t denominator = rateDen;
+    if (numerator < kMinSupportedFps * denominator || numerator > kMaxSupportedFps * denominator)
+        return 0;
+    // 64-bit intermediate: rateNum/rateDen come from attacker-controlled SPS
+    // timing_info (bounded to <=2e9 by parseSpsFrameRate), so 2*rateNum can exceed
+    // INT_MAX — computing in int would be signed-overflow UB.
+    return int((2LL * rateNum + rateDen) / (2LL * rateDen));
+}
+
+int64_t labelFrameCount(const Smpte12mTimecode& tc, int rateNum, int rateDen) {
+    if (!tc.valid) return -1;
+    const int rate = labelRate(rateNum, rateDen);
+    return rate > 0 ? toFrameCount(tc, rate) : -1;
+}
+
+int64_t labelFrameCountFrom100ns(int64_t timecode100ns, int rateNum, int rateDen) {
+    constexpr int64_t kTicksPerSecond = 10'000'000;
+    constexpr int64_t kTicksPerDay = 24LL * 60 * 60 * kTicksPerSecond;
+    if (timecode100ns < 0 || timecode100ns >= kTicksPerDay) return -1;
+    const int rate = labelRate(rateNum, rateDen);
+    if (rate <= 0) return -1;
+    using I128 = __int128;
+    return static_cast<int64_t>((I128(timecode100ns) * rate + kTicksPerSecond / 2) /
+                                kTicksPerSecond);
+}
+
 int64_t to100ns(const Smpte12mTimecode& tc, int nominalFps) {
     if (nominalFps <= 0) {
         return 0;

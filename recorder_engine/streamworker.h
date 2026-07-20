@@ -142,7 +142,8 @@ signals:
     // (m_internalFrameCount) it landed on. ONLY emitted when sourceTimecode100ns >= 0
     // — sources without TC never emit it, so behavior is unchanged when TC is absent.
     // ReplayManager feeds it into its TimecodeAligner (Qt::QueuedConnection).
-    void frameTimecode(int sourceIndex, int64_t sourceTimecode100ns, int64_t sessionFrameIndex);
+    void frameTimecode(int sourceIndex, int64_t tcFrames, int rateNum, int rateDen,
+                       int64_t sessionFrameIndex);
 
 public slots:
     void onMasterPulse(int64_t frameIndex, int64_t streamTimeMs);
@@ -161,6 +162,9 @@ private:
     // m_latestFrame, or -1 when none/blue. Tick-thread-only. Travels with the
     // frame through the jitter pull so the muxed frame's TC can be forwarded.
     std::atomic<int64_t> m_latestFrameTimecode100ns{-1};
+    std::atomic<int64_t> m_latestFrameTcFrames{-1};
+    std::atomic<int32_t> m_latestFrameRateNum{0};
+    std::atomic<int32_t> m_latestFrameRateDen{0};
     int64_t m_internalFrameCount;
     RecordingClock* m_sharedClock;
 
@@ -248,6 +252,9 @@ private:
         // transport carried no TC. Purely additive: never affects A/V sync or the
         // jitter pull; only forwarded via frameTimecode() when the frame is muxed.
         int64_t sourceTimecode100ns = -1;
+        int64_t sourceTcFrames = -1;
+        int32_t sourceFrameRateNum = 0;
+        int32_t sourceFrameRateDen = 0;
 #ifdef OLR_GPU_PIPELINE_BUILD
         FrameHandle gpuFrame;
         uint64_t gpuFenceValue = 0;
@@ -273,6 +280,9 @@ private:
     FrameHandle m_latestGpuFrame;
     uint64_t m_latestGpuFenceValue = 0;
     std::atomic<int64_t> m_latestGpuFrameTimecode100ns{-1};
+    std::atomic<int64_t> m_latestGpuFrameTcFrames{-1};
+    std::atomic<int32_t> m_latestGpuFrameRateNum{0};
+    std::atomic<int32_t> m_latestGpuFrameRateDen{0};
 #endif
 
     // FFmpeg helpers

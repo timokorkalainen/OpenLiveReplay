@@ -209,7 +209,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/timing/driftestimator.h recorder_engine/timing/driftestimator.cpp
         recorder_engine/timing/timecode.h recorder_engine/timing/timecode.cpp
         recorder_engine/timing/smpte12m.h recorder_engine/timing/smpte12m.cpp
-        recorder_engine/timing/timecodealigner.h recorder_engine/timing/timecodealigner.cpp
+        recorder_engine/timing/timecodealignerv2.h recorder_engine/timing/timecodealignerv2.cpp
         recorder_engine/timing/sourceoffsetestimator.h recorder_engine/timing/sourceoffsetestimator.cpp
         recorder_engine/timing/sourceclock.h recorder_engine/timing/sourceclock.cpp
         recorder_engine/timing/timingreference.h recorder_engine/timing/timingreference.cpp
@@ -225,6 +225,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
         recorder_engine/ingest/colorvui.h recorder_engine/ingest/colorvui.cpp
+        recorder_engine/ingest/spsframerate.h recorder_engine/ingest/spsframerate.cpp
         recorder_engine/ingest/gpudecodedframe.h recorder_engine/ingest/gpudecodedframe.cpp
         recorder_engine/codec/avcc.h recorder_engine/codec/avcc.cpp
         recorder_engine/codec/colorvui.h recorder_engine/codec/colorvui.cpp

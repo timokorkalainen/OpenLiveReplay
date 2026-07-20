@@ -4,6 +4,8 @@
 #include "nativesrtconnectdiagnostics.h"
 #include "nativesrturloptions.h"
 #include "gpudecodedframe.h"
+#include "spsframerate.h"
+#include "recorder_engine/timing/smpte12m.h"
 
 #include <QDebug>
 #include <QThread>
@@ -816,6 +818,9 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
         }
 
         const int64_t timecode100ns = m_pendingVideoTimecode100ns;
+        const int64_t tcFrames = m_pendingVideoTcFrames;
+        const int32_t rateNum = m_pendingVideoRateNum;
+        const int32_t rateDen = m_pendingVideoRateDen;
 #if defined(OLR_GPU_PIPELINE_BUILD)
         const bool preferGpuVideoFrames =
             ingestPrefersGpuVideoFrames(m_callbacks) && m_callbacks.onVideoFrame;
@@ -825,7 +830,7 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
             bool gpuSurfaceRejected = false;
             const bool decodedGpu = m_decoder->decodeKeepSurface(
                 unit,
-                [this, &unit, sourcePtsMs, timecode100ns,
+                [this, &unit, sourcePtsMs, timecode100ns, tcFrames, rateNum, rateDen,
                  &gpuSurfaceRejected](void* nativeDecodedImage, qint64 /*pts90k*/) {
                     const FrameMetadata meta =
                         gpuDecodedFrameMetadata(unit, m_outputWidth, m_outputHeight, sourcePtsMs);
@@ -845,6 +850,9 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
                     DecodedVideoFrame decodedFrame;
                     decodedFrame.sourcePtsMs = sourcePtsMs;
                     decodedFrame.sourceTimecode100ns = timecode100ns;
+                    decodedFrame.sourceTcFrames = tcFrames;
+                    decodedFrame.sourceFrameRateNum = rateNum;
+                    decodedFrame.sourceFrameRateDen = rateDen;
                     decodedFrame.gpuFrame = std::move(gpuFrame);
                     decodedFrame.gpuFenceValue = imported.fenceValue;
                     m_callbacks.onVideoFrame(std::move(decodedFrame));
@@ -866,7 +874,7 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
         QString error;
         const bool decoded = m_decoder->decode(
             unit,
-            [this, sourcePtsMs, timecode100ns](AVFrame* frame) {
+            [this, sourcePtsMs, timecode100ns, tcFrames, rateNum, rateDen](AVFrame* frame) {
                 if (!frame) {
                     return;
                 }
@@ -879,6 +887,9 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
                 decodedFrame.frame = frame;
                 decodedFrame.sourcePtsMs = sourcePtsMs;
                 decodedFrame.sourceTimecode100ns = timecode100ns;
+                decodedFrame.sourceTcFrames = tcFrames;
+                decodedFrame.sourceFrameRateNum = rateNum;
+                decodedFrame.sourceFrameRateDen = rateDen;
                 m_callbacks.onVideoFrame(decodedFrame);
             },
             &error);
@@ -1054,9 +1065,21 @@ void NativeSrtIngestSession::updatePendingVideoTimecode(const CompressedAccessUn
     // a garbled/truncated SEI returns {valid=false} and leaves the reset -1, so a bad
     // timecode never disturbs recording.
     m_pendingVideoTimecode100ns = -1;
+    m_pendingVideoTcFrames = -1;
+    m_pendingVideoRateNum = 0;
+    m_pendingVideoRateDen = 0;
     const Smpte12mTimecode tc = extractH26xSeiTimecode(unit.annexB, unit.codec);
     if (tc.valid) {
         m_pendingVideoTimecode100ns = Smpte12m::to100ns(tc, kTimecodeNominalFps);
+        const QByteArray sps = unit.parameterSets.h264Sps.isEmpty()
+                                   ? QByteArray()
+                                   : unit.parameterSets.h264Sps.constFirst();
+        const SpsFrameRate rate = parseSpsFrameRate(unit.codec, sps);
+        if (rate.valid()) {
+            m_pendingVideoTcFrames = Smpte12m::labelFrameCount(tc, rate.num, rate.den);
+            m_pendingVideoRateNum = rate.num;
+            m_pendingVideoRateDen = rate.den;
+        }
     }
 }
 
