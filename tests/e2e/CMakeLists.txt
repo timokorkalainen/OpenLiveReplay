@@ -1055,6 +1055,25 @@ if(APPLE)
     # kind=rtmp line exists, bytes>0, decodefail==0, and the native backend marker. Base 23800.
     add_test(NAME e2e_native_rtmp_ui_stats
         COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_ui_stats.sh" "$<TARGET_FILE:sync_harness>" 23800)
+    # SRT/RTMP parity cells: the RTMP twins of e2e_native_srt_4cam/sync/trim/connect,
+    # using the same deterministic Python RTMP fixture server as
+    # the cells above. Each source gets its own TCP port (no UDP relay pair needed,
+    # unlike SRT), so the 4-source cells need 4 consecutive ports and the 2-source
+    # trim cell needs 2. Base ports 23810-23860 are the next free block after the
+    # existing native-RTMP band (<=23800) and clear of the AAC matrix port (23820).
+    add_test(NAME e2e_native_rtmp_4cam
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_4cam.sh" "$<TARGET_FILE:sync_harness>" 23810)
+    add_test(NAME e2e_native_rtmp_sync
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_sync.sh" "$<TARGET_FILE:sync_harness>" 23830)
+    add_test(NAME e2e_native_rtmp_trim
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_trim.sh" "$<TARGET_FILE:sync_harness>" 23840)
+    add_test(NAME e2e_native_rtmp_connect
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_connect.sh" "$<TARGET_FILE:sync_harness>" 23850)
+    # Plain (non-HEVC) RTMPS/TLS smoke: the TLS twin of e2e_native_rtmp_smoke,
+    # completing the RTMP delivery matrix (rtmps_hevc_smoke already covers the
+    # HEVC/TLS cell). Port 23860 is clear of the block above.
+    add_test(NAME e2e_native_rtmps_smoke
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmps_smoke.sh" "$<TARGET_FILE:record_harness>" 23860)
     set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
         LABELS "native-rtmp;delivery-gate"
         TIMEOUT 180
@@ -1091,6 +1110,31 @@ if(APPLE)
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
     set_tests_properties(e2e_native_rtmp_ui_stats PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+    set_tests_properties(e2e_native_rtmp_4cam PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+    set_tests_properties(e2e_native_rtmp_sync PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+    set_tests_properties(e2e_native_rtmp_trim PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+    set_tests_properties(e2e_native_rtmp_connect PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+    set_tests_properties(e2e_native_rtmps_smoke PROPERTIES
         LABELS "native-rtmp"
         TIMEOUT 180
         RUN_SERIAL TRUE
