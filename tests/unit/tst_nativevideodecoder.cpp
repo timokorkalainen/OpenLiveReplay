@@ -24,7 +24,7 @@ private slots:
 
 namespace {
 
-DecodedFrameEvidence callbackEvidence(qint64 pts90k, int64_t marker) {
+[[maybe_unused]] DecodedFrameEvidence callbackEvidence(qint64 pts90k, int64_t marker) {
     return {pts90k, marker, marker * 10, std::nullopt};
 }
 

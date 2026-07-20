@@ -278,20 +278,20 @@ QByteArray hevcVps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000, u
                    bool interlacedSource = false) {
     BitWriter writer;
     writer.bits(vpsId, 4); // vps_video_parameter_set_id
-    writer.bit(true);  // vps_base_layer_internal_flag
-    writer.bit(true);  // vps_base_layer_available_flag
-    writer.bits(0, 6); // vps_max_layers_minus1
-    writer.bits(0, 3); // vps_max_sub_layers_minus1
-    writer.bit(true);  // vps_temporal_id_nesting_flag
+    writer.bit(true);      // vps_base_layer_internal_flag
+    writer.bit(true);      // vps_base_layer_available_flag
+    writer.bits(0, 6);     // vps_max_layers_minus1
+    writer.bits(0, 3);     // vps_max_sub_layers_minus1
+    writer.bit(true);      // vps_temporal_id_nesting_flag
     writer.bits(0xffff, 16);
-    writer.bits(0, 2);            // general_profile_space
-    writer.bit(false);            // general_tier_flag
-    writer.bits(1, 5);            // Main profile
-    writer.bits(0x80000000u, 32); // Main profile compatibility
+    writer.bits(0, 2);             // general_profile_space
+    writer.bit(false);             // general_tier_flag
+    writer.bits(1, 5);             // Main profile
+    writer.bits(0x80000000u, 32);  // Main profile compatibility
     writer.bit(progressiveSource); // progressive_source_flag
     writer.bit(interlacedSource);  // interlaced_source_flag
-    writer.bit(false);            // non_packed_constraint_flag
-    writer.bit(true);             // frame_only_constraint_flag
+    writer.bit(false);             // non_packed_constraint_flag
+    writer.bit(true);              // frame_only_constraint_flag
     writer.bits(0, 32);
     writer.bits(0, 12);  // reserved_zero_44bits
     writer.bits(120, 8); // general_level_idc
@@ -304,8 +304,8 @@ QByteArray hevcVps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000, u
     writer.bit(true);    // vps_timing_info_present_flag
     writer.bits(numUnitsInTick, 32);
     writer.bits(timeScale, 32);
-    writer.bit(true);  // vps_poc_proportional_to_timing_flag
-    writer.ue(0);      // vps_num_ticks_poc_diff_one_minus1
+    writer.bit(true);                        // vps_poc_proportional_to_timing_flag
+    writer.ue(0);                            // vps_num_ticks_poc_diff_one_minus1
     writer.ue(hrdLayerSetIndex < 0 ? 0 : 1); // vps_num_hrd_parameters
     if (hrdLayerSetIndex >= 0) {
         writer.ue(uint32_t(hrdLayerSetIndex)); // hrd_layer_set_idx[0]
@@ -355,8 +355,8 @@ QByteArray hevcSps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000,
                    bool vuiParametersPresent = true) {
     BitWriter writer;
     writer.bits(referencedVpsId, 4); // sps_video_parameter_set_id
-    writer.bits(0, 3); // sps_max_sub_layers_minus1
-    writer.bit(true);  // sps_temporal_id_nesting_flag
+    writer.bits(0, 3);               // sps_max_sub_layers_minus1
+    writer.bit(true);                // sps_temporal_id_nesting_flag
     writer.bits(0, 2);
     writer.bit(false);
     writer.bits(1, 5);
@@ -380,20 +380,20 @@ QByteArray hevcSps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000,
     writer.ue(0);
     writer.ue(0);
     writer.ue(0);
-    writer.ue(0);      // log2_min_luma_coding_block_size_minus3
-    writer.ue(3);      // log2_diff_max_min_luma_coding_block_size
-    writer.ue(0);      // log2_min_luma_transform_block_size_minus2
-    writer.ue(3);      // log2_diff_max_min_luma_transform_block_size
-    writer.ue(0);      // max_transform_hierarchy_depth_inter
-    writer.ue(0);      // max_transform_hierarchy_depth_intra
-    writer.bit(false); // scaling_list_enabled_flag
-    writer.bit(true);  // amp_enabled_flag
-    writer.bit(true);  // sample_adaptive_offset_enabled_flag
-    writer.bit(false); // pcm_enabled_flag
-    writer.ue(0);      // num_short_term_ref_pic_sets
-    writer.bit(false); // long_term_ref_pics_present_flag
-    writer.bit(true);  // sps_temporal_mvp_enabled_flag
-    writer.bit(true);  // strong_intra_smoothing_enabled_flag
+    writer.ue(0);                     // log2_min_luma_coding_block_size_minus3
+    writer.ue(3);                     // log2_diff_max_min_luma_coding_block_size
+    writer.ue(0);                     // log2_min_luma_transform_block_size_minus2
+    writer.ue(3);                     // log2_diff_max_min_luma_transform_block_size
+    writer.ue(0);                     // max_transform_hierarchy_depth_inter
+    writer.ue(0);                     // max_transform_hierarchy_depth_intra
+    writer.bit(false);                // scaling_list_enabled_flag
+    writer.bit(true);                 // amp_enabled_flag
+    writer.bit(true);                 // sample_adaptive_offset_enabled_flag
+    writer.bit(false);                // pcm_enabled_flag
+    writer.ue(0);                     // num_short_term_ref_pic_sets
+    writer.bit(false);                // long_term_ref_pics_present_flag
+    writer.bit(true);                 // sps_temporal_mvp_enabled_flag
+    writer.bit(true);                 // strong_intra_smoothing_enabled_flag
     writer.bit(vuiParametersPresent); // vui_parameters_present_flag
     if (vuiParametersPresent) {
         writer.bit(false);                 // aspect_ratio_info_present_flag

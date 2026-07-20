@@ -23,6 +23,26 @@ std::atomic<bool> enabled{false};
 std::atomic<uint64_t> count{0};
 } // namespace allocation_probe
 
+// The global operator new/delete overrides below let allocation_probe count heap
+// allocations for the "exactly once" assertion. They are INCOMPATIBLE with
+// AddressSanitizer, which intercepts new/delete itself: routing new-allocated
+// memory (e.g. Qt's nothrow-new QQueuedMetaCallEvent) through std::free trips an
+// alloc-dealloc-mismatch. Compile them out under ASan -- the allocation-count
+// assertion is then vacuous there, but the non-sanitized unit runs still exercise
+// the real count and the sanitizer's memory-safety coverage is unaffected.
+#if defined(__SANITIZE_ADDRESS__)
+#define OLR_TEST_UNDER_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define OLR_TEST_UNDER_ASAN 1
+#else
+#define OLR_TEST_UNDER_ASAN 0
+#endif
+#else
+#define OLR_TEST_UNDER_ASAN 0
+#endif
+
+#if !OLR_TEST_UNDER_ASAN
 void* operator new(std::size_t size) {
     if (allocation_probe::enabled.load(std::memory_order_relaxed))
         allocation_probe::count.fetch_add(1, std::memory_order_relaxed);
@@ -49,6 +69,7 @@ void operator delete(void* memory, std::size_t) noexcept {
 void operator delete[](void* memory, std::size_t) noexcept {
     std::free(memory);
 }
+#endif // !OLR_TEST_UNDER_ASAN
 
 namespace {
 

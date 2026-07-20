@@ -590,9 +590,9 @@ void StreamWorker::latchGpuEncodeCpuFallback() {
     tryLatchGpuEncodeCpuFallback(activeCarrier);
 }
 
-ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForEncode(void* nativeDecodedImage,
-                                                                 const FrameMetadata& metadata,
-                                                                 bool latchFallbackOnFailure) {
+ImportedGpuVideoFrame
+StreamWorker::importGpuVideoFrameForEncode(void* nativeDecodedImage, const FrameMetadata& metadata,
+                                           [[maybe_unused]] bool latchFallbackOnFailure) {
     ImportedGpuVideoFrame imported;
 #if defined(__APPLE__)
     auto surface = wrapAppleImageBuffer(nativeDecodedImage);

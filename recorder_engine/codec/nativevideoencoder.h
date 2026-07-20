@@ -52,11 +52,11 @@ public:
 
         template <typename Callable>
         static PacketCallback bind(Callable& callable) noexcept {
-            return PacketCallback{&callable, 0,
-                                  [](void* context, uint64_t, const QByteArray& data,
-                                     int64_t ptsTicks, bool keyframe) {
-                                      (*static_cast<Callable*>(context))(data, ptsTicks, keyframe);
-                                  }};
+            return PacketCallback{
+                &callable, 0,
+                [](void* ctx, uint64_t, const QByteArray& data, int64_t ptsTicks, bool keyframe) {
+                    (*static_cast<Callable*>(ctx))(data, ptsTicks, keyframe);
+                }};
         }
     };
     static_assert(std::is_trivially_copyable_v<PacketCallback>);
