@@ -27,7 +27,7 @@
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>OpenLiveReplay uses the local network to publish NDI programme output for broadcast monitoring and testing.</string>
+    <string>OpenLiveReplay uses the local network to discover, receive, and publish NDI video sources for broadcast monitoring and testing.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_ndi._tcp.</string>
