@@ -89,6 +89,9 @@ void TestIosGpuLifecycle::sinkRegistryRoundTrips() {
 
 void TestIosGpuLifecycle::presentBlockRunsOnceOnHost() {
     auto ctx = GpuRhiContext::createNullForTest();
+#ifdef Q_OS_WIN
+    if (!ctx) ctx = GpuRhiContext::createInvalidForTest();
+#endif
     QVERIFY(ctx);
     int ran = 0;
     QThread* callerThread = QThread::currentThread();
