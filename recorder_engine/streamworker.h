@@ -462,6 +462,13 @@ private:
     std::function<void()> m_beforeMuxPacketWriteForTest;
     std::function<void()> m_beforeMuxEvidenceSubmissionForTest;
     std::function<void()> m_beforeGpuFallbackTryForTest;
+    // Overrides the software encoder's send/receive so a test can deterministically
+    // script the reordered/delayed output PTS per tick (input frame PTS -> output
+    // packet PTS, or nullopt for "no packet this tick"), instead of depending on a
+    // real codec's platform-variable B-frame reorder timing. Production recording is
+    // all-intra (in-order, no delay), so this exercises the mux carrier's delayed/
+    // out-of-order completion handling without a real reordering codec.
+    std::function<std::optional<int64_t>(int64_t)> m_softwareEncodeOutputPtsForTest;
 #if defined(OLR_GPU_PIPELINE_BUILD)
     std::function<ImportedGpuVideoFrame(void*, const FrameMetadata&)> m_gpuImportForTest;
     std::function<void()> m_afterGpuImportForTest;

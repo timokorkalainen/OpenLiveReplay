@@ -143,7 +143,7 @@ public:
     QByteArray avccExtradata() const override { return QByteArrayLiteral("avcc"); }
 };
 
-AVCodecContext* makeDelayedMpeg2Encoder() {
+AVCodecContext* makeIntraMpeg2Encoder() {
     const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
     if (!codec) return nullptr;
     AVCodecContext* context = avcodec_alloc_context3(codec);
@@ -153,8 +153,8 @@ AVCodecContext* makeDelayedMpeg2Encoder() {
     context->time_base = AVRational{1, 30};
     context->framerate = AVRational{30, 1};
     context->pix_fmt = AV_PIX_FMT_YUV420P;
-    context->gop_size = 12;
-    context->max_b_frames = 1;
+    context->gop_size = 1;     // all-intra, matching production recording
+    context->max_b_frames = 0; // no B-frames: in-order, no reorder/delay
     context->bit_rate = 2'000'000;
     if (avcodec_open2(context, codec, nullptr) < 0) {
         avcodec_free_context(&context);
@@ -612,7 +612,7 @@ void TestReplayManagerTimecode::delayedSoftwareOutputUsesEvidenceForPacketPts() 
     QVERIFY(worker.m_latestFrame != nullptr);
     worker.beginCaptureSession();
     worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
-    AVCodecContext* encoder = makeDelayedMpeg2Encoder();
+    AVCodecContext* encoder = makeIntraMpeg2Encoder();
     QVERIFY(encoder != nullptr);
 
     QList<TimecodeEvidence> delivered;
@@ -624,6 +624,11 @@ void TestReplayManagerTimecode::delayedSoftwareOutputUsesEvidenceForPacketPts() 
         },
         Qt::QueuedConnection));
 
+    // Deterministic software encoder: a 1-frame delay (frame 40's packet surfaces
+    // when frame 41 is fed), replacing a real codec's platform-dependent reorder.
+    worker.m_softwareEncodeOutputPtsForTest = [](int64_t inputPts) -> std::optional<int64_t> {
+        return inputPts == 41 ? std::optional<int64_t>(40) : std::nullopt;
+    };
     const TimecodeEvidence first = evidence(tcFrames(1, 0, 0, 0), 40, 30, 1, 7, 11);
     worker.m_latestFrameTimecodeEvidence = first;
     worker.m_latestFrameTimecode100ns.store(1, std::memory_order_release);
@@ -669,7 +674,7 @@ void TestReplayManagerTimecode::delayedSoftwareCompletionAfterResetDropsEvidence
     QVERIFY(worker.m_latestFrame != nullptr);
     worker.beginCaptureSession();
     worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
-    AVCodecContext* encoder = makeDelayedMpeg2Encoder();
+    AVCodecContext* encoder = makeIntraMpeg2Encoder();
     QVERIFY(encoder != nullptr);
 
     QList<TimecodeEvidence> delivered;
@@ -678,6 +683,22 @@ void TestReplayManagerTimecode::delayedSoftwareCompletionAfterResetDropsEvidence
         [&delivered](int, uint64_t, uint64_t, TimecodeEvidence value) { delivered.append(value); },
         Qt::QueuedConnection));
 
+    // Deterministic software encoder reproducing an MPEG-2 coded order [50, 52, 51]
+    // (display 50(I),51(B),52(P)): frame 50 is held then emitted at tick 51, the P
+    // frame 52 next, the B frame 51 last -- no real reordering codec, so no platform
+    // dependence.
+    worker.m_softwareEncodeOutputPtsForTest = [](int64_t inputPts) -> std::optional<int64_t> {
+        switch (inputPts) {
+        case 51:
+            return int64_t(50);
+        case 52:
+            return int64_t(52);
+        case 53:
+            return int64_t(51);
+        default:
+            return std::nullopt;
+        }
+    };
     const TimecodeEvidence first = evidence(tcFrames(1, 0, 0, 0), 50, 30, 1, 7, 11);
     worker.m_latestFrameTimecodeEvidence = first;
     worker.m_latestFrameTimecode100ns.store(1, std::memory_order_release);
@@ -881,8 +902,12 @@ void TestReplayManagerTimecode::resetBetweenLatestValidationAndSoftwareSubmissio
     worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
     worker.m_latestFrameTimecodeEvidence = evidence(tcFrames(1, 0, 0, 0), 1);
     worker.m_beforeMuxEvidenceSubmissionForTest = [&worker] { worker.clearMuxFrameEvidence(); };
-    AVCodecContext* encoder = makeDelayedMpeg2Encoder();
+    AVCodecContext* encoder = makeIntraMpeg2Encoder();
     QVERIFY(encoder != nullptr);
+    // The submission is rejected before the encoder runs; keep it deterministic.
+    worker.m_softwareEncodeOutputPtsForTest = [](int64_t) -> std::optional<int64_t> {
+        return std::nullopt;
+    };
 
     worker.m_internalFrameCount = 1;
     worker.processEncoderTick(encoder, 33, 0, 0);
@@ -1157,8 +1182,12 @@ void TestReplayManagerTimecode::unstampedEvidenceCannotEncodeOrSeedTimecode() {
     worker.m_latestFrameTimecodeEvidence = evidence(tcFrames(1, 0, 0, 0), 1);
     worker.m_latestFrameTimecode100ns.store(1, std::memory_order_release);
     worker.m_latestFrameCarrierToken.reset();
-    AVCodecContext* encoder = makeDelayedMpeg2Encoder();
+    AVCodecContext* encoder = makeIntraMpeg2Encoder();
     QVERIFY(encoder != nullptr);
+    // Unstamped evidence is rejected before encoding; keep it deterministic.
+    worker.m_softwareEncodeOutputPtsForTest = [](int64_t) -> std::optional<int64_t> {
+        return std::nullopt;
+    };
 
     worker.m_internalFrameCount = 1;
     worker.processEncoderTick(encoder, 33, 0, 0);

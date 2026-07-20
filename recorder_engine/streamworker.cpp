@@ -1716,10 +1716,41 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                 if (selectedEvidence && !m_latestFrameTimecodeEvidence)
                     m_latestFrameTimecodeEvidence = std::move(selectedEvidence);
             } else {
-                const int sendResult = avcodec_send_frame(encCtx, m_latestFrame);
-                if (sendResult == 0) {
+                bool encodeAccepted = false;
+                bool receivedPacket = false;
+#ifdef OLR_UNIT_TEST
+                if (m_softwareEncodeOutputPtsForTest) {
+                    // Deterministic test encoder: script the reordered/delayed output
+                    // PTS instead of driving a real (reordering) codec, whose B-frame
+                    // output timing is platform-dependent. Production is all-intra.
+                    encodeAccepted = true;
                     m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
-                    if (avcodec_receive_packet(encCtx, outPkt) == 0) {
+                    const std::optional<int64_t> scriptedPts =
+                        m_softwareEncodeOutputPtsForTest(m_latestFrame->pts);
+                    if (scriptedPts.has_value()) {
+                        av_packet_unref(outPkt);
+                        if (av_new_packet(outPkt, 1) == 0) {
+                            outPkt->data[0] = 0;
+                            outPkt->pts = *scriptedPts;
+                            outPkt->dts = *scriptedPts;
+                            // All-intra: every output is a keyframe. Without this the
+                            // muxer drops a leading non-keyframe on some platforms.
+                            outPkt->flags |= AV_PKT_FLAG_KEY;
+                            receivedPacket = true;
+                        }
+                    }
+                } else
+#endif
+                {
+                    const int sendResult = avcodec_send_frame(encCtx, m_latestFrame);
+                    encodeAccepted = (sendResult == 0);
+                    if (encodeAccepted) {
+                        m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
+                        receivedPacket = (avcodec_receive_packet(encCtx, outPkt) == 0);
+                    }
+                }
+                if (encodeAccepted) {
+                    if (receivedPacket) {
                         softwareCompletionId = reserveMuxCompletion(0);
                         if (softwareCompletionId == 0) {
                             qWarning()
