@@ -114,7 +114,7 @@ void OutputRuntime::resetFrameIndex(qint64 nextOutputFrameIndex) {
 void OutputRuntime::resetPlayEpoch() {
     QMutexLocker locker(&m_mutex);
     // Re-anchor barrier (Challenge 1, F1): bump the config generation so any
-    // in-flight pre-reset snapshot fails its lease re-check — runCatchUpDispatch
+    // in-flight pre-reset snapshot fails its lease re-check — dispatchDueTicksNs
     // (m_configGeneration != configGeneration) and dispatchImmediateWithReport
     // both re-compare it — and is discarded rather than dispatched against the
     // freshly-cleared epoch. Placed before the dispatch-active branch so it
