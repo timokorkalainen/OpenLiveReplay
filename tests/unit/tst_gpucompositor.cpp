@@ -138,8 +138,8 @@ bool warpRequiredForTest() {
     return qEnvironmentVariableIntValue("OLR_REQUIRE_WARP") != 0;
 }
 
-void compareRows(const CpuPlanes& expected, const CpuPlanes& actual, int plane, int rows,
-                 int bytesPerRow) {
+[[maybe_unused]] void compareRows(const CpuPlanes& expected, const CpuPlanes& actual, int plane,
+                                  int rows, int bytesPerRow) {
     for (int row = 0; row < rows; ++row) {
         const QByteArrayView exp(expected.plane[plane].constData() +
                                      planeOffset(row, expected.stride[plane]),

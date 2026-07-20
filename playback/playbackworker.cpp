@@ -2723,7 +2723,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                 auto* retireQueueForCommit = &m_gpuFrameRetireQueue;
                 auto* outputRuntimeMutexForCommit = &m_outputRuntimeMutex;
                 auto* outputRuntimeForCommit = &m_outputRuntime;
-                auto expectedDecodeSurfaceBytesForTrack = [&]() -> qint64 {
+                [[maybe_unused]] auto expectedDecodeSurfaceBytesForTrack = [&]() -> qint64 {
                     GpuBudgetConfig cfg;
                     cfg.width = m_outputWidth;
                     cfg.height = m_outputHeight;

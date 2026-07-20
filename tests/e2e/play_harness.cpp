@@ -971,10 +971,10 @@ int main(int argc, char** argv) {
         } else if (scen == "liveedge") {
             // Seek near the end and play forward into EOF. Tests the live-EOF
             // tail-hold (no spin / no storm at the file edge).
-            const int64_t nearEndMs = qMax<int64_t>(0, durMs - 1000);
+            const int64_t nearPoint = qMax<int64_t>(0, durMs - 1000);
             transport.setSpeed(1.0);
-            transport.seek(nearEndMs);
-            worker.seekTo(nearEndMs);
+            transport.seek(nearPoint);
+            worker.seekTo(nearPoint);
             transport.setPlaying(true);
             QTimer::singleShot(6000, &app, finish);
 
@@ -1060,10 +1060,10 @@ int main(int argc, char** argv) {
             // seekflash baseline-delta pattern: warm up so a real frame is
             // delivered + cached, snapshot the placeholder baseline BEFORE the
             // backward seek, then jump to 0 and play on.
-            const int64_t nearEndMs = qMax<int64_t>(0, durMs - 1000);
+            const int64_t nearPoint = qMax<int64_t>(0, durMs - 1000);
             transport.setSpeed(1.0);
-            transport.seek(nearEndMs);
-            worker.seekTo(nearEndMs);
+            transport.seek(nearPoint);
+            worker.seekTo(nearPoint);
             transport.setPlaying(true);
             // After warmup (~1.5s near EOF): snapshot baseline, then far-back seek.
             QTimer::singleShot(1500, &app, [&, basePh, baseHeld]() {
