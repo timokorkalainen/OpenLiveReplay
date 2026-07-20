@@ -272,6 +272,10 @@ private:
         bool requireCurrentSeek = true;
         bool clearSeekTarget = false;
         bool guardPlayheadCache = false;
+        // When false, the commit skips the coverage/displayable gate and commits at
+        // playheadMs unconditionally (used by a scheduled cut that has deferred to its
+        // bound: the cut must land on air even if a feed is not yet displayable).
+        bool requireCoverage = true;
         PostCommitDispatch dispatch = PostCommitDispatch::None;
     };
 
@@ -353,6 +357,12 @@ private:
     validatedOutputCommitPlayheadLocked(const OutputCommit& commit,
                                         const OutputFrameCache* coverageCache) const;
     OutputCommitResult commitOutputStateLocked(const OutputCommit& commit);
+    // Whether a still-in-flight operator PGM obligation should be (re)dispatched at a
+    // reposition commit. The per-packet early-completion (tryComplete) is one-shot via
+    // OperatorSeekCompletionState::pgmDispatchAttempted, but the final reposition commit
+    // makes the last PGM attempt for the SAME seek, so a transient early miss does not
+    // strand the operator's take-to-air. Caller holds m_mutex.
+    bool operatorPgmObligationAvailableLocked(uint64_t generation) const;
     OutputCommitResult commitFullRepositionOutputStateLocked(
         const OutputCommit& commit, std::unique_ptr<OutputFrameCache>& liveSaved, qint64 keepFrom,
         qint64 keepTo, qint64 keepAudioFromSample, bool sanitizeForDeviceLoss);
@@ -602,6 +612,17 @@ private:
     // maybeFireScheduledCut (under m_bufferMutex); written by scheduleCutAtFrame.
     std::atomic<qint64> m_scheduledCutFrame{-1};
     std::atomic<int64_t> m_scheduledCutTargetMs{-1};
+    // A scheduled program cut must land on air. When the promoted staging cache is not
+    // yet displayable at the post-cut playhead the fire defers (retries next tick), but
+    // only up to kMaxScheduledCutDeferredTicks; after that it fires unconditionally (a
+    // brief placeholder or hold-last frame on a lagging feed is acceptable, an
+    // indefinitely-deferred cut is not). The bound is kept small because
+    // CutSchedule::playheadAfterCut advances the post-cut playhead each deferred tick
+    // while staging stays pinned to the armed target, so waiting longer yields a staler
+    // forced frame, not a fresher one. Counted and reset on the output thread under
+    // m_bufferMutex.
+    static constexpr int kMaxScheduledCutDeferredTicks = 3;
+    int m_scheduledCutDeferredTicks = 0;
     // Safe re-arm queue: a Recall (armNextCut, UI thread) that arrives while a cut
     // is already in flight stores the LATEST target here instead of dropping it or
     // (unsafely) resetting the staging state mid-cut. The run loop applies it via

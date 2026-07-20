@@ -468,6 +468,12 @@ PlaybackWorker::validatedOutputCommitPlayheadLocked(const OutputCommit& commit,
     qint64 committedPlayheadMs = commit.playheadMs;
     if (m_outputFeedCount > 0) {
         if (!coverageCache) return std::nullopt;
+        if (!commit.requireCoverage) {
+            // Forced commit (a scheduled cut deferred to its bound): land at the
+            // requested playhead without a coverage/displayable gate, so the cut goes
+            // to air even if a feed is not yet displayable there.
+            return commit.playheadMs;
+        }
         // Graph/device recovery may have only placeholders after dead GPU frames
         // are removed. That state is allowed to republish and reset the epoch only
         // while preserving the already committed seek/playhead identity. Real and
@@ -556,6 +562,16 @@ PlaybackWorker::commitOutputStateLocked(const OutputCommit& commit) {
     result.committedGeneration = commit.seekGeneration;
     result.dispatch = commit.dispatch;
     return result;
+}
+
+bool PlaybackWorker::operatorPgmObligationAvailableLocked(uint64_t generation) const {
+    // Deliberately NOT gated by pgmDispatchAttempted: the per-packet early completion
+    // (tryCompleteOperatorSeekFromCurrentOutputCache) stays one-shot via that flag, but
+    // the FINAL reposition commit still owes the PGM obligation for the same seek so a
+    // transient early miss does not strand the operator's take-to-air. A completed
+    // transaction owes nothing, so it cannot double-dispatch.
+    return m_operatorSeekCompletion.waiting && !m_operatorSeekCompletion.completed &&
+           m_operatorSeekCompletion.generation == generation;
 }
 
 PlaybackWorker::OutputCommitResult PlaybackWorker::commitFullRepositionOutputStateLocked(
@@ -3369,9 +3385,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                                                 m_seekGeneration.load(std::memory_order_acquire),
                                                 m_seekTargetMs >= 0)) {
                 const bool operatorPgmObligationAvailable =
-                    m_operatorSeekCompletion.waiting && !m_operatorSeekCompletion.completed &&
-                    m_operatorSeekCompletion.generation == startedSeekGeneration &&
-                    !m_operatorSeekCompletion.pgmDispatchAttempted;
+                    operatorPgmObligationAvailableLocked(startedSeekGeneration);
                 {
                     QMutexLocker bufferLocker(&m_bufferMutex);
                     uint64_t gpuGeneration = 0;
@@ -3633,12 +3647,8 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                 if (gpuPipelineEnabled())
                     gpuGeneration = GpuGenerationCounter::instance().current();
 #endif
-                const bool operatorTransactionStillWaiting =
-                    m_operatorSeekCompletion.waiting && !m_operatorSeekCompletion.completed &&
-                    m_operatorSeekCompletion.generation == startedSeekGeneration;
                 const bool operatorPgmObligationAvailable =
-                    operatorTransactionStillWaiting &&
-                    !m_operatorSeekCompletion.pgmDispatchAttempted;
+                    operatorPgmObligationAvailableLocked(startedSeekGeneration);
                 OutputCommit commit;
                 commit.playheadMs = commitTarget;
                 commit.seekGeneration = startedSeekGeneration;
@@ -3647,12 +3657,10 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                     liveSaved ? OutputCacheAction::MergeStagingAndPublish : OutputCacheAction::Keep;
                 commit.coverageMode = commitTarget == target ? OutputCoverageMode::OperatorSeek
                                                              : OutputCoverageMode::Displayable;
-                commit.dispatch =
-                    operatorPgmObligationAvailable
-                        ? PostCommitDispatch::PgmCritical
-                        : ((operatorTransactionStillWaiting || operatorPgmCompletedEarly)
-                               ? PostCommitDispatch::Preview
-                               : PostCommitDispatch::Output);
+                commit.dispatch = operatorPgmObligationAvailable
+                                      ? PostCommitDispatch::PgmCritical
+                                      : (operatorPgmCompletedEarly ? PostCommitDispatch::Preview
+                                                                   : PostCommitDispatch::Output);
                 if (liveSaved) {
                     const qint64 keepFrom =
                         (dir < 0) ? commitTarget - (windowLeadMs() + windowSlackMs())
@@ -4325,7 +4333,10 @@ bool PlaybackWorker::stagingGpuSurfacesIdle() const {
 PlaybackWorker::PostCommitDispatch
 PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     const qint64 scheduled = m_scheduledCutFrame.load();
-    if (scheduled < 0) return PostCommitDispatch::None;
+    if (scheduled < 0) {
+        m_scheduledCutDeferredTicks = 0;
+        return PostCommitDispatch::None;
+    }
     if (!CutSchedule::shouldFireAt(dispatcherNextIndex, scheduled)) return PostCommitDispatch::None;
     if (!m_prerollStagingCache) return PostCommitDispatch::None;
     // GPU staging-swap fence: do not promote staging -> live until the staging
@@ -4358,6 +4369,7 @@ PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
         m_armedFireAtMs.store(-1);
         m_prerollSeekPending.store(false);
         m_stagedFenceValue.store(0, std::memory_order_release);
+        m_scheduledCutDeferredTicks = 0;
         m_cutArmed.store(false, std::memory_order_release);
         return result.dispatch;
     }
@@ -4382,6 +4394,7 @@ PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
 #ifdef OLR_GPU_PIPELINE_BUILD
         m_stagedFenceValue.store(0, std::memory_order_release);
 #endif
+        m_scheduledCutDeferredTicks = 0;
         m_cutArmed.store(false, std::memory_order_release);
         return PostCommitDispatch::None;
     }
@@ -4407,11 +4420,26 @@ PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     commit.requireCurrentSeek = false;
     commit.guardPlayheadCache = true;
     commit.dispatch = PostCommitDispatch::None;
-    const OutputCommitResult cutCommit = commitOutputStateLocked(commit);
+    OutputCommitResult cutCommit = commitOutputStateLocked(commit);
     if (!cutCommit.committed) {
-        std::swap(m_outputCache, m_prerollStagingCache);
-        return PostCommitDispatch::None;
+        // The promoted staging cache is not yet displayable at newPlayhead. Prefer a
+        // clean frame by deferring to the next tick, but a SCHEDULED program cut must
+        // land on air: after kMaxScheduledCutDeferredTicks deferrals fire it anyway (a
+        // brief placeholder or hold-last frame on a lagging feed is acceptable, an
+        // indefinitely-deferred cut is not). The forced commit still re-anchors the
+        // epoch atomically (F2), so the held frame is emitted at the correct clock.
+        if (++m_scheduledCutDeferredTicks < kMaxScheduledCutDeferredTicks) {
+            std::swap(m_outputCache, m_prerollStagingCache);
+            return PostCommitDispatch::None;
+        }
+        commit.requireCoverage = false;
+        cutCommit = commitOutputStateLocked(commit);
+        if (!cutCommit.committed) {
+            std::swap(m_outputCache, m_prerollStagingCache);
+            return PostCommitDispatch::None;
+        }
     }
+    m_scheduledCutDeferredTicks = 0;
     // Decoder-follow for a BACKWARD cut: the swap fixed the OUTPUT, but the primary
     // demuxer+decoder bank is still parked AHEAD of the new playhead, so the worker
     // would otherwise hit the reactive backward-jump path (run loop §6.1(2)) one or

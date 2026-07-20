@@ -42,6 +42,8 @@ private slots:
     void fullRepositionRejectedCommitRestoresLiveAndStagingCaches();
     void armedCutPromotionCommitsSubmittedIdentityAndEpoch();
     void armedCutRejectedPromotionRollsBackWithoutEpochReset();
+    void armedCutFiresAfterDeferBoundWhenNotDisplayable();
+    void finalRepositionOwesPgmObligationAfterEarlyMiss();
     void coveredSeekCommitsPlayheadBeforeWorkerRuns();
     void coveredSeekPublishesLiveCacheForInstantSnapshot();
     void outputRuntimeStatsDoesNotBlockOnActiveDispatch();
@@ -967,6 +969,86 @@ void TestPlaybackWorker::armedCutRejectedPromotionRollsBackWithoutEpochReset() {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), 0);
     }
+}
+
+void TestPlaybackWorker::armedCutFiresAfterDeferBoundWhenNotDisplayable() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    transport.seek(1000);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(1000, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(1000, std::memory_order_release);
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 64));
+        worker.publishOutputCacheLocked();
+        // The promoted staging cache never covers the post-cut playhead (target 2000),
+        // so Displayable coverage rejects the promotion on every tick.
+        worker.m_prerollStagingCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_prerollStagingCache->insertVideoFrame(testVideoFrame(0, 400, 96));
+    }
+    worker.m_scheduledCutFrame.store(0, std::memory_order_release);
+    worker.m_scheduledCutTargetMs.store(2000, std::memory_order_release);
+    worker.m_armSeekGen.store(7, std::memory_order_release);
+    worker.m_stagingCovers.store(true, std::memory_order_release);
+    worker.m_cutArmed.store(true, std::memory_order_release);
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    }
+
+    // While the promotion is not displayable the fire defers (rolls back, stays armed)
+    // up to the bound...
+    for (int tick = 0; tick < PlaybackWorker::kMaxScheduledCutDeferredTicks - 1; ++tick) {
+        worker.makeOutputSnapshot();
+        QCOMPARE(worker.m_cutsFired.load(std::memory_order_acquire), qint64(0));
+        QVERIFY(worker.m_cutArmed.load(std::memory_order_acquire));
+    }
+    // ...but the bounded tick fires the scheduled program cut unconditionally so it
+    // lands on air rather than deferring forever.
+    worker.makeOutputSnapshot();
+    QCOMPARE(worker.m_cutsFired.load(std::memory_order_acquire), qint64(1));
+    QVERIFY(!worker.m_cutArmed.load(std::memory_order_acquire));
+    QCOMPARE(worker.m_committedPlayheadMs.load(std::memory_order_acquire), qint64(2000));
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        QVERIFY(worker.m_outputRuntime->playEpochResetCountForTest() >= 1);
+    }
+}
+
+void TestPlaybackWorker::finalRepositionOwesPgmObligationAfterEarlyMiss() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_operatorSeekCompletion = PlaybackWorker::OperatorSeekCompletionState{};
+    worker.m_operatorSeekCompletion.generation = 8;
+    worker.m_operatorSeekCompletion.targetMs = 1000;
+    worker.m_operatorSeekCompletion.waiting = true;
+    worker.m_operatorSeekCompletion.completed = false;
+    // The per-packet early completion already made (and missed) its one attempt.
+    worker.m_operatorSeekCompletion.pgmDispatchAttempted = true;
+
+    QMutexLocker locker(&worker.m_mutex);
+    // The per-packet path is one-shot, but the FINAL reposition commit must still owe
+    // the PGM obligation for the SAME seek, so a transient early miss does not strand
+    // the operator's take-to-air (it would otherwise time out).
+    QVERIFY(worker.operatorPgmObligationAvailableLocked(8));
+    // A completed transaction owes nothing (no double PGM dispatch).
+    worker.m_operatorSeekCompletion.completed = true;
+    QVERIFY(!worker.operatorPgmObligationAvailableLocked(8));
+    // A different generation owes nothing.
+    worker.m_operatorSeekCompletion.completed = false;
+    QVERIFY(!worker.operatorPgmObligationAvailableLocked(9));
 }
 
 void TestPlaybackWorker::coveredSeekCommitsPlayheadBeforeWorkerRuns() {
