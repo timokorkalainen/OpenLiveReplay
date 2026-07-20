@@ -55,14 +55,14 @@ from gpu_capability_source_audit import (  # noqa: E402
 
 
 class AuditEngineFingerprintTests(unittest.TestCase):
-    def test_task5_stage_and_module_roots_are_exact(self):
+    def test_task6_stage_and_module_roots_are_exact(self):
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_GRAPH_SCHEMA_BYTES,
-            b"olr-gpu-capability-live-graph-v4",
+            b"olr-gpu-capability-live-graph-v5",
         )
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-5-audit-discard-worker",
+            b"task-6-worker-decision-contract",
         )
         self.assertEqual(
             tuple(module.__name__ for module in capability_audit._AUDIT_ENGINE_TARGET_MODULES),
@@ -464,8 +464,44 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             self.assertIn(expected, names)
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-5-audit-discard-worker",
+            b"task-6-worker-decision-contract",
         )
+
+    def test_decision_graph_is_exhaustive_and_rebinding_changes_fingerprint(self):
+        baseline = capability_audit.decision_engine_fingerprint(
+            capability_audit.audit_engine_fingerprint())
+        graph = capability_audit._enumerate_live_decision_semantic_graph(
+            capability_audit.audit_engine_fingerprint())
+        names = tuple(name for name, _value in graph)
+        self.assertEqual(names, tuple(sorted(names)))
+        for expected in (
+            "gpu_capability_process_tree._query_job_member_identity",
+            "gpu_capability_calibration._sample_is_eligible",
+            "gpu_capability_calibration.WORKER_SELECTION_SEMANTICS_BYTES",
+            "gpu_capability_calibration._WORKER_SELECTION_ORDER",
+        ):
+            self.assertIn(expected, names)
+        original = capability_audit._gpu_capability_calibration._sample_is_eligible
+        with mock.patch.object(
+                capability_audit._gpu_capability_calibration,
+                "_sample_is_eligible",
+                lambda _sample, _platform: not original(_sample, _platform)):
+            self.assertNotEqual(
+                capability_audit.decision_engine_fingerprint(
+                    capability_audit.audit_engine_fingerprint()), baseline)
+        with mock.patch.object(
+                capability_audit._gpu_capability_process_tree,
+                "_query_job_member_identity",
+                lambda pid, native_start_identity: (pid, native_start_identity)):
+            self.assertNotEqual(
+                capability_audit.decision_engine_fingerprint(
+                    capability_audit.audit_engine_fingerprint()), baseline)
+        with mock.patch.object(
+                capability_audit._gpu_capability_calibration,
+                "_WORKER_SELECTION_ORDER", (1, 2)):
+            self.assertNotEqual(
+                capability_audit.decision_engine_fingerprint(
+                    capability_audit.audit_engine_fingerprint()), baseline)
 
         marshaled = tuple(
             (name, capability_audit._marshal_live_semantic_object(loaded_object))
@@ -595,6 +631,8 @@ class AuditEngineFingerprintTests(unittest.TestCase):
                 "gpu_capability_cache.py",
                 "gpu_capability_provenance.py",
                 "gpu_capability_runner.py",
+                "gpu_capability_process_tree.py",
+                "gpu_capability_calibration.py",
             )
             for name in module_files:
                 shutil.copyfile(source_directory / name, imported_root / name)
@@ -688,13 +726,65 @@ print(recomputed)
             self.assertEqual(fingerprint(first), fingerprint(second))
             mutated = (second / "gpu_capability_source_audit.py").read_text(encoding="utf-8")
             self.assertIn(
-                'AUDIT_ENGINE_STAGE_BYTES = b"task-5-audit-discard-worker"',
+                'AUDIT_ENGINE_STAGE_BYTES = b"task-6-worker-decision-contract"',
                 mutated,
             )
             (second / "gpu_capability_source_audit.py").write_text(
                 mutated.replace(
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-5-audit-discard-worker"',
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-5-audit-discard-worker-mutated"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-6-worker-decision-contract"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-6-worker-decision-contract-mutated"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assertNotEqual(fingerprint(first), fingerprint(second))
+
+    def test_decision_fingerprint_is_portable_across_absolute_import_roots(self):
+        source_directory = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first" / "gpu"
+            second = root / "second" / "gpu"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            module_files = (
+                "gpu_capability_model.py",
+                "gpu_capability_source_audit.py",
+                "gpu_capability_command.py",
+                "gpu_capability_cache.py",
+                "gpu_capability_provenance.py",
+                "gpu_capability_runner.py",
+                "gpu_capability_process_tree.py",
+                "gpu_capability_calibration.py",
+            )
+            for name in module_files:
+                shutil.copyfile(source_directory / name, first / name)
+                shutil.copyfile(source_directory / name, second / name)
+
+            script = (
+                "import sys; sys.path[:0] = [sys.argv[1], sys.argv[2]]; "
+                "import gpu_capability_source_audit as a; "
+                "print(a.decision_engine_fingerprint(a.audit_engine_fingerprint()))"
+            )
+
+            def fingerprint(path: Path) -> str:
+                completed = subprocess.run(
+                    (sys.executable, "-c", script, str(path), str(source_directory)),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                return completed.stdout.strip()
+
+            self.assertEqual(fingerprint(first), fingerprint(second))
+            mutated = (second / "gpu_capability_calibration.py").read_text(
+                encoding="utf-8")
+            self.assertIn("_WORKER_SELECTION_ORDER = (2, 1)", mutated)
+            (second / "gpu_capability_calibration.py").write_text(
+                mutated.replace(
+                    "_WORKER_SELECTION_ORDER = (2, 1)",
+                    "_WORKER_SELECTION_ORDER = (1, 2)",
                     1,
                 ),
                 encoding="utf-8",

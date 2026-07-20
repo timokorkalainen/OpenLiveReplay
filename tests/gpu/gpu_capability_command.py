@@ -24,6 +24,7 @@ from collections import deque
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 
 from gpu_capability_model import (
     AuditInfrastructureError,
@@ -33,6 +34,8 @@ from gpu_capability_model import (
     CompilerLaunchEvent,
     CompilerLaunchPurpose,
     CompilerInspection,
+    CommandArgumentSpan,
+    CommandRewriteClassification,
     _FilesystemGenerationObserver,
     DependencyDigest,
     DependencyRootAuthority,
@@ -614,6 +617,567 @@ class RewrittenCommand:
     arguments: tuple[str, ...]
     dependency_output: Path
     dependency_format: str
+    classification: CommandRewriteClassification | None = None
+
+
+DECISION_ENVIRONMENT_SCHEMA_BYTES = b"olr-gpu-decision-environment-v1"
+DECISION_ARGUMENT_SCHEMA_BYTES = b"olr-gpu-decision-arguments-v1"
+COMPILER_DIGEST_SCHEMA_BYTES = b"olr-gpu-compiler-digest-v1"
+_DECISION_SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".mm"})
+
+_DECISION_GNU_SEMANTIC_PATHS = MappingProxyType({
+    "-I": "include-path", "-isystem": "system-include-path",
+    "-iquote": "quote-include-path", "-idirafter": "after-include-path",
+    "-iprefix": "include-prefix", "-iwithprefix": "include-path",
+    "-iwithprefixbefore": "include-path",
+    "-include": "forced-include", "-imacros": "forced-macros",
+    "--include": "forced-include", "--imacros": "forced-macros",
+    "-isysroot": "sysroot", "--sysroot": "sysroot", "-F": "framework-path",
+    "-iframework": "framework-path", "-include-pch": "pch-path",
+    "-include-pth": "pch-path", "-B": "tool-search-path", "-specs": "specs-path",
+    "-fmodule-file": "module-file", "-fmodule-map-file": "module-map-file",
+    "-fmodules-cache-path": "module-cache-path",
+    "-fprebuilt-module-path": "module-search-path",
+    "-fmodules-user-build-path": "module-build-path",
+    "-ivfsoverlay": "vfs-overlay", "-resource-dir": "resource-dir",
+    "-fprofile-use": "profile-path", "-fprofile-instr-use": "profile-path",
+    "-fprofile-sample-use": "profile-path", "-fcoverage-compilation-dir": "coverage-path",
+})
+_DECISION_GNU_NONSEMANTIC_OUTPUTS = MappingProxyType({
+    "-o": "output", "--output": "output", "-MJ": "output",
+    "--dump": "output", "-d": "output",
+    "-serialize-diagnostics": "output", "--serialize-diagnostics": "output",
+    "-fdiagnostics-file": "output",
+    "-fdiagnostics-serialization-file": "output",
+    "-fmodule-output": "output",
+})
+_DECISION_GNU_NONSEMANTIC_DEPENDENCIES = MappingProxyType({
+    "-MF": "dependency-file", "-MT": "dependency-target",
+    "-MQ": "dependency-target", "-dependency-file": "dependency-file",
+    "--dependency-file": "dependency-file",
+})
+_DECISION_GNU_SCALAR_VALUES = frozenset({
+    "-D", "-U", "-A", "-x", "-target", "--target", "-arch",
+})
+_DECISION_MSVC_SEMANTIC_PATHS = MappingProxyType({
+    "/I": "include-path", "/FI": "forced-include", "/Fp": "pch-path",
+    "/Yu": "pch-path", "/external:I": "system-include-path", "/AI": "assembly-path",
+    "/FU": "forced-assembly", "/reference": "module-reference",
+    "/headerUnit": "module-reference",
+})
+_DECISION_MSVC_OUTPUTS = MappingProxyType({
+    "/Fo": "output", "/Fe": "output", "/Fd": "output", "/Fi": "output",
+    "/Ft": "output", "/ifcOutput": "output", "/experimental:log": "output",
+    "/FA": "output", "/Fa": "output", "/Fm": "output",
+    "/FR": "output", "/Fr": "output", "/doc": "output",
+})
+_DECISION_MSVC_DEPENDENCIES = MappingProxyType({
+    "/sourceDependencies": "dependency-file", "/scanDependencies": "dependency-file",
+    "/sourceDependencies:directives": "dependency-file",
+    "/showIncludes": "dependency-output",
+})
+_DECISION_MSVC_SCALAR_VALUES = frozenset({"/D", "/U"})
+_DECISION_LAUNCHER_PATH_ASSIGNMENTS = frozenset({
+    "cache_dir", "ccache_basedir", "ccache_configpath", "ccache_dir",
+    "ccache_tempdir",
+})
+
+
+def _decision_span(role: str, option_index: int, operand_index: int,
+                   attachment: str, forwarded_depth: int = 0) -> CommandArgumentSpan:
+    return CommandArgumentSpan(role, option_index, operand_index, attachment,
+                               forwarded_depth)
+
+
+def _decision_attached_option(value: str, options: Mapping[str, str],
+                              *, msvc: bool) -> tuple[str, str] | None:
+    candidates = sorted(options, key=len, reverse=True)
+    for option in candidates:
+        if value.startswith(f"{option}=") and len(value) > len(option) + 1:
+            return option, options[option]
+        if len(value) > len(option) and value.startswith(option):
+            if msvc or option in {
+                "-I", "-D", "-U", "-A", "-F", "-B", "-o", "-MF",
+                "-MT", "-MQ", "-MJ",
+            }:
+                return option, options[option]
+    return None
+
+
+def _looks_path_bearing(value: str) -> bool:
+    if not value:
+        return False
+    if value.startswith(("-", "/")):
+        head = value[:256].casefold()
+        separator = "=" if "=" in head else ":" if ":" in head else ""
+        option = head.split(separator, 1)[0] if separator else head
+        if separator:
+            separator_index = value.find(separator)
+            payload_index = separator_index + 1
+            if (option.endswith((
+                    "path", "file", "dir", "root", "include", "framework",
+                    "module", "pch", "sdkroot"))
+                    or value.find("/", payload_index) >= 0
+                    or value.find("\\", payload_index) >= 0
+                    or (payload_index < len(value)
+                        and value[payload_index] in ".~")
+                    or (payload_index + 1 < len(value)
+                        and value[payload_index].isalpha()
+                        and value[payload_index + 1] == ":")):
+                return True
+        return (not value.startswith("/")
+                and (value.find("/", 1) >= 0 or value.find("\\", 1) >= 0))
+    candidate = value
+    return (
+        "/" in candidate or "\\" in candidate
+        or candidate.startswith((".", "~"))
+        or bool(re.fullmatch(r"[A-Za-z]:.*", candidate))
+        or Path(candidate).suffix.casefold() in {
+            ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".mm",
+            ".pch", ".pth", ".pcm", ".modulemap", ".o", ".obj", ".d",
+        }
+    )
+
+
+def _validate_classifier_forwarded_controls(
+    arguments: tuple[str, ...], compiler_family: CompilerFamily,
+) -> None:
+    if compiler_family is CompilerFamily.CLANG_CL:
+        category = _gnu_forwarded_sequence_control(
+            _clang_cl_forwarded_arguments(arguments))
+        if category:
+            raise AuditInfrastructureError(
+                f"hidden {category} option is unsupported: /clang:")
+        return
+    if compiler_family not in {CompilerFamily.GCC, CompilerFamily.CLANG}:
+        return
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value.startswith("-Wp,"):
+            category = _gnu_forwarded_sequence_control((value,))
+            if category:
+                raise AuditInfrastructureError(
+                    f"hidden {category} option is unsupported: {value}")
+        forwarder = next((candidate for candidate in _GNU_FORWARDERS
+                          if value == candidate
+                          or value.startswith(f"{candidate}=")), None)
+        if forwarder is None:
+            index += 1
+            continue
+        end, category = _gnu_forwarded_span(arguments, index, forwarder)
+        if category:
+            raise AuditInfrastructureError(
+                f"hidden {category} option is unsupported: {value}")
+        index = end
+
+
+def _forwarded_wp_path(value: str) -> tuple[str, str, str] | None:
+    if not value.startswith("-Wp,"):
+        return None
+    separator = value.find(",", 4)
+    if separator < 0 or value.find(",", separator + 1) >= 0:
+        return None
+    option = value[4:separator]
+    role = _DECISION_GNU_SEMANTIC_PATHS.get(option)
+    if role is None:
+        return None
+    operand = value[separator + 1:]
+    prefix = value[:separator + 1]
+    return role, prefix, operand
+
+
+def classify_command_rewrite(
+    raw_arguments: tuple[str, ...], cwd: Path, compiler_family: CompilerFamily
+) -> CommandRewriteClassification:
+    """Freeze one typed parse shared by rewrite and decision normalization."""
+
+    if (not isinstance(raw_arguments, tuple)
+            or any(not isinstance(value, str) for value in raw_arguments)
+            or not isinstance(cwd, Path) or not cwd.is_absolute()
+            or not isinstance(compiler_family, CompilerFamily)):
+        raise AuditInfrastructureError("command rewrite classification input is invalid")
+    arguments = raw_arguments
+    _validate_classifier_forwarded_controls(arguments, compiler_family)
+    sources: list[CommandArgumentSpan] = []
+    outputs: list[CommandArgumentSpan] = []
+    dependencies: list[CommandArgumentSpan] = []
+    scalars: list[CommandArgumentSpan] = []
+    paths: list[CommandArgumentSpan] = []
+    msvc = compiler_family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
+    path_options = _DECISION_MSVC_SEMANTIC_PATHS if msvc else _DECISION_GNU_SEMANTIC_PATHS
+    output_options = _DECISION_MSVC_OUTPUTS if msvc else _DECISION_GNU_NONSEMANTIC_OUTPUTS
+    dependency_options = (
+        _DECISION_MSVC_DEPENDENCIES if msvc
+        else _DECISION_GNU_NONSEMANTIC_DEPENDENCIES
+    )
+    scalar_values = _DECISION_MSVC_SCALAR_VALUES if msvc else _DECISION_GNU_SCALAR_VALUES
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if not msvc and not value.startswith("-"):
+            sources.append(_decision_span("source", index, index, "source"))
+            index += 1
+            continue
+        if (not msvc and value in _GNU_FORWARDERS and index + 1 < len(arguments)):
+            forwarded_option = arguments[index + 1]
+            if (index + 3 < len(arguments)
+                    and arguments[index + 2] in _GNU_FORWARDERS
+                    and forwarded_option in _DECISION_GNU_SEMANTIC_PATHS):
+                scalars.extend((
+                    _decision_span("forwarder", index, index, "scalar", 1),
+                    _decision_span("forwarded-option", index + 1, index + 1,
+                                   "scalar", 1),
+                    _decision_span("forwarder", index + 2, index + 2,
+                                   "scalar", 1),
+                ))
+                paths.append(_decision_span(
+                    _DECISION_GNU_SEMANTIC_PATHS[forwarded_option],
+                    index + 3, index + 3, "forwarded", 1))
+                index += 4
+                continue
+        if not msvc:
+            wp_path = _forwarded_wp_path(value)
+            if wp_path is not None:
+                paths.append(_decision_span(
+                    wp_path[0], index, index, "forwarded-comma", 1))
+                index += 1
+                continue
+        if (msvc and value.startswith("/clang:") and index + 1 < len(arguments)):
+            forwarded_option = value[len("/clang:"):]
+            if (forwarded_option in _DECISION_GNU_SEMANTIC_PATHS
+                    and arguments[index + 1].startswith("/clang:")):
+                scalars.append(_decision_span(
+                    "forwarded-option", index, index, "scalar", 1))
+                paths.append(_decision_span(
+                    _DECISION_GNU_SEMANTIC_PATHS[forwarded_option],
+                    index + 1, index + 1, "forwarded", 1))
+                index += 2
+                continue
+        option = _msvc_option(value) if msvc and value.startswith(("/", "-")) else value
+        if msvc and option in {"/TC", "/TP"}:
+            scalars.append(_decision_span("language-mode", index, index, "scalar"))
+            index += 1
+            continue
+        if msvc and option in {"/Tc", "/Tp"}:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(
+                    f"compiler option requires a source: {value}")
+            sources.append(_decision_span("source", index, index + 1, "separate"))
+            index += 2
+            continue
+        if msvc and (option.startswith(("/Tc", "/Tp"))
+                     and len(option) > 3):
+            sources.append(_decision_span("source", index, index, "attached"))
+            index += 1
+            continue
+        if msvc and option in {"/FA", "/Fa", "/Fm", "/FR", "/Fr", "/doc"}:
+            outputs.append(_decision_span("output", index, index, "attached"))
+            index += 1
+            continue
+        if msvc and option == "/showIncludes":
+            dependencies.append(_decision_span(
+                "dependency-output", index, index, "scalar"))
+            index += 1
+            continue
+        matched = False
+        for table, destination in (
+            (path_options, paths), (output_options, outputs),
+            (dependency_options, dependencies),
+        ):
+            if option in table:
+                if index + 1 >= len(arguments):
+                    raise AuditInfrastructureError(
+                        f"compiler option requires a value: {value}")
+                destination.append(_decision_span(table[option], index, index + 1,
+                                                  "separate"))
+                index += 2
+                matched = True
+                break
+            attached = _decision_attached_option(option, table, msvc=msvc)
+            if attached is not None:
+                destination.append(_decision_span(attached[1], index, index, "attached"))
+                index += 1
+                matched = True
+                break
+        if matched:
+            continue
+        if option in scalar_values:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            scalars.append(_decision_span("semantic-scalar", index, index + 1,
+                                         "separate"))
+            index += 2
+            continue
+        scalar_attached = _decision_attached_option(
+            option, {name: "semantic-scalar" for name in scalar_values}, msvc=msvc)
+        if scalar_attached is not None:
+            scalars.append(_decision_span("semantic-scalar", index, index, "attached"))
+            index += 1
+            continue
+        forwarded_role = _forwarded_decision_path_role(arguments, index, msvc)
+        if forwarded_role is not None:
+            paths.append(_decision_span(forwarded_role, index, index, "forwarded", 1))
+            index += 1
+            continue
+        if ((not msvc and not value.startswith("-"))
+                or (msvc and not value.startswith(("-", "/")))):
+            sources.append(_decision_span("source", index, index, "source"))
+            index += 1
+            continue
+        if _looks_path_bearing(value):
+            raise AuditInfrastructureError(
+                f"unclassified path-bearing option: {value}")
+        scalars.append(_decision_span("semantic-scalar", index, index, "scalar"))
+        index += 1
+    return CommandRewriteClassification(
+        response_expanded_launcher_stripped_arguments=arguments,
+        compiler=_decision_span("compiler", -1, -1, "compiler"),
+        sources=tuple(sources), nonsemantic_outputs=tuple(outputs),
+        nonsemantic_dependencies=tuple(dependencies),
+        semantic_scalars=tuple(scalars), semantic_paths=tuple(paths))
+
+
+def _forwarded_decision_path_role(arguments: tuple[str, ...], index: int,
+                                  msvc: bool) -> str | None:
+    if msvc and index > 0 and arguments[index].startswith("/clang:"):
+        payload = arguments[index][len("/clang:"):]
+        attached = _decision_attached_option(
+            payload, _DECISION_GNU_SEMANTIC_PATHS, msvc=False)
+        if attached is not None:
+            return attached[1]
+        previous = arguments[index - 1]
+        if previous.startswith("/clang:"):
+            option = previous[len("/clang:"):]
+            return _DECISION_GNU_SEMANTIC_PATHS.get(option)
+    if index >= 3 and arguments[index - 1] in _GNU_FORWARDERS:
+        option = arguments[index - 2]
+        if arguments[index - 3] in _GNU_FORWARDERS:
+            return _DECISION_GNU_SEMANTIC_PATHS.get(option)
+    return None
+
+
+def _attached_operand(value: str, role: str, compiler_family: CompilerFamily) -> tuple[str, str]:
+    options = (_DECISION_MSVC_SEMANTIC_PATHS
+               if compiler_family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
+               else _DECISION_GNU_SEMANTIC_PATHS)
+    for option, candidate_role in sorted(options.items(), key=lambda item: len(item[0]),
+                                         reverse=True):
+        if candidate_role != role:
+            continue
+        if value.startswith(f"{option}="):
+            return f"{option}=", value[len(option) + 1:]
+        if value.startswith(option) and len(value) > len(option):
+            return option, value[len(option):]
+    raise AuditInfrastructureError("unclassified path-bearing option")
+
+
+def _normalize_typed_path(value: str, cwd: Path, working_directory_role: str,
+                          source_root: Path, build_root: Path,
+                          toolchain_root: Path) -> str:
+    path = Path(value)
+    if not path.is_absolute():
+        path = cwd / path
+    normalized = Path(os.path.normpath(path))
+    roots = (
+        (source_root, "<SOURCE_ROOT>"), (build_root, "<BUILD_ROOT>"),
+        (toolchain_root, "<TOOLCHAIN_ROOT>"),
+        (cwd, f"<WORKING_DIRECTORY:{working_directory_role}>"),
+    )
+    for root, marker in roots:
+        try:
+            suffix = normalized.relative_to(Path(os.path.normpath(root)))
+        except ValueError:
+            continue
+        return marker if not suffix.parts else f"{marker}/{suffix.as_posix()}"
+    raise AuditInfrastructureError("decision semantic path is outside typed roots")
+
+
+def normalize_decision_arguments(
+    rewritten: RewrittenCommand, cwd: Path, working_directory_role: str,
+    source_root: Path, build_root: Path, toolchain_root: Path,
+) -> tuple[str, ...]:
+    if (not isinstance(rewritten, RewrittenCommand)
+            or not isinstance(rewritten.classification, CommandRewriteClassification)
+            or not isinstance(working_directory_role, str)
+            or not working_directory_role):
+        raise AuditInfrastructureError("decision argument classification is invalid")
+    classification = rewritten.classification
+    arguments = classification.response_expanded_launcher_stripped_arguments
+    excluded = {span.option_index for span in (
+        classification.sources + classification.nonsemantic_outputs
+        + classification.nonsemantic_dependencies)}
+    excluded.update(span.operand_index for span in (
+        classification.sources + classification.nonsemantic_outputs
+        + classification.nonsemantic_dependencies)
+        if span.attachment == "separate")
+    path_by_option = {span.option_index: span for span in classification.semantic_paths}
+    result: list[str] = []
+    index = 0
+    while index < len(arguments):
+        if index in excluded:
+            index += 1
+            continue
+        span = path_by_option.get(index)
+        if span is None:
+            result.append(arguments[index])
+            index += 1
+            continue
+        if span.attachment == "separate":
+            result.extend((arguments[index], _normalize_typed_path(
+                arguments[span.operand_index], cwd, working_directory_role,
+                source_root, build_root, toolchain_root)))
+            index = span.operand_index + 1
+        elif span.attachment == "forwarded":
+            token = arguments[index]
+            prefix = "/clang:" if token.startswith("/clang:") else ""
+            operand = token[len(prefix):]
+            try:
+                option_prefix, attached_operand = _attached_operand(
+                    operand, span.role, CompilerFamily.CLANG)
+            except AuditInfrastructureError:
+                option_prefix, attached_operand = "", operand
+            result.append(prefix + option_prefix + _normalize_typed_path(
+                attached_operand, cwd, working_directory_role, source_root,
+                build_root, toolchain_root))
+            index += 1
+        elif span.attachment == "forwarded-comma":
+            wp_path = _forwarded_wp_path(arguments[index])
+            if wp_path is None or wp_path[0] != span.role:
+                raise AuditInfrastructureError("unclassified path-bearing option")
+            result.append(wp_path[1] + _normalize_typed_path(
+                wp_path[2], cwd, working_directory_role, source_root,
+                build_root, toolchain_root))
+            index += 1
+        else:
+            prefix, operand = _attached_operand(
+                arguments[index], span.role,
+                CompilerFamily.MSVC if arguments[index].startswith("/")
+                else CompilerFamily.CLANG)
+            result.append(prefix + _normalize_typed_path(
+                operand, cwd, working_directory_role, source_root, build_root,
+                toolchain_root))
+            index += 1
+    return tuple(result)
+
+
+def decision_environment_digest(
+    compiler_family: CompilerFamily, effective_environment: Mapping[str, str],
+    explicit_launcher_assignments: Mapping[str, str], cwd: Path,
+    working_directory_role: str, source_root: Path, build_root: Path,
+    toolchain_root: Path,
+) -> str:
+    if not isinstance(compiler_family, CompilerFamily):
+        raise AuditInfrastructureError("decision environment family is invalid")
+    _environment_digest(effective_environment)
+    common_paths = {
+        "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
+        "COMPILER_PATH", "GCC_EXEC_PREFIX",
+    }
+    path_names = set(common_paths) if compiler_family in {
+        CompilerFamily.GCC, CompilerFamily.CLANG
+    } else {"INCLUDE", "WindowsSdkDir"}
+    scalar_names = {"MACOSX_DEPLOYMENT_TARGET"} if compiler_family is CompilerFamily.CLANG else set()
+    if compiler_family is CompilerFamily.CLANG:
+        path_names.add("SDKROOT")
+    if compiler_family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
+        _reject_msvc_environment_arguments(effective_environment)
+    normalized: list[tuple[str, str]] = []
+    for name in sorted(path_names | scalar_names, key=str.casefold):
+        actual = next((key for key in effective_environment
+                       if key.casefold() == name.casefold()), None)
+        if actual is None or not effective_environment[actual]:
+            continue
+        value = effective_environment[actual]
+        if name in path_names:
+            parts = value.split(os.pathsep)
+            value = os.pathsep.join(_normalize_typed_path(
+                part, cwd, working_directory_role, source_root, build_root,
+                toolchain_root) for part in parts)
+        normalized.append((name, value))
+    for name, value in sorted(explicit_launcher_assignments.items(),
+                              key=lambda item: (item[0].casefold(), item[0])):
+        if (not isinstance(name, str) or not name or not isinstance(value, str)
+                or any(secret in name.casefold() for secret in (
+                    "token", "secret", "credential", "password"))):
+            raise AuditInfrastructureError("decision launcher environment is invalid")
+        canonical_path_name = next(
+            (candidate for candidate in path_names
+             if candidate.casefold() == name.casefold()), None)
+        launcher_path = name.casefold() in _DECISION_LAUNCHER_PATH_ASSIGNMENTS
+        if canonical_path_name is not None or launcher_path:
+            value = os.pathsep.join(_normalize_typed_path(
+                part, cwd, working_directory_role, source_root, build_root,
+                toolchain_root) for part in value.split(os.pathsep))
+        elif _looks_path_bearing(value):
+            raise AuditInfrastructureError(
+                "unclassified path-bearing launcher assignment")
+        normalized.append((f"launcher:{name}", value))
+    digest = hashlib.sha256()
+    _hash_field(digest, DECISION_ENVIRONMENT_SCHEMA_BYTES)
+    _hash_field(digest, compiler_family.value.encode("ascii"))
+    for name, value in normalized:
+        _hash_field(digest, name.encode("utf-8"))
+        _hash_field(digest, value.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def compiler_digest(compiler_family: CompilerFamily, executable: Path,
+                    normalized_version: str) -> str:
+    if (not isinstance(compiler_family, CompilerFamily)
+            or not isinstance(executable, Path)
+            or not isinstance(normalized_version, str)
+            or not normalized_version.strip()):
+        raise AuditInfrastructureError("compiler decision identity is invalid")
+    content = hashlib.sha256()
+    try:
+        with executable.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                content.update(chunk)
+    except OSError as error:
+        raise AuditInfrastructureError("compiler decision identity is unavailable") from error
+    return _compiler_decision_digest(
+        compiler_family, normalized_version, content.hexdigest())
+
+
+def _compiler_decision_digest(compiler_family: CompilerFamily,
+                              normalized_version: str,
+                              executable_sha256: str) -> str:
+    if (not isinstance(compiler_family, CompilerFamily)
+            or not isinstance(normalized_version, str)
+            or not normalized_version.strip()
+            or re.fullmatch(r"[0-9a-f]{64}", executable_sha256) is None):
+        raise AuditInfrastructureError("compiler decision identity is invalid")
+    digest = hashlib.sha256()
+    _hash_field(digest, COMPILER_DIGEST_SCHEMA_BYTES)
+    _hash_field(digest, compiler_family.value.encode("ascii"))
+    _hash_field(digest, normalized_version.encode("utf-8"))
+    _hash_field(digest, bytes.fromhex(executable_sha256))
+    return digest.hexdigest()
+
+
+def compiler_digest_from_capability(
+    compiler_family: CompilerFamily,
+    capability: CompilerExecutableCapability,
+    normalized_version: str,
+    *,
+    deadline: float | None = None,
+) -> str:
+    """Bind the decision to the already-held executable, never its pathname."""
+
+    if not isinstance(capability, CompilerExecutableCapability):
+        raise AuditInfrastructureError("compiler decision capability is invalid")
+    owner = capability.native_owner
+    if not isinstance(owner, _CompilerCapabilityOwner):
+        raise AuditInfrastructureError("compiler decision capability owner is invalid")
+    owner.validate(content=True, deadline=deadline, cancel_event=None)
+    actual = _compiler_decision_digest(
+        compiler_family, normalized_version, capability.executable_sha256)
+    owner.validate(content=True, deadline=deadline, cancel_event=None)
+    return actual
 
 
 def _launcher_name(value: str) -> str:
@@ -3905,7 +4469,13 @@ _CLANG_FRONTEND_SAFE_EQUALS_OPTIONS = frozenset({
 })
 
 
-def _validate_rewrite_source(configuration: PreprocessConfiguration) -> None:
+def _validate_rewrite_source(
+    configuration: PreprocessConfiguration,
+    classification: CommandRewriteClassification,
+) -> None:
+    if (classification.response_expanded_launcher_stripped_arguments
+            != configuration.arguments):
+        raise AuditInfrastructureError("command rewrite classification differs")
     sources = _source_inputs(
         configuration.arguments,
         configuration.working_directory,
@@ -4200,10 +4770,11 @@ def _gnu_forwarded_span(
 
 
 def _rewrite_gnu(
-    configuration: PreprocessConfiguration, dependency_output: Path
+    configuration: PreprocessConfiguration, dependency_output: Path,
+    classification: CommandRewriteClassification,
 ) -> RewrittenCommand:
     rewritten: list[str] = [str(configuration.compiler)]
-    arguments = configuration.arguments
+    arguments = classification.response_expanded_launcher_stripped_arguments
     index = 0
     while index < len(arguments):
         value = arguments[index]
@@ -4325,10 +4896,11 @@ def _msvc_attached_required_output(option: str) -> bool:
 
 
 def _rewrite_msvc(
-    configuration: PreprocessConfiguration, dependency_output: Path
+    configuration: PreprocessConfiguration, dependency_output: Path,
+    classification: CommandRewriteClassification,
 ) -> RewrittenCommand:
     rewritten: list[str] = [str(configuration.compiler)]
-    arguments = configuration.arguments
+    arguments = classification.response_expanded_launcher_stripped_arguments
     if configuration.family is CompilerFamily.CLANG_CL:
         category = _gnu_forwarded_sequence_control(
             _clang_cl_forwarded_arguments(arguments)
@@ -4433,13 +5005,23 @@ def rewrite_preprocess_command(
     if not isinstance(dependency_output, Path) or not dependency_output.is_absolute():
         raise AuditInfrastructureError("dependency output must be an absolute path")
     _validate_arguments((str(configuration.compiler), *configuration.arguments))
-    _validate_rewrite_source(configuration)
+    classification = classify_command_rewrite(
+        configuration.arguments, configuration.working_directory,
+        configuration.family)
+    _validate_rewrite_source(configuration, classification)
     if configuration.family in {CompilerFamily.GCC, CompilerFamily.CLANG}:
-        return _rewrite_gnu(configuration, dependency_output)
-    if configuration.family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
-        return _rewrite_msvc(configuration, dependency_output)
-    raise AuditInfrastructureError(
-        f"unsupported compiler family: {configuration.family}"
+        rewritten = _rewrite_gnu(configuration, dependency_output, classification)
+    elif configuration.family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
+        rewritten = _rewrite_msvc(configuration, dependency_output, classification)
+    else:
+        raise AuditInfrastructureError(
+            f"unsupported compiler family: {configuration.family}"
+        )
+    return RewrittenCommand(
+        arguments=rewritten.arguments,
+        dependency_output=rewritten.dependency_output,
+        dependency_format=rewritten.dependency_format,
+        classification=classification,
     )
 
 
@@ -4477,6 +5059,7 @@ def make_configuration(
     inspection_cache=None,
     expected_audit_engine_fingerprint: str = "",
     pipeline_deadline: float | None = None,
+    launch_accountant=None,
 ) -> PreprocessConfiguration:
     """Build one stable semantic configuration from a compile database entry."""
 
@@ -4536,6 +5119,7 @@ def make_configuration(
         expected_audit_engine_fingerprint,
         deadline,
         limits,
+        launch_accountant,
         working_directory=cwd,
         preprocess_arguments=expanded_arguments,
         preprocess_language=preprocess_language,

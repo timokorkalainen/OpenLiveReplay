@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import dataclasses
 import hashlib
 import json
 import math
@@ -323,6 +324,112 @@ class CompilerLaunchPurpose(enum.Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class CommandArgumentSpan:
+    role: str
+    option_index: int
+    operand_index: int
+    attachment: str
+    forwarded_depth: int
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.role, str) or not self.role
+                or not isinstance(self.option_index, int)
+                or isinstance(self.option_index, bool)
+                or self.option_index < -1
+                or not isinstance(self.operand_index, int)
+                or isinstance(self.operand_index, bool)
+                or self.operand_index < -1
+                or self.attachment not in {
+                    "compiler", "source", "scalar", "separate", "attached",
+                    "forwarded", "forwarded-comma",
+                }
+                or not isinstance(self.forwarded_depth, int)
+                or isinstance(self.forwarded_depth, bool)
+                or self.forwarded_depth < 0):
+            raise AuditInfrastructureError("command argument span is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CommandRewriteClassification:
+    response_expanded_launcher_stripped_arguments: tuple[str, ...]
+    compiler: CommandArgumentSpan
+    sources: tuple[CommandArgumentSpan, ...]
+    nonsemantic_outputs: tuple[CommandArgumentSpan, ...]
+    nonsemantic_dependencies: tuple[CommandArgumentSpan, ...]
+    semantic_scalars: tuple[CommandArgumentSpan, ...]
+    semantic_paths: tuple[CommandArgumentSpan, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.response_expanded_launcher_stripped_arguments, tuple)
+                or any(not isinstance(value, str)
+                       for value in self.response_expanded_launcher_stripped_arguments)
+                or not isinstance(self.compiler, CommandArgumentSpan)):
+            raise AuditInfrastructureError("command rewrite classification is invalid")
+        for collection in (
+            self.sources, self.nonsemantic_outputs,
+            self.nonsemantic_dependencies, self.semantic_scalars,
+            self.semantic_paths,
+        ):
+            if (not isinstance(collection, tuple)
+                    or any(not isinstance(span, CommandArgumentSpan)
+                           for span in collection)):
+                raise AuditInfrastructureError("command rewrite classification is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionConfigurationRecord:
+    configuration_digest: str
+    compiler_family: CompilerFamily
+    compiler_digest: str
+    production_source: PurePosixPath
+    normalized_decision_arguments: tuple[str, ...]
+    decision_environment_digest: str
+    working_directory_role: str
+    compiler_capability_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_digest(self.configuration_digest, "decision configuration")
+        _validate_digest(self.compiler_digest, "decision compiler")
+        _validate_digest(self.decision_environment_digest,
+                         "decision environment")
+        _validate_digest(self.compiler_capability_digest,
+                         "decision compiler capability")
+        if (not isinstance(self.compiler_family, CompilerFamily)
+                or not isinstance(self.production_source, PurePosixPath)
+                or not isinstance(self.normalized_decision_arguments, tuple)
+                or any(not isinstance(value, str)
+                       for value in self.normalized_decision_arguments)
+                or not isinstance(self.working_directory_role, str)
+                or not self.working_directory_role):
+            raise AuditInfrastructureError("decision configuration record is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationCollection:
+    configurations: tuple["PreprocessConfiguration", ...]
+    decision_records: Mapping[str, DecisionConfigurationRecord]
+    inspection_probe_invocations: int
+    dependency_root_authority: "DependencyRootAuthority"
+    capability_registry: object
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.configurations, tuple)
+                or any(not isinstance(value, PreprocessConfiguration)
+                       for value in self.configurations)
+                or not isinstance(self.decision_records, Mapping)
+                or set(self.decision_records)
+                != {value.digest for value in self.configurations}
+                or any(not isinstance(value, DecisionConfigurationRecord)
+                       for value in self.decision_records.values())
+                or not isinstance(self.inspection_probe_invocations, int)
+                or isinstance(self.inspection_probe_invocations, bool)
+                or self.inspection_probe_invocations < 0
+                or not isinstance(self.dependency_root_authority,
+                                  DependencyRootAuthority)):
+            raise AuditInfrastructureError("configuration collection is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessStartIdentity:
     platform_kind: str
     pid: int
@@ -371,6 +478,168 @@ class CompilerLaunchEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class WindowsWorkerContainment:
+    duplicated_job_handle: int
+    expected_job_cookie: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.duplicated_job_handle, int)
+                or isinstance(self.duplicated_job_handle, bool)
+                or self.duplicated_job_handle <= 0
+                or not isinstance(self.expected_job_cookie, str)
+                or not self.expected_job_cookie):
+            raise AuditInfrastructureError("Windows worker containment is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class LinuxWorkerContainment:
+    cgroup_run_path: str
+    cgroup_leaf_path: str
+    generation_token: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.cgroup_run_path, str)
+                or not self.cgroup_run_path.startswith("/")
+                or not isinstance(self.cgroup_leaf_path, str)
+                or not self.cgroup_leaf_path.startswith(
+                    self.cgroup_run_path.rstrip("/") + "/")
+                or re.fullmatch(r"[0-9a-f]{64}", self.generation_token) is None):
+            raise AuditInfrastructureError("Linux worker containment is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSWorkerContainment:
+    trusted_compiler_driver_fingerprints: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.trusted_compiler_driver_fingerprints, tuple)
+                or not self.trusted_compiler_driver_fingerprints
+                or any(re.fullmatch(r"[0-9a-f]{64}", value) is None
+                       for value in self.trusted_compiler_driver_fingerprints)):
+            raise AuditInfrastructureError("macOS worker containment is invalid")
+
+
+WorkerContainment = (
+    WindowsWorkerContainment | LinuxWorkerContainment | MacOSWorkerContainment
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerContained:
+    worker_index: int
+    generation: int
+    worker_pid: int
+    containment_identity: str
+
+    def __post_init__(self) -> None:
+        if (any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in (self.worker_index, self.generation))
+                or not isinstance(self.worker_pid, int)
+                or isinstance(self.worker_pid, bool)
+                or self.worker_pid <= 0
+                or not isinstance(self.containment_identity, str)
+                or not self.containment_identity):
+            raise AuditInfrastructureError("worker containment acknowledgement is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSWorkerSessionReported:
+    worker_index: int
+    generation: int
+    pid: int
+    pgid: int
+    bsd_start_identity: str
+
+    def __post_init__(self) -> None:
+        if (any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in (self.worker_index, self.generation, self.pid, self.pgid))
+                or self.pid <= 0 or self.pgid != self.pid
+                or not isinstance(self.bsd_start_identity, str)
+                or not self.bsd_start_identity):
+            raise AuditInfrastructureError("macOS worker session report is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CompilerPgidReported:
+    worker_index: int
+    generation: int
+    task_id: int
+    purpose: CompilerLaunchPurpose
+    pid: int
+    pgid: int
+    bsd_start_identity: str
+    executable_identity: FileIdentity
+    executable_sha256: str
+    driver_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in (self.worker_index, self.generation, self.task_id,
+                              self.pid, self.pgid))
+                or self.purpose not in {CompilerLaunchPurpose.AUDIT_DISCOVERY,
+                                CompilerLaunchPurpose.AUDIT_ACCEPTED}
+                or self.pid <= 0 or self.pgid != self.pid
+                or not isinstance(self.bsd_start_identity, str)
+                or not self.bsd_start_identity
+                or not isinstance(self.executable_identity, FileIdentity)):
+            raise AuditInfrastructureError("macOS compiler PGID report is invalid")
+        _validate_digest(self.executable_sha256, "macOS compiler executable")
+        _validate_digest(self.driver_fingerprint, "macOS compiler driver")
+
+
+@dataclass(frozen=True, slots=True)
+class CompilerExecPermit:
+    worker_index: int
+    generation: int
+    task_id: int
+    pgid: int
+
+    def __post_init__(self) -> None:
+        if (any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in (self.worker_index, self.generation, self.task_id,
+                              self.pgid))
+                or self.pgid <= 0):
+            raise AuditInfrastructureError("macOS compiler exec permit is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSInspectionPgidReported:
+    inspection_id: str
+    pid: int
+    pgid: int
+    bsd_start_identity: str
+    executable_identity: FileIdentity
+    executable_sha256: str
+
+    def __post_init__(self) -> None:
+        if (any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in (self.pid, self.pgid))
+                or not isinstance(self.inspection_id, str) or not self.inspection_id
+                or self.pid <= 0 or self.pgid != self.pid
+                or not isinstance(self.bsd_start_identity, str)
+                or not self.bsd_start_identity
+                or not isinstance(self.executable_identity, FileIdentity)):
+            raise AuditInfrastructureError("macOS inspection PGID report is invalid")
+        _validate_digest(self.executable_sha256, "macOS inspection executable")
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSInspectionExecPermit:
+    inspection_id: str
+    pid: int
+    pgid: int
+    driver_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in (self.pid, self.pgid))
+                or not isinstance(self.inspection_id, str) or not self.inspection_id
+                or self.pid <= 0 or self.pgid != self.pid):
+            raise AuditInfrastructureError("macOS inspection exec permit is invalid")
+        _validate_digest(self.driver_fingerprint, "macOS inspection driver")
+
+
+@dataclass(frozen=True, slots=True)
 class CachePublicationRequested:
     worker_index: int
     generation: int
@@ -411,6 +680,538 @@ class WorkerStageTimings:
             )
         ):
             raise AuditInfrastructureError("worker stage timing is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsRunMemoryMeasurements:
+    parent_peak_rss_bytes: int
+    worker_peak_rss_bytes: int
+    maximum_simultaneous_working_set_bytes: int
+    aggregate_peak_rss_upper_bound_bytes: int
+    job_peak_commit_charge_bytes: int
+    job_total_process_count: int
+    retained_process_identity_count: int
+    inspection_peak_tree_bytes: int
+    retained_inspection_process_identity_count: int
+    surviving_job_process_count: int
+    accounting_complete: bool
+
+    def __post_init__(self) -> None:
+        _validate_nonnegative_int_fields(self, "Windows memory measurement")
+        if not isinstance(self.accounting_complete, bool):
+            raise AuditInfrastructureError("Windows memory accounting flag is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class LinuxRunMemoryMeasurements:
+    cgroup_current_accounted_memory_bytes: int
+    cgroup_peak_accounted_memory_bytes: int
+    cgroup_memory_max_bytes: int
+    cgroup_memory_high_bytes: int
+    cgroup_oom_count_delta: int
+    cgroup_oom_kill_count_delta: int
+    cgroup_max_event_count_delta: int
+    service_root_oom_count_delta: int
+    service_root_oom_kill_count_delta: int
+    service_root_max_event_count_delta: int
+    surviving_cgroup_process_count: int
+    accounting_complete: bool
+
+    def __post_init__(self) -> None:
+        _validate_nonnegative_int_fields(self, "Linux memory measurement")
+        if not isinstance(self.accounting_complete, bool):
+            raise AuditInfrastructureError("Linux memory accounting flag is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSRunMemoryMeasurements:
+    maximum_observed_aggregate_resident_bytes: int
+    maximum_observed_parent_resident_bytes: int
+    maximum_observed_owned_group_resident_bytes: int
+    surviving_registered_process_count: int
+    known_unreconciled_descendant_count: int
+    accounting_complete: bool
+
+    def __post_init__(self) -> None:
+        _validate_nonnegative_int_fields(self, "macOS memory measurement")
+        if not isinstance(self.accounting_complete, bool):
+            raise AuditInfrastructureError("macOS memory accounting flag is invalid")
+
+
+PlatformRunMemoryMeasurements = (
+    WindowsRunMemoryMeasurements | LinuxRunMemoryMeasurements
+    | MacOSRunMemoryMeasurements
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerTelemetry:
+    worker_index: int
+    generation: int
+    worker_pid: int
+    sequence: int
+    owned_process_count: int
+    worker_current_resident_bytes: int
+    worker_peak_resident_bytes: int
+    accounting_complete: bool
+
+    def __post_init__(self) -> None:
+        _validate_nonnegative_int_fields(self, "worker telemetry")
+        if self.worker_pid <= 0 or not isinstance(self.accounting_complete, bool):
+            raise AuditInfrastructureError("worker telemetry is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsPostReturnSample:
+    platform_kind: str
+    worker_slot: int
+    worker_generation: int
+    task_ordinal_in_generation: int
+    worker_current_rss_bytes: int
+    aggregate_peak_rss_upper_bound_bytes: int
+    accounting_complete: bool
+
+    def __post_init__(self) -> None:
+        if self.platform_kind != "windows":
+            raise AuditInfrastructureError("Windows post-return sample is invalid")
+        _validate_post_return_sample(self)
+
+
+@dataclass(frozen=True, slots=True)
+class LinuxPostReturnSample:
+    platform_kind: str
+    worker_slot: int
+    worker_generation: int
+    task_ordinal_in_generation: int
+    worker_current_rss_bytes: int
+    cgroup_current_accounted_memory_bytes: int
+    cgroup_peak_accounted_memory_bytes: int
+    cgroup_memory_high_bytes: int
+    cgroup_memory_max_bytes: int
+    service_and_run_event_deltas_zero: bool
+    accounting_complete: bool
+
+    def __post_init__(self) -> None:
+        if self.platform_kind != "linux":
+            raise AuditInfrastructureError("Linux post-return sample is invalid")
+        _validate_post_return_sample(self)
+        if not isinstance(self.service_and_run_event_deltas_zero, bool):
+            raise AuditInfrastructureError("Linux post-return events are invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSPostReturnSample:
+    platform_kind: str
+    worker_slot: int
+    worker_generation: int
+    task_ordinal_in_generation: int
+    worker_current_rss_bytes: int
+    maximum_observed_owned_group_resident_bytes: int
+    registered_survivors: int
+    known_unreconciled_descendants: int
+    accounting_complete: bool
+
+    def __post_init__(self) -> None:
+        if self.platform_kind != "macos":
+            raise AuditInfrastructureError("macOS post-return sample is invalid")
+        _validate_post_return_sample(self)
+
+
+PlatformPostReturnSample = (
+    WindowsPostReturnSample | LinuxPostReturnSample | MacOSPostReturnSample
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsPhaseSnapshot:
+    platform_kind: str
+    phase: str
+    memory: WindowsRunMemoryMeasurements
+    archived_generation_count: int
+
+    def __post_init__(self) -> None:
+        _validate_phase_snapshot(self, "windows", WindowsRunMemoryMeasurements)
+
+
+@dataclass(frozen=True, slots=True)
+class LinuxPhaseSnapshot:
+    platform_kind: str
+    phase: str
+    memory: LinuxRunMemoryMeasurements
+    archived_generation_count: int
+
+    def __post_init__(self) -> None:
+        _validate_phase_snapshot(self, "linux", LinuxRunMemoryMeasurements)
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSPhaseSnapshot:
+    platform_kind: str
+    phase: str
+    memory: MacOSRunMemoryMeasurements
+    archived_generation_count: int
+
+    def __post_init__(self) -> None:
+        _validate_phase_snapshot(self, "macos", MacOSRunMemoryMeasurements)
+
+
+NativePhaseSnapshot = WindowsPhaseSnapshot | LinuxPhaseSnapshot | MacOSPhaseSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceCalibrationEnvelope:
+    runner_image: str
+    python_version: str
+    qt_package: str
+    mingw_package: str
+    worker_capacity: int
+    affinity_cpu_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        _validate_envelope_strings(self, ("runner_image", "python_version",
+                                          "qt_package", "mingw_package"))
+        if (not isinstance(self.worker_capacity, int)
+                or isinstance(self.worker_capacity, bool)
+                or self.worker_capacity <= 0
+                or not isinstance(self.affinity_cpu_indices, tuple)
+                or self.affinity_cpu_indices != tuple(range(self.worker_capacity))):
+            raise AuditInfrastructureError("reference calibration envelope is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class LinuxCalibrationEnvelope:
+    runner_image: str
+    kernel_release: str
+    python_version: str
+    clang_version: str
+    systemd_version: str
+    cgroup_v2: bool
+    effective_worker_capacity: int
+
+    def __post_init__(self) -> None:
+        _validate_envelope_strings(self, ("runner_image", "kernel_release",
+                                          "python_version", "clang_version",
+                                          "systemd_version"))
+        if (not isinstance(self.cgroup_v2, bool)
+                or not isinstance(self.effective_worker_capacity, int)
+                or isinstance(self.effective_worker_capacity, bool)
+                or self.effective_worker_capacity <= 0):
+            raise AuditInfrastructureError("Linux calibration envelope is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSCalibrationEnvelope:
+    runner_image: str
+    macos_version: str
+    python_version: str
+    appleclang_version: str
+    effective_worker_capacity: int
+
+    def __post_init__(self) -> None:
+        _validate_envelope_strings(self, ("runner_image", "macos_version",
+                                          "python_version", "appleclang_version"))
+        if (not isinstance(self.effective_worker_capacity, int)
+                or isinstance(self.effective_worker_capacity, bool)
+                or self.effective_worker_capacity <= 0):
+            raise AuditInfrastructureError("macOS calibration envelope is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerDecisionKey:
+    platform_tag: str
+    compiler_digest: str
+    configuration_set_digest: str
+    uninspected_configuration_digest: str
+    decision_engine_fingerprint: str
+    effective_worker_capacity: int
+    reference_envelope_digest: str
+    key_digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.platform_tag, str) or not self.platform_tag:
+            raise AuditInfrastructureError("worker decision platform tag is invalid")
+        for label, value in (
+            ("compiler", self.compiler_digest),
+            ("configuration set", self.configuration_set_digest),
+            ("uninspected configuration", self.uninspected_configuration_digest),
+            ("decision engine", self.decision_engine_fingerprint),
+            ("reference envelope", self.reference_envelope_digest),
+            ("key", self.key_digest),
+        ):
+            _validate_digest(value, f"worker decision {label}")
+        if (not isinstance(self.effective_worker_capacity, int)
+                or isinstance(self.effective_worker_capacity, bool)
+                or self.effective_worker_capacity <= 0):
+            raise AuditInfrastructureError("worker decision capacity is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationRejection:
+    platform_kind: str
+    worker_count: int
+    failure_stage: str
+    failure_code: str
+    cleanup_complete: bool
+    surviving_owned_process_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerCalibrationSample:
+    platform_kind: str
+    worker_count: int
+    configuration_count: int
+    elapsed_seconds: float
+    memory: WindowsRunMemoryMeasurements
+    inspection_probe_invocations: int
+    audit_compiler_invocations: int
+    stdout_bytes: int
+    cache_bytes: int
+    cache_entries: int
+    maximum_tasks_per_worker: int
+    recycle_rss_bytes: int
+    pilot_eligible: bool
+    surviving_owned_process_count: int
+    included_stages: tuple[str, ...]
+    post_return_samples: tuple[WindowsPostReturnSample, ...]
+    stage_p50_seconds: WorkerStageTimings
+    stage_p95_seconds: WorkerStageTimings
+    inspection_phase_snapshot: WindowsPhaseSnapshot
+    task_phase_snapshot: WindowsPhaseSnapshot
+
+    def __post_init__(self) -> None:
+        _validate_calibration_sample(self, "windows", WindowsRunMemoryMeasurements,
+                                     WindowsPostReturnSample, WindowsPhaseSnapshot)
+
+
+@dataclass(frozen=True, slots=True)
+class LinuxWorkerCalibrationSample:
+    platform_kind: str
+    worker_count: int
+    configuration_count: int
+    elapsed_seconds: float
+    maximum_tasks_per_worker: int
+    recycle_rss_bytes: int
+    memory: LinuxRunMemoryMeasurements
+    inspection_probe_invocations: int
+    audit_compiler_invocations: int
+    stdout_bytes: int
+    cache_bytes: int
+    cache_entries: int
+    pilot_eligible: bool
+    surviving_owned_process_count: int
+    included_stages: tuple[str, ...]
+    post_return_samples: tuple[LinuxPostReturnSample, ...]
+    stage_p50_seconds: WorkerStageTimings
+    stage_p95_seconds: WorkerStageTimings
+    inspection_phase_snapshot: LinuxPhaseSnapshot
+    task_phase_snapshot: LinuxPhaseSnapshot
+
+    def __post_init__(self) -> None:
+        _validate_calibration_sample(self, "linux", LinuxRunMemoryMeasurements,
+                                     LinuxPostReturnSample, LinuxPhaseSnapshot)
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSWorkerCalibrationSample:
+    platform_kind: str
+    worker_count: int
+    configuration_count: int
+    elapsed_seconds: float
+    maximum_tasks_per_worker: int
+    recycle_rss_bytes: int
+    memory: MacOSRunMemoryMeasurements
+    inspection_probe_invocations: int
+    audit_compiler_invocations: int
+    stdout_bytes: int
+    cache_bytes: int
+    cache_entries: int
+    pilot_eligible: bool
+    surviving_owned_process_count: int
+    included_stages: tuple[str, ...]
+    post_return_samples: tuple[MacOSPostReturnSample, ...]
+    stage_p50_seconds: WorkerStageTimings
+    stage_p95_seconds: WorkerStageTimings
+    inspection_phase_snapshot: MacOSPhaseSnapshot
+    task_phase_snapshot: MacOSPhaseSnapshot
+
+    def __post_init__(self) -> None:
+        _validate_calibration_sample(self, "macos", MacOSRunMemoryMeasurements,
+                                     MacOSPostReturnSample, MacOSPhaseSnapshot)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerCountDecision:
+    platform_kind: str
+    artifact_schema: int
+    key: WorkerDecisionKey
+    selected_workers: int
+    maximum_tasks_per_worker: int
+    recycle_rss_bytes: int
+    attempted_worker_counts: tuple[int, ...]
+    rejections: tuple[CalibrationRejection, ...]
+    samples: tuple[WorkerCalibrationSample, ...]
+    evidence_record_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class LinuxWorkerCountDecision:
+    platform_kind: str
+    artifact_schema: int
+    key: WorkerDecisionKey
+    envelope: LinuxCalibrationEnvelope
+    selected_workers: int
+    maximum_tasks_per_worker: int
+    recycle_rss_bytes: int
+    attempted_worker_counts: tuple[int, ...]
+    rejections: tuple[CalibrationRejection, ...]
+    samples: tuple[LinuxWorkerCalibrationSample, ...]
+    evidence_record_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSWorkerCountDecision:
+    platform_kind: str
+    artifact_schema: int
+    key: WorkerDecisionKey
+    envelope: MacOSCalibrationEnvelope
+    selected_workers: int
+    maximum_tasks_per_worker: int
+    recycle_rss_bytes: int
+    attempted_worker_counts: tuple[int, ...]
+    rejections: tuple[CalibrationRejection, ...]
+    samples: tuple[MacOSWorkerCalibrationSample, ...]
+    evidence_record_sha256: str
+
+
+PlatformWorkerDecision = (
+    WorkerCountDecision | LinuxWorkerCountDecision | MacOSWorkerCountDecision
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PrevalidatedWorkerDecision:
+    path: Path
+    platform_kind: str
+    audit_engine_fingerprint: str
+    uninspected_configuration_digest: str
+    bounded_payload_sha256: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.path, Path)
+                or self.platform_kind not in {"windows", "linux", "macos"}):
+            raise AuditInfrastructureError("prevalidated worker decision is invalid")
+        _validate_digest(self.audit_engine_fingerprint,
+                         "prevalidated decision audit engine")
+        _validate_digest(self.uninspected_configuration_digest,
+                         "prevalidated decision configuration")
+        _validate_digest(self.bounded_payload_sha256,
+                         "prevalidated decision payload")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRuntimeContract:
+    workers: int
+    maximum_tasks_per_worker: int
+    recycle_rss_bytes: int
+    pipeline_deadline: float
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.workers, int) or isinstance(self.workers, bool)
+                or self.workers <= 0
+                or not isinstance(self.maximum_tasks_per_worker, int)
+                or isinstance(self.maximum_tasks_per_worker, bool)
+                or self.maximum_tasks_per_worker <= 0
+                or not isinstance(self.recycle_rss_bytes, int)
+                or isinstance(self.recycle_rss_bytes, bool)
+                or self.recycle_rss_bytes < 0
+                or not isinstance(self.pipeline_deadline, (int, float))
+                or isinstance(self.pipeline_deadline, bool)
+                or not math.isfinite(self.pipeline_deadline)):
+            raise AuditInfrastructureError("worker runtime contract is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class PilotRuntimeParameters:
+    maximum_tasks_per_worker: int
+    recycle_rss_bytes: int
+    pilot_eligible: bool
+
+    @property
+    def diagnostic_parameters(self) -> tuple[int, int]:
+        if not self.pilot_eligible:
+            return (1, 1)
+        return (self.maximum_tasks_per_worker, self.recycle_rss_bytes)
+
+
+def _validate_nonnegative_int_fields(value: object, label: str) -> None:
+    for field_info in dataclasses.fields(value):
+        candidate = getattr(value, field_info.name)
+        if field_info.name in {
+            "platform_kind", "accounting_complete",
+            "service_and_run_event_deltas_zero",
+        }:
+            continue
+        if (not isinstance(candidate, int) or isinstance(candidate, bool)
+                or candidate < 0):
+            raise AuditInfrastructureError(f"{label} is invalid")
+
+
+def _validate_post_return_sample(value: object) -> None:
+    _validate_nonnegative_int_fields(value, "post-return sample")
+    if (getattr(value, "task_ordinal_in_generation") <= 0
+            or not isinstance(getattr(value, "accounting_complete"), bool)):
+        raise AuditInfrastructureError("post-return sample is invalid")
+
+
+def _validate_phase_snapshot(value: object, platform_kind: str,
+                             memory_type: type) -> None:
+    if (getattr(value, "platform_kind") != platform_kind
+            or getattr(value, "phase") not in {"inspection", "tasks"}
+            or not isinstance(getattr(value, "memory"), memory_type)
+            or not isinstance(getattr(value, "archived_generation_count"), int)
+            or isinstance(getattr(value, "archived_generation_count"), bool)
+            or getattr(value, "archived_generation_count") < 0):
+        raise AuditInfrastructureError("native phase snapshot is invalid")
+
+
+def _validate_envelope_strings(value: object, names: tuple[str, ...]) -> None:
+    if any(not isinstance(getattr(value, name), str) or not getattr(value, name)
+           for name in names):
+        raise AuditInfrastructureError("calibration envelope is invalid")
+
+
+def _validate_calibration_sample(value: object, platform_kind: str,
+                                 memory_type: type, post_type: type,
+                                 phase_type: type) -> None:
+    integer_names = (
+        "worker_count", "configuration_count", "inspection_probe_invocations",
+        "audit_compiler_invocations", "stdout_bytes", "cache_bytes", "cache_entries",
+        "maximum_tasks_per_worker", "recycle_rss_bytes",
+        "surviving_owned_process_count",
+    )
+    if (getattr(value, "platform_kind") != platform_kind
+            or any(not isinstance(getattr(value, name), int)
+                   or isinstance(getattr(value, name), bool)
+                   or getattr(value, name) < (1 if name in {
+                       "worker_count", "configuration_count", "maximum_tasks_per_worker"
+                   } else 0) for name in integer_names)
+            or not isinstance(getattr(value, "elapsed_seconds"), (int, float))
+            or isinstance(getattr(value, "elapsed_seconds"), bool)
+            or not math.isfinite(getattr(value, "elapsed_seconds"))
+            or getattr(value, "elapsed_seconds") < 0
+            or not isinstance(getattr(value, "memory"), memory_type)
+            or not isinstance(getattr(value, "pilot_eligible"), bool)
+            or not isinstance(getattr(value, "included_stages"), tuple)
+            or any(not isinstance(item, str) or not item
+                   for item in getattr(value, "included_stages"))
+            or not isinstance(getattr(value, "post_return_samples"), tuple)
+            or any(not isinstance(item, post_type)
+                   for item in getattr(value, "post_return_samples"))
+            or not isinstance(getattr(value, "stage_p50_seconds"), WorkerStageTimings)
+            or not isinstance(getattr(value, "stage_p95_seconds"), WorkerStageTimings)
+            or not isinstance(getattr(value, "inspection_phase_snapshot"), phase_type)
+            or not isinstance(getattr(value, "task_phase_snapshot"), phase_type)):
+        raise AuditInfrastructureError("worker calibration sample is invalid")
 
 
 @dataclass(frozen=True, slots=True)

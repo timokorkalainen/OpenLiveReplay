@@ -56,6 +56,7 @@ from gpu_capability_runner import (  # noqa: E402
     ExecutionResult,
     _WindowsJob,
     collect_configurations,
+    collect_configurations_with_decision_records,
     discover_configuration,
     load_or_preprocess,
     preprocess_all,
@@ -70,6 +71,116 @@ class BoundedPreprocessorTests(unittest.TestCase):
         path = Path(__file__).resolve().with_name("gpu_capability_runner.py")
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
         self.assertFalse(any(isinstance(node, ast.Assert) for node in ast.walk(tree)))
+
+    def test_decision_collection_uses_explicit_production_and_immutable_sidecars(self):
+        database = self.root / "compile_commands.json"
+        entry = {"directory": str(self.root), "file": str(self.source),
+                 "arguments": [sys.executable, str(self.source)]}
+        database.write_text(json.dumps((entry, entry)), encoding="utf-8")
+        configuration = dataclasses.replace(
+            self.configuration("success"), digest="a" * 64,
+            arguments=(str(self.source),))
+
+        class DuplicateOwner:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        duplicate_owner = DuplicateOwner()
+        duplicate_capability = dataclasses.replace(
+            configuration.compiler_capability, native_owner=duplicate_owner)
+        duplicate_configuration = dataclasses.replace(
+            configuration, compiler_capability=duplicate_capability)
+
+        class Registry:
+            def register(_self, capability):
+                return capability.capability_digest
+
+        accountant = SimpleNamespace(inspection_probe_invocations=0)
+        inspection = SimpleNamespace(normalized_version="Python fixture compiler")
+        with mock.patch(
+                "gpu_capability_source_audit._attest_loaded_audit_engine",
+                return_value="f" * 64), mock.patch(
+                "gpu_capability_runner.make_configuration",
+                side_effect=(configuration, duplicate_configuration)) as make, mock.patch(
+                "gpu_capability_runner.inspect_compiler",
+                return_value=inspection):
+            collection = collect_configurations_with_decision_records(
+                self.root, (database,), dict(os.environ), self.production,
+                self.dependency_roots, Registry(), object(), "f" * 64,
+                AuditLimits(), time.monotonic() + 10.0, accountant)
+        self.assertEqual(collection.configurations, (configuration,))
+        self.assertEqual(set(collection.decision_records), {"a" * 64})
+        self.assertIsInstance(collection.decision_records, MappingProxyType)
+        self.assertEqual(make.call_count, 2)
+        self.assertTrue(duplicate_owner.closed)
+        with self.assertRaises(TypeError):
+            collection.decision_records["a" * 64] = collection.decision_records["a" * 64]
+
+    def test_fake_preprocessor_holds_allocation_until_native_observation_ack(self):
+        from gpu_capability_process_tree import (
+            OwnedProcessIdentity, OwnedProcessTree, native_process_resident_bytes)
+
+        ready = self.root / "allocation.ready"
+        release = self.root / "allocation.release"
+        process = subprocess.Popen(
+            (sys.executable, str(self.fixture), "--fixture-mode", "allocation-hold",
+             "--allocation-bytes", str(4 << 20),
+             "--allocation-ready-file", str(ready),
+             "--allocation-release-file", str(release),
+             "--sleep-seconds", "10", str(self.source)),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=sys.platform == "darwin")
+        try:
+            deadline = time.monotonic() + 5
+            observed_ready = None
+            while time.monotonic() < deadline:
+                try:
+                    observed_ready = ready.read_text(encoding="ascii")
+                except FileNotFoundError:
+                    observed_ready = None
+                if observed_ready == str(4 << 20):
+                    break
+                time.sleep(0.01)
+            self.assertEqual(observed_ready, str(4 << 20))
+            if sys.platform == "darwin":
+                from gpu_capability_process_tree import (
+                    MacOSLibprocProvider, MacOSRegisteredPgidAccountant)
+                provider = MacOSLibprocProvider()
+                native_identity, resident, _parent = (
+                    provider._identity_and_residency(process.pid, process.pid))
+                accountant = MacOSRegisteredPgidAccountant()
+                accountant.register_group(process.pid, native_identity,
+                                          "allocation-fixture")
+                provider.observe(accountant, 0)
+                observed = accountant.memory_measurements()
+                self.assertGreaterEqual(
+                    observed.maximum_observed_owned_group_resident_bytes,
+                    4 << 20)
+                release.write_text("observed", encoding="ascii")
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, (stdout, stderr))
+                accountant.reconcile_group(process.pid, provider)
+                self.assertTrue(accountant.memory_measurements().accounting_complete)
+                return
+            identity = OwnedProcessIdentity(
+                "windows" if os.name == "nt" else "linux", process.pid,
+                f"fixture-{process.pid}")
+            tree = OwnedProcessTree(identity.platform_kind, "allocation-fixture")
+            tree.register(identity, None, "acknowledged-allocation")
+            resident = native_process_resident_bytes(process.pid)
+            tree.observe_resident_bytes(
+                identity, current_bytes=resident, peak_bytes=resident)
+            self.assertGreaterEqual(resident, 4 << 20)
+            release.write_text("observed", encoding="ascii")
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, (stdout, stderr))
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
 
     @unittest.skipUnless(os.name == "nt", "requires Windows suspended launch")
     def test_windows_launch_gate_suspends_the_actual_compiler_without_helper(self):

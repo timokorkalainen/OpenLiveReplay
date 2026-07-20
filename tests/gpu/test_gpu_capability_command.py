@@ -34,6 +34,10 @@ from gpu_capability_command import (  # noqa: E402
     open_compiler_executable_capability,
     rewrite_preprocess_command,
     strip_launchers,
+    classify_command_rewrite,
+    compiler_digest,
+    decision_environment_digest,
+    normalize_decision_arguments,
 )
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
@@ -3239,8 +3243,8 @@ class CommandRewriteTests(unittest.TestCase):
     def test_rewritten_command_is_exact_and_immutable(self):
         rewritten = self.rewrite(CompilerFamily.GCC, ("file.cpp",))
         self.assertEqual(
-            tuple(field.name for field in dataclasses.fields(RewrittenCommand)),
-            ("arguments", "dependency_output", "dependency_format"),
+        tuple(field.name for field in dataclasses.fields(RewrittenCommand)),
+        ("arguments", "dependency_output", "dependency_format", "classification"),
         )
         self.assertIsInstance(rewritten.arguments, tuple)
         self.assertEqual(rewritten.dependency_output, self.dependency_output)
@@ -4076,6 +4080,181 @@ class CommandRewriteTests(unittest.TestCase):
                     AuditInfrastructureError, message
                 ):
                     self.rewrite(family, arguments)
+
+
+class DecisionProjectionContractTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "source"
+        self.build = self.root / "build"
+        self.toolchain = self.root / "toolchain"
+        self.cwd = self.build / "obj"
+        for path in (self.source / "include", self.build, self.toolchain / "sysroot",
+                     self.cwd):
+            path.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_typed_spans_remove_only_proven_outputs_and_source(self):
+        arguments = (
+            "-DOLR_GPU=1", "-I", str(self.source / "include"),
+            f"--sysroot={self.toolchain / 'sysroot'}", "-std=c++20",
+            "-o", str(self.build / "out.o"), "-MF", str(self.build / "out.d"),
+            str(self.source / "unit.cpp"),
+        )
+        classification = classify_command_rewrite(arguments, self.cwd,
+                                                   CompilerFamily.CLANG)
+        rewritten = RewrittenCommand(
+            (str(self.toolchain / "clang++"), *arguments, "-E", "-MD"),
+            self.build / "generated.d", "gcc-depfile", classification)
+        normalized = normalize_decision_arguments(
+            rewritten, self.cwd, "build-object", self.source, self.build,
+            self.toolchain)
+        self.assertEqual(normalized, (
+            "-DOLR_GPU=1", "-I", "<SOURCE_ROOT>/include",
+            "--sysroot=<TOOLCHAIN_ROOT>/sysroot", "-std=c++20"))
+        self.assertEqual(tuple(span.role for span in classification.semantic_paths),
+                         ("include-path", "sysroot"))
+        self.assertEqual(tuple(span.role for span in classification.nonsemantic_outputs),
+                         ("output",))
+        self.assertEqual(tuple(span.role for span in classification.nonsemantic_dependencies),
+                         ("dependency-file",))
+
+    def test_unknown_path_bearing_option_fails_closed(self):
+        with self.assertRaisesRegex(AuditInfrastructureError,
+                                    "unclassified path-bearing option"):
+            classify_command_rewrite(
+                (f"--mystery-path={self.source / 'include'}",), self.cwd,
+                CompilerFamily.CLANG)
+        with self.assertRaisesRegex(AuditInfrastructureError,
+                                    "unclassified path-bearing option"):
+            classify_command_rewrite(
+                (f"--unknown-module-dir={self.source / 'modules'}",), self.cwd,
+                CompilerFamily.CLANG)
+
+    def test_forwarded_separate_path_and_absolute_posix_source_are_typed(self):
+        source = self.source / "unit.cpp"
+        arguments = ("-Xclang", "-I", "-Xclang",
+                     str(self.source / "include"), str(source))
+        classification = classify_command_rewrite(
+            arguments, self.cwd, CompilerFamily.CLANG)
+        self.assertEqual(tuple(span.operand_index for span in classification.sources),
+                         (4,))
+        self.assertEqual(tuple(span.operand_index
+                               for span in classification.semantic_paths), (3,))
+        rewritten = RewrittenCommand(("clang++", *arguments), self.build / "out.d",
+                                     "gcc-depfile", classification)
+        self.assertEqual(normalize_decision_arguments(
+            rewritten, self.cwd, "object", self.source, self.build,
+            self.toolchain),
+            ("-Xclang", "-I", "-Xclang", "<SOURCE_ROOT>/include"))
+
+    def test_iprefix_and_wp_semantic_paths_cannot_collide(self):
+        source = str(self.source / "unit.cpp")
+
+        def project(prefix: Path, wp: bool = False):
+            option = (f"-Wp,-I,{prefix}" if wp
+                      else ("-iprefix", str(prefix)))
+            arguments = ((option, source) if isinstance(option, str)
+                         else (*option, source))
+            classification = classify_command_rewrite(
+                arguments, self.cwd, CompilerFamily.CLANG)
+            rewritten = RewrittenCommand(("clang++", *arguments),
+                                         self.build / "out.d", "gcc-depfile",
+                                         classification)
+            return normalize_decision_arguments(
+                rewritten, self.cwd, "object", self.source, self.build,
+                self.toolchain)
+
+        self.assertNotEqual(project(self.source / "include"),
+                            project(self.source / "other"))
+        self.assertEqual(project(self.source / "include", wp=True),
+                         ("-Wp,-I,<SOURCE_ROOT>/include",))
+
+    def test_normalization_is_relocatable_but_semantic(self):
+        def project(root: Path, define: str = "OLR_GPU=1"):
+            source = root / "source"
+            build = root / "build"
+            toolchain = root / "toolchain"
+            cwd = build / "obj"
+            arguments = (f"-D{define}", "-I../source/include", "-o", "../build/out.o",
+                         "../source/unit.cpp")
+            classification = classify_command_rewrite(arguments, cwd,
+                                                       CompilerFamily.GCC)
+            rewritten = RewrittenCommand(("g++", *arguments), build / "out.d",
+                                         "gcc-depfile", classification)
+            return normalize_decision_arguments(
+                rewritten, cwd, "object", source, build, toolchain)
+        relocated = self.root / "relocated"
+        self.assertEqual(project(self.root), project(relocated))
+        self.assertNotEqual(project(self.root), project(relocated, "OLR_GPU=0"))
+
+    def test_decision_environment_allowlist_excludes_ambient_and_secrets(self):
+        base = {
+            "CPATH": str(self.source / "include"),
+            "SDKROOT": str(self.toolchain / "sysroot"),
+            "MACOSX_DEPLOYMENT_TARGET": "14.0",
+            "GITHUB_RUN_ID": "1", "RUNNER_TEMP": str(self.build / "tmp"),
+            "ACTIONS_RUNTIME_TOKEN": "secret",
+        }
+        first = decision_environment_digest(
+            CompilerFamily.CLANG, base, {"CCACHE_NAMESPACE": "gpu"}, self.cwd,
+            "object", self.source, self.build, self.toolchain)
+        noisy = dict(base, GITHUB_RUN_ID="2", RUNNER_TEMP="elsewhere",
+                     ACTIONS_RUNTIME_TOKEN="different")
+        self.assertEqual(first, decision_environment_digest(
+            CompilerFamily.CLANG, noisy, {"CCACHE_NAMESPACE": "gpu"}, self.cwd,
+            "object", self.source, self.build, self.toolchain))
+        changed = dict(base, MACOSX_DEPLOYMENT_TARGET="15.0")
+        self.assertNotEqual(first, decision_environment_digest(
+            CompilerFamily.CLANG, changed, {"CCACHE_NAMESPACE": "gpu"}, self.cwd,
+            "object", self.source, self.build, self.toolchain))
+
+    def test_explicit_launcher_path_assignments_are_relocation_stable(self):
+        def project(root: Path) -> str:
+            source = root / "source"
+            build = root / "build"
+            toolchain = root / "toolchain"
+            return decision_environment_digest(
+                CompilerFamily.CLANG, {},
+                {"SDKROOT": str(toolchain / "sdk"),
+                 "cache_dir": str(build / "ccache")}, build / "obj",
+                "object", source, build, toolchain)
+
+        self.assertEqual(project(self.root), project(self.root / "relocated"))
+
+    def test_msvc_showincludes_flag_does_not_consume_semantic_macro(self):
+        source = str(self.source / "unit.cpp")
+
+        def project(arguments: tuple[str, ...]) -> tuple[str, ...]:
+            classification = classify_command_rewrite(
+                arguments, self.cwd, CompilerFamily.MSVC)
+            rewritten = RewrittenCommand(
+                ("cl.exe", *arguments), self.build / "out.json",
+                "msvc-source-dependencies", classification)
+            return normalize_decision_arguments(
+                rewritten, self.cwd, "object", self.source, self.build,
+                self.toolchain)
+
+        with_macro = project(("/showIncludes", "/DFOO=1", source))
+        without_macro = project(("/showIncludes", source))
+        self.assertEqual(with_macro, ("/DFOO=1",))
+        self.assertNotEqual(with_macro, without_macro)
+
+    def test_compiler_digest_ignores_path_but_binds_content_and_version(self):
+        first = self.toolchain / "clang-a"
+        relocated = self.root / "other" / "clang-b"
+        relocated.parent.mkdir()
+        first.write_bytes(b"compiler")
+        relocated.write_bytes(b"compiler")
+        self.assertEqual(compiler_digest(CompilerFamily.CLANG, first, "clang 18.1.8"),
+                         compiler_digest(CompilerFamily.CLANG, relocated, "clang 18.1.8"))
+        relocated.write_bytes(b"changed")
+        self.assertNotEqual(compiler_digest(CompilerFamily.CLANG, first, "clang 18.1.8"),
+                            compiler_digest(CompilerFamily.CLANG, relocated,
+                                            "clang 18.1.8"))
 
 
 if __name__ == "__main__":

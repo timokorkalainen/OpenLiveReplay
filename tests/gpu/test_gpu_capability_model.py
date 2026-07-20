@@ -33,6 +33,12 @@ from gpu_capability_model import (  # noqa: E402
     CompilerInspection,
     CompilerFamily,
     CoverageReport,
+    WindowsRunMemoryMeasurements,
+    WorkerTelemetry,
+    LinuxWorkerContainment,
+    MacOSWorkerContainment,
+    WindowsWorkerContainment,
+    MacOSWorkerSessionReported,
     ConfigurationAuditResult,
     ConfigurationAuditOutcome,
     ConfigurationAuditPublicationPermit,
@@ -83,6 +89,28 @@ class ModelTests(unittest.TestCase):
             line_count=line_count,
             production=True,
         )
+
+    def test_native_worker_containment_carriers_are_exact_and_fail_closed(self):
+        self.assertEqual(
+            WindowsWorkerContainment(7, "job-cookie").duplicated_job_handle, 7)
+        self.assertEqual(
+            LinuxWorkerContainment(
+                "/cg/run", "/cg/run/worker-0-g0", "a" * 64).generation_token,
+            "a" * 64)
+        self.assertEqual(
+            MacOSWorkerContainment(("b" * 64,)).trusted_compiler_driver_fingerprints,
+            ("b" * 64,))
+        self.assertEqual(
+            MacOSWorkerSessionReported(0, 0, 91, 91, "1:2").pgid, 91)
+        for constructor in (
+            lambda: WindowsWorkerContainment(0, "cookie"),
+            lambda: LinuxWorkerContainment("/cg/run", "/other", "a" * 64),
+            lambda: MacOSWorkerContainment(()),
+            lambda: MacOSWorkerSessionReported(0, 0, 91, 92, "1:2"),
+        ):
+            with self.subTest(constructor=constructor), self.assertRaises(
+                    AuditInfrastructureError):
+                constructor()
 
     def configuration(self, *, digest: str = "cfg-a") -> PreprocessConfiguration:
         identity = self.identity()
@@ -1823,6 +1851,20 @@ class ProductionIdentityTests(unittest.TestCase):
             r"playback/gpu/file\.cpp.*case.*playback/Gpu/File\.cpp",
         ):
             _check_casefold_collision(PurePosixPath("playback/gpu/file.cpp"), seen)
+
+
+class Task6TelemetryCarrierTests(unittest.TestCase):
+    def test_worker_telemetry_is_complete_tree_and_typed(self):
+        telemetry = WorkerTelemetry(0, 1, 123, 2, 3, 4, 5, True)
+        self.assertEqual(telemetry.owned_process_count, 3)
+        with self.assertRaisesRegex(AuditInfrastructureError, "worker telemetry"):
+            WorkerTelemetry(0, 1, 123, 2, 3, 4, 5, 1)
+
+    def test_windows_memory_keeps_commit_separate_from_rss(self):
+        memory = WindowsRunMemoryMeasurements(
+            1, 2, 3, 4, 99, 2, 2, 1, 1, 0, True)
+        self.assertEqual(memory.aggregate_peak_rss_upper_bound_bytes, 4)
+        self.assertEqual(memory.job_peak_commit_charge_bytes, 99)
 
 
 if __name__ == "__main__":

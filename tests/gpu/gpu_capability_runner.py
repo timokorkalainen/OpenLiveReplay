@@ -35,7 +35,12 @@ from gpu_capability_command import (
     decode_compile_entry,
     make_configuration,
     launch_compiler_process,
+    compiler_digest_from_capability,
+    decision_environment_digest,
+    inspect_compiler,
+    normalize_decision_arguments,
     rewrite_preprocess_command,
+    strip_launchers,
     validate_compiler_executable_capability,
 )
 from gpu_capability_model import (
@@ -50,6 +55,8 @@ from gpu_capability_model import (
     CompilerFamily,
     CompilerLaunchEvent,
     CompilerLaunchPurpose,
+    ConfigurationCollection,
+    DecisionConfigurationRecord,
     ConfigurationAuditOutcome,
     ConfigurationAuditOutcomeOwner,
     ConfigurationAuditResult,
@@ -2678,6 +2685,166 @@ def collect_configurations(
                     f"configuration digest collision: {configuration.digest}"
                 )
     return tuple(by_digest[digest] for digest in sorted(by_digest))
+
+
+def _decision_root_context(configuration: PreprocessConfiguration, database: Path,
+                           dependency_roots: DependencyRootAuthority,
+                           source_root: Path) -> tuple[str, Path, Path]:
+    bindings = (dependency_roots.source_root, *dependency_roots.external_roots)
+    working_matches = []
+    compiler_matches = []
+    for binding in bindings:
+        try:
+            configuration.working_directory.relative_to(binding.resolved_root)
+            working_matches.append(binding)
+        except ValueError:
+            pass
+        try:
+            configuration.compiler.relative_to(binding.resolved_root)
+            compiler_matches.append(binding)
+        except ValueError:
+            pass
+    if len(working_matches) > 1 or len(compiler_matches) != 1:
+        raise AuditInfrastructureError("decision root roles are ambiguous")
+    if working_matches:
+        working = working_matches[0]
+        role = working.stable_role
+        build_root = working.resolved_root
+    else:
+        role = "build"
+        build_root = database.parent
+    toolchain_root = compiler_matches[0].resolved_root
+    if source_root == toolchain_root or build_root == toolchain_root:
+        raise AuditInfrastructureError("decision typed roots are ambiguous")
+    return role, build_root, toolchain_root
+
+
+def _inspection_counter(accountant: object) -> int:
+    value = getattr(accountant, "inspection_probe_invocations", None)
+    if (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+        raise AuditInfrastructureError("inspection invocation counter is unavailable")
+    return value
+
+
+def collect_configurations_with_decision_records(
+    source_root: Path,
+    compile_commands: tuple[Path, ...],
+    launcher_environment: Mapping[str, str],
+    production: Mapping[PurePosixPath, FileIdentity],
+    dependency_roots: DependencyRootAuthority,
+    capability_registry: object,
+    inspection_cache: object,
+    expected_audit_engine_fingerprint: str,
+    limits: AuditLimits,
+    pipeline_deadline: float,
+    launch_accountant: object,
+) -> ConfigurationCollection:
+    """Collect immutable configurations plus relocation-safe decision sidecars."""
+
+    from gpu_capability_source_audit import _attest_loaded_audit_engine
+
+    _attest_loaded_audit_engine(expected_audit_engine_fingerprint)
+    if (not isinstance(source_root, Path)
+            or not isinstance(compile_commands, tuple) or not compile_commands
+            or any(not isinstance(path, Path) for path in compile_commands)
+            or not isinstance(launcher_environment, Mapping)
+            or not isinstance(production, Mapping)
+            or not isinstance(dependency_roots, DependencyRootAuthority)
+            or dependency_roots.source_root.resolved_root != source_root
+            or not isinstance(limits, AuditLimits)
+            or not isinstance(pipeline_deadline, (int, float))
+            or isinstance(pipeline_deadline, bool)
+            or time.monotonic() >= pipeline_deadline):
+        raise AuditInfrastructureError("decision configuration collection is invalid")
+    before = _inspection_counter(launch_accountant)
+    register = getattr(capability_registry, "register", None)
+    if not callable(register):
+        raise AuditInfrastructureError("compiler capability registry is invalid")
+    by_digest: dict[str, PreprocessConfiguration] = {}
+    records: dict[str, DecisionConfigurationRecord] = {}
+    canonical_source = source_root.resolve(strict=True)
+    for requested_database in compile_commands:
+        database = _database_path(canonical_source, requested_database)
+        for entry_index, entry in _load_database_entries(database):
+            if time.monotonic() >= pipeline_deadline:
+                raise AuditInfrastructureError(
+                    "decision configuration collection deadline exceeded")
+            if not _entry_is_production(entry, database, canonical_source, production):
+                continue
+            configuration = make_configuration(
+                entry, database, entry_index, canonical_source, production,
+                launcher_environment, limits, dependency_roots, inspection_cache,
+                expected_audit_engine_fingerprint, pipeline_deadline,
+                launch_accountant)
+            existing = by_digest.get(configuration.digest)
+            if existing is not None:
+                semantics_differ = (
+                    _configuration_semantics(existing)
+                    != _configuration_semantics(configuration))
+                duplicate_owner = configuration.compiler_capability.native_owner
+                retained_owner = existing.compiler_capability.native_owner
+                if duplicate_owner is not retained_owner:
+                    close_duplicate = getattr(duplicate_owner, "close", None)
+                    if not callable(close_duplicate):
+                        raise AuditInfrastructureError(
+                            "duplicate compiler capability owner is invalid")
+                    close_duplicate()
+                if semantics_differ:
+                    raise AuditInfrastructureError(
+                        f"configuration digest collision: {configuration.digest}")
+                continue
+            registered = register(configuration.compiler_capability)
+            if registered != configuration.compiler_capability_digest:
+                raise AuditInfrastructureError("compiler capability registry digest differs")
+            inspection = inspect_compiler(
+                configuration.compiler, configuration.family,
+                launcher_environment, dependency_roots, inspection_cache,
+                expected_audit_engine_fingerprint, pipeline_deadline, limits,
+                launch_accountant, working_directory=configuration.working_directory,
+                preprocess_arguments=configuration.arguments,
+                compiler_capability=configuration.compiler_capability)
+            role, build_root, toolchain_root = _decision_root_context(
+                configuration, database, dependency_roots, canonical_source)
+            _compiler, _launcher_arguments, assignments = strip_launchers(
+                decode_compile_entry(entry, database, os.name == "nt")[1])
+            rewritten = rewrite_preprocess_command(
+                configuration, configuration.working_directory
+                / ".olr-decision-dependencies")
+            try:
+                relative_source = configuration.source.canonical.relative_to(
+                    canonical_source)
+            except ValueError as error:
+                raise AuditInfrastructureError(
+                    "decision production source is outside source root") from error
+            record = DecisionConfigurationRecord(
+                configuration_digest=configuration.digest,
+                compiler_family=configuration.family,
+                compiler_digest=compiler_digest_from_capability(
+                    configuration.family, configuration.compiler_capability,
+                    inspection.normalized_version, deadline=pipeline_deadline),
+                production_source=PurePosixPath(relative_source.as_posix()),
+                normalized_decision_arguments=normalize_decision_arguments(
+                    rewritten, configuration.working_directory, role,
+                    canonical_source, build_root, toolchain_root),
+                decision_environment_digest=decision_environment_digest(
+                    configuration.family, launcher_environment, assignments,
+                    configuration.working_directory, role, canonical_source,
+                    build_root, toolchain_root),
+                working_directory_role=role,
+                compiler_capability_digest=configuration.compiler_capability_digest,
+            )
+            by_digest[configuration.digest] = configuration
+            records[configuration.digest] = record
+    after = _inspection_counter(launch_accountant)
+    if after < before:
+        raise AuditInfrastructureError("inspection invocation counter regressed")
+    return ConfigurationCollection(
+        configurations=tuple(by_digest.values()),
+        decision_records=MappingProxyType(records),
+        inspection_probe_invocations=after - before,
+        dependency_root_authority=dependency_roots,
+        capability_registry=capability_registry,
+    )
 
 
 def _configuration_is_objcpp(configuration: PreprocessConfiguration) -> bool:

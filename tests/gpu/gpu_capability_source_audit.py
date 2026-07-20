@@ -29,6 +29,8 @@ import gpu_capability_command as _gpu_capability_command
 import gpu_capability_cache as _gpu_capability_cache
 import gpu_capability_provenance as _gpu_capability_provenance
 import gpu_capability_runner as _gpu_capability_runner
+import gpu_capability_process_tree as _gpu_capability_process_tree
+import gpu_capability_calibration as _gpu_capability_calibration
 from gpu_capability_model import (
     AUDIT_RESULT_SCHEMA_BYTES,
     AuditInfrastructureError,
@@ -8039,8 +8041,9 @@ def run_live_only(
         printer(f"PASS: live compiler capability parity: {family.value}={canonical}")
 
 
-AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v4"
-AUDIT_ENGINE_STAGE_BYTES = b"task-5-audit-discard-worker"
+AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v5"
+AUDIT_ENGINE_STAGE_BYTES = b"task-6-worker-decision-contract"
+DECISION_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-decision-live-graph-v1"
 _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "gpu_capability_command.py": 1,
     "test_gpu_capability_audit_lanes.py": 1,
@@ -8080,6 +8083,14 @@ _AUDIT_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
         "_WORKER_PRODUCTION",
         "_WORKER_RSS",
     }),
+})
+_DECISION_ENGINE_TARGET_MODULES = (
+    _gpu_capability_process_tree,
+    _gpu_capability_calibration,
+)
+_DECISION_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
+    "gpu_capability_process_tree": frozenset(),
+    "gpu_capability_calibration": frozenset(),
 })
 _CLASS_STRUCTURAL_MEMBER_EXCLUSIONS = frozenset({
     "__dict__",
@@ -8137,6 +8148,9 @@ def _capture_module_origins_and_identities_at_import(
 _IMPORTED_MODULE_IDENTITIES = _capture_module_origins_and_identities_at_import(
     tuple(module.__name__ for module in _AUDIT_ENGINE_TARGET_MODULES)
 )
+_DECISION_IMPORTED_MODULE_IDENTITIES = _capture_module_origins_and_identities_at_import(
+    tuple(module.__name__ for module in _DECISION_ENGINE_TARGET_MODULES)
+)
 
 
 def _canonical_module_origin_spelling(value: str) -> str:
@@ -8164,7 +8178,7 @@ def _build_module_origin_path_roles(
 
 
 _MODULE_ORIGIN_PATH_ROLES = _build_module_origin_path_roles(
-    _IMPORTED_MODULE_IDENTITIES
+    _IMPORTED_MODULE_IDENTITIES + _DECISION_IMPORTED_MODULE_IDENTITIES
 )
 
 
@@ -8206,7 +8220,18 @@ def _normalized_code_filename(value: str) -> str:
 class _LiveSemanticEncoder:
     """Deterministic structural encoder for the already-loaded audit engine."""
 
-    def __init__(self) -> None:
+    def __init__(self, owned_module_names: frozenset[str] | None = None) -> None:
+        if owned_module_names is None:
+            owned_module_names = frozenset(
+                module.__name__ for module in _AUDIT_ENGINE_TARGET_MODULES)
+        if (not isinstance(owned_module_names, frozenset)
+                or any(not isinstance(name, str) or not name
+                       for name in owned_module_names)):
+            raise AuditInfrastructureError(
+                "semantic encoder module ownership is invalid")
+        self._owned_module_names = owned_module_names
+        self._require_frozen_dataclass_classes = owned_module_names == frozenset(
+            module.__name__ for module in _AUDIT_ENGINE_TARGET_MODULES)
         # Retain the object as well as its ID. Structural encoding constructs
         # short-lived tuples; keeping them alive prevents a recycled ID from
         # being mistaken for a semantic cycle later in the same walk.
@@ -8274,13 +8299,13 @@ class _LiveSemanticEncoder:
         if isinstance(value, types.CodeType):
             return self._encode_code(value)
         if isinstance(value, types.FunctionType):
-            if value.__module__ in {module.__name__ for module in _AUDIT_ENGINE_TARGET_MODULES}:
+            if value.__module__ in self._owned_module_names:
                 return self._encode_function(value)
             return self._frame(b"imported-function", (_semantic_origin_role(value).encode("utf-8"),))
         if isinstance(value, (types.BuiltinFunctionType, types.BuiltinMethodType)):
             return self._frame(b"imported-callable", (_semantic_origin_role(value).encode("utf-8"),))
         if isinstance(value, type):
-            if value.__module__ in {module.__name__ for module in _AUDIT_ENGINE_TARGET_MODULES}:
+            if value.__module__ in self._owned_module_names:
                 return self._encode_class(value)
             return self._frame(b"imported-class", (_semantic_origin_role(value).encode("utf-8"),))
         if isinstance(value, types.ModuleType):
@@ -8290,6 +8315,9 @@ class _LiveSemanticEncoder:
                 b"generic-alias",
                 (self.encode(value.__origin__), self.encode(value.__args__)),
             )
+        if type(value).__module__ == "typing":
+            return self._frame(
+                b"typing-object", (repr(value).encode("utf-8"),))
         if isinstance(value, tuple):
             cycle = self._cycle_or_mark(value)
             if cycle is not None:
@@ -8300,7 +8328,7 @@ class _LiveSemanticEncoder:
             if cycle is not None:
                 return cycle
             ordered_items = sorted((
-                (_LiveSemanticEncoder().encode(item), item)
+                (_LiveSemanticEncoder(self._owned_module_names).encode(item), item)
                 for item in value
             ), key=lambda encoded_item: encoded_item[0])
             element_encodings = tuple(item[0] for item in ordered_items)
@@ -8321,7 +8349,7 @@ class _LiveSemanticEncoder:
             # value is expanded under whichever key was inserted first.
             ordered_items = sorted((
                 (
-                    _LiveSemanticEncoder().encode(key),
+                    _LiveSemanticEncoder(self._owned_module_names).encode(key),
                     key,
                     item,
                 )
@@ -8441,15 +8469,31 @@ class _LiveSemanticEncoder:
                 continue
             if name in exclusions:
                 encoded = b"excluded-runtime-state"
-            elif name == "_IMPORTED_MODULE_IDENTITIES":
+            elif name in {
+                    "_IMPORTED_MODULE_IDENTITIES",
+                    "_DECISION_IMPORTED_MODULE_IDENTITIES"}:
+                identities = (
+                    _IMPORTED_MODULE_IDENTITIES
+                    if name == "_IMPORTED_MODULE_IDENTITIES"
+                    else _DECISION_IMPORTED_MODULE_IDENTITIES
+                )
                 encoded = self.encode(tuple(
                     (module_name, role)
-                    for module_name, role, _identity in _IMPORTED_MODULE_IDENTITIES
+                    for module_name, role, _identity in identities
                 ))
             elif name == "_MODULE_ORIGIN_PATH_ROLES":
                 encoded = self.encode(frozenset(_MODULE_ORIGIN_PATH_ROLES.values()))
             else:
-                encoded = self.encode(function.__globals__[name])
+                global_value = function.__globals__[name]
+                if (isinstance(global_value, (types.FunctionType, type))
+                        and getattr(global_value, "__module__", None)
+                        in self._owned_module_names):
+                    encoded = self._frame(
+                        b"owned-global-reference",
+                        (_semantic_origin_role(global_value).encode("utf-8"),),
+                    )
+                else:
+                    encoded = self.encode(global_value)
             global_pieces.append(self._frame(b"global", (name.encode("utf-8"), encoded)))
         pieces.append(self._frame(b"globals", global_pieces))
         return self._frame(b"function", pieces)
@@ -8487,7 +8531,8 @@ class _LiveSemanticEncoder:
             encoded_items = sorted(
                 (
                     (
-                        _LiveSemanticEncoder().encode(key),
+                        _LiveSemanticEncoder(
+                            self._owned_module_names).encode(key),
                         key,
                         item,
                     )
@@ -8606,7 +8651,9 @@ class _LiveSemanticEncoder:
             ))
         if dataclasses.is_dataclass(class_object):
             parameters = getattr(class_object, "__dataclass_params__", None)
-            if parameters is None or not parameters.frozen:
+            if (parameters is None
+                    or (self._require_frozen_dataclass_classes
+                        and not parameters.frozen)):
                 raise AuditInfrastructureError("audit engine dataclass class is mutable")
             parameter_pieces = []
             for parameter_name in (
@@ -8744,17 +8791,24 @@ def _global_names_from_code(code: types.CodeType) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
-def _marshal_live_semantic_object(loaded_object: object) -> bytes:
-    return _LiveSemanticEncoder().encode(loaded_object)
+def _marshal_live_semantic_object(
+    loaded_object: object,
+    owned_module_names: frozenset[str] | None = None,
+) -> bytes:
+    return _LiveSemanticEncoder(owned_module_names).encode(loaded_object)
 
 
 def _is_semantic_constant_name(name: str) -> bool:
     return (
         not name.startswith("__")
-        and not name.startswith("_WORKER_")
+        and (not name.startswith("_WORKER_")
+             or name == "_WORKER_SELECTION_ORDER")
         and any(character.isalpha() for character in name)
         and name.upper() == name
-        and name not in {"_IMPORTED_MODULE_IDENTITIES"}
+        and name not in {
+            "_IMPORTED_MODULE_IDENTITIES",
+            "_DECISION_IMPORTED_MODULE_IDENTITIES",
+        }
     )
 
 
@@ -8813,6 +8867,20 @@ def _enumerate_live_semantic_graph() -> tuple[tuple[str, object], ...]:
     )
 
 
+def _enumerate_live_decision_semantic_graph(
+    audit_digest: str,
+) -> tuple[tuple[str, object], ...]:
+    if (not isinstance(audit_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", audit_digest) is None):
+        raise AuditInfrastructureError("decision audit digest is invalid")
+    graph = list(_walk_live_semantic_graph_cycle_safe(
+        target_modules=_DECISION_ENGINE_TARGET_MODULES,
+        runtime_state_exclusions=_DECISION_RUNTIME_STATE_EXCLUSIONS,
+    ))
+    graph.append(("decision-input.audit-engine-fingerprint", audit_digest.encode("ascii")))
+    return tuple(sorted(graph))
+
+
 def _audit_engine_fingerprint_from_marshaled_graph(
     graph: tuple[tuple[str, bytes], ...],
 ) -> str:
@@ -8863,6 +8931,32 @@ def _attest_loaded_audit_engine(expected: str | None = None) -> str:
     ):
         raise AuditInfrastructureError("loaded audit engine attestation mismatch")
     return actual
+
+
+def decision_engine_fingerprint(
+    expected_audit_engine_fingerprint: str | None = None,
+) -> str:
+    audit_digest = _attest_loaded_audit_engine(expected_audit_engine_fingerprint)
+    graph = _enumerate_live_decision_semantic_graph(audit_digest)
+    digest = hashlib.sha256()
+    _update_framed(digest, DECISION_ENGINE_GRAPH_SCHEMA_BYTES)
+    _update_framed(digest, audit_digest.encode("ascii"))
+    names: list[str] = []
+    for name, value in graph:
+        names.append(name)
+        _update_framed(digest, name.encode("ascii"))
+        _update_framed(digest, _marshal_live_semantic_object(
+            value,
+            frozenset(module.__name__
+                      for module in _DECISION_ENGINE_TARGET_MODULES),
+        ))
+    if tuple(names) != tuple(sorted(names)) or len(names) != len(set(names)):
+        raise AuditInfrastructureError(
+            "decision engine graph is not unique and sorted")
+    for module_name, origin_role, _local_identity in _DECISION_IMPORTED_MODULE_IDENTITIES:
+        _update_framed(digest, f"module-root:{module_name}".encode("ascii"))
+        _update_framed(digest, origin_role.encode("ascii"))
+    return digest.hexdigest()
 
 
 def profile_compiler_view(

@@ -95,6 +95,7 @@ def main() -> int:
             "mutate-restore",
             "discovery-mutate-restore",
             "swap-root-restore",
+            "allocation-hold",
         ),
         required=True,
     )
@@ -104,6 +105,9 @@ def main() -> int:
     parser.add_argument("--stderr-bytes", type=int, default=0)
     parser.add_argument("--sleep-seconds", type=float, default=30.0)
     parser.add_argument("--child-pid-file", type=Path)
+    parser.add_argument("--allocation-bytes", type=int, default=0)
+    parser.add_argument("--allocation-ready-file", type=Path)
+    parser.add_argument("--allocation-release-file", type=Path)
     parser.add_argument("--outside-path", type=Path)
     parser.add_argument("--invocation-counter", type=Path)
     parser.add_argument("--extra-dependency", type=Path)
@@ -187,6 +191,25 @@ def main() -> int:
         except OSError:
             sys.stderr.write("guard prevented generation change\n")
             return 91
+
+    held_allocation = None
+    if options.fixture_mode == "allocation-hold":
+        if options.allocation_bytes <= 0 or options.allocation_bytes > (512 << 20):
+            raise SystemExit("allocation-hold requires bounded --allocation-bytes")
+        held_allocation = bytearray(options.allocation_bytes)
+        for offset in range(0, len(held_allocation), 4096):
+            held_allocation[offset] = 1
+        if options.allocation_ready_file is not None:
+            options.allocation_ready_file.write_text(
+                str(len(held_allocation)), encoding="ascii")
+        if options.allocation_release_file is not None:
+            deadline = time.monotonic() + options.sleep_seconds
+            while not options.allocation_release_file.exists():
+                if time.monotonic() >= deadline:
+                    raise SystemExit("allocation observation acknowledgement timed out")
+                time.sleep(0.01)
+        else:
+            time.sleep(options.sleep_seconds)
 
     if options.stderr_bytes:
         prefix = b"BEGIN-OF-STDERR|"
