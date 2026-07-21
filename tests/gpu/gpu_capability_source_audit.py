@@ -8041,17 +8041,87 @@ def run_live_only(
         printer(f"PASS: live compiler capability parity: {family.value}={canonical}")
 
 
-AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v5"
-AUDIT_ENGINE_STAGE_BYTES = b"task-6-worker-decision-contract"
+def schedule_correctness_configuration_audits(
+    *,
+    decision: object,
+    pipeline_deadline: float,
+    source_root: Path,
+    configurations: tuple[object, ...],
+    dependency_roots: object,
+    capability_registry: object,
+    initial_digest_map: Mapping[object, object],
+    prepared_cache: object,
+    limits: AuditLimits,
+    expected_audit_engine_fingerprint: str,
+    inspection_probe_invocations: int,
+    run_accountant: object,
+    compact_observer: object,
+):
+    """Correctness-run entry using the same frozen runtime contract."""
+
+    runtime_contract = (
+        _gpu_capability_calibration.runtime_contract_from_platform_decision(
+            decision, pipeline_deadline
+        )
+    )
+    return _gpu_capability_runner.schedule_configuration_audits(
+        source_root,
+        configurations,
+        dependency_roots,
+        capability_registry,
+        initial_digest_map,
+        prepared_cache,
+        limits,
+        expected_audit_engine_fingerprint,
+        runtime_contract,
+        inspection_probe_invocations=inspection_probe_invocations,
+        run_accountant=run_accountant,
+        compact_observer=compact_observer,
+    )
+
+
+def execute_prepared_correctness_audits(**prepared: object):
+    """Enter the real Task-7 scheduler with already validated run inputs."""
+
+    return schedule_correctness_configuration_audits(**prepared)
+
+
+def run_correctness_only_cli(args: argparse.Namespace) -> None:
+    """Validate the Task-7 CLI boundary before Task 10 supplies preparation.
+
+    The native decision-key derivation, strict artifact load, cache/snapshot
+    ownership, and final policy lifecycle are deliberately owned by Task 10.
+    This function is the stable CLI seam that Task 10 completes; it must not
+    invent a default worker count or fabricate a decision in the meantime.
+    """
+
+    if (
+        not isinstance(args, argparse.Namespace)
+        or not isinstance(args.source_root, Path)
+        or not isinstance(args.compile_commands, Path)
+        or not isinstance(args.worker_decision, Path)
+        or not isinstance(args.dependency_root, list)
+        or any(not isinstance(item, str) or "=" not in item
+               for item in args.dependency_root)
+    ):
+        raise AuditInfrastructureError(
+            "correctness-only orchestration input is invalid")
+    raise AuditInfrastructureError(
+        "correctness-only native decision preparation belongs to Task 10")
+
+
+AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v6"
+AUDIT_ENGINE_STAGE_BYTES = b"task-7-spawn-process-coordinator"
 DECISION_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-decision-live-graph-v1"
 _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "gpu_capability_command.py": 1,
+    "gpu_capability_runner.py": 1,
     "test_gpu_capability_audit_lanes.py": 1,
     "test_gpu_capability_cache.py": 2,
     "test_gpu_capability_command.py": 1,
     "test_gpu_capability_model.py": 1,
     "test_gpu_capability_provenance.py": 1,
-    "test_gpu_capability_runner.py": 4,
+    "test_gpu_capability_runner.py": 7,
 })
 _AUDIT_ENGINE_TARGET_MODULES = (
     _gpu_capability_model,
@@ -8075,12 +8145,16 @@ _AUDIT_RUNTIME_STATE_EXCLUSIONS = MappingProxyType({
     "gpu_capability_provenance": frozenset(),
     "gpu_capability_runner": frozenset({
         "_WORKER_CACHE",
+        "_WORKER_CAPABILITIES",
         "_WORKER_CANCEL_EVENT",
         "_WORKER_ENGINE",
         "_WORKER_GENERATION",
         "_WORKER_INDEX",
         "_WORKER_LIMITS",
+        "_WORKER_MAXIMUM_TASKS",
+        "_WORKER_PREATTESTED_ENGINE",
         "_WORKER_PRODUCTION",
+        "_WORKER_RECYCLE_RSS_BYTES",
         "_WORKER_RSS",
     }),
 })
@@ -8273,6 +8347,15 @@ class _LiveSemanticEncoder:
         if isinstance(value, str):
             return self._frame(
                 b"str", (_normalized_semantic_string(value).encode("utf-8"),)
+            )
+        if isinstance(value, slice):
+            return self._frame(
+                b"slice",
+                (
+                    self.encode(value.start),
+                    self.encode(value.stop),
+                    self.encode(value.step),
+                ),
             )
         if isinstance(value, PurePosixPath):
             if value.is_absolute() or any(part in ("", ".", "..") for part in value.parts):
@@ -9043,7 +9126,7 @@ def profile_compiler_view(
     )
 
 
-def main() -> int:
+def main(argv: tuple[str, ...] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
     # Preserve the committed CTest interface while the compiler-authoritative
@@ -9052,10 +9135,34 @@ def main() -> int:
     parser.add_argument("--profile-view", type=Path)
     parser.add_argument("--profile-source", type=PurePosixPath)
     parser.add_argument("--performance-only", action="store_true")
+    parser.add_argument("--correctness-only", action="store_true")
+    parser.add_argument("--worker-decision", type=Path)
+    parser.add_argument("--dependency-root", action="append", default=[])
     parser.add_argument("--live-only", action="store_true")
     parser.add_argument("--live-compiler", action="append", default=[])
     parser.add_argument("--require-live-family", action="append", default=[])
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.correctness_only:
+        if (
+            args.profile_view is not None
+            or args.profile_source is not None
+            or args.performance_only
+            or args.live_only
+            or args.live_compiler
+            or args.require_live_family
+        ):
+            parser.error("--correctness-only cannot be combined with another mode")
+        if args.compile_commands is None or args.worker_decision is None:
+            parser.error(
+                "--correctness-only requires --compile-commands and --worker-decision")
+        try:
+            run_correctness_only_cli(args)
+        except (AuditInfrastructureError, OSError) as error:
+            print(f"FAIL: GPU capability correctness audit: {error}")
+            return 2
+        print("PASS: GPU capability correctness audit")
+        return 0
 
     if (args.profile_view is None) != (args.profile_source is None):
         parser.error("--profile-view and --profile-source must be supplied together")

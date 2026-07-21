@@ -3177,6 +3177,158 @@ class ConfigurationTests(unittest.TestCase):
             kernel32.CloseHandle(process)
 
 
+class MacOSCompilerExecGateTests(unittest.TestCase):
+    def test_gate_report_wait_honors_cancel_before_exec(self):
+        read_descriptor, write_descriptor = os.pipe()
+        cancelled = threading.Event()
+        cancelled.set()
+        try:
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "cancelled"
+            ):
+                capability_command._read_length_prefixed_fd(
+                    read_descriptor,
+                    time.monotonic() + 10.0,
+                    cancelled,
+                )
+        finally:
+            os.close(read_descriptor)
+            os.close(write_descriptor)
+
+    def test_gate_helper_rejects_invalid_permit_without_exec(self):
+        report_read, report_write = os.pipe()
+        permit_read, permit_write = os.pipe()
+        errors = []
+
+        def run_gate():
+            try:
+                capability_command._run_macos_compiler_exec_gate(
+                    report_write,
+                    permit_read,
+                    "a" * 64,
+                    ("/trusted/compiler", "--version"),
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(
+            capability_command,
+            "_native_macos_self_start_identity",
+            return_value=(71, 71, "1:2"),
+        ), mock.patch.object(capability_command.os, "execvpe") as execute:
+            thread = threading.Thread(target=run_gate)
+            thread.start()
+            header = os.read(report_read, 4)
+            length = struct.unpack(">I", header)[0]
+            self.assertLessEqual(length, 4096)
+            os.read(report_read, length)
+            os.write(permit_write, struct.pack(">I", 2) + b"{}")
+            os.close(permit_write)
+            thread.join(timeout=2.0)
+        os.close(report_read)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "macOS compiler exec permit")
+        execute.assert_not_called()
+
+    def test_shared_boundary_authorizes_macos_gate_before_launch_event(self):
+        order = []
+
+        class Process:
+            pid = 71
+            stdin = None
+
+            def kill(self): order.append("kill")
+            def wait(self, timeout): order.append(("wait", timeout))
+
+        class Containment:
+            popen_arguments = {"start_new_session": True}
+            requires_handshake = False
+
+            def attach(self, _process): order.append("attach")
+            def release(self, _process): order.append("release")
+            def terminate(self): order.append("terminate")
+
+        class Observer:
+            macos_launch_deadline = time.monotonic() + 10.0
+
+            def authorize_macos_compiler_exec(self, process_start):
+                order.append(("authorize", process_start.pid))
+                return capability_command.CompilerExecPermit(3, 7, 5, 71)
+
+            def register_compiler_process_launch(self, _event, _carrier):
+                order.append("register")
+
+        class Gate:
+            command = ("gate",)
+            environment = {"GATE": "1"}
+            launch_options = {"pass_fds": (90, 91)}
+
+            def __init__(self, *_args, **_kwargs): order.append("gate-create")
+
+            def authorize(self, process, observer, **identity):
+                order.append("gate-report")
+                start = capability_command.ProcessStartIdentity(
+                    "macos", process.pid, "1:2", "b" * 64
+                )
+                permit = observer.authorize_macos_compiler_exec(start)
+                capability_command._validate_macos_compiler_exec_permit(
+                    permit, start, **identity
+                )
+                order.append("gate-permit")
+                return start
+
+            def close(self): order.append("gate-close")
+
+        with mock.patch.object(
+            capability_command, "_MacOSCompilerExecGate", Gate
+        ), mock.patch.object(
+            capability_command.subprocess, "Popen", return_value=Process()
+        ) as popen, mock.patch.object(
+            capability_command, "_open_macos_process_identity_handle"
+        ):
+            process, _carrier = capability_command.launch_compiler_process(
+                ("/trusted/compiler",),
+                cwd=Path.cwd(),
+                environment={},
+                containment=Containment(),
+                platform_kind="macos",
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                launch_options={},
+                purpose=capability_command.CompilerLaunchPurpose.AUDIT_DISCOVERY,
+                launch_observer=Observer(),
+                worker_index=3,
+                task_id="audit-5-0123456789abcdef",
+                generation=7,
+            )
+        self.assertEqual(process.pid, 71)
+        self.assertEqual(popen.call_args.args[0], ("gate",))
+        self.assertEqual(
+            order,
+            [
+                "gate-create", "attach", "gate-report", ("authorize", 71),
+                "gate-permit", "register", "release", "gate-close",
+            ],
+        )
+
+    def test_wrong_generation_permit_is_rejected(self):
+        start = capability_command.ProcessStartIdentity(
+            "macos", 71, "1:2", "c" * 64
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "macOS compiler exec permit"
+        ):
+            capability_command._validate_macos_compiler_exec_permit(
+                capability_command.CompilerExecPermit(3, 8, 5, 71),
+                start,
+                worker_index=3,
+                task_id="audit-5-0123456789abcdef",
+                generation=7,
+            )
+
+
 class CommandRewriteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

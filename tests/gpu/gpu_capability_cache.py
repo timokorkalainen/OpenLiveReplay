@@ -3295,10 +3295,23 @@ class _TracebackLifetimeOwnerships:
 
     def __exit__(self, error_type, _error, _traceback) -> bool:
         if error_type is None:
+            release_errors: list[BaseException] = []
             for ownership in reversed(self._ownerships):
                 if not ownership.released:
-                    ownership.release()
+                    try:
+                        ownership.release()
+                    except BaseException as release_error:
+                        release_errors.append(release_error)
             self._ownerships.clear()
+            if release_errors:
+                error = AuditInfrastructureError(
+                    "temporary ownership cleanup is incomplete"
+                )
+                for additional in release_errors:
+                    error.add_note(
+                        f"temporary ownership release failed: {additional}"
+                    )
+                raise error from release_errors[0]
         return False
 
 
@@ -3988,6 +4001,13 @@ class ConfigurationAuditCache:
         candidates: dict[str, _AuditCacheCandidate] = {}
         misses: set[str] = set()
         checkpoint = aggregator._checkpoint()
+        observer = result_budget.observer
+        semantic_transaction = (
+            None
+            if observer is None
+            else observer.begin_semantic_transaction()
+        )
+        commit_semantics = False
 
         try:
             with _TracebackLifetimeOwnerships() as ownership_cleanup, contextlib.ExitStack() as dependency_stack:
@@ -4171,6 +4191,10 @@ class ConfigurationAuditCache:
                                 aggregator.reserve_cold_slot(maximum_cold_slot)
                             release_result_ownership = True
                             continue
+                        result_ownership.record_semantic(
+                            "retain-hit",
+                            delta_bytes=result_ownership.byte_count,
+                        )
                         aggregator.accept_validated_result(
                             configuration,
                             result,
@@ -4196,7 +4220,9 @@ class ConfigurationAuditCache:
                             release_result_ownership
                             and not result_ownership.released
                         ):
-                            result_ownership.release()
+                            result_ownership.release(
+                                semantic_event="release-result"
+                            )
                     if accepted:
                         accepted_digests.append(configuration.digest)
                         hit_count += 1
@@ -4227,6 +4253,7 @@ class ConfigurationAuditCache:
                 else:
                     for digest in accepted_digests:
                         self._record_access(candidates[digest].key)
+                    commit_semantics = True
 
                 ordered_misses = tuple(
                     configuration for configuration in configurations
@@ -4250,10 +4277,30 @@ class ConfigurationAuditCache:
                 held.clear()
                 initial.clear()
                 final.clear()
-                return batch
-        except BaseException:
-            aggregator._rollback_to(checkpoint)
-            raise
+            if semantic_transaction is not None:
+                observer.finish_semantic_transaction(
+                    semantic_transaction, commit=commit_semantics
+                )
+                semantic_transaction = None
+            return batch
+        except BaseException as load_error:
+            if semantic_transaction is not None:
+                try:
+                    observer.finish_semantic_transaction(
+                        semantic_transaction, commit=False
+                    )
+                except BaseException as cleanup_error:
+                    load_error.add_note(
+                        "semantic transaction rollback also failed: "
+                        f"{cleanup_error}"
+                    )
+            try:
+                aggregator._rollback_to(checkpoint)
+            except BaseException as cleanup_error:
+                load_error.add_note(
+                    f"aggregate rollback also failed: {cleanup_error}"
+                )
+            raise load_error
 
     def _remove_audit_entry(self, entry: Path, key: str) -> bool:
         quarantine = entry.with_name(f".quarantine-{key}-{uuid.uuid4().hex}")

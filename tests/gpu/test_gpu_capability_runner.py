@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import hashlib
 import inspect
@@ -26,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_capability_command as capability_command  # noqa: E402
 import gpu_capability_cache as capability_cache  # noqa: E402
+import gpu_capability_calibration as capability_calibration  # noqa: E402
 import gpu_capability_model as capability_model  # noqa: E402
 import gpu_capability_runner as capability_runner  # noqa: E402
 import gpu_capability_source_audit as capability_audit  # noqa: E402
@@ -852,6 +854,34 @@ class BoundedPreprocessorTests(unittest.TestCase):
                 cancellation,
             )
         popen.assert_not_called()
+
+    def test_transferred_capability_launch_never_resolves_compiler_path(self):
+        configuration = self.configuration("success")
+        owner = configuration.compiler_capability.native_owner
+        original_resolve = Path.resolve
+
+        def reject_compiler_lookup(path, *args, **kwargs):
+            if os.path.normcase(str(path)) == os.path.normcase(
+                str(configuration.compiler_capability.executable_identity.canonical)
+            ):
+                raise AssertionError("worker resolved transferred compiler path")
+            return original_resolve(path, *args, **kwargs)
+
+        owner.validate_paths = False
+        try:
+            chunks = []
+            with mock.patch.object(Path, "resolve", reject_compiler_lookup):
+                result = run_bounded_preprocessor(
+                    self.direct_command("success"),
+                    configuration,
+                    AuditLimits(rss_bytes=2**63 - 1),
+                    time.monotonic() + 10.0,
+                    chunks.append,
+                )
+            self.assertIsInstance(result, ExecutionResult)
+            self.assertTrue(chunks)
+        finally:
+            owner.validate_paths = True
 
     def test_cancellation_is_rechecked_immediately_before_popen(self):
         cancellation = threading.Event()
@@ -2704,6 +2734,14 @@ class WorkerAuditTests(unittest.TestCase):
             self.sealed = False
             self.active_carriers = {}
             self.completed_carriers = []
+            self.publication_contexts = []
+
+        def set_publication_context(
+            self, task_id, generation, configuration_digest, engine, dependencies
+        ):
+            self.publication_contexts.append((
+                task_id, generation, configuration_digest, engine, dependencies
+            ))
 
         def register_compiler_process_launch(self, event, carrier):
             self.active_carriers[event.process_start] = carrier
@@ -3118,6 +3156,10 @@ class WorkerAuditTests(unittest.TestCase):
         self.assertFalse(hasattr(outcome, "view"))
         self.assertEqual(len(self.live_views), 0)
         self.assertEqual(cache.loads, 0)
+        self.assertEqual(control.publication_contexts, [(
+            "task-a", 7, self.configuration.digest, self.engine,
+            self.dependencies,
+        )])
         self.assertEqual(outcome.result.reached_production, (
             PurePosixPath("playback/gpu/empty.h"),
             PurePosixPath("playback/gpu/worker.cpp"),
@@ -3586,6 +3628,2296 @@ class WorkerAuditTests(unittest.TestCase):
             self._run_worker(task=task, command=command, cache=cache)
         self.assertEqual(releases, ["root"])
         self.assertTrue(reservation.released)
+
+
+class ProcessCoordinatorTests(unittest.TestCase):
+    """Locked Task-7 parent/process boundary and admission invariants."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = capability_audit.audit_engine_fingerprint()
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.source = self.root / "playback" / "gpu" / "coordinator.cpp"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_text("int coordinator;\n", encoding="utf-8")
+        self.toolchain_temporary = tempfile.TemporaryDirectory()
+        self.toolchain = Path(self.toolchain_temporary.name).resolve()
+        self.compiler = self.toolchain / "compiler.exe"
+        self.compiler.write_bytes(b"coordinator-compiler")
+        self.authority = build_dependency_root_authority(
+            self.root, {"toolchain": self.toolchain}
+        )
+        self.capability = open_compiler_executable_capability(
+            self.compiler,
+            self.authority,
+            time.monotonic() + 10.0,
+            compiler_family=CompilerFamily.GCC,
+        )
+        metadata = self.source.stat()
+        self.configuration = PreprocessConfiguration(
+            entry_id="coordinator:0",
+            family=CompilerFamily.GCC,
+            compiler=self.compiler,
+            working_directory=self.root,
+            source=FileIdentity(
+                self.source,
+                PurePosixPath("playback/gpu/coordinator.cpp"),
+                int(metadata.st_dev),
+                int(metadata.st_ino) if int(metadata.st_ino) else None,
+                1,
+                True,
+            ),
+            arguments=(str(self.source),),
+            environment_digest="coordinator-environment",
+            digest="c" * 64,
+            dependency_root_authority_digest=(
+                self.authority.portable_authority_digest
+            ),
+            compiler_capability_digest=self.capability.capability_digest,
+            compiler_capability=self.capability,
+        )
+        self.runtime = capability_model.WorkerRuntimeContract(
+            2, 2, 1 << 30, time.monotonic() + 30.0
+        )
+
+    def tearDown(self):
+        self.capability.native_owner.close()
+        _clear_compiler_inspection_memo_for_tests()
+        self.temporary.cleanup()
+        self.toolchain_temporary.cleanup()
+
+    def test_parent_load_many_validates_warm_batch_before_spawning(self):
+        configuration = self.configuration
+        engine = self.engine
+
+        class WarmCache:
+            root = self.root / "cache"
+
+            def load_many(
+                _self, configurations, dependency_roots, loaded_engine,
+                production_snapshot, result_budget, aggregator,
+                maximum_cold_slot, pipeline_deadline,
+            ):
+                self.assertEqual(configurations, (configuration,))
+                self.assertIs(dependency_roots, self.authority)
+                self.assertEqual(loaded_engine, engine)
+                self.assertGreater(pipeline_deadline, time.monotonic())
+                result = capability_model.ConfigurationAuditResult(
+                    configuration.digest, engine, (), (), ()
+                )
+                ownership = result_budget.reserve(
+                    capability_model.compact_result_retained_bytes(result),
+                    label="warm fixture result",
+                ).commit()
+                ownership.record_semantic(
+                    "retain-hit", delta_bytes=ownership.byte_count
+                )
+                aggregator.accept_validated_result(
+                    configuration, result, ownership
+                )
+                return ConfigurationAuditLoadBatch(1, (), 0)
+
+        with mock.patch("multiprocessing.Process.start") as start:
+            session = capability_runner.schedule_configuration_audits(
+                self.root,
+                (configuration,),
+                self.authority,
+                SimpleNamespace(),
+                {},
+                WarmCache(),
+                AuditLimits(),
+                engine,
+                self.runtime,
+                inspection_probe_invocations=7,
+                run_accountant=SimpleNamespace(),
+                compact_observer=capability_model.CompactAccountingObserver(),
+            )
+        start.assert_not_called()
+        summary = session.consume_aggregate()
+        self.assertEqual(summary.configurations, (configuration.digest,))
+        self.assertEqual(session.cache_hits, 1)
+        self.assertEqual(session.cache_misses, 0)
+        self.assertEqual(session.inspection_probe_invocations, 7)
+        self.assertEqual(session.audit_compiler_invocations, 0)
+        session.shutdown_reap(self.runtime.pipeline_deadline)
+        summary.release()
+
+    def test_scheduler_preserves_run_scoped_owners_and_observer(self):
+        configuration = self.configuration
+        observer = capability_model.CompactAccountingObserver()
+        registry = SimpleNamespace(register=lambda capability: capability.capability_digest)
+        accountant = SimpleNamespace()
+
+        class WarmCache:
+            root = self.root / "owner-cache"
+
+            def load_many(
+                _self, configurations, dependency_roots, loaded_engine,
+                production_snapshot, result_budget, aggregator,
+                maximum_cold_slot, pipeline_deadline,
+            ):
+                self.assertIs(result_budget.observer, observer)
+                result = capability_model.ConfigurationAuditResult(
+                    configuration.digest, self.engine, (), (), ()
+                )
+                ownership = result_budget.reserve(
+                    capability_model.compact_result_retained_bytes(result),
+                    label="owner fixture result",
+                ).commit()
+                ownership.record_semantic(
+                    "retain-hit", delta_bytes=ownership.byte_count
+                )
+                aggregator.accept_validated_result(
+                    configuration, result, ownership
+                )
+                return ConfigurationAuditLoadBatch(1, (), 0)
+
+        session = capability_runner.schedule_configuration_audits(
+            self.root,
+            (configuration,),
+            self.authority,
+            registry,
+            {},
+            WarmCache(),
+            AuditLimits(),
+            self.engine,
+            self.runtime,
+            inspection_probe_invocations=3,
+            run_accountant=accountant,
+            compact_observer=observer,
+        )
+        self.assertIs(session.compact_accounting_observer, observer)
+        self.assertIs(session.run_accountant, accountant)
+        self.assertIs(session.capability_registry, registry)
+        self.assertIs(session.runtime_contract, self.runtime)
+        self.assertEqual(session.inspection_probe_invocations, 3)
+        summary = session.consume_aggregate()
+        session.shutdown_reap(self.runtime.pipeline_deadline)
+        summary.release()
+
+    def test_decision_and_correctness_entries_construct_the_same_runtime_contract(self):
+        decision = object()
+        registry = object()
+        cache = object()
+        accountant = object()
+        observer = capability_model.CompactAccountingObserver()
+        common = dict(
+            decision=decision,
+            pipeline_deadline=self.runtime.pipeline_deadline,
+            source_root=self.root,
+            configurations=(self.configuration,),
+            dependency_roots=self.authority,
+            capability_registry=registry,
+            initial_digest_map={},
+            prepared_cache=cache,
+            limits=AuditLimits(),
+            expected_audit_engine_fingerprint=self.engine,
+            inspection_probe_invocations=5,
+            run_accountant=accountant,
+            compact_observer=observer,
+        )
+        decision_session = object()
+        correctness_session = object()
+        with mock.patch(
+            "gpu_capability_calibration.runtime_contract_from_platform_decision",
+            return_value=self.runtime,
+        ) as contract, mock.patch(
+            "gpu_capability_runner.schedule_configuration_audits",
+            side_effect=(decision_session, correctness_session),
+        ) as schedule:
+            self.assertIs(
+                capability_calibration.schedule_decision_configuration_audits(
+                    **common
+                ),
+                decision_session,
+            )
+            self.assertIs(
+                capability_audit.schedule_correctness_configuration_audits(
+                    **common
+                ),
+                correctness_session,
+            )
+        self.assertEqual(
+            contract.call_args_list,
+            [
+                mock.call(decision, self.runtime.pipeline_deadline),
+                mock.call(decision, self.runtime.pipeline_deadline),
+            ],
+        )
+        self.assertEqual(schedule.call_count, 2)
+        for call in schedule.call_args_list:
+            self.assertEqual(call.args[:3], (
+                self.root, (self.configuration,), self.authority
+            ))
+            self.assertIs(call.args[3], registry)
+            self.assertIs(call.args[8], self.runtime)
+            self.assertEqual(call.kwargs["inspection_probe_invocations"], 5)
+            self.assertIs(call.kwargs["run_accountant"], accountant)
+            self.assertIs(call.kwargs["compact_observer"], observer)
+
+    def test_task6_fake_decision_seam_reaches_real_scheduler(self):
+        observer = capability_model.CompactAccountingObserver()
+        accountant = SimpleNamespace()
+        registry = SimpleNamespace()
+
+        class WarmCache:
+            root = self.root / "decision-seam-cache"
+
+            def load_many(
+                _self, configurations, dependency_roots, loaded_engine,
+                production_snapshot, result_budget, aggregator,
+                maximum_cold_slot, pipeline_deadline,
+            ):
+                result = capability_model.ConfigurationAuditResult(
+                    self.configuration.digest, self.engine, (), (), ()
+                )
+                ownership = result_budget.reserve(
+                    capability_model.compact_result_retained_bytes(result),
+                    label="task6 fake decision warm result",
+                ).commit()
+                ownership.record_semantic(
+                    "retain-hit", delta_bytes=ownership.byte_count
+                )
+                aggregator.accept_validated_result(
+                    self.configuration, result, ownership
+                )
+                return ConfigurationAuditLoadBatch(1, (), 0)
+
+        fake_task6_decision = object()
+        with mock.patch(
+            "gpu_capability_calibration.runtime_contract_from_platform_decision",
+            return_value=self.runtime,
+        ) as convert:
+            session = capability_calibration.schedule_decision_configuration_audits(
+                decision=fake_task6_decision,
+                pipeline_deadline=self.runtime.pipeline_deadline,
+                source_root=self.root,
+                configurations=(self.configuration,),
+                dependency_roots=self.authority,
+                capability_registry=registry,
+                initial_digest_map={},
+                prepared_cache=WarmCache(),
+                limits=AuditLimits(),
+                expected_audit_engine_fingerprint=self.engine,
+                inspection_probe_invocations=6,
+                run_accountant=accountant,
+                compact_observer=observer,
+            )
+        convert.assert_called_once_with(
+            fake_task6_decision, self.runtime.pipeline_deadline
+        )
+        self.assertIs(session.runtime_contract, self.runtime)
+        self.assertIs(session.run_accountant, accountant)
+        self.assertIs(session.compact_accounting_observer, observer)
+        self.assertEqual(session.cache_hits, 1)
+        summary = session.consume_aggregate()
+        session.shutdown_reap(self.runtime.pipeline_deadline)
+        summary.release()
+
+    def test_real_calibration_runner_decision_audit_path_invokes_scheduler(self):
+        runner = capability_calibration.RealCalibrationRunner(
+            "windows" if os.name == "nt" else "linux"
+        )
+        decision = SimpleNamespace(platform_kind=runner.platform_kind)
+        expected_session = object()
+        common = dict(
+            decision=decision,
+            pipeline_deadline=self.runtime.pipeline_deadline,
+            source_root=self.root,
+            configurations=(self.configuration,),
+            dependency_roots=self.authority,
+            capability_registry=object(),
+            initial_digest_map={},
+            prepared_cache=object(),
+            limits=AuditLimits(),
+            expected_audit_engine_fingerprint=self.engine,
+            inspection_probe_invocations=3,
+            run_accountant=object(),
+            compact_observer=capability_model.CompactAccountingObserver(),
+        )
+        with mock.patch(
+            "gpu_capability_calibration.schedule_decision_configuration_audits",
+            return_value=expected_session,
+        ) as schedule:
+            self.assertIs(
+                runner.run(kind="decision-audit", **common),
+                expected_session,
+            )
+        schedule.assert_called_once_with(**common)
+
+    def test_correctness_cli_and_prepared_execution_reach_scheduler(self):
+        expected_session = object()
+        common = dict(
+            decision=object(),
+            pipeline_deadline=self.runtime.pipeline_deadline,
+            source_root=self.root,
+            configurations=(self.configuration,),
+            dependency_roots=self.authority,
+            capability_registry=object(),
+            initial_digest_map={},
+            prepared_cache=object(),
+            limits=AuditLimits(),
+            expected_audit_engine_fingerprint=self.engine,
+            inspection_probe_invocations=3,
+            run_accountant=object(),
+            compact_observer=capability_model.CompactAccountingObserver(),
+        )
+        with mock.patch(
+            "gpu_capability_source_audit.schedule_correctness_configuration_audits",
+            return_value=expected_session,
+        ) as schedule:
+            self.assertIs(
+                capability_audit.execute_prepared_correctness_audits(**common),
+                expected_session,
+            )
+        schedule.assert_called_once_with(**common)
+
+        database = self.root / "compile_commands.json"
+        decision_path = self.root / "worker-decision.json"
+        with mock.patch(
+            "gpu_capability_source_audit.run_correctness_only_cli",
+            return_value=None,
+        ) as run:
+            self.assertEqual(
+                capability_audit.main((
+                    "--source-root", str(self.root),
+                    "--compile-commands", str(database),
+                    "--correctness-only",
+                    "--worker-decision", str(decision_path),
+                    "--dependency-root", f"toolchain={self.toolchain}",
+                )),
+                0,
+            )
+        run.assert_called_once()
+        parsed = run.call_args.args[0]
+        self.assertEqual(parsed.compile_commands, database)
+        self.assertEqual(parsed.worker_decision, decision_path)
+        self.assertEqual(parsed.dependency_root, [f"toolchain={self.toolchain}"])
+
+        with mock.patch(
+            "gpu_capability_source_audit.execute_prepared_correctness_audits"
+        ) as schedule:
+            self.assertEqual(
+                capability_audit.main((
+                    "--source-root", str(self.root),
+                    "--compile-commands", str(database),
+                    "--correctness-only",
+                    "--worker-decision", str(decision_path),
+                    "--dependency-root", f"toolchain={self.toolchain}",
+                )),
+                2,
+            )
+        schedule.assert_not_called()
+
+    def test_real_spawn_cold_miss_has_pid_separation_and_exact_launch_count(self):
+        compiler_text = shutil.which("g++")
+        if compiler_text is None:
+            self.skipTest("requires a production g++ compiler")
+        compiler = Path(compiler_text).resolve()
+        toolchain_root = compiler.parent.parent
+        if sys.platform.startswith("linux"):
+            compiler = (self.toolchain / "linux-fake-compiler").resolve()
+            launcher_source = self.toolchain / "linux-fake-compiler.cpp"
+            fixture = (
+                Path(__file__).parent / "fixtures" / "fake_preprocessor.py"
+            ).resolve()
+            launcher_source.write_text(
+                "#include <unistd.h>\n"
+                "#include <string>\n"
+                "#include <vector>\n"
+                "int main(int argc, char** argv) {\n"
+                f"  std::vector<std::string> v = {{{json.dumps(str(Path(sys.executable).resolve()))}, {json.dumps(str(fixture))}}};\n"
+                "  for (int i = 1; i < argc; ++i) {\n"
+                "    if (std::string(argv[i]) == \"-MF\" && i + 1 < argc) {\n"
+                "      v.emplace_back(std::string(\"-MF=\") + argv[++i]);\n"
+                "    } else { v.emplace_back(argv[i]); }\n"
+                "  }\n"
+                "  std::vector<char*> p;\n"
+                "  for (auto& s : v) p.push_back(s.data());\n"
+                "  p.push_back(nullptr);\n"
+                "  execv(p[0], p.data());\n"
+                "  return 127;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                (compiler_text, str(launcher_source), "-O2", "-o", str(compiler)),
+                check=True,
+                capture_output=True,
+            )
+            toolchain_root = self.toolchain
+        if os.name == "nt" and len(compiler.parents) > 3:
+            toolchain_root = compiler.parents[3]
+        roots = {"toolchain": toolchain_root}
+        if os.name == "nt":
+            roots["windows-system"] = Path(
+                os.environ.get("SystemRoot", "C:/Windows")
+            ).resolve()
+        elif sys.platform.startswith("linux"):
+            roots["linux-system"] = Path("/usr").resolve()
+        authority = build_dependency_root_authority(self.root, roots)
+        deadline = time.monotonic() + 180.0
+        helper_probe = (
+            mock.patch(
+                "gpu_capability_command._driver_selected_helper_paths",
+                return_value=(),
+            )
+            if sys.platform.startswith("linux")
+            else contextlib.nullcontext()
+        )
+        with helper_probe:
+            capability = open_compiler_executable_capability(
+                compiler,
+                authority,
+                deadline,
+                compiler_family=CompilerFamily.GCC,
+                working_directory=self.root,
+                preprocess_arguments=(str(self.source),),
+            )
+        metadata = self.source.stat()
+        configuration_arguments = (
+            (
+                "--fixture-mode=dense",
+                "--token-count=16",
+                str(self.source),
+            )
+            if sys.platform.startswith("linux")
+            else (str(self.source),)
+        )
+        source_identity = FileIdentity(
+            self.source,
+            PurePosixPath("playback/gpu/coordinator.cpp"),
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) else None,
+            1,
+            True,
+        )
+        configuration = PreprocessConfiguration(
+            entry_id="coordinator-real:0",
+            family=CompilerFamily.GCC,
+            compiler=compiler,
+            working_directory=self.root,
+            source=source_identity,
+            arguments=configuration_arguments,
+            environment_digest=_environment_digest(dict(os.environ)),
+            digest="d" * 64,
+            dependency_root_authority_digest=authority.portable_authority_digest,
+            compiler_capability_digest=capability.capability_digest,
+            compiler_capability=capability,
+        )
+        configurations = (
+            configuration,
+            dataclasses.replace(
+                configuration,
+                entry_id="coordinator-real:1",
+                digest="e" * 64,
+            ),
+            dataclasses.replace(
+                configuration,
+                entry_id="coordinator-real:2",
+                digest="f" * 64,
+            ),
+        )
+        source_digest = DependencyDigest(
+            "production",
+            source_identity.relative,
+            source_identity,
+            hashlib.sha256(self.source.read_bytes()).hexdigest(),
+        )
+
+        class ColdCache:
+            root = (self.root / "cold-cache").resolve()
+
+            def load_many(
+                _self, configurations, dependency_roots, loaded_engine,
+                production_snapshot, result_budget, aggregator,
+                maximum_cold_slot, pipeline_deadline,
+            ):
+                _self.root.mkdir(parents=True, exist_ok=True)
+                aggregator.reserve_cold_slot(maximum_cold_slot)
+                return ConfigurationAuditLoadBatch(
+                    0, configurations, maximum_cold_slot.worst_case_live_bytes
+                )
+
+        class Registry(capability_runner.CompilerCapabilityRegistry):
+            def __init__(_self):
+                super().__init__(authority)
+                _self.duplicates = []
+                _self.transfers = []
+                _self.releases = []
+
+            def duplicate_for_generation(
+                _self, digest, worker_index, generation
+            ):
+                duplicate = super().duplicate_for_generation(
+                    digest, worker_index, generation
+                )
+                _self.duplicates.append(duplicate)
+                return duplicate
+
+            def transfer_duplicate_to_child(_self, duplicate, process):
+                self.assertIsInstance(process.pid, int)
+                super().transfer_duplicate_to_child(duplicate, process)
+                _self.transfers.append(duplicate)
+
+            def release_generation(_self, worker_index, generation):
+                _self.releases.append((worker_index, generation))
+                super().release_generation(worker_index, generation)
+
+        registry = Registry()
+        registry.register(capability)
+        if os.name == "nt":
+            from gpu_capability_process_tree import WindowsNativeRunAccountant
+
+            run_accountant = WindowsNativeRunAccountant(os.getpid())
+        elif sys.platform.startswith("linux"):
+            if not {
+                "OLR_CGROUP_RENDEZVOUS_PATH",
+                "OLR_CGROUP_RENDEZVOUS_TOKEN",
+            }.issubset(os.environ):
+                self.skipTest("requires Task-6 delegated cgroup supervisor")
+            from gpu_capability_process_tree import LinuxRendezvousClient
+
+            run_accountant = LinuxRendezvousClient(os.environ)
+        else:
+            from gpu_capability_process_tree import MacOSRegisteredPgidAccountant
+
+            run_accountant = MacOSRegisteredPgidAccountant()
+
+        try:
+            compact_observer = capability_model.CompactAccountingObserver()
+            session = capability_runner.schedule_configuration_audits(
+                self.root,
+                configurations,
+                authority,
+                registry,
+                {source_identity.relative: source_digest},
+                ColdCache(),
+                AuditLimits(rss_bytes=2**63 - 1),
+                self.engine,
+                capability_model.WorkerRuntimeContract(2, 1, 1 << 30, deadline),
+                inspection_probe_invocations=0,
+                run_accountant=run_accountant,
+                compact_observer=compact_observer,
+            )
+            summary = session.consume_aggregate()
+            self.assertEqual(
+                summary.configurations,
+                tuple(item.digest for item in configurations),
+            )
+            self.assertEqual(session.cache_misses, 3)
+            self.assertEqual(session.audit_compiler_invocations, 6)
+            self.assertEqual(session.expected_audit_compiler_invocations, 6)
+            self.assertGreaterEqual(len(session.worker_pids), 3)
+            self.assertGreaterEqual(
+                len(session.reactor.archived_generation_telemetry), 3
+            )
+            self.assertNotIn(os.getpid(), session.worker_pids)
+            session.shutdown_reap(deadline)
+            summary.release()
+            semantic_names = tuple(
+                event for event, _delta, _label, _owner
+                in compact_observer.semantic_events
+            )
+            for event in (
+                "reserve-dispatch",
+                "activate-publication",
+                "release-publication",
+                "send-pipe",
+                "decode",
+                "retain-result",
+                "release-result",
+            ):
+                self.assertEqual(semantic_names.count(event), 3)
+            self.assertTrue(session.reactor.archived_scratch_roots)
+            self.assertTrue(all(
+                not path.exists()
+                for path in session.reactor.archived_scratch_roots
+            ))
+            if os.name == "nt":
+                self.assertIsNotNone(session.reactor.task_phase_snapshot)
+                self.assertEqual(
+                    session.reactor.task_phase_snapshot.surviving_job_process_count,
+                    0,
+                )
+            elif sys.platform.startswith("linux"):
+                self.assertIsInstance(
+                    session.reactor.task_phase_snapshot,
+                    capability_model.LinuxPhaseSnapshot,
+                )
+                self.assertEqual(
+                    session.reactor.task_phase_snapshot.memory
+                    .surviving_cgroup_process_count,
+                    0,
+                )
+            else:
+                self.assertIsInstance(
+                    session.reactor.task_phase_snapshot,
+                    capability_model.MacOSPhaseSnapshot,
+                )
+                self.assertTrue(
+                    session.reactor.task_phase_snapshot.memory.accounting_complete
+                )
+            self.assertEqual(registry.transfers, registry.duplicates)
+            self.assertEqual(
+                set(registry.releases),
+                {
+                    (duplicate.worker_index, duplicate.generation)
+                    for duplicate in registry.duplicates
+                },
+            )
+        finally:
+            close_accountant = getattr(run_accountant, "close", None)
+            if callable(close_accountant):
+                close_accountant()
+            capability.native_owner.close()
+
+    def test_real_cpu_matrix_runs_one_two_and_four_workers_simultaneously(self):
+        if os.name != "nt":
+            self.skipTest("locked reference CPU matrix runs on Windows")
+        gxx = shutil.which("g++")
+        if gxx is None:
+            self.skipTest("requires g++ to build the fake compiler launcher")
+        compiler = (self.toolchain / "matrix-fake-compiler.exe").resolve()
+        launcher_source = self.toolchain / "matrix-fake-compiler.cpp"
+        launcher_source.write_text(
+            "#include <process.h>\n"
+            "#include <string>\n"
+            "#include <vector>\n"
+            "int main(int argc, char** argv) {\n"
+            f"  std::vector<std::string> v = {{{json.dumps(str(Path(sys.executable).resolve()))}, \"-m\", \"tests.gpu.fixtures.fake_preprocessor\"}};\n"
+            "  for (int i = 1; i < argc; ++i) v.emplace_back(argv[i]);\n"
+            "  std::vector<const char*> p;\n"
+            "  for (const auto& s : v) p.push_back(s.c_str());\n"
+            "  p.push_back(nullptr);\n"
+            "  return static_cast<int>(_spawnv(_P_WAIT, p[0], p.data()));\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            (gxx, str(launcher_source), "-O2", "-o", str(compiler)),
+            check=True,
+            capture_output=True,
+        )
+        roots = {
+            "toolchain": self.toolchain,
+            "mingw-runtime": Path(gxx).resolve().parent,
+            "windows-system": Path(
+                os.environ.get("SystemRoot", "C:/Windows")
+            ).resolve(),
+        }
+        selected_runtime_root = next((
+            Path(entry).resolve()
+            for entry in os.environ.get("PATH", "").split(os.pathsep)
+            if entry and (Path(entry) / "libgcc_s_seh-1.dll").is_file()
+        ), None)
+        if (
+            selected_runtime_root is not None
+            and selected_runtime_root != Path(gxx).resolve().parent
+        ):
+            roots["selected-mingw-runtime"] = selected_runtime_root
+        authority = build_dependency_root_authority(self.root, roots)
+        deadline = time.monotonic() + 240.0
+        capability = open_compiler_executable_capability(
+            compiler,
+            authority,
+            deadline,
+            compiler_family=CompilerFamily.GCC,
+        )
+        metadata = self.source.stat()
+        source_identity = FileIdentity(
+            self.source,
+            PurePosixPath("playback/gpu/coordinator.cpp"),
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) else None,
+            1,
+            True,
+        )
+        source_digest = DependencyDigest(
+            "production",
+            source_identity.relative,
+            source_identity,
+            hashlib.sha256(self.source.read_bytes()).hexdigest(),
+        )
+        repository_root = Path(__file__).resolve().parents[2]
+
+        try:
+            for worker_count in (1, 2, 4):
+                with self.subTest(worker_count=worker_count):
+                    ready = self.root / f"matrix-{worker_count}-ready"
+                    release = self.root / f"matrix-{worker_count}.release"
+                    previous_ready = os.environ.get("OLR_CPU_READY_DIRECTORY")
+                    previous_release = os.environ.get("OLR_CPU_RELEASE_FILE")
+                    os.environ["OLR_CPU_READY_DIRECTORY"] = str(ready)
+                    os.environ["OLR_CPU_RELEASE_FILE"] = str(release)
+                    arguments = (
+                        "--fixture-mode=dense",
+                        "--cpu-burn-seconds=0.02",
+                        "--token-count=16",
+                        str(self.source),
+                    )
+                    configurations = tuple(
+                        PreprocessConfiguration(
+                            entry_id=f"matrix-{worker_count}:{index}",
+                            family=CompilerFamily.GCC,
+                            compiler=compiler,
+                            working_directory=repository_root,
+                            source=source_identity,
+                            arguments=arguments,
+                            environment_digest=_environment_digest(
+                                dict(os.environ)
+                            ),
+                            digest=hashlib.sha256(
+                                f"matrix:{worker_count}:{index}".encode("ascii")
+                            ).hexdigest(),
+                            dependency_root_authority_digest=(
+                                authority.portable_authority_digest
+                            ),
+                            compiler_capability_digest=(
+                                capability.capability_digest
+                            ),
+                            compiler_capability=capability,
+                        )
+                        for index in range(worker_count)
+                    )
+
+                    class ColdCache:
+                        root = (
+                            self.root / f"matrix-{worker_count}-cache"
+                        ).resolve()
+
+                        def load_many(
+                            _self, configurations, dependency_roots,
+                            loaded_engine, production_snapshot, result_budget,
+                            aggregator, maximum_cold_slot, pipeline_deadline,
+                        ):
+                            _self.root.mkdir(parents=True, exist_ok=True)
+                            aggregator.reserve_cold_slot(maximum_cold_slot)
+                            return ConfigurationAuditLoadBatch(
+                                0,
+                                configurations,
+                                maximum_cold_slot.worst_case_live_bytes,
+                            )
+
+                    from gpu_capability_process_tree import (
+                        WindowsNativeRunAccountant,
+                    )
+
+                    accountant = WindowsNativeRunAccountant(os.getpid())
+                    registry = capability_runner.CompilerCapabilityRegistry(
+                        authority
+                    )
+                    registry.register(capability)
+                    result = []
+                    errors = []
+
+                    def run_matrix():
+                        try:
+                            result.append(
+                                capability_runner.schedule_configuration_audits(
+                                    self.root,
+                                    configurations,
+                                    authority,
+                                    registry,
+                                    {source_identity.relative: source_digest},
+                                    ColdCache(),
+                                    AuditLimits(rss_bytes=2**63 - 1),
+                                    self.engine,
+                                    capability_model.WorkerRuntimeContract(
+                                        worker_count,
+                                        16,
+                                        1 << 30,
+                                        deadline,
+                                    ),
+                                    inspection_probe_invocations=0,
+                                    run_accountant=accountant,
+                                    compact_observer=(
+                                        capability_model.CompactAccountingObserver()
+                                    ),
+                                )
+                            )
+                        except BaseException as error:
+                            errors.append(error)
+
+                    thread = threading.Thread(target=run_matrix)
+                    thread.start()
+                    observation_deadline = time.monotonic() + 60.0
+                    while (
+                        len(tuple(ready.glob("*.ready"))) < worker_count
+                        and thread.is_alive()
+                        and not errors
+                        and time.monotonic() < observation_deadline
+                    ):
+                        time.sleep(0.01)
+                    observed = tuple(ready.glob("*.ready"))
+                    release.write_text("release", encoding="ascii")
+                    thread.join(timeout=max(1.0, deadline - time.monotonic()))
+                    try:
+                        self.assertFalse(thread.is_alive())
+                        if errors:
+                            raise errors[0]
+                        self.assertGreaterEqual(len(observed), worker_count)
+                        session = result[0]
+                        summary = session.consume_aggregate()
+                        self.assertEqual(
+                            summary.configurations,
+                            tuple(item.digest for item in configurations),
+                        )
+                        self.assertEqual(
+                            session.audit_compiler_invocations,
+                            2 * worker_count,
+                        )
+                        session.shutdown_reap(deadline)
+                        summary.release()
+                    finally:
+                        close_accountant = getattr(accountant, "close", None)
+                        if callable(close_accountant):
+                            close_accountant()
+                        if previous_ready is None:
+                            os.environ.pop("OLR_CPU_READY_DIRECTORY", None)
+                        else:
+                            os.environ["OLR_CPU_READY_DIRECTORY"] = previous_ready
+                        if previous_release is None:
+                            os.environ.pop("OLR_CPU_RELEASE_FILE", None)
+                        else:
+                            os.environ["OLR_CPU_RELEASE_FILE"] = previous_release
+        finally:
+            capability.native_owner.close()
+
+    def test_startup_lifecycle_control_matrix_is_canonical_and_bounded(self):
+        lifecycle = (
+            capability_model.WorkerContained(3, 9, 123, "job:123:9"),
+            capability_model.MacOSWorkerSessionReported(
+                3, 9, 123, 123, "1:2"
+            ),
+            capability_model.CompilerPgidReported(
+                3,
+                9,
+                5,
+                capability_model.CompilerLaunchPurpose.AUDIT_DISCOVERY,
+                124,
+                124,
+                "3:4",
+                self.capability.executable_identity,
+                self.capability.executable_sha256,
+                self.capability.capability_digest,
+            ),
+            capability_model.CompilerExecPermit(3, 9, 5, 124),
+            capability_model.WorkerCapabilitiesAccepted(
+                3, 9, (self.capability.capability_digest,)
+            ),
+            capability_model.WorkerEngineReady(
+                3, 9, 123, self.engine, (self.capability.capability_digest,)
+            ),
+            capability_model.WorkerRetire(3, 9, "task-limit"),
+            capability_model.WorkerRetireAck(3, 9),
+            capability_model.WorkerStop(3, 9),
+            capability_model.WorkerStopped(3, 9),
+            capability_model.WorkerFailure(3, 9, "task-0", "worker failed"),
+        )
+        for message in lifecycle:
+            with self.subTest(message=type(message).__name__):
+                encoded = capability_runner.encode_control_message(message)
+                self.assertLessEqual(
+                    len(encoded), capability_runner.CONTROL_MAX_BYTES
+                )
+                decoded = capability_runner.decode_control_message(encoded)
+                self.assertEqual(decoded, message)
+                self.assertEqual(
+                    capability_runner.encode_control_message(decoded), encoded
+                )
+        corruptions = (
+            b"\x80\x04N.",
+            b'{"generation":true,"tag":"worker-stop","worker_index":3}',
+            b'{"generation":9,"tag":"unknown","worker_index":3}',
+            b"x" * (capability_runner.CONTROL_MAX_BYTES + 1),
+        )
+        for payload in corruptions:
+            with self.subTest(payload=payload[:16]), self.assertRaises(
+                AuditInfrastructureError
+            ):
+                capability_runner.decode_control_message(payload)
+
+    def test_worker_payload_ready_codec_carries_allocation_declarations(self):
+        message = capability_model.WorkerPayloadReady(
+            worker_index=3,
+            generation=9,
+            task_id="task-0",
+            configuration_digest="a" * 64,
+            audit_engine_fingerprint="b" * 64,
+            pipe_nonce="c" * 64,
+            serial=11,
+            nonce="e" * 64,
+            encoded_bytes=4096,
+            encoded_sha256="d" * 64,
+            charged_bytes=8192,
+            conservative_decoded_bytes=48 << 10,
+            conservative_retained_bytes=16 << 10,
+            counting_pass_peak_bytes=12 << 10,
+            stdout_bytes=17,
+            stages=capability_model.WorkerStageTimings(1.0, 2.0, 3.0, 4.0),
+        )
+        encoded = capability_runner.encode_control_message(message)
+        self.assertEqual(capability_runner.decode_control_message(encoded), message)
+        document = json.loads(encoded)
+        self.assertEqual(
+            {
+                "conservative_decoded_bytes",
+                "conservative_retained_bytes",
+                "counting_pass_peak_bytes",
+            },
+            set(document)
+            & {
+                "conservative_decoded_bytes",
+                "conservative_retained_bytes",
+                "counting_pass_peak_bytes",
+            },
+        )
+        document["conservative_decoded_bytes"] = True
+        corrupted = json.dumps(
+            document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+        with self.assertRaises(AuditInfrastructureError):
+            capability_runner.decode_control_message(corrupted)
+
+    def test_worker_capability_bootstrap_uses_transferred_streams_without_open(self):
+        deadline = time.monotonic() + 30.0
+        payload = capability_runner._encode_worker_bootstrap(
+            (self.configuration,),
+            self.authority,
+            {},
+            AuditLimits(),
+            self.engine,
+            deadline,
+            transfer_cookie="a" * 64,
+            transferred_handles={},
+        )
+        decoded = capability_runner._decode_worker_bootstrap(payload)
+        document = decoded[1][0]
+        streams = tuple(
+            os.fdopen(os.dup(stream.fileno()), "rb", closefd=True)
+            for stream in self.capability.native_owner.streams
+        )
+        transferred = None
+        try:
+            with mock.patch.object(
+                Path,
+                "open",
+                side_effect=AssertionError("worker reopened capability path"),
+            ):
+                transferred = capability_runner._compiler_capability_from_bootstrap(
+                    document,
+                    self.authority,
+                    deadline,
+                    threading.Event(),
+                    streams,
+                )
+            self.assertEqual(
+                transferred.capability_digest,
+                self.capability.capability_digest,
+            )
+        finally:
+            if transferred is not None:
+                transferred.native_owner.close()
+            else:
+                for stream in streams:
+                    stream.close()
+
+    def test_task_frame_binds_only_receiver_held_authority_and_capability(self):
+        reservation = capability_model.PerTaskCompactReservation(
+            "task-0", 4, 56 << 20
+        )
+        capability = reservation.issue_worker_transport_capability(
+            "task-0", 4, self.configuration.digest, self.engine, 1
+        )
+        task = capability_model.ConfigurationAuditTask(
+            "task-0", 4, self.configuration, self.authority,
+            capability_model.PerTaskCompactReservation.for_worker_transport(
+                capability
+            ),
+        )
+        encoded = capability_runner.encode_task_frame(17, 1, task, capability)
+        self.assertLessEqual(len(encoded), capability_runner.TASK_MAX_BYTES)
+        document = json.loads(encoded)
+        self.assertEqual(
+            document["dependency_root_authority_digest"],
+            self.authority.portable_authority_digest,
+        )
+        self.assertNotIn("dependency_root_authority", document)
+        decoded_ordinal, decoded, decoded_capability = (
+            capability_runner.decode_task_frame(
+                encoded,
+                self.authority,
+                {self.capability.capability_digest: self.capability},
+            )
+        )
+        self.assertEqual(decoded_ordinal, 17)
+        self.assertIs(decoded.dependency_root_authority, self.authority)
+        self.assertIs(decoded.configuration.compiler_capability, self.capability)
+        self.assertEqual(decoded_capability, capability)
+        decoded.compact_reservation.release("task-codec-test")
+        reservation.release_worker_transport_capability(
+            capability, "task-codec-test"
+        )
+
+        changed_root = self.root / "other-source-root"
+        changed_root.mkdir()
+        changed_metadata = changed_root.stat()
+        changed_binding = dataclasses.replace(
+            self.authority.source_root,
+            resolved_root=changed_root,
+            root_identity=dataclasses.replace(
+                self.authority.source_root.root_identity,
+                canonical=changed_root,
+                device=int(changed_metadata.st_dev),
+                inode=(
+                    int(changed_metadata.st_ino)
+                    if int(changed_metadata.st_ino) else None
+                ),
+            ),
+        )
+        changed_authority = dataclasses.replace(
+            self.authority, source_root=changed_binding
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "authority"):
+            capability_runner.decode_task_frame(
+                encoded,
+                changed_authority,
+                {self.capability.capability_digest: self.capability},
+            )
+
+    def test_bounded_frame_channel_honors_deadline_cancel_and_peer_close(self):
+        receiver, sender = capability_runner.BoundedFrameChannel.create(1024)
+        try:
+            sender.send_bytes_before(b"ready", time.monotonic() + 2.0)
+            self.assertEqual(
+                receiver.receive_bytes_before(time.monotonic() + 2.0), b"ready"
+            )
+            cancelled = threading.Event()
+            cancelled.set()
+            with self.assertRaisesRegex(AuditInfrastructureError, "cancel"):
+                receiver.receive_bytes_before(
+                    time.monotonic() + 2.0, cancel_event=cancelled
+                )
+            sender.close()
+            with self.assertRaisesRegex(AuditInfrastructureError, "closed|truncated"):
+                receiver.receive_bytes_before(time.monotonic() + 2.0)
+        finally:
+            receiver.close()
+            sender.close()
+
+        blocked_receiver, blocked_sender = (
+            capability_runner.BoundedFrameChannel.create(
+                capability_runner.TASK_MAX_BYTES
+            )
+        )
+        failures = []
+
+        def fill_without_reader():
+            try:
+                blocked_sender.send_bytes_before(
+                    b"x" * capability_runner.TASK_MAX_BYTES,
+                    time.monotonic() + 0.1,
+                )
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=fill_without_reader)
+        thread.start()
+        thread.join(timeout=0.5)
+        if thread.is_alive():
+            blocked_receiver.close()
+            thread.join(timeout=2.0)
+        blocked_sender.close()
+        blocked_receiver.close()
+        self.assertFalse(thread.is_alive(), "bounded write ignored its deadline")
+        self.assertEqual(len(failures), 1)
+        self.assertRegex(str(failures[0]), "deadline")
+
+    def test_bounded_payload_channel_authenticates_with_deadline_aware_send(self):
+        reservation = capability_model.PerTaskCompactReservation(
+            "payload-task", 2, 64 << 20
+        )
+        capability = reservation.issue_worker_transport_capability(
+            "payload-task",
+            2,
+            self.configuration.digest,
+            self.engine,
+            1,
+        )
+        stages = capability_model.WorkerStageTimings(1.0, 2.0, 3.0, 4.0)
+        payload = b'{"bounded":true}'
+        receipt = capability_model.CompactResultTransportReceipt(
+            capability.task_id,
+            capability.generation,
+            capability.configuration_digest,
+            capability.audit_engine_fingerprint,
+            capability.worker_slot,
+            capability.pipe_nonce,
+            capability.serial,
+            capability.nonce,
+            len(payload),
+            4096,
+            hashlib.sha256(payload).hexdigest(),
+            7,
+            stages,
+        )
+        outcome = capability_model.ConfigurationAuditTransportOutcome(
+            capability_model.ConfigurationAuditResultTransport(payload, receipt),
+            7,
+            stages,
+        )
+        receiver, sender = capability_runner.BoundedPayloadChannel.create()
+        try:
+            sender.send_transport_before(outcome, time.monotonic() + 2.0)
+            self.assertEqual(
+                receiver.receive_transport_before(
+                    capability, time.monotonic() + 2.0
+                ),
+                outcome,
+            )
+            cancelled = threading.Event()
+            cancelled.set()
+            with self.assertRaisesRegex(AuditInfrastructureError, "cancel"):
+                sender.send_transport_before(
+                    outcome,
+                    time.monotonic() + 2.0,
+                    cancel_event=cancelled,
+                )
+        finally:
+            receiver.close()
+            sender.close()
+            reservation.release_worker_transport_capability(
+                capability, "payload-channel-test"
+            )
+
+    def test_transport_allocation_layout_counts_each_live_copy_once(self):
+        bounds = capability_model.CompactResultPreparseBounds(
+            4 << 20, 16 << 20, 3 << 20
+        )
+        layout = capability_runner._transport_allocation_bound(
+            bounds.encoded_bytes,
+            bounds,
+            capability_runner.conservative_allocation_schema(),
+            64 << 10,
+        )
+        self.assertEqual(
+            layout.permit_reservation_bytes,
+            layout.canonical_encoder_scratch_bytes
+            + layout.sender_payload_bytes
+            + layout.pipe_frame_bytes
+            + layout.pipe_kernel_capacity_bytes
+            + layout.receiver_payload_bytes,
+        )
+        self.assertEqual(
+            layout.decode_reservation_bytes,
+            layout.receiver_payload_bytes
+            + layout.json_decoded_transient_bytes
+            + layout.retained_result_bytes,
+        )
+        self.assertEqual(
+            layout.peak_pending_bytes,
+            max(
+                layout.counting_pass_peak_bytes,
+                layout.permit_reservation_bytes,
+                layout.decode_reservation_bytes,
+            ),
+        )
+
+    def test_compact_payload_preparse_is_allocation_free_and_conservative(self):
+        result = capability_model.ConfigurationAuditResult(
+            self.configuration.digest,
+            self.engine,
+            (),
+            (PurePosixPath("playback/gpu/coordinator.cpp"),),
+            (),
+        )
+        payload = capability_cache.encode_configuration_audit_result(result)
+        with mock.patch(
+            "gpu_capability_runner.json.loads",
+            side_effect=AssertionError("preparse allocated JSON"),
+        ):
+            bounds = capability_runner.preparse_compact_result(
+                payload,
+                expected_configuration_digest=self.configuration.digest,
+                expected_audit_engine_fingerprint=self.engine,
+                limits=AuditLimits(),
+            )
+        self.assertEqual(bounds.encoded_bytes, len(payload))
+        self.assertGreaterEqual(
+            bounds.conservative_retained_bytes,
+            capability_model.compact_result_retained_bytes(result),
+        )
+        self.assertGreaterEqual(
+            bounds.conservative_decoded_bytes,
+            bounds.encoded_bytes,
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "payload"):
+            capability_runner.preparse_compact_result(
+                payload + b" ",
+                expected_configuration_digest=self.configuration.digest,
+                expected_audit_engine_fingerprint=self.engine,
+                limits=AuditLimits(),
+            )
+
+    def test_mixed_budget_rejects_worker_payload_before_decode(self):
+        result = capability_model.ConfigurationAuditResult(
+            self.configuration.digest,
+            self.engine,
+            (),
+            (),
+            (
+                capability_model.AuditResultFinding(
+                    PurePosixPath("playback/gpu/coordinator.cpp"),
+                    1,
+                    "x" * (16 << 10),
+                    "mixed budget pressure",
+                ),
+            ),
+        )
+        payload = capability_cache.encode_configuration_audit_result(result)
+        bounds = capability_runner.preparse_compact_result(
+            payload,
+            expected_configuration_digest=self.configuration.digest,
+            expected_audit_engine_fingerprint=self.engine,
+            limits=AuditLimits(),
+        )
+        layout = capability_runner._transport_allocation_bound(
+            len(payload),
+            bounds,
+            capability_runner.conservative_allocation_schema(),
+            capability_runner._PIPE_KERNEL_CAPACITY_BYTES,
+        )
+        budget = CompactResultMemoryBudget(maximum_bytes=layout.decode_reservation_bytes)
+        queued = budget.reserve(
+            layout.permit_reservation_bytes,
+            label="task:mixed-budget:queued",
+        ).commit()
+        blocker = budget.reserve(
+            layout.decode_reservation_bytes - layout.permit_reservation_bytes,
+            label="hit:mixed-budget:retained",
+        ).commit()
+        with mock.patch(
+            "gpu_capability_runner.receive_configuration_audit_outcome"
+        ) as decode, self.assertRaisesRegex(
+            AuditInfrastructureError, "128 MiB|replacement"
+        ):
+            capability_runner._transition_worker_payload_to_decode(
+                queued, bounds, layout
+            )
+        decode.assert_not_called()
+        blocker.release()
+        queued.release()
+
+    def test_cold_slot_can_be_transferred_to_one_worker_decode_owner(self):
+        budget = CompactResultMemoryBudget(maximum_bytes=128 << 20)
+        aggregator = capability_model.StreamingResultAggregator(
+            (self.configuration,), budget, AuditLimits()
+        )
+        slot = capability_model.CompactResultColdSlot(32 << 20)
+        aggregator.reserve_cold_slot(slot)
+        live_before = budget.live_bytes
+        ownership = aggregator.take_cold_slot("task:decode")
+        self.assertTrue(ownership.committed)
+        self.assertEqual(ownership.byte_count, slot.worst_case_live_bytes)
+        self.assertEqual(aggregator.cold_slot_reserved_bytes, 0)
+        self.assertEqual(budget.live_bytes, live_before)
+        with self.assertRaisesRegex(AuditInfrastructureError, "cold slot"):
+            aggregator.take_cold_slot("task:second-decode")
+        ownership.release()
+        summary = aggregator.finish()
+        summary.release()
+
+    def test_ordinal_dispatch_window_does_not_advance_across_a_gap(self):
+        window = capability_runner.OrdinalDispatchWindow(251, 4)
+        self.assertEqual(window.dispatchable_ordinals(), (0, 1, 2, 3))
+        window.accept(1)
+        window.accept(2)
+        window.accept(3)
+        self.assertEqual(window.next_unaggregated, 0)
+        self.assertEqual(window.dispatchable_ordinals(), ())
+        window.accept(0)
+        self.assertEqual(window.next_unaggregated, 4)
+        self.assertEqual(window.dispatchable_ordinals(), (4, 5, 6, 7))
+
+    def test_native_memory_contract_is_independent_from_compact_budget(self):
+        compact = SimpleNamespace(peak_live_bytes=128 << 20)
+        capability_runner._enforce_platform_memory_contract(
+            SimpleNamespace(
+                platform_kind=(
+                    "windows" if os.name == "nt"
+                    else ("macos" if sys.platform == "darwin" else "linux")
+                ),
+                maximum_observed_resident_bytes=(512 << 20) - 1,
+                accounting_complete=True,
+                surviving_processes=(),
+            ),
+            compact,
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "process-tree memory contract"
+        ):
+            capability_runner._enforce_platform_memory_contract(
+                SimpleNamespace(
+                    platform_kind=(
+                        "windows" if os.name == "nt"
+                        else (
+                            "macos" if sys.platform == "darwin" else "linux"
+                        )
+                    ),
+                    maximum_observed_resident_bytes=512 << 20,
+                    accounting_complete=True,
+                    surviving_processes=(),
+                ),
+                compact,
+            )
+
+    def test_recycled_generation_memory_uses_per_slot_archived_maximum(self):
+        self.assertEqual(
+            capability_runner._combine_owned_generation_memory(
+                10,
+                {0: 20, 1: 15},
+                ((0, 0, 30), (0, 1, 25), (1, 0, 5)),
+            ),
+            55,
+        )
+
+    def test_run_scoped_compact_accounting_observer_never_double_charges(self):
+        observer = capability_model.CompactAccountingObserver()
+        budget = CompactResultMemoryBudget(observer=observer)
+        ownership = budget.reserve(4096, label="observer-fixture").commit()
+        self.assertEqual(observer.live_bytes, 4096)
+        self.assertEqual(observer.peak_live_bytes, 4096)
+        ownership.release()
+        self.assertEqual(observer.live_bytes, 0)
+        self.assertEqual(
+            tuple(event[0] for event in observer.events),
+            ("reserve", "commit", "release"),
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "already released"):
+            ownership.release()
+
+    def test_compact_observer_rejects_duplicate_semantic_owner_identity(self):
+        observer = capability_model.CompactAccountingObserver()
+        budget = CompactResultMemoryBudget(
+            maximum_bytes=1 << 20, observer=observer
+        )
+        ownership = budget.reserve(4096, label="semantic-owner").commit()
+        with self.assertRaisesRegex(AuditInfrastructureError, "owner|overlap"):
+            observer.transition(
+                "reserve",
+                4096,
+                "forged-alias",
+                owner_id=ownership.owner_id,
+            )
+        replacement = ownership.replace_committed(
+            2048, label="semantic-owner:retained"
+        )
+        self.assertNotEqual(replacement.owner_id, ownership.owner_id)
+        with self.assertRaisesRegex(AuditInfrastructureError, "owner|underflow"):
+            observer.transition(
+                "release",
+                -4096,
+                "stale-owner",
+                owner_id=ownership.owner_id,
+            )
+        replacement.release()
+        self.assertEqual(
+            tuple(event[0] for event in observer.events),
+            ("reserve", "commit", "replace", "release"),
+        )
+
+        stale_observer = capability_model.CompactAccountingObserver()
+        stale_budget = CompactResultMemoryBudget(
+            maximum_bytes=1 << 20, observer=stale_observer
+        )
+        stale = stale_budget.reserve(
+            1024, label="stale semantic owner"
+        ).commit()
+        stale_observer.transition(
+            "release",
+            -1024,
+            stale.label,
+            owner_id=stale.owner_id,
+            budget_id=stale_budget.budget_id,
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "owner|underflow"
+        ):
+            stale.release(semantic_event="release-result")
+        self.assertEqual(stale_budget.live_bytes, 1024)
+
+    def test_run_scoped_observer_allocates_unique_cross_budget_semantic_owners(self):
+        observer = capability_model.CompactAccountingObserver()
+        hit_budget = CompactResultMemoryBudget(
+            maximum_bytes=1 << 20, observer=observer
+        )
+        dispatch_budget = CompactResultMemoryBudget(
+            maximum_bytes=1 << 20, observer=observer
+        )
+        hit = hit_budget.reserve(
+            4096, label="cached result"
+        ).commit()
+        hit.record_semantic("retain-hit", delta_bytes=4096)
+        dispatch = dispatch_budget.reserve(
+            2048, label="queued transport", semantic_event="reserve-dispatch"
+        ).commit()
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "semantic owner"
+        ):
+            hit.record_semantic("retain-hit", delta_bytes=1)
+        self.assertNotEqual(hit_budget.budget_id, dispatch_budget.budget_id)
+        self.assertNotEqual(hit.owner_id, dispatch.owner_id)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "cross-budget|semantic owner"
+        ):
+            observer.transition(
+                "commit",
+                0,
+                "forged cross-budget alias",
+                budget_id=dispatch_budget.budget_id,
+                owner_id=hit.owner_id,
+            )
+        hit.release(semantic_event="release-result")
+        dispatch.record_semantic("activate-publication")
+        dispatch.record_semantic("release-publication")
+        dispatch.record_semantic("send-pipe")
+        dispatch.release()
+        self.assertEqual(
+            tuple((event, delta) for event, delta, _label, _owner in observer.semantic_events),
+            (
+                ("retain-hit", 4096),
+                ("reserve-dispatch", 2048),
+                ("release-result", -4096),
+                ("activate-publication", 0),
+                ("release-publication", 0),
+                ("send-pipe", 0),
+            ),
+        )
+
+    def test_compact_observer_rejects_wrong_semantic_transition_and_order(self):
+        observer = capability_model.CompactAccountingObserver()
+        budget = CompactResultMemoryBudget(observer=observer)
+        with self.assertRaisesRegex(AuditInfrastructureError, "semantic"):
+            budget.reserve(
+                8, label="wrong reserve", semantic_event="release-result"
+            )
+        ownership = budget.reserve(8, label="unclassified").commit()
+        with self.assertRaisesRegex(AuditInfrastructureError, "semantic"):
+            ownership.record_semantic("decode")
+        with self.assertRaisesRegex(AuditInfrastructureError, "semantic"):
+            ownership.release(semantic_event="retain-hit")
+        self.assertEqual(budget.live_bytes, 8)
+        ownership.release()
+
+        dispatch = budget.reserve(
+            16, label="dispatch", semantic_event="reserve-dispatch"
+        ).commit()
+        with self.assertRaisesRegex(AuditInfrastructureError, "semantic"):
+            dispatch.record_semantic("release-publication")
+        dispatch.record_semantic("activate-publication")
+        dispatch.record_semantic("release-publication")
+        dispatch.record_semantic("send-pipe")
+        dispatch.release()
+
+    def test_forged_payload_ready_cannot_release_active_or_advance_fifo(self):
+        observer = capability_model.CompactAccountingObserver()
+        budget = CompactResultMemoryBudget(observer=observer)
+        reservation = capability_model.PerTaskCompactReservation(
+            "audit-0-cccccccccccccccc", 0, 64 << 20
+        )
+        capability = reservation.issue_worker_transport_capability(
+            "audit-0-cccccccccccccccc",
+            0,
+            self.configuration.digest,
+            self.engine,
+            0,
+        )
+        queued = budget.reserve(
+            4096, label="queued transport", semantic_event="reserve-dispatch"
+        ).commit()
+        pending = capability_runner._PendingCoordinatorTask(
+            0,
+            self.configuration,
+            "audit-0-cccccccccccccccc",
+            reservation,
+            capability,
+            queued,
+        )
+        state = SimpleNamespace(
+            worker_index=0,
+            generation=0,
+            pending=pending,
+            launch_events=[
+                SimpleNamespace(
+                    purpose=capability_model.CompilerLaunchPurpose.AUDIT_DISCOVERY
+                ),
+                SimpleNamespace(
+                    purpose=capability_model.CompilerLaunchPurpose.AUDIT_ACCEPTED
+                ),
+            ],
+            payload_receiver=SimpleNamespace(
+                receive_transport_before=mock.Mock(
+                    side_effect=AssertionError("payload read before ready authentication")
+                )
+            ),
+        )
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        reactor.states = [state, SimpleNamespace(generation=0, pending=None)]
+        reactor.active_publication = (
+            0, 0, "audit-0-cccccccccccccccc"
+        )
+        reactor.publication_requests = __import__("collections").deque(
+            ((1, 0, "audit-1-dddddddddddddddd"),)
+        )
+        reactor.runtime_contract = self.runtime
+        reactor.cancel_event = threading.Event()
+        reactor._send_command = mock.Mock()
+        reactor.grant_next_publication = mock.Mock()
+        event = capability_model.WorkerPayloadReady(
+            worker_index=0,
+            generation=0,
+            task_id=pending.task_id,
+            configuration_digest=self.configuration.digest,
+            audit_engine_fingerprint=self.engine,
+            pipe_nonce=capability.pipe_nonce,
+            serial=capability.serial,
+            nonce="f" * 64,
+            encoded_bytes=256,
+            encoded_sha256="e" * 64,
+            charged_bytes=4096,
+            conservative_decoded_bytes=512,
+            conservative_retained_bytes=128,
+            counting_pass_peak_bytes=1,
+            stdout_bytes=256,
+            stages=capability_model.WorkerStageTimings(0.1, 0.1, 0.1, 0.1),
+        )
+        try:
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "receipt|declaration|capability"
+            ):
+                reactor.handle_task_event(
+                    state,
+                    event,
+                    SimpleNamespace(),
+                )
+            self.assertEqual(
+                reactor.active_publication,
+                (0, 0, "audit-0-cccccccccccccccc"),
+            )
+            self.assertEqual(
+                tuple(reactor.publication_requests),
+                ((1, 0, "audit-1-dddddddddddddddd"),),
+            )
+            reactor._send_command.assert_not_called()
+            reactor.grant_next_publication.assert_not_called()
+            state.payload_receiver.receive_transport_before.assert_not_called()
+        finally:
+            if not queued.released:
+                queued.release()
+            if not reservation.released:
+                reservation.release_worker_transport_capability(
+                    capability, "test-cleanup"
+                )
+
+    def test_spawn_primary_error_survives_linux_release_cleanup_error(self):
+        class PrimarySpawnError(RuntimeError):
+            pass
+
+        class CleanupError(RuntimeError):
+            pass
+
+        class FailingLinuxLifecycle(capability_runner._LinuxGenerationLifecycle):
+            def __init__(self):
+                pass
+
+            def create_generation(self, worker_index, generation):
+                return (worker_index, generation)
+
+            def release_generation(
+                self, worker_index, generation, carrier, deadline, *, force
+            ):
+                raise CleanupError("release failed")
+
+        class Process:
+            pid = 123
+
+            def start(self):
+                raise PrimarySpawnError("spawn failed")
+
+            def is_alive(self):
+                return True
+
+            def terminate(self):
+                raise CleanupError("terminate failed")
+
+            def join(self, timeout):
+                del timeout
+                raise CleanupError("join failed")
+
+            def kill(self):
+                raise CleanupError("kill failed")
+
+        class Context:
+            @staticmethod
+            def Process(**_kwargs):
+                return Process()
+
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        reactor.states = [None]
+        reactor.next_generations = [0]
+        reactor.context = Context()
+        reactor.cancel_event = threading.Event()
+        reactor.runtime_contract = self.runtime
+        reactor.configurations = (self.configuration,)
+        reactor.dependency_roots = self.authority
+        reactor.production_snapshot = {}
+        reactor.cache_root = self.root / "spawn-cleanup-cache"
+        reactor.limits = AuditLimits()
+        reactor.engine = self.engine
+        reactor.run_accountant = SimpleNamespace()
+        registry = capability_runner.CompilerCapabilityRegistry(self.authority)
+        registry.register(self.capability)
+        reactor.capability_registry = registry
+        reactor.native_lifecycle = FailingLinuxLifecycle()
+        reactor._accounting_lock = threading.Lock()
+        reactor.registry_generation_duplicates = {}
+        reactor.worker_pids = []
+        try:
+            with mock.patch.object(
+                capability_runner, "_worker_scratch_parent", return_value=self.root
+            ), mock.patch.object(
+                capability_runner.shutil,
+                "rmtree",
+                side_effect=CleanupError("rmtree failed"),
+            ):
+                with self.assertRaises(PrimarySpawnError) as raised:
+                    reactor.spawn_next_generation(0)
+            notes = getattr(raised.exception, "__notes__", ())
+            self.assertTrue(any("terminate failed" in note for note in notes))
+            self.assertTrue(any("join failed" in note for note in notes))
+            self.assertTrue(any("kill failed" in note for note in notes))
+            self.assertTrue(any("rmtree failed" in note for note in notes))
+            self.assertTrue(any("release failed" in note for note in notes))
+        finally:
+            registry.close()
+
+    def test_spawn_setup_failure_closes_every_previously_created_channel(self):
+        class SetupError(RuntimeError):
+            pass
+
+        endpoints = [mock.Mock() for _ in range(8)]
+        pairs = tuple(
+            (endpoints[index], endpoints[index + 1])
+            for index in range(0, len(endpoints), 2)
+        )
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        reactor.states = [None]
+        reactor.next_generations = [0]
+        reactor.runtime_contract = self.runtime
+        with mock.patch.object(
+            capability_runner.BoundedFrameChannel,
+            "create",
+            side_effect=pairs,
+        ), mock.patch.object(
+            capability_runner.BoundedPayloadChannel,
+            "create",
+            side_effect=SetupError("payload setup failed"),
+        ), self.assertRaisesRegex(SetupError, "payload setup failed"):
+            reactor.spawn_next_generation(0)
+        for endpoint in endpoints:
+            endpoint.close.assert_called_once_with()
+
+    def test_late_spawn_failure_fully_reaps_before_clearing_installed_state(self):
+        class PrimaryError(RuntimeError):
+            pass
+
+        process = mock.Mock()
+        process.pid = 4321
+        process.sentinel = 99
+        process.is_alive.side_effect = RuntimeError("liveness failed")
+        process.terminate.side_effect = RuntimeError("terminate failed")
+        process.join.side_effect = RuntimeError("join failed")
+        process.kill.side_effect = RuntimeError("kill failed")
+        context = SimpleNamespace(Process=mock.Mock(return_value=process))
+        frame_endpoints = [mock.Mock() for _ in range(8)]
+        frame_pairs = tuple(
+            (frame_endpoints[index], frame_endpoints[index + 1])
+            for index in range(0, len(frame_endpoints), 2)
+        )
+        startup_sender = frame_pairs[0][1]
+        startup_sender.send_bytes_before.side_effect = PrimaryError(
+            "bootstrap failed"
+        )
+        frame_pairs[3][0].poll.return_value = False
+        payload_receiver, payload_sender = mock.Mock(), mock.Mock()
+
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        reactor.states = [None]
+        reactor.next_generations = [0]
+        reactor.context = context
+        reactor.cancel_event = threading.Event()
+        reactor.runtime_contract = self.runtime
+        reactor.configurations = (self.configuration,)
+        reactor.dependency_roots = self.authority
+        reactor.production_snapshot = {}
+        reactor.cache_root = self.root / "late-spawn-cache"
+        reactor.limits = AuditLimits()
+        reactor.engine = self.engine
+        reactor.run_accountant = SimpleNamespace(
+            create_generation_job=mock.Mock(),
+            assign_generation_process=mock.Mock(),
+            archive_generation_job=mock.Mock(),
+        )
+        registry = capability_runner.CompilerCapabilityRegistry(self.authority)
+        registry.register(self.capability)
+        reactor.capability_registry = registry
+        reactor.native_lifecycle = None
+        reactor._accounting_lock = threading.Lock()
+        reactor.registry_generation_duplicates = {}
+        reactor.worker_pids = []
+        try:
+            with mock.patch.object(
+                capability_runner.BoundedFrameChannel,
+                "create",
+                side_effect=frame_pairs,
+            ), mock.patch.object(
+                capability_runner.BoundedPayloadChannel,
+                "create",
+                return_value=(payload_receiver, payload_sender),
+            ), mock.patch.object(
+                capability_runner,
+                "_worker_scratch_parent",
+                return_value=self.root,
+            ), mock.patch.object(
+                capability_runner,
+                "_duplicate_windows_capability_streams",
+                return_value=tuple(
+                    range(100, 100 + len(self.capability.native_owner.streams))
+                ),
+            ), self.assertRaisesRegex(PrimaryError, "bootstrap failed"):
+                reactor.spawn_next_generation(0)
+            process.terminate.assert_called_once_with()
+            self.assertGreaterEqual(process.join.call_count, 2)
+            process.kill.assert_called_once_with()
+            self.assertEqual(reactor.states, [None])
+            self.assertEqual(reactor.registry_generation_duplicates, {})
+            self.assertEqual(reactor.worker_pids, [])
+        finally:
+            registry.close()
+
+    def test_abort_and_reap_sweeps_every_generation_after_cleanup_failures(self):
+        class CleanupError(RuntimeError):
+            pass
+
+        def state(index):
+            process = mock.Mock()
+            process.is_alive.side_effect = CleanupError(
+                f"liveness {index} failed"
+            )
+            process.terminate.side_effect = CleanupError(
+                f"terminate {index} failed"
+            )
+            process.join.side_effect = CleanupError(f"join {index} failed")
+            process.kill.side_effect = CleanupError(f"kill {index} failed")
+            pending = SimpleNamespace(
+                reservation=SimpleNamespace(
+                    released=False,
+                    release_worker_transport_capability=mock.Mock(
+                        side_effect=CleanupError(
+                            f"reservation {index} failed"
+                        )
+                    ),
+                ),
+                capability=object(),
+                queued_ownership=SimpleNamespace(
+                    released=False,
+                    release=mock.Mock(
+                        side_effect=CleanupError(f"queue {index} failed")
+                    ),
+                ),
+            )
+            return SimpleNamespace(
+                worker_index=index,
+                generation=0,
+                process=process,
+                native_carrier=object(),
+                pending=pending,
+                scratch_root=self.root / f"abort-{index}",
+                startup_sender=mock.Mock(),
+                task_sender=mock.Mock(),
+                command_sender=mock.Mock(),
+                event_receiver=mock.Mock(),
+                payload_receiver=mock.Mock(),
+            )
+
+        states = [state(0), state(1)]
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        reactor.cancel_event = threading.Event()
+        reactor.states = states.copy()
+        reactor.native_lifecycle = SimpleNamespace(
+            release_generation=mock.Mock(
+                side_effect=CleanupError("native release failed")
+            )
+        )
+        reactor.run_accountant = SimpleNamespace(
+            archive_generation_job=mock.Mock(
+                side_effect=CleanupError("archive failed")
+            )
+        )
+        reactor._accounting_lock = threading.Lock()
+        reactor.registry_generation_duplicates = {(0, 0): (), (1, 0): ()}
+        reactor.capability_registry = SimpleNamespace(
+            release_generation=mock.Mock(
+                side_effect=CleanupError("registry release failed")
+            )
+        )
+        reactor.archived_scratch_roots = []
+        reactor.publication_requests = []
+        reactor.active_publication = None
+        reactor._stop_accounting_pump = mock.Mock(
+            side_effect=CleanupError("pump failed")
+        )
+        reactor._closed = False
+        with mock.patch.object(
+            capability_runner.shutil,
+            "rmtree",
+            side_effect=CleanupError("scratch failed"),
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "cleanup is incomplete"
+        ):
+            reactor.abort_and_reap(time.monotonic() + 1.0)
+        self.assertEqual(reactor.states, [None, None])
+        for item in states:
+            item.process.terminate.assert_called_once_with()
+            item.process.kill.assert_called_once_with()
+            item.payload_receiver.close.assert_called_once_with()
+            item.pending.queued_ownership.release.assert_called_once_with()
+
+    def test_registry_transfers_exact_generation_duplicates_and_ack_closes_them(self):
+        registry = capability_runner.CompilerCapabilityRegistry(self.authority)
+        digest = registry.register(self.capability)
+        duplicate = registry.duplicate_for_generation(digest, 2, 7)
+        self.assertEqual(
+            tuple(os.fstat(stream.fileno())[:4] for stream in duplicate.streams),
+            tuple(
+                os.fstat(stream.fileno())[:4]
+                for stream in self.capability.native_owner.streams
+            ),
+        )
+        registry.transfer_duplicate_to_child(
+            duplicate, SimpleNamespace(pid=os.getpid())
+        )
+        registry.acknowledge_generation(2, 7, (digest,))
+        self.assertTrue(duplicate.closed)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "acknowledged|closed|generation"
+        ):
+            registry.acknowledge_generation(2, 7, (digest,))
+        registry.release_generation(2, 7)
+        registry.close()
+
+    def test_registry_close_rejects_live_acknowledged_generation(self):
+        registry = capability_runner.CompilerCapabilityRegistry(self.authority)
+        digest = registry.register(self.capability)
+        duplicate = registry.duplicate_for_generation(digest, 2, 8)
+        registry.transfer_duplicate_to_child(
+            duplicate, SimpleNamespace(pid=os.getpid())
+        )
+        registry.acknowledge_generation(2, 8, (digest,))
+        with self.assertRaisesRegex(AuditInfrastructureError, "live generations"):
+            registry.close()
+        registry.release_generation(2, 8)
+        registry.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows locked-name capability")
+    def test_windows_registry_lease_blocks_all_path_mutation_until_reap(self):
+        registry = capability_runner.CompilerCapabilityRegistry(self.authority)
+        digest = registry.register(self.capability)
+        duplicate = registry.duplicate_for_generation(digest, 3, 1)
+        registry.transfer_duplicate_to_child(
+            duplicate, SimpleNamespace(pid=os.getpid())
+        )
+        registry.acknowledge_generation(3, 1, (digest,))
+        replacement = self.compiler.with_name("replacement.exe")
+        replacement.write_bytes(self.compiler.read_bytes())
+        renamed = self.compiler.with_name("compiler-renamed.exe")
+        try:
+            with self.assertRaises(OSError):
+                self.compiler.write_bytes(b"replacement")
+            with self.assertRaises(OSError):
+                self.compiler.rename(renamed)
+            with self.assertRaises(OSError):
+                self.compiler.unlink()
+            with self.assertRaises(OSError):
+                os.replace(replacement, self.compiler)
+            registry.release_generation(3, 1)
+            registry.close()
+            self.compiler.rename(renamed)
+            self.assertTrue(renamed.is_file())
+        finally:
+            if not registry._closed:
+                registry.release_generation(3, 1)
+                registry.close()
+            replacement.unlink(missing_ok=True)
+
+    def test_child_bootstrap_uses_only_transferred_handles_without_path_or_watcher(self):
+        streams = tuple(
+            os.fdopen(os.dup(stream.fileno()), "rb", closefd=True)
+            for stream in self.capability.native_owner.streams
+        )
+        payload = capability_runner._encode_worker_bootstrap(
+            (self.configuration,),
+            self.authority,
+            {},
+            AuditLimits(),
+            self.engine,
+            time.monotonic() + 10.0,
+            transfer_cookie="a" * 64,
+            transferred_handles={},
+        )
+        (
+            authority,
+            documents,
+            _snapshot,
+            _limits,
+            _engine,
+            deadline,
+            _cookie,
+            _count,
+        ) = capability_runner._decode_worker_bootstrap(payload)
+        child_capability = None
+        try:
+            with mock.patch.object(
+                capability_runner,
+                "_regular_file_snapshot",
+                side_effect=AssertionError("child re-statted compiler path"),
+            ), mock.patch.object(
+                capability_runner,
+                "_FilesystemGenerationObserver",
+                side_effect=AssertionError("child created a filesystem watcher"),
+            ), mock.patch.object(
+                Path,
+                "open",
+                side_effect=AssertionError("child reopened compiler path"),
+            ):
+                child_capability = capability_runner._compiler_capability_from_bootstrap(
+                    documents[0],
+                    authority,
+                    deadline,
+                    threading.Event(),
+                    streams,
+                )
+            self.assertEqual(
+                child_capability.native_owner.executable_fd,
+                streams[0].fileno(),
+            )
+        finally:
+            if child_capability is not None:
+                child_capability.native_owner.close()
+            else:
+                for stream in reversed(streams):
+                    if not stream.closed:
+                        stream.close()
+
+    def test_registry_final_close_releases_path_generation_guard_for_rename(self):
+        registry = capability_runner.CompilerCapabilityRegistry(self.authority)
+        registry.register(self.capability)
+        registry.close()
+        renamed = self.compiler.with_name("compiler-renamed.exe")
+        self.compiler.rename(renamed)
+        self.assertTrue(renamed.is_file())
+
+    def test_held_executable_launch_uses_native_descriptor_path_on_posix(self):
+        arguments, options = capability_command._held_compiler_launch(
+            dataclasses.replace(self.capability, platform_kind="linux"),
+            (str(self.compiler), "--version"),
+        )
+        self.assertEqual(
+            arguments[0],
+            f"/proc/self/fd/{self.capability.native_owner.executable_fd}",
+        )
+        self.assertEqual(
+            options["pass_fds"],
+            (self.capability.native_owner.executable_fd,),
+        )
+        arguments, options = capability_command._held_compiler_launch(
+            dataclasses.replace(self.capability, platform_kind="macos"),
+            (str(self.compiler), "--version"),
+        )
+        self.assertEqual(
+            arguments[0],
+            f"/dev/fd/{self.capability.native_owner.executable_fd}",
+        )
+        self.assertEqual(
+            options["pass_fds"],
+            (self.capability.native_owner.executable_fd,),
+        )
+
+    def test_fake_preprocessor_has_bounded_cpu_and_crash_coordinator_modes(self):
+        fixture = Path(__file__).parent / "fixtures" / "fake_preprocessor.py"
+        burned = subprocess.run(
+            (
+                sys.executable,
+                str(fixture),
+                "--fixture-mode",
+                "cpu-burn",
+                "--cpu-burn-seconds",
+                "0.02",
+                str(self.source),
+            ),
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(burned.returncode, 0, burned.stderr)
+        self.assertIn(b"coordinator.cpp", burned.stdout)
+        crashed = subprocess.run(
+            (
+                sys.executable,
+                str(fixture),
+                "--fixture-mode",
+                "coordinator-crash",
+                str(self.source),
+            ),
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(crashed.returncode, 86)
+
+
+class NativeGenerationLifecycleAdapterTests(unittest.TestCase):
+    def test_linux_abort_kills_generation_leaf_before_release(self):
+        events = []
+        carrier = capability_model.LinuxWorkerContainment(
+            "/cg/run", "/cg/run/worker-1-g2", "b" * 64
+        )
+
+        class Client:
+            def create_leaf(self, *_args):
+                return carrier
+
+            def acknowledge_leaf(self, *_args):
+                pass
+
+            def release_leaf(self, worker_index, generation, deadline):
+                events.append(("release", worker_index, generation, deadline))
+
+        lifecycle = capability_runner._LinuxGenerationLifecycle(Client(), 91.0)
+        lifecycle.live[(1, 2)] = carrier
+        with mock.patch.object(
+            lifecycle,
+            "_force_empty",
+            side_effect=lambda actual, deadline: events.append(
+                ("kill", actual, deadline)
+            ),
+        ):
+            lifecycle.release_generation(1, 2, carrier, 92.0, force=True)
+        self.assertEqual(
+            events,
+            [("kill", carrier, 92.0), ("release", 1, 2, 92.0)],
+        )
+
+    def test_linux_generation_leaf_precedes_spawn_ack_and_empty_release(self):
+        events = []
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        service = Path(temporary.name).resolve()
+        run = service / "run"
+        leaf = run / "worker-2-g4"
+        leaf.mkdir(parents=True)
+        for root in (service, run):
+            (root / "memory.events").write_text(
+                "oom 0\noom_kill 0\nmax 0\n", encoding="ascii"
+            )
+        for name, value in (
+            ("memory.current", "1"),
+            ("memory.peak", "2"),
+            ("memory.max", str(512 << 20)),
+            ("memory.high", str(448 << 20)),
+        ):
+            (run / name).write_text(value, encoding="ascii")
+        (leaf / "cgroup.procs").write_text("", encoding="ascii")
+        carrier_run = str(run) if sys.platform.startswith("linux") else "/cg/run"
+        carrier_leaf = (
+            str(leaf)
+            if sys.platform.startswith("linux")
+            else "/cg/run/worker-2-g4"
+        )
+        carrier = capability_model.LinuxWorkerContainment(
+            carrier_run, carrier_leaf, "a" * 64
+        )
+
+        class Client:
+            def create_leaf(self, worker_index, generation, deadline):
+                events.append(("create", worker_index, generation, deadline))
+                return carrier
+
+            def acknowledge_leaf(
+                self, worker_index, generation, worker_pid, actual, deadline
+            ):
+                events.append((
+                    "ack", worker_index, generation, worker_pid,
+                    actual, deadline,
+                ))
+
+            def release_leaf(self, worker_index, generation, deadline):
+                events.append(("release", worker_index, generation, deadline))
+
+        lifecycle = capability_runner._LinuxGenerationLifecycle(Client(), 99.0)
+        actual = lifecycle.create_generation(2, 4)
+        lifecycle.accept_worker_contained(
+            capability_model.WorkerContained(2, 4, 701, "linux:701:4"),
+            actual,
+        )
+        lifecycle.release_generation(2, 4, actual, 99.0, force=False)
+        self.assertEqual(
+            events,
+            [
+                ("create", 2, 4, 99.0),
+                ("ack", 2, 4, 701, carrier, 99.0),
+                ("release", 2, 4, 99.0),
+            ],
+        )
+
+    def test_macos_registers_worker_and_compiler_then_reconciles_compiler_first(self):
+        events = []
+        deadline = time.monotonic() + 10.0
+
+        class Accountant:
+            def register_group(self, pgid, leader, purpose):
+                events.append(("register", pgid, purpose))
+
+            def reconcile_group(self, pgid, provider):
+                events.append(("reconcile", pgid, provider.name))
+
+            def memory_measurements(self):
+                return capability_model.MacOSRunMemoryMeasurements(
+                    30, 10, 20, 0, 0, True
+                )
+
+        class Provider:
+            name = "provider"
+
+            def _identity_and_residency(self, pid, pgid):
+                return (
+                    capability_runner._owned_process_identity(
+                        "macos", pid, "1:2"
+                    ),
+                    1,
+                    0,
+                )
+
+            def observe(self, _accountant, parent_resident):
+                events.append(("observe", parent_resident))
+
+        class Authority:
+            def permit_compiler(self, report):
+                events.append(("permit", report.pgid))
+                return capability_model.CompilerExecPermit(
+                    report.worker_index,
+                    report.generation,
+                    report.task_id,
+                    report.pgid,
+                )
+
+        lifecycle = capability_runner._MacOSGenerationLifecycle(
+            Accountant(),
+            (),
+            deadline,
+            provider=Provider(),
+            permit_authority=Authority(),
+        )
+        lifecycle.accept_worker_session(
+            capability_model.MacOSWorkerSessionReported(2, 4, 701, 701, "1:2")
+        )
+        report = SimpleNamespace(
+            worker_index=2, generation=4, task_id=5, pgid=811
+        )
+        permit = lifecycle.permit_compiler(report)
+        self.assertEqual(permit.pgid, 811)
+        lifecycle.reconcile_task(2, 4, 5)
+        lifecycle.release_generation(2, 4, None, deadline, force=False)
+        snapshot = lifecycle.seal_task_phase(1)
+        self.assertEqual(snapshot.platform_kind, "macos")
+        self.assertEqual(snapshot.phase, "tasks")
+        self.assertTrue(snapshot.memory.accounting_complete)
+        self.assertEqual(
+            events[:5],
+            [
+                ("register", 701, "worker:2:4"),
+                ("permit", 811),
+                ("reconcile", 811, "provider"),
+                ("reconcile", 701, "provider"),
+                ("observe", mock.ANY),
+            ],
+        )
+
+    def test_macos_abort_kills_compiler_then_worker_and_reconciles_both(self):
+        events = []
+        deadline = time.monotonic() + 10.0
+
+        class Accountant:
+            def register_group(self, pgid, _leader, purpose):
+                events.append(("register", pgid, purpose))
+
+            def reconcile_group(self, pgid, _provider):
+                events.append(("reconcile", pgid))
+
+            def memory_measurements(self):
+                return capability_model.MacOSRunMemoryMeasurements(
+                    0, 0, 0, 0, 0, True
+                )
+
+        class Provider:
+            def _identity_and_residency(self, pid, _pgid):
+                return capability_runner._owned_process_identity(
+                    "macos", pid, "1:2"
+                ), 1, 0
+
+            def reconcile_survivors(self, _accountant, pgid):
+                events.append(("empty", pgid))
+                return ()
+
+            def observe(self, *_args):
+                pass
+
+        class Authority:
+            def permit_compiler(self, report):
+                return capability_model.CompilerExecPermit(
+                    report.worker_index, report.generation,
+                    report.task_id, report.pgid
+                )
+
+        lifecycle = capability_runner._MacOSGenerationLifecycle(
+            Accountant(), (), deadline,
+            provider=Provider(), permit_authority=Authority(),
+        )
+        lifecycle.accept_worker_session(
+            capability_model.MacOSWorkerSessionReported(1, 2, 701, 701, "1:2")
+        )
+        lifecycle.permit_compiler(SimpleNamespace(
+            worker_index=1, generation=2, task_id=3, pgid=811
+        ))
+        with mock.patch.object(
+            capability_runner.os,
+            "killpg",
+            side_effect=lambda pgid, _signal: events.append(("kill", pgid)),
+            create=True,
+        ), mock.patch.object(
+            capability_runner.signal, "SIGKILL", 9, create=True
+        ):
+            lifecycle.release_generation(
+                1, 2, None, deadline, force=True
+            )
+        self.assertLess(events.index(("kill", 811)),
+                        events.index(("reconcile", 811)))
+        self.assertLess(events.index(("reconcile", 811)),
+                        events.index(("kill", 701)))
+        self.assertLess(events.index(("kill", 701)),
+                        events.index(("reconcile", 701)))
 
 
 if __name__ == "__main__":

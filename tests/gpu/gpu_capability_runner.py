@@ -3,35 +3,51 @@
 from __future__ import annotations
 
 import concurrent.futures
+import collections
 import contextlib
+import base64
 import hashlib
+import hmac
 import json
+import math
+import multiprocessing
 import os
 import queue
+import selectors
+import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import socket
+from array import array
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 
 from gpu_capability_cache import (
+    ConfigurationAuditCache,
     PreprocessCache,
     _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES,
     decode_configuration_audit_result_transport,
     encode_configuration_audit_result_transport,
     receive_configuration_audit_transport,
+    send_configuration_audit_transport,
 )
 from gpu_capability_command import (
     CompilerProcessHandleCarrier,
     RewrittenCommand,
+    _CompilerCapabilityOwner,
     _environment_digest,
+    _held_compiler_launch,
+    _regular_file_snapshot,
     _resume_suspended_windows_process,
+    _native_process_start_token,
     decode_compile_entry,
     make_configuration,
     launch_compiler_process,
@@ -50,11 +66,21 @@ from gpu_capability_model import (
     AuditLimits,
     CachePublicationPermit,
     CachePublicationRequested,
+    CompactResultColdSlot,
+    CompactAccountingObserver,
+    CompactResultMemoryBudget,
+    CompactResultOwnership,
+    CompactResultPreparseBounds,
+    CompactResultSlot,
+    CompactResultTransportAllocation,
     CompactResultTransportCapability,
     CompactResultDraftBounds,
     CompilerFamily,
+    CompilerExecutableCapability,
     CompilerLaunchEvent,
     CompilerLaunchPurpose,
+    CompilerPgidReported,
+    CompilerExecPermit,
     ConfigurationCollection,
     DecisionConfigurationRecord,
     ConfigurationAuditOutcome,
@@ -71,10 +97,31 @@ from gpu_capability_model import (
     PreprocessConfiguration,
     ProcessStartIdentity,
     WorkerStageTimings,
+    WorkerEngineReady,
+    WorkerContained,
+    LinuxWorkerContainment,
+    LinuxRunMemoryMeasurements,
+    LinuxPhaseSnapshot,
+    MacOSPhaseSnapshot,
+    MacOSWorkerSessionReported,
+    WorkerCapabilitiesAccepted,
+    WorkerFailure,
+    WorkerPayloadPermit,
+    WorkerPayloadReady,
+    WorkerRetire,
+    WorkerRetireAck,
+    WorkerRuntimeContract,
+    WorkerStop,
+    WorkerStopped,
+    StreamingAuditSummary,
+    StreamingResultAggregator,
+    compact_result_retained_bytes,
     _FilesystemGenerationObserver,
     _current_process_rss_bytes,
     _preprocessed_view_semantic_digest,
     enumerate_production_identities,
+    encode_dependency_root_authority,
+    decode_dependency_root_authority,
     requires_compile_entry,
     validate_dependency_root_authority,
 )
@@ -92,6 +139,4660 @@ _REAP_SECONDS = 1.0
 _DEPENDENCY_FILE_BYTES = 256 * 1024 * 1024
 _DEPENDENCY_TOTAL_BYTES = 1024 * 1024 * 1024
 
+CONTROL_MAX_BYTES = 64 * 1024
+TASK_MAX_BYTES = 256 * 1024
+COMMAND_MAX_BYTES = 64 * 1024
+_PIPE_KERNEL_CAPACITY_BYTES = 64 * 1024
+_PROCESS_TREE_MEMORY_LIMIT_BYTES = 512 << 20
+_FAILURE_REAP_SECONDS = 30.0
+
+
+@dataclass(frozen=True, slots=True)
+class _ConservativeAllocationSchema:
+    json_decoded_multiplier: int = 9
+    json_decoded_fixed_bytes: int = 8192
+    canonical_encoder_fixed_bytes: int = 4096
+
+
+def conservative_allocation_schema() -> _ConservativeAllocationSchema:
+    return _ConservativeAllocationSchema()
+
+
+class _CompactResultPreparseCursor:
+    """Allocation-bounded fixed-grammar scanner for canonical result bytes."""
+
+    __slots__ = ("payload", "offset")
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.offset = 0
+
+    def expect(self, token: bytes) -> None:
+        if not self.payload.startswith(token, self.offset):
+            raise ValueError("compact result payload syntax differs")
+        self.offset += len(token)
+
+    def expect_ascii_string(self, expected: bytes) -> None:
+        self.expect(b'"')
+        self.expect(expected)
+        self.expect(b'"')
+
+    @staticmethod
+    def _hex_value(value: int) -> int:
+        if 0x30 <= value <= 0x39:
+            return value - 0x30
+        if 0x61 <= value <= 0x66:
+            return value - 0x61 + 10
+        raise ValueError("compact result payload unicode escape is invalid")
+
+    def _unicode_escape(self) -> int:
+        if self.offset + 4 > len(self.payload):
+            raise ValueError("compact result payload string is truncated")
+        value = 0
+        for _ in range(4):
+            value = (value << 4) | self._hex_value(self.payload[self.offset])
+            self.offset += 1
+        return value
+
+    def string_bytes(self, maximum_bytes: int | None = None) -> int:
+        self.expect(b'"')
+        decoded_bytes = 0
+        while self.offset < len(self.payload):
+            value = self.payload[self.offset]
+            self.offset += 1
+            if value == 0x22:
+                return decoded_bytes
+            if value == 0x5C:
+                if self.offset >= len(self.payload):
+                    break
+                escape = self.payload[self.offset]
+                self.offset += 1
+                if escape in b'"\\/bfnrt':
+                    decoded_bytes += 1
+                elif escape == 0x75:
+                    codepoint = self._unicode_escape()
+                    if 0xD800 <= codepoint <= 0xDBFF:
+                        self.expect(b"\\u")
+                        low = self._unicode_escape()
+                        if not 0xDC00 <= low <= 0xDFFF:
+                            raise ValueError(
+                                "compact result payload surrogate is invalid"
+                            )
+                        decoded_bytes += 4
+                    elif 0xDC00 <= codepoint <= 0xDFFF:
+                        raise ValueError(
+                            "compact result payload surrogate is invalid"
+                        )
+                    elif codepoint <= 0x7F:
+                        decoded_bytes += 1
+                    elif codepoint <= 0x7FF:
+                        decoded_bytes += 2
+                    else:
+                        decoded_bytes += 3
+                else:
+                    raise ValueError("compact result payload escape is invalid")
+            elif 0x20 <= value <= 0x7E:
+                decoded_bytes += 1
+            else:
+                raise ValueError("compact result payload string is invalid")
+            if maximum_bytes is not None and decoded_bytes > maximum_bytes:
+                raise AuditInfrastructureError(
+                    "compact result payload text limit exceeded"
+                )
+        raise ValueError("compact result payload string is truncated")
+
+    def integer_or_null(self) -> None:
+        if self.payload.startswith(b"null", self.offset):
+            self.offset += 4
+            return
+        negative = False
+        if self.offset < len(self.payload) and self.payload[self.offset] == 0x2D:
+            negative = True
+            self.offset += 1
+        if self.offset >= len(self.payload):
+            raise ValueError("compact result payload integer is truncated")
+        first = self.payload[self.offset]
+        if first == 0x30:
+            self.offset += 1
+            if negative:
+                raise ValueError("compact result payload integer is noncanonical")
+            if (
+                self.offset < len(self.payload)
+                and 0x30 <= self.payload[self.offset] <= 0x39
+            ):
+                raise ValueError("compact result payload integer is noncanonical")
+            return
+        if not 0x31 <= first <= 0x39:
+            raise ValueError("compact result payload integer is invalid")
+        self.offset += 1
+        while (
+            self.offset < len(self.payload)
+            and 0x30 <= self.payload[self.offset] <= 0x39
+        ):
+            self.offset += 1
+
+    def boolean(self) -> None:
+        if self.payload.startswith(b"true", self.offset):
+            self.offset += 4
+            return
+        if self.payload.startswith(b"false", self.offset):
+            self.offset += 5
+            return
+        raise ValueError("compact result payload boolean is invalid")
+
+
+def _expected_compact_ascii(value: str, label: str) -> bytes:
+    if not isinstance(value, str) or not value:
+        raise AuditInfrastructureError(f"compact result {label} is invalid")
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise AuditInfrastructureError(
+            f"compact result {label} is invalid"
+        ) from error
+    if any(byte < 0x20 or byte in (0x22, 0x5C) for byte in encoded):
+        raise AuditInfrastructureError(f"compact result {label} is invalid")
+    return encoded
+
+
+def preparse_compact_result(
+    payload: bytes,
+    *,
+    expected_configuration_digest: str,
+    expected_audit_engine_fingerprint: str,
+    limits: AuditLimits,
+) -> CompactResultPreparseBounds:
+    """Bound a canonical payload without constructing decoded result objects."""
+    if (
+        not isinstance(payload, bytes)
+        or not payload
+        or len(payload) > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+        or not isinstance(limits, AuditLimits)
+    ):
+        raise AuditInfrastructureError("compact result payload is invalid")
+    configuration_digest = _expected_compact_ascii(
+        expected_configuration_digest, "configuration digest"
+    )
+    engine = _expected_compact_ascii(
+        expected_audit_engine_fingerprint, "engine fingerprint"
+    )
+    cursor = _CompactResultPreparseCursor(payload)
+    retained_bytes = 1024
+    try:
+        cursor.expect(b'{"audit_engine_fingerprint":')
+        cursor.expect_ascii_string(engine)
+        cursor.expect(b',"configuration_digest":')
+        cursor.expect_ascii_string(configuration_digest)
+        cursor.expect(b',"dependencies":[')
+        dependency_count = 0
+        while not payload.startswith(b"]", cursor.offset):
+            if dependency_count:
+                cursor.expect(b",")
+            if dependency_count >= limits.compact_result_dependencies:
+                raise AuditInfrastructureError(
+                    "compact result payload dependency limit exceeded"
+                )
+            cursor.expect(b'{"canonical":')
+            canonical_bytes = cursor.string_bytes(limits.compact_result_path_bytes)
+            cursor.expect(b',"device":')
+            cursor.integer_or_null()
+            cursor.expect(b',"inode":')
+            cursor.integer_or_null()
+            cursor.expect(b',"line_count":')
+            cursor.integer_or_null()
+            cursor.expect(b',"production":')
+            cursor.boolean()
+            cursor.expect(b',"relative":')
+            if payload.startswith(b"null", cursor.offset):
+                cursor.offset += 4
+                relative_bytes = 0
+            else:
+                relative_bytes = cursor.string_bytes(
+                    limits.compact_result_path_bytes
+                )
+            cursor.expect(b',"role_relative_path":')
+            role_relative_bytes = cursor.string_bytes(
+                limits.compact_result_path_bytes
+            )
+            cursor.expect(b',"sha256":')
+            cursor.string_bytes()
+            cursor.expect(b',"stable_role":')
+            stable_role_bytes = cursor.string_bytes(
+                limits.compact_result_path_bytes
+            )
+            cursor.expect(b"}")
+            retained_bytes += (
+                384
+                + canonical_bytes
+                + relative_bytes
+                + role_relative_bytes
+                + stable_role_bytes
+            )
+            dependency_count += 1
+        cursor.expect(b"]")
+
+        cursor.expect(b',"findings":[')
+        finding_count = 0
+        while not payload.startswith(b"]", cursor.offset):
+            if finding_count:
+                cursor.expect(b",")
+            if finding_count >= limits.compact_result_findings:
+                raise AuditInfrastructureError(
+                    "compact result payload finding limit exceeded"
+                )
+            cursor.expect(b'{"expression":')
+            expression_bytes = cursor.string_bytes(
+                limits.compact_result_expression_bytes
+            )
+            cursor.expect(b',"line":')
+            cursor.integer_or_null()
+            cursor.expect(b',"path":')
+            path_bytes = cursor.string_bytes(limits.compact_result_path_bytes)
+            cursor.expect(b',"reason":')
+            reason_bytes = cursor.string_bytes(
+                limits.compact_result_reason_bytes
+            )
+            cursor.expect(b"}")
+            retained_bytes += (
+                320 + expression_bytes + path_bytes + reason_bytes
+            )
+            finding_count += 1
+        cursor.expect(b"]")
+
+        cursor.expect(b',"reached_production":[')
+        reached_count = 0
+        while not payload.startswith(b"]", cursor.offset):
+            if reached_count:
+                cursor.expect(b",")
+            if reached_count >= limits.compact_result_reached:
+                raise AuditInfrastructureError(
+                    "compact result payload reached-production limit exceeded"
+                )
+            reached_bytes = cursor.string_bytes(limits.compact_result_path_bytes)
+            retained_bytes += 128 + reached_bytes
+            reached_count += 1
+        cursor.expect(b"]")
+        cursor.expect(b',"schema":')
+        cursor.expect_ascii_string(AUDIT_RESULT_SCHEMA_BYTES)
+        cursor.expect(b"}")
+        if cursor.offset != len(payload):
+            raise ValueError("compact result payload has trailing data")
+    except ValueError as error:
+        raise AuditInfrastructureError("compact result payload is invalid") from error
+
+    if retained_bytes > limits.compact_result_bytes:
+        raise AuditInfrastructureError(
+            "compact result payload retained result limit exceeded"
+        )
+    allocation_schema = conservative_allocation_schema()
+    decoded_bytes = max(
+        len(payload),
+        allocation_schema.json_decoded_fixed_bytes
+        + allocation_schema.json_decoded_multiplier * len(payload),
+    )
+    return CompactResultPreparseBounds(
+        len(payload), decoded_bytes, retained_bytes
+    )
+
+
+def _transition_worker_payload_to_decode(
+    ownership: CompactResultOwnership,
+    bounds: CompactResultPreparseBounds,
+    layout: CompactResultTransportAllocation,
+) -> CompactResultOwnership:
+    if (
+        not isinstance(ownership, CompactResultOwnership)
+        or not ownership.committed
+        or not isinstance(bounds, CompactResultPreparseBounds)
+        or not isinstance(layout, CompactResultTransportAllocation)
+        or layout.receiver_payload_bytes != bounds.encoded_bytes
+        or layout.json_decoded_transient_bytes < bounds.conservative_decoded_bytes
+        or layout.retained_result_bytes != bounds.conservative_retained_bytes
+    ):
+        raise AuditInfrastructureError(
+            "compact result payload decode transition is invalid"
+        )
+    return ownership.replace_committed(
+        layout.decode_reservation_bytes,
+        label=f"{ownership.label}:decode",
+        semantic_event="decode",
+    )
+
+
+def _transport_allocation_bound(
+    encoded_bytes: int,
+    bounds: CompactResultPreparseBounds,
+    allocation_schema: _ConservativeAllocationSchema,
+    pipe_kernel_capacity: int,
+) -> CompactResultTransportAllocation:
+    if (
+        not isinstance(encoded_bytes, int)
+        or isinstance(encoded_bytes, bool)
+        or encoded_bytes < 0
+        or not isinstance(bounds, CompactResultPreparseBounds)
+        or encoded_bytes != bounds.encoded_bytes
+        or not isinstance(allocation_schema, _ConservativeAllocationSchema)
+        or not isinstance(pipe_kernel_capacity, int)
+        or isinstance(pipe_kernel_capacity, bool)
+        or pipe_kernel_capacity < 0
+    ):
+        raise AuditInfrastructureError(
+            "compact result transport allocation inputs are invalid"
+        )
+    canonical_scratch = (
+        encoded_bytes + allocation_schema.canonical_encoder_fixed_bytes
+    )
+    sender_payload = encoded_bytes
+    pipe_frame = encoded_bytes + 4
+    receiver_payload = encoded_bytes
+    decoded_transient = max(
+        bounds.conservative_decoded_bytes,
+        allocation_schema.json_decoded_fixed_bytes
+        + allocation_schema.json_decoded_multiplier * encoded_bytes,
+    )
+    retained = bounds.conservative_retained_bytes
+    counting_peak = canonical_scratch
+    permit = (
+        canonical_scratch
+        + sender_payload
+        + pipe_frame
+        + pipe_kernel_capacity
+        + receiver_payload
+    )
+    decode = receiver_payload + decoded_transient + retained
+    return CompactResultTransportAllocation(
+        counting_peak,
+        canonical_scratch,
+        sender_payload,
+        pipe_frame,
+        pipe_kernel_capacity,
+        receiver_payload,
+        decoded_transient,
+        retained,
+        permit,
+        decode,
+        max(counting_peak, permit, decode),
+    )
+
+
+def maximum_compact_result_slot(
+    limits: AuditLimits,
+    allocation_schema: _ConservativeAllocationSchema,
+    pipe_kernel_capacity: int,
+) -> CompactResultSlot:
+    if not isinstance(limits, AuditLimits):
+        raise AuditInfrastructureError("compact result limits are invalid")
+    encoded = _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+    bounds = CompactResultPreparseBounds(
+        encoded,
+        allocation_schema.json_decoded_fixed_bytes
+        + allocation_schema.json_decoded_multiplier * encoded,
+        limits.compact_result_bytes,
+    )
+    layout = _transport_allocation_bound(
+        encoded, bounds, allocation_schema, pipe_kernel_capacity
+    )
+    return CompactResultSlot(
+        layout.peak_pending_bytes,
+        (
+            "canonical_encoder_scratch_bytes",
+            "sender_payload_bytes",
+            "pipe_frame_bytes",
+            "pipe_kernel_capacity_bytes",
+            "receiver_payload_bytes",
+            "json_decoded_transient_bytes",
+            "retained_result_bytes",
+        ),
+    )
+
+
+class BoundedFrameChannel:
+    """One-way Connection wrapper that permits bounded byte frames only."""
+
+    __slots__ = ("_connection", "maximum_bytes", "_can_receive", "_closed")
+
+    def __init__(self, connection, maximum_bytes: int, *, can_receive: bool) -> None:
+        if (
+            not isinstance(maximum_bytes, int)
+            or isinstance(maximum_bytes, bool)
+            or maximum_bytes <= 0
+            or maximum_bytes > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+        ):
+            raise AuditInfrastructureError("bounded frame limit is invalid")
+        self._connection = connection
+        self.maximum_bytes = maximum_bytes
+        self._can_receive = can_receive
+        self._closed = False
+
+    @classmethod
+    def create(cls, maximum_bytes: int):
+        receiver, sender = multiprocessing.get_context("spawn").Pipe(
+            duplex=False
+        )
+        return (
+            cls(receiver, maximum_bytes, can_receive=True),
+            cls(sender, maximum_bytes, can_receive=False),
+        )
+
+    @property
+    def connection(self):
+        if self._closed:
+            raise AuditInfrastructureError("bounded frame endpoint is closed")
+        return self._connection
+
+    def send_bytes_before(
+        self, payload: bytes, deadline: float, *, cancel_event=None
+    ) -> None:
+        if self._can_receive or self._closed:
+            raise AuditInfrastructureError("bounded frame sender is closed")
+        if (
+            not isinstance(payload, bytes)
+            or len(payload) > self.maximum_bytes
+            or not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or not math.isfinite(deadline)
+        ):
+            raise AuditInfrastructureError("bounded frame write is invalid")
+        if cancel_event is not None and cancel_event.is_set():
+            raise AuditInfrastructureError("bounded frame write was cancelled")
+        if time.monotonic() >= deadline:
+            raise AuditInfrastructureError("bounded frame write deadline exceeded")
+        if os.name == "nt":
+            import _winapi
+
+            def write_overlapped(frame: bytes) -> None:
+                overlapped, error_code = _winapi.WriteFile(
+                    self._connection.fileno(), frame, overlapped=True
+                )
+                while error_code == _winapi.ERROR_IO_PENDING:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        overlapped.cancel()
+                        overlapped.GetOverlappedResult(True)
+                        raise AuditInfrastructureError(
+                            "bounded frame write deadline exceeded"
+                        )
+                    wait_result = _winapi.WaitForMultipleObjects(
+                        [overlapped.event],
+                        False,
+                        max(1, min(50, math.ceil(remaining * 1000))),
+                    )
+                    if wait_result == _winapi.WAIT_TIMEOUT:
+                        if cancel_event is not None and cancel_event.is_set():
+                            overlapped.cancel()
+                            overlapped.GetOverlappedResult(True)
+                            raise AuditInfrastructureError(
+                                "bounded frame write was cancelled"
+                            )
+                        continue
+                    if wait_result != _winapi.WAIT_OBJECT_0:
+                        raise OSError("overlapped pipe wait failed")
+                    break
+                written, completion_error = overlapped.GetOverlappedResult(True)
+                if completion_error != 0 or written != len(frame):
+                    raise OSError("overlapped pipe write failed")
+
+            try:
+                write_overlapped(payload)
+            except AuditInfrastructureError:
+                raise
+            except (AttributeError, BrokenPipeError, EOFError, OSError, ValueError) as error:
+                raise AuditInfrastructureError(
+                    "bounded frame peer closed during write"
+                ) from error
+            return
+        descriptor = None
+        selector = None
+        try:
+            descriptor = self._connection.fileno()
+            was_blocking = os.get_blocking(descriptor)
+            os.set_blocking(descriptor, False)
+            selector = selectors.DefaultSelector()
+            selector.register(descriptor, selectors.EVENT_WRITE)
+            frame = memoryview(struct.pack("!i", len(payload)) + payload)
+            offset = 0
+            while offset < len(frame):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise AuditInfrastructureError(
+                        "bounded frame write was cancelled"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AuditInfrastructureError(
+                        "bounded frame write deadline exceeded"
+                    )
+                if not selector.select(min(0.05, remaining)):
+                    continue
+                try:
+                    written = os.write(
+                        descriptor,
+                        frame[offset:offset + (64 * 1024)],
+                    )
+                except BlockingIOError:
+                    continue
+                if written <= 0:
+                    raise OSError("bounded frame pipe write returned zero")
+                offset += written
+        except AuditInfrastructureError:
+            raise
+        except (AttributeError, BrokenPipeError, EOFError, OSError, ValueError) as error:
+            raise AuditInfrastructureError(
+                "bounded frame peer closed during write"
+            ) from error
+        finally:
+            if selector is not None:
+                selector.close()
+            if descriptor is not None:
+                try:
+                    os.set_blocking(descriptor, was_blocking)
+                except OSError:
+                    pass
+
+    def receive_bytes_before(
+        self, deadline: float, *, cancel_event=None, worker_alive=None
+    ) -> bytes:
+        if not self._can_receive or self._closed:
+            raise AuditInfrastructureError("bounded frame receiver is closed")
+        if (
+            not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or not math.isfinite(deadline)
+            or (worker_alive is not None and not callable(worker_alive))
+        ):
+            raise AuditInfrastructureError("bounded frame receive is invalid")
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise AuditInfrastructureError(
+                    "bounded frame receive was cancelled"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AuditInfrastructureError(
+                    "bounded frame receive deadline exceeded"
+                )
+            try:
+                if not self._connection.poll(min(0.05, remaining)):
+                    if worker_alive is not None and not worker_alive():
+                        raise AuditInfrastructureError(
+                            "bounded frame peer closed before receive"
+                        )
+                    continue
+                return self._connection.recv_bytes(self.maximum_bytes + 1)
+            except AuditInfrastructureError:
+                raise
+            except (EOFError, OSError, ValueError) as error:
+                raise AuditInfrastructureError(
+                    "bounded frame peer closed or frame was truncated"
+                ) from error
+
+    def poll(self, timeout: float = 0.0) -> bool:
+        if not self._can_receive or self._closed:
+            return False
+        try:
+            return bool(self._connection.poll(timeout))
+        except (EOFError, OSError, ValueError):
+            return True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._connection.close()
+        except (OSError, ValueError):
+            pass
+
+
+class _DeadlineBoundPayloadConnection:
+    """send_bytes adapter that preserves cache transport framing semantics."""
+
+    __slots__ = ("channel", "deadline", "cancel_event")
+
+    def __init__(self, channel, deadline: float, cancel_event) -> None:
+        self.channel = channel
+        self.deadline = deadline
+        self.cancel_event = cancel_event
+
+    def send_bytes(self, payload: bytes) -> None:
+        self.channel.send_bytes_before(
+            payload, self.deadline, cancel_event=self.cancel_event
+        )
+
+
+class BoundedPayloadChannel(BoundedFrameChannel):
+    """Separate 4-MiB authenticated payload endpoint with bounded waits."""
+
+    @classmethod
+    def create(cls):
+        receiver, sender = multiprocessing.get_context("spawn").Pipe(
+            duplex=False
+        )
+        return (
+            cls(
+                receiver,
+                _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES,
+                can_receive=True,
+            ),
+            cls(
+                sender,
+                _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES,
+                can_receive=False,
+            ),
+        )
+
+    def send_transport_before(
+        self,
+        outcome: ConfigurationAuditTransportOutcome,
+        deadline: float,
+        *,
+        cancel_event=None,
+    ) -> None:
+        if self._can_receive or self._closed:
+            raise AuditInfrastructureError("bounded payload sender is closed")
+        send_configuration_audit_transport(
+            _DeadlineBoundPayloadConnection(self, deadline, cancel_event),
+            outcome,
+        )
+
+    def receive_transport_before(
+        self,
+        capability: CompactResultTransportCapability,
+        deadline: float,
+        *,
+        cancel_event=None,
+        worker_alive=None,
+    ) -> ConfigurationAuditTransportOutcome:
+        if not self._can_receive or self._closed:
+            raise AuditInfrastructureError("bounded payload receiver is closed")
+        return receive_configuration_audit_transport(
+            self.connection,
+            capability,
+            deadline,
+            cancel_event=cancel_event,
+            worker_alive=worker_alive,
+        )
+
+
+def _bounded_wire_int(value: object, label: str, maximum: int) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value > maximum
+    ):
+        raise AuditInfrastructureError(f"{label} is invalid")
+    return value
+
+
+def _bounded_diagnostic(error: BaseException) -> str:
+    text = f"{type(error).__name__}: {error}".replace("\0", "?")
+    encoded = text.encode("utf-8", errors="replace")[:4096]
+    return encoded.decode("utf-8", errors="ignore") or "worker failed"
+
+
+def _control_document(message) -> dict[str, object]:
+    base = {
+        "worker_index": message.worker_index,
+        "generation": message.generation,
+    }
+    if isinstance(message, WorkerStop):
+        return {**base, "tag": "worker-stop"}
+    if isinstance(message, WorkerStopped):
+        return {**base, "tag": "worker-stopped"}
+    if isinstance(message, WorkerRetireAck):
+        return {**base, "tag": "worker-retire-ack"}
+    if isinstance(message, WorkerRetire):
+        return {**base, "tag": "worker-retire", "reason": message.reason}
+    if isinstance(message, WorkerFailure):
+        return {
+            **base,
+            "tag": "worker-failure",
+            "task_id": message.task_id,
+            "diagnostic": message.diagnostic,
+        }
+    if isinstance(message, WorkerEngineReady):
+        return {
+            **base,
+            "tag": "worker-engine-ready",
+            "worker_pid": message.worker_pid,
+            "audit_engine_fingerprint": message.audit_engine_fingerprint,
+            "capability_digests": list(message.capability_digests),
+        }
+    if isinstance(message, WorkerCapabilitiesAccepted):
+        return {
+            **base,
+            "tag": "worker-capabilities-accepted",
+            "capability_digests": list(message.capability_digests),
+        }
+    if isinstance(message, WorkerContained):
+        return {
+            **base,
+            "tag": "worker-contained",
+            "worker_pid": message.worker_pid,
+            "containment_identity": message.containment_identity,
+        }
+    if isinstance(message, MacOSWorkerSessionReported):
+        return {
+            **base,
+            "tag": "macos-worker-session-reported",
+            "pid": message.pid,
+            "pgid": message.pgid,
+            "bsd_start_identity": message.bsd_start_identity,
+        }
+    if isinstance(message, CompilerPgidReported):
+        return {
+            **base,
+            "tag": "macos-compiler-pgid-reported",
+            "task_id": message.task_id,
+            "purpose": message.purpose.value,
+            "pid": message.pid,
+            "pgid": message.pgid,
+            "bsd_start_identity": message.bsd_start_identity,
+            "executable_identity": _identity_wire_document(
+                message.executable_identity
+            ),
+            "executable_sha256": message.executable_sha256,
+            "driver_fingerprint": message.driver_fingerprint,
+        }
+    if isinstance(message, CompilerExecPermit):
+        return {
+            **base,
+            "tag": "macos-compiler-exec-permit",
+            "task_id": message.task_id,
+            "pgid": message.pgid,
+        }
+    if isinstance(message, WorkerPayloadPermit):
+        return {**base, "tag": "worker-payload-permit", "task_id": message.task_id}
+    if isinstance(message, WorkerPayloadReady):
+        return {
+            **base,
+            "tag": "worker-payload-ready",
+            "task_id": message.task_id,
+            "configuration_digest": message.configuration_digest,
+            "audit_engine_fingerprint": message.audit_engine_fingerprint,
+            "pipe_nonce": message.pipe_nonce,
+            "serial": message.serial,
+            "nonce": message.nonce,
+            "encoded_bytes": message.encoded_bytes,
+            "encoded_sha256": message.encoded_sha256,
+            "charged_bytes": message.charged_bytes,
+            "conservative_decoded_bytes": message.conservative_decoded_bytes,
+            "conservative_retained_bytes": message.conservative_retained_bytes,
+            "counting_pass_peak_bytes": message.counting_pass_peak_bytes,
+            "stdout_bytes": message.stdout_bytes,
+            "stages": asdict(message.stages),
+        }
+    if isinstance(message, CachePublicationRequested):
+        return {**base, "tag": "cache-publication-requested", "task_id": message.task_id}
+    if isinstance(message, CompilerLaunchEvent):
+        if message.worker_index is None or message.generation is None:
+            raise AuditInfrastructureError("audit compiler launch frame is invalid")
+        return {
+            **base,
+            "tag": "compiler-launch",
+            "task_id": message.task_id,
+            "purpose": message.purpose.value,
+            "process_start": asdict(message.process_start),
+        }
+    raise AuditInfrastructureError("worker control message is invalid")
+
+
+def encode_control_message(message) -> bytes:
+    try:
+        payload = json.dumps(
+            _control_document(message),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise AuditInfrastructureError("worker control message is invalid") from error
+    if len(payload) > CONTROL_MAX_BYTES:
+        raise AuditInfrastructureError("worker control frame exceeds limit")
+    return payload
+
+
+def _decode_stage_timings(value: object) -> WorkerStageTimings:
+    if not isinstance(value, dict) or set(value) != {
+        "discovery_seconds", "accepted_parse_seconds", "audit_seconds",
+        "publish_seconds",
+    }:
+        raise AuditInfrastructureError("worker stage timings are invalid")
+    return WorkerStageTimings(**value)
+
+
+def decode_control_message(payload: bytes):
+    if not isinstance(payload, bytes) or len(payload) > CONTROL_MAX_BYTES:
+        raise AuditInfrastructureError("worker control frame exceeds limit")
+    try:
+        value = json.loads(payload.decode("ascii"))
+        if (
+            not isinstance(value, dict)
+            or json.dumps(value, ensure_ascii=True, sort_keys=True,
+                          separators=(",", ":")).encode("ascii") != payload
+        ):
+            raise ValueError("noncanonical")
+        tag = value.get("tag")
+        worker_index = _bounded_wire_int(
+            value.get("worker_index"), "worker control index", (1 << 32) - 1
+        )
+        generation = _bounded_wire_int(
+            value.get("generation"), "worker control generation", (1 << 64) - 1
+        )
+        common = {"worker_index": worker_index, "generation": generation}
+        if tag == "worker-stop" and set(value) == {
+            "tag", "worker_index", "generation"
+        }:
+            return WorkerStop(**common)
+        if tag == "worker-stopped" and set(value) == {
+            "tag", "worker_index", "generation"
+        }:
+            return WorkerStopped(**common)
+        if tag == "worker-retire-ack" and set(value) == {
+            "tag", "worker_index", "generation"
+        }:
+            return WorkerRetireAck(**common)
+        if tag == "worker-retire" and set(value) == {
+            "tag", "worker_index", "generation", "reason"
+        }:
+            return WorkerRetire(**common, reason=value["reason"])
+        if tag == "worker-failure" and set(value) == {
+            "tag", "worker_index", "generation", "task_id", "diagnostic"
+        }:
+            return WorkerFailure(
+                **common, task_id=value["task_id"], diagnostic=value["diagnostic"]
+            )
+        if tag == "worker-engine-ready" and set(value) == {
+            "tag", "worker_index", "generation", "worker_pid",
+            "audit_engine_fingerprint", "capability_digests",
+        }:
+            digests = value["capability_digests"]
+            if not isinstance(digests, list):
+                raise ValueError("digests")
+            return WorkerEngineReady(
+                **common,
+                worker_pid=value["worker_pid"],
+                audit_engine_fingerprint=value["audit_engine_fingerprint"],
+                capability_digests=tuple(digests),
+            )
+        if tag == "worker-capabilities-accepted" and set(value) == {
+            "tag", "worker_index", "generation", "capability_digests",
+        }:
+            digests = value["capability_digests"]
+            if not isinstance(digests, list):
+                raise ValueError("digests")
+            return WorkerCapabilitiesAccepted(
+                **common, capability_digests=tuple(digests)
+            )
+        if tag == "worker-contained" and set(value) == {
+            "tag", "worker_index", "generation", "worker_pid",
+            "containment_identity",
+        }:
+            return WorkerContained(
+                **common,
+                worker_pid=value["worker_pid"],
+                containment_identity=value["containment_identity"],
+            )
+        if tag == "macos-worker-session-reported" and set(value) == {
+            "tag", "worker_index", "generation", "pid", "pgid",
+            "bsd_start_identity",
+        }:
+            return MacOSWorkerSessionReported(
+                **common,
+                pid=value["pid"],
+                pgid=value["pgid"],
+                bsd_start_identity=value["bsd_start_identity"],
+            )
+        if tag == "macos-compiler-pgid-reported" and set(value) == {
+            "tag", "worker_index", "generation", "task_id", "purpose",
+            "pid", "pgid", "bsd_start_identity", "executable_identity",
+            "executable_sha256", "driver_fingerprint",
+        }:
+            return CompilerPgidReported(
+                **common,
+                task_id=value["task_id"],
+                purpose=CompilerLaunchPurpose(value["purpose"]),
+                pid=value["pid"],
+                pgid=value["pgid"],
+                bsd_start_identity=value["bsd_start_identity"],
+                executable_identity=_identity_from_wire_document(
+                    value["executable_identity"]
+                ),
+                executable_sha256=value["executable_sha256"],
+                driver_fingerprint=value["driver_fingerprint"],
+            )
+        if tag == "macos-compiler-exec-permit" and set(value) == {
+            "tag", "worker_index", "generation", "task_id", "pgid",
+        }:
+            return CompilerExecPermit(
+                **common, task_id=value["task_id"], pgid=value["pgid"]
+            )
+        if tag == "worker-payload-permit" and set(value) == {
+            "tag", "worker_index", "generation", "task_id"
+        }:
+            return WorkerPayloadPermit(**common, task_id=value["task_id"])
+        if tag == "worker-payload-ready" and set(value) == {
+            "tag", "worker_index", "generation", "task_id", "encoded_bytes",
+            "encoded_sha256", "charged_bytes", "conservative_decoded_bytes",
+            "conservative_retained_bytes", "counting_pass_peak_bytes",
+            "stdout_bytes", "stages", "configuration_digest",
+            "audit_engine_fingerprint", "pipe_nonce", "serial", "nonce",
+        }:
+            return WorkerPayloadReady(
+                **common,
+                task_id=value["task_id"],
+                configuration_digest=value["configuration_digest"],
+                audit_engine_fingerprint=value["audit_engine_fingerprint"],
+                pipe_nonce=value["pipe_nonce"],
+                serial=value["serial"],
+                nonce=value["nonce"],
+                encoded_bytes=value["encoded_bytes"],
+                encoded_sha256=value["encoded_sha256"],
+                charged_bytes=value["charged_bytes"],
+                conservative_decoded_bytes=value[
+                    "conservative_decoded_bytes"
+                ],
+                conservative_retained_bytes=value[
+                    "conservative_retained_bytes"
+                ],
+                counting_pass_peak_bytes=value["counting_pass_peak_bytes"],
+                stdout_bytes=value["stdout_bytes"],
+                stages=_decode_stage_timings(value["stages"]),
+            )
+        if tag == "cache-publication-requested" and set(value) == {
+            "tag", "worker_index", "generation", "task_id"
+        }:
+            return CachePublicationRequested(**common, task_id=value["task_id"])
+        if tag == "compiler-launch" and set(value) == {
+            "tag", "worker_index", "generation", "task_id", "purpose",
+            "process_start",
+        }:
+            start = value["process_start"]
+            if not isinstance(start, dict) or set(start) != {
+                "platform_kind", "pid", "native_start_token", "handle_cookie"
+            }:
+                raise ValueError("process start")
+            return CompilerLaunchEvent(
+                CompilerLaunchPurpose(value["purpose"]),
+                ProcessStartIdentity(**start),
+                worker_index=worker_index,
+                task_id=value["task_id"],
+                generation=generation,
+            )
+    except AuditInfrastructureError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError,
+            json.JSONDecodeError) as error:
+        raise AuditInfrastructureError("worker control frame is invalid") from error
+    raise AuditInfrastructureError("worker control frame is invalid")
+
+
+def _identity_wire_document(identity: FileIdentity) -> dict[str, object]:
+    if not isinstance(identity, FileIdentity):
+        raise AuditInfrastructureError("task source identity is invalid")
+    return {
+        "canonical": str(identity.canonical),
+        "relative": (
+            None if identity.relative is None else identity.relative.as_posix()
+        ),
+        "device": identity.device,
+        "inode": identity.inode,
+        "line_count": identity.line_count,
+        "production": identity.production,
+    }
+
+
+def _identity_from_wire_document(value: object) -> FileIdentity:
+    if not isinstance(value, dict) or set(value) != {
+        "canonical", "relative", "device", "inode", "line_count", "production"
+    }:
+        raise AuditInfrastructureError("task source identity is invalid")
+    relative = value["relative"]
+    if relative is not None and not isinstance(relative, str):
+        raise AuditInfrastructureError("task source identity is invalid")
+    return FileIdentity(
+        Path(value["canonical"]),
+        None if relative is None else PurePosixPath(relative),
+        value["device"],
+        value["inode"],
+        value["line_count"],
+        value["production"],
+    )
+
+
+def _transport_capability_document(
+    capability: CompactResultTransportCapability,
+) -> dict[str, object]:
+    if not isinstance(capability, CompactResultTransportCapability):
+        raise AuditInfrastructureError("worker transport capability is invalid")
+    return {
+        "task_id": capability.task_id,
+        "generation": capability.generation,
+        "configuration_digest": capability.configuration_digest,
+        "audit_engine_fingerprint": capability.audit_engine_fingerprint,
+        "worker_slot": capability.worker_slot,
+        "pipe_nonce": capability.pipe_nonce,
+        "maximum_bytes": capability.maximum_bytes,
+        "serial": capability.serial,
+        "nonce": capability.nonce,
+    }
+
+
+def encode_task_frame(
+    ordinal: int,
+    worker_index: int,
+    task: ConfigurationAuditTask,
+    transport_capability: CompactResultTransportCapability,
+) -> bytes:
+    if (
+        not isinstance(task, ConfigurationAuditTask)
+        or task.compact_reservation is None
+        or not isinstance(transport_capability, CompactResultTransportCapability)
+        or transport_capability.task_id != task.task_id
+        or transport_capability.generation != task.generation
+        or transport_capability.worker_slot != worker_index
+    ):
+        raise AuditInfrastructureError("worker task frame is invalid")
+    _bounded_wire_int(ordinal, "worker task ordinal", (1 << 32) - 1)
+    _bounded_wire_int(worker_index, "worker task index", (1 << 32) - 1)
+    configuration = task.configuration
+    document = {
+        "tag": "worker-task",
+        "ordinal": ordinal,
+        "worker_index": worker_index,
+        "generation": task.generation,
+        "task_id": task.task_id,
+        "dependency_root_authority_digest": (
+            task.dependency_root_authority.portable_authority_digest
+        ),
+        "configuration": {
+            "entry_id": configuration.entry_id,
+            "family": configuration.family.value,
+            "compiler": str(configuration.compiler),
+            "working_directory": str(configuration.working_directory),
+            "source": _identity_wire_document(configuration.source),
+            "arguments": list(configuration.arguments),
+            "environment_digest": configuration.environment_digest,
+            "digest": configuration.digest,
+            "dependency_root_authority_digest": (
+                configuration.dependency_root_authority_digest
+            ),
+            "compiler_capability_digest": (
+                configuration.compiler_capability_digest
+            ),
+        },
+        "transport_capability": _transport_capability_document(
+            transport_capability
+        ),
+    }
+    try:
+        payload = json.dumps(
+            document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise AuditInfrastructureError("worker task frame is invalid") from error
+    if len(payload) > TASK_MAX_BYTES:
+        raise AuditInfrastructureError("worker task frame exceeds limit")
+    return payload
+
+
+def decode_task_frame(
+    payload: bytes,
+    expected_authority: DependencyRootAuthority,
+    capability_registry: Mapping[str, object] | None = None,
+):
+    if not isinstance(payload, bytes) or len(payload) > TASK_MAX_BYTES:
+        raise AuditInfrastructureError("worker task frame exceeds limit")
+    if capability_registry is None:
+        capability_registry = globals().get("_WORKER_CAPABILITIES")
+    if not isinstance(capability_registry, Mapping):
+        raise AuditInfrastructureError("worker capability registry is unavailable")
+    authority = validate_dependency_root_authority(expected_authority)
+    if authority is not expected_authority:
+        raise AuditInfrastructureError(
+            "worker dependency-root authority identity changed"
+        )
+    try:
+        value = json.loads(payload.decode("ascii"))
+        if json.dumps(
+            value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii") != payload:
+            raise ValueError("noncanonical")
+        if not isinstance(value, dict) or set(value) != {
+            "tag", "ordinal", "worker_index", "generation", "task_id",
+            "dependency_root_authority_digest", "configuration",
+            "transport_capability",
+        } or value["tag"] != "worker-task":
+            raise ValueError("schema")
+        ordinal = _bounded_wire_int(
+            value["ordinal"], "worker task ordinal", (1 << 32) - 1
+        )
+        worker_index = _bounded_wire_int(
+            value["worker_index"], "worker task index", (1 << 32) - 1
+        )
+        generation = _bounded_wire_int(
+            value["generation"], "worker task generation", (1 << 64) - 1
+        )
+        authority_digest = value["dependency_root_authority_digest"]
+        if authority_digest != authority.portable_authority_digest:
+            raise AuditInfrastructureError(
+                "worker dependency-root authority digest differs"
+            )
+        configuration_value = value["configuration"]
+        if not isinstance(configuration_value, dict) or set(configuration_value) != {
+            "entry_id", "family", "compiler", "working_directory", "source",
+            "arguments", "environment_digest", "digest",
+            "dependency_root_authority_digest", "compiler_capability_digest",
+        }:
+            raise ValueError("configuration")
+        arguments = configuration_value["arguments"]
+        if (
+            not isinstance(arguments, list)
+            or len(arguments) > 8192
+            or any(not isinstance(argument, str) or "\0" in argument
+                   or len(argument.encode("utf-8")) > (1 << 20)
+                   for argument in arguments)
+        ):
+            raise AuditInfrastructureError("worker task compile arguments exceed limit")
+        capability_digest = configuration_value["compiler_capability_digest"]
+        compiler_capability = capability_registry.get(capability_digest)
+        if compiler_capability is None or getattr(
+            compiler_capability, "capability_digest", None
+        ) != capability_digest:
+            raise AuditInfrastructureError(
+                "worker compiler capability digest differs"
+            )
+        configuration = PreprocessConfiguration(
+            entry_id=configuration_value["entry_id"],
+            family=CompilerFamily(configuration_value["family"]),
+            compiler=Path(configuration_value["compiler"]),
+            working_directory=Path(configuration_value["working_directory"]),
+            source=_identity_from_wire_document(configuration_value["source"]),
+            arguments=tuple(arguments),
+            environment_digest=configuration_value["environment_digest"],
+            digest=configuration_value["digest"],
+            dependency_root_authority_digest=(
+                configuration_value["dependency_root_authority_digest"]
+            ),
+            compiler_capability_digest=capability_digest,
+            compiler_capability=compiler_capability,
+        )
+        try:
+            source_relative = configuration.source.canonical.relative_to(
+                authority.source_root.resolved_root
+            )
+        except ValueError as error:
+            raise AuditInfrastructureError(
+                "worker dependency-root authority source differs"
+            ) from error
+        if (
+            configuration.source.relative is None
+            or PurePosixPath(source_relative.as_posix())
+            != configuration.source.relative
+        ):
+            raise AuditInfrastructureError(
+                "worker dependency-root authority source differs"
+            )
+        trusted_binding = getattr(
+            compiler_capability, "trusted_toolchain_root", None
+        )
+        if trusted_binding not in authority.external_roots:
+            raise AuditInfrastructureError(
+                "worker dependency-root authority capability differs"
+            )
+        capability_value = value["transport_capability"]
+        if not isinstance(capability_value, dict) or set(capability_value) != {
+            "task_id", "generation", "configuration_digest",
+            "audit_engine_fingerprint", "worker_slot", "pipe_nonce",
+            "maximum_bytes", "serial", "nonce",
+        }:
+            raise ValueError("transport capability")
+        transport_capability = CompactResultTransportCapability(
+            **capability_value
+        )
+        if (
+            value["task_id"] != transport_capability.task_id
+            or generation != transport_capability.generation
+            or worker_index != transport_capability.worker_slot
+            or configuration.digest
+            != transport_capability.configuration_digest
+            or configuration.dependency_root_authority_digest
+            != authority.portable_authority_digest
+        ):
+            raise AuditInfrastructureError("worker task generation differs")
+        reservation = PerTaskCompactReservation.for_worker_transport(
+            transport_capability
+        )
+        task = ConfigurationAuditTask(
+            value["task_id"], generation, configuration, authority, reservation
+        )
+        return ordinal, task, transport_capability
+    except AuditInfrastructureError:
+        raise
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+        raise AuditInfrastructureError("worker task frame is invalid") from error
+
+
+def _dependency_wire_document(dependency: DependencyDigest) -> dict[str, object]:
+    if not isinstance(dependency, DependencyDigest):
+        raise AuditInfrastructureError("production snapshot dependency is invalid")
+    return {
+        "stable_role": dependency.stable_role,
+        "role_relative_path": dependency.role_relative_path.as_posix(),
+        "identity": _identity_wire_document(dependency.identity),
+        "sha256": dependency.sha256,
+    }
+
+
+def _dependency_from_wire_document(value: object) -> DependencyDigest:
+    if not isinstance(value, dict) or set(value) != {
+        "stable_role", "role_relative_path", "identity", "sha256"
+    }:
+        raise AuditInfrastructureError("production snapshot dependency is invalid")
+    return DependencyDigest(
+        value["stable_role"],
+        PurePosixPath(value["role_relative_path"]),
+        _identity_from_wire_document(value["identity"]),
+        value["sha256"],
+    )
+
+
+_CAPABILITY_FD_CHUNK = 64
+_CAPABILITY_FD_HEADER_FORMAT = "!32sIII"
+
+
+def _send_posix_capability_streams(
+    endpoint: socket.socket,
+    streams: tuple[object, ...],
+    cookie: str,
+    deadline: float,
+    cancel_event,
+) -> None:
+    if os.name == "nt" or not isinstance(endpoint, socket.socket):
+        raise AuditInfrastructureError(
+            "worker compiler capability transfer endpoint is invalid"
+        )
+    chunks = max(1, math.ceil(len(streams) / _CAPABILITY_FD_CHUNK))
+    endpoint.setblocking(False)
+    selector = selectors.DefaultSelector()
+    selector.register(endpoint, selectors.EVENT_WRITE)
+    try:
+        for chunk_index in range(chunks):
+            first = chunk_index * _CAPABILITY_FD_CHUNK
+            selected = streams[first:first + _CAPABILITY_FD_CHUNK]
+            descriptors = array("i", (stream.fileno() for stream in selected))
+            header = struct.pack(
+                _CAPABILITY_FD_HEADER_FORMAT,
+                bytes.fromhex(cookie), chunk_index, chunks, len(selected)
+            )
+            while True:
+                if cancel_event.is_set():
+                    raise AuditInfrastructureError(
+                        "worker compiler capability transfer was cancelled"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AuditInfrastructureError(
+                        "worker compiler capability transfer deadline exceeded"
+                    )
+                if not selector.select(min(0.05, remaining)):
+                    continue
+                try:
+                    sent = endpoint.sendmsg(
+                        [header],
+                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)],
+                    )
+                except BlockingIOError:
+                    continue
+                if sent != len(header):
+                    raise AuditInfrastructureError(
+                        "worker compiler capability transfer was truncated"
+                    )
+                break
+    except (OSError, ValueError) as error:
+        raise AuditInfrastructureError(
+            "worker compiler capability transfer failed"
+        ) from error
+    finally:
+        selector.close()
+
+
+def _receive_posix_capability_streams(
+    endpoint: socket.socket,
+    expected_count: int,
+    cookie: str,
+    deadline: float,
+    cancel_event,
+) -> tuple[object, ...]:
+    if (
+        os.name == "nt"
+        or not isinstance(endpoint, socket.socket)
+        or not isinstance(expected_count, int)
+        or expected_count <= 0
+    ):
+        raise AuditInfrastructureError(
+            "worker compiler capability receive is invalid"
+        )
+    expected_chunks = max(
+        1, math.ceil(expected_count / _CAPABILITY_FD_CHUNK)
+    )
+    received_fds: list[int] = []
+    endpoint.setblocking(False)
+    selector = selectors.DefaultSelector()
+    selector.register(endpoint, selectors.EVENT_READ)
+    try:
+        for chunk_index in range(expected_chunks):
+            while True:
+                if cancel_event.is_set():
+                    raise AuditInfrastructureError(
+                        "worker compiler capability receive was cancelled"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AuditInfrastructureError(
+                        "worker compiler capability receive deadline exceeded"
+                    )
+                if not selector.select(min(0.05, remaining)):
+                    continue
+                try:
+                    header, ancillary, flags, _address = endpoint.recvmsg(
+                        struct.calcsize(_CAPABILITY_FD_HEADER_FORMAT),
+                        socket.CMSG_SPACE(_CAPABILITY_FD_CHUNK * array("i").itemsize),
+                    )
+                except BlockingIOError:
+                    continue
+                break
+            if flags & getattr(socket, "MSG_CTRUNC", 0):
+                raise AuditInfrastructureError(
+                    "worker compiler capability receive was truncated"
+                )
+            if len(header) != struct.calcsize(_CAPABILITY_FD_HEADER_FORMAT):
+                raise AuditInfrastructureError(
+                    "worker compiler capability receive header differs"
+                )
+            raw_cookie, observed_index, observed_chunks, observed_count = (
+                struct.unpack(_CAPABILITY_FD_HEADER_FORMAT, header)
+            )
+            if (
+                raw_cookie.hex() != cookie
+                or observed_index != chunk_index
+                or observed_chunks != expected_chunks
+                or observed_count <= 0
+                or observed_count > _CAPABILITY_FD_CHUNK
+            ):
+                raise AuditInfrastructureError(
+                    "worker compiler capability receive generation differs"
+                )
+            chunk_fds = array("i")
+            for level, kind, payload in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    usable = len(payload) - (len(payload) % chunk_fds.itemsize)
+                    chunk_fds.frombytes(payload[:usable])
+            if len(chunk_fds) != observed_count:
+                raise AuditInfrastructureError(
+                    "worker compiler capability receive count differs"
+                )
+            for descriptor in chunk_fds:
+                os.set_inheritable(descriptor, False)
+                received_fds.append(descriptor)
+        if len(received_fds) != expected_count:
+            raise AuditInfrastructureError(
+                "worker compiler capability receive total differs"
+            )
+        streams = tuple(os.fdopen(descriptor, "rb", closefd=True) for descriptor in received_fds)
+        received_fds.clear()
+        return streams
+    except (OSError, ValueError) as error:
+        raise AuditInfrastructureError(
+            "worker compiler capability receive failed"
+        ) from error
+    finally:
+        selector.close()
+        for descriptor in received_fds:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _duplicate_windows_capability_streams(
+    process,
+    streams: tuple[object, ...],
+) -> tuple[int, ...]:
+    if os.name != "nt":
+        raise AuditInfrastructureError(
+            "worker compiler capability handle transfer is unavailable"
+        )
+    import _winapi
+    import msvcrt
+
+    handles = []
+    target_process = None
+    try:
+        target_process = _winapi.OpenProcess(
+            0x0040, False, int(process.pid)
+        )
+        for stream in streams:
+            handles.append(_winapi.DuplicateHandle(
+                _winapi.GetCurrentProcess(),
+                msvcrt.get_osfhandle(stream.fileno()),
+                target_process,
+                0,
+                False,
+                _winapi.DUPLICATE_SAME_ACCESS,
+            ))
+        return tuple(int(handle) for handle in handles)
+    except (AttributeError, OSError, ValueError) as error:
+        raise AuditInfrastructureError(
+            "worker compiler capability handle transfer failed"
+        ) from error
+    finally:
+        if target_process is not None:
+            _winapi.CloseHandle(target_process)
+
+
+def _windows_capability_streams(handles: tuple[int, ...]) -> tuple[object, ...]:
+    if os.name != "nt" or not handles:
+        raise AuditInfrastructureError(
+            "worker compiler capability handles are invalid"
+        )
+    import msvcrt
+
+    streams = []
+    try:
+        for handle in handles:
+            descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
+            streams.append(os.fdopen(descriptor, "rb", closefd=True))
+        return tuple(streams)
+    except (OSError, ValueError) as error:
+        for stream in reversed(streams):
+            stream.close()
+        raise AuditInfrastructureError(
+            "worker compiler capability handle receive failed"
+        ) from error
+
+
+class _GenerationCompilerCapabilityDuplicate:
+    __slots__ = (
+        "registry", "digest", "worker_index", "generation", "streams",
+        "transferred_pid", "closed",
+    )
+
+    def __init__(
+        self,
+        registry: "CompilerCapabilityRegistry",
+        digest: str,
+        worker_index: int,
+        generation: int,
+        streams: tuple[object, ...],
+    ) -> None:
+        self.registry = registry
+        self.digest = digest
+        self.worker_index = worker_index
+        self.generation = generation
+        self.streams = streams
+        self.transferred_pid: int | None = None
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        errors = []
+        for stream in reversed(self.streams):
+            try:
+                stream.close()
+            except BaseException as error:
+                errors.append(error)
+        self.closed = True
+        if errors:
+            raise AuditInfrastructureError(
+                "compiler capability generation duplicate cleanup failed"
+            ) from errors[0]
+
+
+class CompilerCapabilityRegistry:
+    """Single parent owner for held compiler capabilities and transfers."""
+
+    def __init__(self, dependency_roots: DependencyRootAuthority) -> None:
+        self.dependency_roots = validate_dependency_root_authority(
+            dependency_roots
+        )
+        self._capabilities: dict[str, CompilerExecutableCapability] = {}
+        self._generation_duplicates: dict[
+            tuple[int, int], dict[str, _GenerationCompilerCapabilityDuplicate]
+        ] = {}
+        self._acknowledged_generations: set[tuple[int, int]] = set()
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def register(self, capability: CompilerExecutableCapability) -> str:
+        validate_compiler_executable_capability(
+            capability, self.dependency_roots
+        )
+        digest = capability.capability_digest
+        with self._lock:
+            if self._closed:
+                raise AuditInfrastructureError(
+                    "compiler capability registry is closed"
+                )
+            existing = self._capabilities.get(digest)
+            if existing is None:
+                self._capabilities[digest] = capability
+            elif existing.native_owner is not capability.native_owner:
+                raise AuditInfrastructureError(
+                    "compiler capability registry owner differs"
+                )
+        return digest
+
+    def duplicate_for_generation(
+        self, digest: str, worker_index: int, generation: int
+    ) -> _GenerationCompilerCapabilityDuplicate:
+        if (
+            not isinstance(digest, str)
+            or not isinstance(worker_index, int)
+            or isinstance(worker_index, bool)
+            or worker_index < 0
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+        ):
+            raise AuditInfrastructureError(
+                "compiler capability generation duplicate is invalid"
+            )
+        key = (worker_index, generation)
+        with self._lock:
+            if self._closed or key in self._acknowledged_generations:
+                raise AuditInfrastructureError(
+                    "compiler capability generation is unavailable"
+                )
+            capability = self._capabilities.get(digest)
+            generation_duplicates = self._generation_duplicates.setdefault(
+                key, {}
+            )
+            if capability is None or digest in generation_duplicates:
+                raise AuditInfrastructureError(
+                    "compiler capability generation duplicate differs"
+                )
+            streams = []
+            try:
+                for source in capability.native_owner.streams:
+                    descriptor = os.dup(source.fileno())
+                    os.set_inheritable(descriptor, False)
+                    streams.append(os.fdopen(descriptor, "rb", closefd=True))
+            except BaseException:
+                for stream in reversed(streams):
+                    stream.close()
+                raise
+            duplicate = _GenerationCompilerCapabilityDuplicate(
+                self, digest, worker_index, generation, tuple(streams)
+            )
+            generation_duplicates[digest] = duplicate
+            return duplicate
+
+    def transfer_duplicate_to_child(
+        self,
+        duplicate: _GenerationCompilerCapabilityDuplicate,
+        process,
+    ) -> None:
+        pid = getattr(process, "pid", None)
+        with self._lock:
+            actual = self._generation_duplicates.get(
+                (duplicate.worker_index, duplicate.generation), {}
+            ).get(duplicate.digest)
+            if (
+                actual is not duplicate
+                or duplicate.registry is not self
+                or duplicate.closed
+                or duplicate.transferred_pid is not None
+                or not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 0
+            ):
+                raise AuditInfrastructureError(
+                    "compiler capability generation transfer differs"
+                )
+            duplicate.transferred_pid = pid
+
+    def acknowledge_generation(
+        self,
+        worker_index: int,
+        generation: int,
+        capability_digests: tuple[str, ...],
+    ) -> None:
+        key = (worker_index, generation)
+        with self._lock:
+            duplicates = self._generation_duplicates.get(key)
+            if (
+                duplicates is None
+                or key in self._acknowledged_generations
+                or capability_digests != tuple(sorted(duplicates))
+                or any(
+                    duplicate.transferred_pid is None or duplicate.closed
+                    for duplicate in duplicates.values()
+                )
+            ):
+                raise AuditInfrastructureError(
+                    "compiler capability generation acknowledgement differs"
+                )
+            errors = []
+            for digest in reversed(sorted(duplicates)):
+                try:
+                    duplicates[digest].close()
+                except BaseException as error:
+                    errors.append(error)
+            del self._generation_duplicates[key]
+            self._acknowledged_generations.add(key)
+            if errors:
+                raise AuditInfrastructureError(
+                    "compiler capability generation acknowledgement cleanup failed"
+                ) from errors[0]
+
+    def release_generation(self, worker_index: int, generation: int) -> None:
+        key = (worker_index, generation)
+        with self._lock:
+            duplicates = self._generation_duplicates.pop(key, None)
+            acknowledged = key in self._acknowledged_generations
+            self._acknowledged_generations.discard(key)
+            if duplicates is None:
+                if not acknowledged:
+                    raise AuditInfrastructureError(
+                        "compiler capability generation is unavailable"
+                    )
+                return
+            errors = []
+            for digest in reversed(sorted(duplicates)):
+                try:
+                    duplicates[digest].close()
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                raise AuditInfrastructureError(
+                    "compiler capability generation release failed"
+                ) from errors[0]
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if self._generation_duplicates or self._acknowledged_generations:
+                raise AuditInfrastructureError(
+                    "compiler capability registry has live generations"
+                )
+            self._closed = True
+            errors = []
+            for duplicates in self._generation_duplicates.values():
+                for duplicate in duplicates.values():
+                    try:
+                        duplicate.close()
+                    except BaseException as error:
+                        errors.append(error)
+            owners = []
+            seen = set()
+            for capability in self._capabilities.values():
+                owner = capability.native_owner
+                if id(owner) not in seen:
+                    seen.add(id(owner))
+                    owners.append(owner)
+            self._capabilities.clear()
+            for owner in reversed(owners):
+                try:
+                    owner.close()
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                raise AuditInfrastructureError(
+                    "compiler capability registry cleanup failed"
+                ) from errors[0]
+
+
+def _encode_worker_bootstrap(
+    configurations: tuple[PreprocessConfiguration, ...],
+    authority: DependencyRootAuthority,
+    production_snapshot,
+    limits: AuditLimits,
+    engine: str,
+    deadline: float,
+    *,
+    transfer_cookie: str,
+    transferred_handles: Mapping[str, tuple[int, ...]],
+) -> bytes:
+    capabilities: dict[str, dict[str, object]] = {}
+    transfer_owners: dict[str, _CompilerCapabilityOwner] = {}
+    for configuration in configurations:
+        owner = configuration.compiler_capability.native_owner
+        digest = configuration.compiler_capability_digest
+        existing = transfer_owners.setdefault(digest, owner)
+        if existing is not owner:
+            raise AuditInfrastructureError(
+                "compiler capability bootstrap owner differs"
+            )
+    transfer_offsets: dict[str, int] = {}
+    transfer_count = 0
+    for digest in sorted(transfer_owners):
+        transfer_offsets[digest] = transfer_count
+        transfer_count += len(transfer_owners[digest].streams)
+    for configuration in configurations:
+        capability = configuration.compiler_capability
+        owner = capability.native_owner
+        if not isinstance(owner, _CompilerCapabilityOwner):
+            raise AuditInfrastructureError(
+                "compiler capability bootstrap owner is invalid"
+            )
+        document = {
+            "digest": configuration.compiler_capability_digest,
+            "platform_kind": capability.platform_kind,
+            "executable_identity": _identity_wire_document(
+                capability.executable_identity
+            ),
+            "executable_sha256": capability.executable_sha256,
+            "trusted_toolchain_role": (
+                capability.trusted_toolchain_root.stable_role
+            ),
+            "directory_chain_owners": [
+                str(path) for path in capability.directory_chain_owners
+            ],
+            "directory_chain_identities": [
+                _identity_wire_document(identity)
+                for identity in capability.directory_chain_identities
+            ],
+            "resolved_runtime_closure_digest": (
+                capability.resolved_runtime_closure_digest
+            ),
+            "resolved_runtime_closure": [
+                _dependency_wire_document(dependency)
+                for dependency in capability.resolved_runtime_closure
+            ],
+            "owner": {
+                "file_paths": [str(path) for path in owner.file_paths],
+                "file_snapshots": [list(value) for value in owner.file_snapshots],
+                "file_hashes": list(owner.file_hashes),
+                "alias_paths": [str(path) for path in owner.alias_paths],
+                "alias_snapshots": [list(value) for value in owner.alias_snapshots],
+                "directory_paths": [str(path) for path in owner.directory_paths],
+                "directory_snapshots": [
+                    list(value) for value in owner.directory_snapshots
+                ],
+                "transfer_offset": transfer_offsets.get(
+                    configuration.compiler_capability_digest,
+                    0,
+                ),
+                "transfer_count": len(owner.streams),
+                "transferred_handles": list(transferred_handles.get(
+                    configuration.compiler_capability_digest, ()
+                )),
+            },
+        }
+        digest = configuration.compiler_capability_digest
+        existing = capabilities.setdefault(digest, document)
+        if existing != document:
+            raise AuditInfrastructureError(
+                "compiler capability bootstrap differs"
+            )
+    if not hasattr(production_snapshot, "items"):
+        raise AuditInfrastructureError("production snapshot generation is invalid")
+    snapshot = []
+    for raw_path, dependency in production_snapshot.items():
+        path = (
+            raw_path
+            if isinstance(raw_path, PurePosixPath)
+            else PurePosixPath(str(raw_path).replace("\\", "/"))
+        )
+        if path != dependency.role_relative_path:
+            raise AuditInfrastructureError(
+                "production snapshot generation is invalid"
+            )
+        snapshot.append(_dependency_wire_document(dependency))
+    document = {
+        "tag": "worker-bootstrap",
+        "authority": base64.b64encode(
+            encode_dependency_root_authority(authority)
+        ).decode("ascii"),
+        "capabilities": [capabilities[key] for key in sorted(capabilities)],
+        "production_snapshot": sorted(
+            snapshot, key=lambda value: value["role_relative_path"]
+        ),
+        "limits": asdict(limits),
+        "audit_engine_fingerprint": engine,
+        "pipeline_deadline": deadline,
+        "capability_transfer_cookie": transfer_cookie,
+        "capability_transfer_count": transfer_count,
+    }
+    payload = json.dumps(
+        document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    if len(payload) > TASK_MAX_BYTES:
+        raise AuditInfrastructureError("worker startup bootstrap exceeds limit")
+    return payload
+
+
+def _decode_worker_bootstrap(payload: bytes):
+    if not isinstance(payload, bytes) or len(payload) > TASK_MAX_BYTES:
+        raise AuditInfrastructureError("worker startup bootstrap exceeds limit")
+    try:
+        value = json.loads(payload.decode("ascii"))
+        if json.dumps(
+            value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii") != payload:
+            raise ValueError("noncanonical")
+        if not isinstance(value, dict) or set(value) != {
+            "tag", "authority", "capabilities", "production_snapshot",
+            "limits", "audit_engine_fingerprint", "pipeline_deadline",
+            "capability_transfer_cookie", "capability_transfer_count",
+        } or value["tag"] != "worker-bootstrap":
+            raise ValueError("schema")
+        deadline = value["pipeline_deadline"]
+        if (
+            not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or not math.isfinite(deadline)
+            or time.monotonic() >= deadline
+        ):
+            raise AuditInfrastructureError("pipeline deadline exceeded during startup")
+        authority = decode_dependency_root_authority(
+            base64.b64decode(value["authority"], validate=True)
+        )
+        limits_value = value["limits"]
+        if not isinstance(limits_value, dict):
+            raise ValueError("limits")
+        limits = AuditLimits(**limits_value)
+        snapshot_values = value["production_snapshot"]
+        if not isinstance(snapshot_values, list):
+            raise ValueError("snapshot")
+        snapshot: dict[PurePosixPath, DependencyDigest] = {}
+        for item in snapshot_values:
+            dependency = _dependency_from_wire_document(item)
+            if dependency.role_relative_path in snapshot:
+                raise AuditInfrastructureError(
+                    "production snapshot generation is ambiguous"
+                )
+            snapshot[dependency.role_relative_path] = dependency
+        capabilities = value["capabilities"]
+        if not isinstance(capabilities, list):
+            raise ValueError("capabilities")
+        engine = value["audit_engine_fingerprint"]
+        transfer_cookie = value["capability_transfer_cookie"]
+        transfer_count = value["capability_transfer_count"]
+        if (
+            not isinstance(engine, str)
+            or not isinstance(transfer_cookie, str)
+            or len(transfer_cookie) != 64
+            or any(byte not in "0123456789abcdef" for byte in transfer_cookie)
+            or not isinstance(transfer_count, int)
+            or isinstance(transfer_count, bool)
+            or transfer_count <= 0
+        ):
+            raise ValueError("engine")
+        return (
+            authority,
+            tuple(capabilities),
+            snapshot,
+            limits,
+            engine,
+            float(deadline),
+            transfer_cookie,
+            transfer_count,
+        )
+    except AuditInfrastructureError:
+        raise
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+        raise AuditInfrastructureError("worker startup bootstrap is invalid") from error
+
+
+class _GenerationWorkerControlEndpoint:
+    def __init__(
+        self, worker_index: int, generation: int,
+        sender: BoundedFrameChannel, deadline: float,
+    ) -> None:
+        self.worker_index = worker_index
+        self.generation = generation
+        self.sender = sender
+        self.deadline = deadline
+        self.active_carriers: dict[ProcessStartIdentity, object] = {}
+        self.launches: dict[str, list[CompilerLaunchEvent]] = {}
+        self.publication_contexts: dict[
+            str, tuple[str, str, tuple[DependencyDigest, ...]]
+        ] = {}
+
+    def send(self, frame, deadline: float) -> None:
+        if isinstance(frame, CompilerLaunchEvent):
+            self.launches.setdefault(frame.task_id or "", []).append(frame)
+        self.sender.send_bytes_before(
+            encode_control_message(frame), min(deadline, self.deadline),
+            cancel_event=_WORKER_CANCEL_EVENT,
+        )
+
+    def register_compiler_process_launch(self, event, carrier) -> None:
+        if event.process_start in self.active_carriers:
+            raise AuditInfrastructureError(
+                "compiler process carrier was registered twice"
+            )
+        self.active_carriers[event.process_start] = carrier
+
+    def complete_compiler_process_launch(self, event, carrier) -> None:
+        if self.active_carriers.pop(event.process_start, None) is not carrier:
+            raise AuditInfrastructureError("compiler process carrier differs")
+
+    def fail_compiler_process_launch(self, event, carrier) -> None:
+        if self.active_carriers.get(event.process_start) is carrier:
+            self.active_carriers.pop(event.process_start)
+
+    def seal_audit_launch_protocol(
+        self, task_id: str, generation: int, deadline: float
+    ) -> None:
+        if generation != self.generation or time.monotonic() >= min(
+            deadline, self.deadline
+        ):
+            raise AuditInfrastructureError(
+                "audit compiler launch protocol generation differs"
+            )
+        events = self.launches.get(task_id, [])
+        if tuple(event.purpose for event in events) != (
+            CompilerLaunchPurpose.AUDIT_DISCOVERY,
+            CompilerLaunchPurpose.AUDIT_ACCEPTED,
+        ):
+            raise AuditInfrastructureError("audit compiler launch protocol differs")
+
+    def set_publication_context(
+        self, task_id: str, generation: int, configuration_digest: str,
+        engine: str, dependencies: tuple[DependencyDigest, ...],
+    ) -> None:
+        if generation != self.generation or task_id in self.publication_contexts:
+            raise AuditInfrastructureError(
+                "root publication request generation differs"
+            )
+        self.publication_contexts[task_id] = (
+            configuration_digest, engine, dependencies
+        )
+
+
+class _GenerationWorkerCommandEndpoint:
+    def __init__(
+        self, control: _GenerationWorkerControlEndpoint,
+        receiver: BoundedFrameChannel,
+    ) -> None:
+        self.control = control
+        self.receiver = receiver
+
+    def receive(
+        self, task: ConfigurationAuditTask, cancel_event, deadline: float,
+        maximum_quantum_seconds: float,
+    ) -> CachePublicationPermit:
+        payload = self.receiver.receive_bytes_before(
+            deadline, cancel_event=cancel_event
+        )
+        message = decode_control_message(payload)
+        if not isinstance(message, WorkerPayloadPermit) or (
+            message.worker_index != self.control.worker_index
+            or message.generation != self.control.generation
+            or message.task_id != task.task_id
+        ):
+            raise AuditInfrastructureError(
+                "root publication permit generation differs"
+            )
+        context = self.control.publication_contexts.pop(task.task_id, None)
+        if context is None:
+            raise AuditInfrastructureError(
+                "root publication context is unavailable"
+            )
+        configuration_digest, engine, dependencies = context
+        return CachePublicationPermit(
+            configuration_digest,
+            engine,
+            dependencies,
+            task_id=task.task_id,
+            generation=task.generation,
+        )
+
+    def receive_macos_exec_permit(
+        self, task: ConfigurationAuditTask, task_ordinal: int,
+        expected_pgid: int, cancel_event, deadline: float,
+    ) -> CompilerExecPermit:
+        payload = self.receiver.receive_bytes_before(
+            deadline, cancel_event=cancel_event
+        )
+        permit = decode_control_message(payload)
+        if (
+            not isinstance(permit, CompilerExecPermit)
+            or permit.worker_index != self.control.worker_index
+            or permit.generation != self.control.generation
+            or permit.task_id != task_ordinal
+            or permit.pgid != expected_pgid
+        ):
+            raise AuditInfrastructureError(
+                "macOS compiler exec permit generation differs"
+            )
+        return permit
+
+
+def _compiler_capability_from_bootstrap(
+    document: object,
+    authority: DependencyRootAuthority,
+    deadline: float,
+    cancel_event,
+    transferred_streams: tuple[object, ...],
+) -> CompilerExecutableCapability:
+    if not isinstance(document, dict) or set(document) != {
+        "digest", "platform_kind", "executable_identity", "executable_sha256",
+        "trusted_toolchain_role", "directory_chain_owners",
+        "directory_chain_identities", "resolved_runtime_closure_digest",
+        "resolved_runtime_closure", "owner",
+    }:
+        raise AuditInfrastructureError(
+            "worker compiler capability bootstrap is invalid"
+        )
+    owner_document = document["owner"]
+    if not isinstance(owner_document, dict) or set(owner_document) != {
+        "file_paths", "file_snapshots", "file_hashes", "alias_paths",
+        "alias_snapshots", "directory_paths", "directory_snapshots",
+        "transfer_offset", "transfer_count", "transferred_handles",
+    }:
+        raise AuditInfrastructureError(
+            "worker compiler capability bootstrap is invalid"
+        )
+
+    def paths(name: str) -> tuple[Path, ...]:
+        values = owner_document[name]
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) for value in values
+        ):
+            raise AuditInfrastructureError(
+                "worker compiler capability bootstrap is invalid"
+            )
+        return tuple(Path(value) for value in values)
+
+    def tuples(name: str) -> tuple[tuple[object, ...], ...]:
+        values = owner_document[name]
+        if not isinstance(values, list) or any(
+            not isinstance(value, list) for value in values
+        ):
+            raise AuditInfrastructureError(
+                "worker compiler capability bootstrap is invalid"
+            )
+        return tuple(tuple(value) for value in values)
+
+    file_paths = paths("file_paths")
+    alias_paths = paths("alias_paths")
+    directory_paths = paths("directory_paths")
+    file_snapshots = tuples("file_snapshots")
+    alias_snapshots = tuples("alias_snapshots")
+    directory_snapshots = tuples("directory_snapshots")
+    file_hashes_value = owner_document["file_hashes"]
+    if (
+        not file_paths
+        or not isinstance(file_hashes_value, list)
+        or any(not isinstance(value, str) for value in file_hashes_value)
+        or len(file_paths) != len(file_snapshots)
+        or len(file_paths) != len(file_hashes_value)
+        or len(alias_paths) != len(alias_snapshots)
+        or len(directory_paths) != len(directory_snapshots)
+        or not isinstance(transferred_streams, tuple)
+        or len(transferred_streams) != len(file_paths)
+    ):
+        raise AuditInfrastructureError(
+            "worker compiler capability bootstrap is invalid"
+        )
+    bindings = tuple(
+        binding for binding in authority.external_roots
+        if binding.stable_role == document["trusted_toolchain_role"]
+    )
+    if len(bindings) != 1:
+        raise AuditInfrastructureError(
+            "worker compiler capability root differs"
+        )
+    streams = list(transferred_streams)
+    native_owner = None
+    try:
+        for stream, _path, expected in zip(
+            streams, file_paths, file_snapshots
+        ):
+            if time.monotonic() >= deadline or cancel_event.is_set():
+                raise AuditInfrastructureError(
+                    "worker compiler capability transfer deadline exceeded"
+                )
+            metadata = os.fstat(stream.fileno())
+            observed = (
+                int(metadata.st_dev),
+                int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+                int(metadata.st_size),
+                int(metadata.st_mtime_ns),
+                int(getattr(metadata, "st_ctime_ns", 0)),
+                int(metadata.st_mode),
+            )
+            if observed[:4] != expected[:4]:
+                raise AuditInfrastructureError(
+                    "worker compiler capability transferred identity differs"
+                )
+        native_owner = _CompilerCapabilityOwner(
+            tuple(streams),
+            file_paths,
+            file_snapshots,
+            tuple(file_hashes_value),
+            alias_paths,
+            alias_snapshots,
+            directory_paths,
+            directory_snapshots,
+            None,
+            authority,
+            validate_paths=False,
+        )
+        capability = CompilerExecutableCapability(
+            document["platform_kind"],
+            _identity_from_wire_document(document["executable_identity"]),
+            document["executable_sha256"],
+            document["digest"],
+            native_owner,
+            bindings[0],
+            tuple(Path(value) for value in document["directory_chain_owners"]),
+            tuple(
+                _identity_from_wire_document(value)
+                for value in document["directory_chain_identities"]
+            ),
+            document["resolved_runtime_closure_digest"],
+            tuple(
+                _dependency_from_wire_document(value)
+                for value in document["resolved_runtime_closure"]
+            ),
+        )
+        validate_compiler_executable_capability(
+            capability,
+            authority,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+        return capability
+    except BaseException:
+        if native_owner is not None:
+            try:
+                native_owner.close()
+            except BaseException:
+                pass
+        if native_owner is None:
+            for stream in reversed(streams):
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
+        raise
+
+
+def _audit_worker_generation_main(
+    worker_index: int,
+    generation: int,
+    startup_receiver: BoundedFrameChannel,
+    task_receiver: BoundedFrameChannel,
+    command_receiver: BoundedFrameChannel,
+    event_sender: BoundedFrameChannel,
+    payload_sender,
+    capability_transfer_receiver,
+    native_containment,
+    worker_scratch_root: str,
+    cancel_event,
+    cache_root: str,
+    pipeline_deadline: float,
+    maximum_tasks: int,
+    recycle_rss_bytes: int,
+) -> None:
+    global _WORKER_INDEX, _WORKER_GENERATION, _WORKER_PRODUCTION
+    global _WORKER_LIMITS, _WORKER_CANCEL_EVENT, _WORKER_ENGINE
+    global _WORKER_CACHE, _WORKER_RSS, _WORKER_CAPABILITIES
+    global _WORKER_MAXIMUM_TASKS, _WORKER_RECYCLE_RSS_BYTES
+    global _WORKER_PREATTESTED_ENGINE
+
+    capabilities: dict[str, object] = {}
+    current_task_id: str | None = None
+    control = _GenerationWorkerControlEndpoint(
+        worker_index, generation, event_sender, pipeline_deadline
+    )
+    if sys.platform.startswith("linux"):
+        if not isinstance(native_containment, LinuxWorkerContainment):
+            raise AuditInfrastructureError(
+                "Linux worker generation containment is unavailable"
+            )
+        from gpu_capability_process_tree import acknowledge_linux_worker_containment
+
+        acknowledge_linux_worker_containment(native_containment, os.getpid())
+        control.send(
+            WorkerContained(
+                worker_index, generation, os.getpid(),
+                f"linux:{os.getpid()}:{generation}",
+            ),
+            pipeline_deadline,
+        )
+    elif sys.platform == "darwin":
+        os.setsid()
+
+        class _SelfProcess:
+            pid = os.getpid()
+
+        start_identity = _native_process_start_token(
+            _SelfProcess(), "macos"
+        ).removeprefix("macos-proc:")
+        control.send(
+            MacOSWorkerSessionReported(
+                worker_index, generation, os.getpid(), os.getpgrp(),
+                start_identity,
+            ),
+            pipeline_deadline,
+        )
+    parent_temporary_root = tempfile.gettempdir()
+    worker_temporary_root = str(Path(worker_scratch_root).resolve())
+    if (
+        not Path(worker_temporary_root).is_dir()
+        or any(Path(worker_temporary_root).iterdir())
+    ):
+        raise AuditInfrastructureError(
+            "worker scratch generation ownership differs"
+        )
+    tempfile.tempdir = worker_temporary_root
+    try:
+        bootstrap_payload = startup_receiver.receive_bytes_before(
+            pipeline_deadline, cancel_event=cancel_event
+        )
+        (
+            authority,
+            capability_documents,
+            production_snapshot,
+            limits,
+            expected_engine,
+            decoded_deadline,
+            transfer_cookie,
+            transfer_count,
+        ) = _decode_worker_bootstrap(bootstrap_payload)
+        if decoded_deadline != pipeline_deadline:
+            raise AuditInfrastructureError(
+                "worker startup deadline differs"
+            )
+        if os.name == "nt":
+            control.send(
+                WorkerContained(
+                    worker_index,
+                    generation,
+                    os.getpid(),
+                    f"windows:{os.getpid()}:{generation}",
+                ),
+                pipeline_deadline,
+            )
+        from gpu_capability_source_audit import _attest_loaded_audit_engine
+
+        engine = _attest_loaded_audit_engine(expected_engine)
+        _WORKER_PREATTESTED_ENGINE = engine
+        if os.name == "nt":
+            transferred_streams = ()
+        else:
+            transferred_streams = _receive_posix_capability_streams(
+                capability_transfer_receiver,
+                transfer_count,
+                transfer_cookie,
+                pipeline_deadline,
+                cancel_event,
+            )
+        for document in capability_documents:
+            owner_document = document.get("owner")
+            if not isinstance(owner_document, dict):
+                raise AuditInfrastructureError(
+                    "worker compiler capability transfer metadata is invalid"
+                )
+            offset = owner_document.get("transfer_offset")
+            count = owner_document.get("transfer_count")
+            handles = owner_document.get("transferred_handles")
+            if (
+                not isinstance(offset, int)
+                or isinstance(offset, bool)
+                or offset < 0
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count <= 0
+                or not isinstance(handles, list)
+                or any(
+                    not isinstance(handle, int) or isinstance(handle, bool)
+                    or handle <= 0
+                    for handle in handles
+                )
+            ):
+                raise AuditInfrastructureError(
+                    "worker compiler capability transfer metadata is invalid"
+                )
+            if os.name == "nt":
+                if len(handles) != count:
+                    raise AuditInfrastructureError(
+                        "worker compiler capability handle count differs"
+                    )
+                capability_streams = _windows_capability_streams(
+                    tuple(handles)
+                )
+            else:
+                if handles or offset + count > len(transferred_streams):
+                    raise AuditInfrastructureError(
+                        "worker compiler capability descriptor count differs"
+                    )
+                capability_streams = transferred_streams[offset:offset + count]
+            capability = _compiler_capability_from_bootstrap(
+                document,
+                authority,
+                pipeline_deadline,
+                cancel_event,
+                capability_streams,
+            )
+            if capability.capability_digest != document["digest"]:
+                raise AuditInfrastructureError(
+                    "worker compiler capability digest differs"
+                )
+            if document["digest"] in capabilities:
+                raise AuditInfrastructureError(
+                    "worker compiler capability bootstrap is duplicated"
+                )
+            capabilities[document["digest"]] = capability
+        control.send(
+            WorkerCapabilitiesAccepted(
+                worker_index,
+                generation,
+                tuple(sorted(capabilities)),
+            ),
+            pipeline_deadline,
+        )
+        _WORKER_INDEX = worker_index
+        _WORKER_GENERATION = generation
+        _WORKER_PRODUCTION = {
+            path: dependency.identity
+            for path, dependency in production_snapshot.items()
+            if dependency.stable_role == "production"
+        }
+        _WORKER_LIMITS = limits
+        _WORKER_CANCEL_EVENT = cancel_event
+        _WORKER_ENGINE = engine
+        _WORKER_CACHE = ConfigurationAuditCache(Path(cache_root))
+        _WORKER_RSS = _WorkerRssSampler()
+        _WORKER_CAPABILITIES = MappingProxyType(capabilities)
+        _WORKER_MAXIMUM_TASKS = maximum_tasks
+        _WORKER_RECYCLE_RSS_BYTES = recycle_rss_bytes
+        control.send(
+            WorkerEngineReady(
+                worker_index,
+                generation,
+                os.getpid(),
+                engine,
+                tuple(sorted(capabilities)),
+            ),
+            pipeline_deadline,
+        )
+        command = _GenerationWorkerCommandEndpoint(control, command_receiver)
+        completed = 0
+        while True:
+            payload = task_receiver.receive_bytes_before(
+                pipeline_deadline, cancel_event=cancel_event
+            )
+            try:
+                document = json.loads(payload.decode("ascii"))
+            except (UnicodeError, ValueError, json.JSONDecodeError):
+                document = None
+            if isinstance(document, dict) and document.get("tag") == "worker-stop":
+                stop = decode_control_message(payload)
+                if not isinstance(stop, WorkerStop) or (
+                    stop.worker_index != worker_index
+                    or stop.generation != generation
+                ):
+                    raise AuditInfrastructureError(
+                        "worker stop generation differs"
+                    )
+                control.send(
+                    WorkerStopped(worker_index, generation), pipeline_deadline
+                )
+                return
+            ordinal, task, transport_capability = decode_task_frame(
+                payload, authority, _WORKER_CAPABILITIES
+            )
+            del ordinal
+            current_task_id = task.task_id
+            outcome = audit_configuration_worker(
+                task,
+                authority,
+                production_snapshot,
+                control,
+                command,
+                pipeline_deadline,
+            )
+            receipt = outcome.transport.receipt
+            bounds = preparse_compact_result(
+                outcome.transport.payload,
+                expected_configuration_digest=task.configuration.digest,
+                expected_audit_engine_fingerprint=_WORKER_ENGINE,
+                limits=_WORKER_LIMITS,
+            )
+            layout = _transport_allocation_bound(
+                receipt.encoded_bytes,
+                bounds,
+                conservative_allocation_schema(),
+                _PIPE_KERNEL_CAPACITY_BYTES,
+            )
+            control.send(
+                WorkerPayloadReady(
+                    worker_index,
+                    generation,
+                    task.task_id,
+                    receipt.configuration_digest,
+                    receipt.audit_engine_fingerprint,
+                    receipt.pipe_nonce,
+                    receipt.serial,
+                    receipt.nonce,
+                    receipt.encoded_bytes,
+                    receipt.payload_sha256,
+                    receipt.charged_bytes,
+                    bounds.conservative_decoded_bytes,
+                    bounds.conservative_retained_bytes,
+                    layout.counting_pass_peak_bytes,
+                    receipt.stdout_bytes,
+                    receipt.stages,
+                ),
+                pipeline_deadline,
+            )
+            permit = decode_control_message(
+                command_receiver.receive_bytes_before(
+                    pipeline_deadline, cancel_event=cancel_event
+                )
+            )
+            if not isinstance(permit, WorkerPayloadPermit) or (
+                permit.worker_index != worker_index
+                or permit.generation != generation
+                or permit.task_id != task.task_id
+            ):
+                raise AuditInfrastructureError(
+                    "worker result payload permit differs"
+                )
+            payload_sender.send_transport_before(
+                outcome,
+                pipeline_deadline,
+                cancel_event=cancel_event,
+            )
+            completed += 1
+            current_task_id = None
+            resident = _WORKER_RSS.sample()
+            should_retire = completed >= _WORKER_MAXIMUM_TASKS or (
+                _WORKER_RECYCLE_RSS_BYTES > 0
+                and resident >= _WORKER_RECYCLE_RSS_BYTES
+            )
+            if should_retire:
+                reason = (
+                    "task-limit"
+                    if completed >= _WORKER_MAXIMUM_TASKS
+                    else "resident-memory"
+                )
+                control.send(
+                    WorkerRetire(worker_index, generation, reason),
+                    pipeline_deadline,
+                )
+                acknowledgement = decode_control_message(
+                    command_receiver.receive_bytes_before(
+                        pipeline_deadline, cancel_event=cancel_event
+                    )
+                )
+                if not isinstance(acknowledgement, WorkerRetireAck) or (
+                    acknowledgement.worker_index != worker_index
+                    or acknowledgement.generation != generation
+                ):
+                    raise AuditInfrastructureError(
+                        "worker retirement acknowledgement differs"
+                    )
+                return
+    except BaseException as error:
+        try:
+            diagnostic = _bounded_diagnostic(error)
+            event_sender.send_bytes_before(
+                encode_control_message(WorkerFailure(
+                    worker_index, generation, current_task_id, diagnostic
+                )),
+                pipeline_deadline,
+            )
+        except BaseException:
+            pass
+        try:
+            cancel_event.set()
+        except BaseException:
+            pass
+    finally:
+        for capability in capabilities.values():
+            try:
+                capability.native_owner.close()
+            except BaseException:
+                pass
+        _WORKER_CAPABILITIES = None
+        _WORKER_PREATTESTED_ENGINE = None
+        for endpoint in (
+            startup_receiver, task_receiver, command_receiver, event_sender
+        ):
+            endpoint.close()
+        try:
+            payload_sender.close()
+        except BaseException:
+            pass
+        if capability_transfer_receiver is not None:
+            try:
+                capability_transfer_receiver.close()
+            except BaseException:
+                pass
+        tempfile.tempdir = parent_temporary_root
+
+
+class OrdinalDispatchWindow:
+    """Bounded in-flight ordinal window anchored at the first result gap."""
+
+    def __init__(self, task_count: int, worker_count: int) -> None:
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in (task_count, worker_count)
+        ):
+            raise AuditInfrastructureError("ordinal dispatch window is invalid")
+        self.task_count = task_count
+        self.worker_count = worker_count
+        self.next_unaggregated = 0
+        self._accepted: set[int] = set()
+        self._dispatched: set[int] = set()
+
+    def dispatchable_ordinals(self) -> tuple[int, ...]:
+        upper = min(
+            self.task_count,
+            self.next_unaggregated + self.worker_count,
+        )
+        values = tuple(
+            ordinal for ordinal in range(self.next_unaggregated, upper)
+            if ordinal not in self._accepted and ordinal not in self._dispatched
+        )
+        self._dispatched.update(values)
+        return values
+
+    def accept(self, ordinal: int) -> None:
+        if (
+            not isinstance(ordinal, int)
+            or isinstance(ordinal, bool)
+            or ordinal < self.next_unaggregated
+            or ordinal >= self.task_count
+            or ordinal not in self._dispatched
+            or ordinal in self._accepted
+        ):
+            raise AuditInfrastructureError("accepted worker ordinal is invalid")
+        self._accepted.add(ordinal)
+        while self.next_unaggregated in self._accepted:
+            self.next_unaggregated += 1
+
+
+class _GenerationState:
+    __slots__ = (
+        "worker_index", "generation", "process", "tree", "identity",
+        "startup_sender", "task_sender", "command_sender", "event_receiver",
+        "payload_receiver", "contained", "ready", "pending", "launch_events",
+        "tasks_completed", "expects_retire", "maximum_resident_bytes",
+        "active_descendants", "capabilities_accepted",
+        "scratch_root", "native_carrier",
+    )
+
+    def __init__(
+        self, worker_index, generation, process, tree, identity,
+        startup_sender, task_sender, command_sender, event_receiver,
+        payload_receiver, scratch_root, native_carrier=None,
+    ) -> None:
+        self.worker_index = worker_index
+        self.generation = generation
+        self.process = process
+        self.tree = tree
+        self.identity = identity
+        self.startup_sender = startup_sender
+        self.task_sender = task_sender
+        self.command_sender = command_sender
+        self.event_receiver = event_receiver
+        self.payload_receiver = payload_receiver
+        self.contained = False
+        self.ready = False
+        self.capabilities_accepted = False
+        self.pending = None
+        self.launch_events = []
+        self.tasks_completed = 0
+        self.expects_retire = False
+        self.maximum_resident_bytes = 0
+        self.active_descendants = {}
+        self.scratch_root = scratch_root
+        self.native_carrier = native_carrier
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingCoordinatorTask:
+    ordinal: int
+    configuration: PreprocessConfiguration
+    task_id: str
+    reservation: PerTaskCompactReservation
+    capability: CompactResultTransportCapability
+    queued_ownership: CompactResultOwnership
+
+
+def _validate_worker_payload_ready_receipt(
+    event: WorkerPayloadReady,
+    pending: _PendingCoordinatorTask,
+) -> None:
+    """Authenticate the complete ready receipt before publication handoff."""
+
+    if (
+        not isinstance(event, WorkerPayloadReady)
+        or not isinstance(pending, _PendingCoordinatorTask)
+    ):
+        raise AuditInfrastructureError(
+            "worker result payload receipt is invalid"
+        )
+    capability = pending.capability
+    reservation = pending.reservation
+    if (
+        event.task_id != pending.task_id
+        or event.generation != reservation.generation
+        or event.configuration_digest != pending.configuration.digest
+        or event.configuration_digest != capability.configuration_digest
+        or event.audit_engine_fingerprint
+        != capability.audit_engine_fingerprint
+        or event.worker_index != capability.worker_slot
+        or event.pipe_nonce != capability.pipe_nonce
+        or event.serial != capability.serial
+        or not hmac.compare_digest(event.nonce, capability.nonce)
+        or event.charged_bytes > capability.maximum_bytes
+    ):
+        raise AuditInfrastructureError(
+            "worker result payload receipt capability differs"
+        )
+    declared = CompactResultPreparseBounds(
+        event.encoded_bytes,
+        event.conservative_decoded_bytes,
+        event.conservative_retained_bytes,
+    )
+    layout = _transport_allocation_bound(
+        event.encoded_bytes,
+        declared,
+        conservative_allocation_schema(),
+        _PIPE_KERNEL_CAPACITY_BYTES,
+    )
+    if layout.counting_pass_peak_bytes != event.counting_pass_peak_bytes:
+        raise AuditInfrastructureError(
+            "worker result payload counting declaration differs"
+        )
+
+
+def _decode_authenticated_worker_payload(
+    event: WorkerPayloadReady,
+    pending: _PendingCoordinatorTask,
+    worker_outcome: ConfigurationAuditTransportOutcome,
+    aggregator: StreamingResultAggregator,
+) -> tuple[ConfigurationAuditOutcomeOwner, CompactResultOwnership, int]:
+    """Authenticate declarations and acquire shared decode ownership first."""
+    if (
+        not isinstance(event, WorkerPayloadReady)
+        or not isinstance(pending, _PendingCoordinatorTask)
+        or not isinstance(worker_outcome, ConfigurationAuditTransportOutcome)
+        or not isinstance(aggregator, StreamingResultAggregator)
+    ):
+        raise AuditInfrastructureError("worker result payload is invalid")
+    receipt = worker_outcome.transport.receipt
+    if (
+        receipt.task_id != event.task_id
+        or receipt.generation != event.generation
+        or receipt.worker_slot != event.worker_index
+        or receipt.configuration_digest != event.configuration_digest
+        or receipt.audit_engine_fingerprint
+        != event.audit_engine_fingerprint
+        or receipt.pipe_nonce != event.pipe_nonce
+        or receipt.serial != event.serial
+        or not hmac.compare_digest(receipt.nonce, event.nonce)
+        or receipt.encoded_bytes != event.encoded_bytes
+        or receipt.payload_sha256 != event.encoded_sha256
+        or receipt.charged_bytes != event.charged_bytes
+        or receipt.stdout_bytes != event.stdout_bytes
+        or receipt.stages != event.stages
+    ):
+        raise AuditInfrastructureError(
+            "worker result payload declaration differs"
+        )
+    bounds = preparse_compact_result(
+        worker_outcome.transport.payload,
+        expected_configuration_digest=pending.configuration.digest,
+        expected_audit_engine_fingerprint=receipt.audit_engine_fingerprint,
+        limits=aggregator._limits,
+    )
+    declared = CompactResultPreparseBounds(
+        event.encoded_bytes,
+        event.conservative_decoded_bytes,
+        event.conservative_retained_bytes,
+    )
+    if bounds != declared:
+        raise AuditInfrastructureError(
+            "worker result payload allocation declaration differs"
+        )
+    layout = _transport_allocation_bound(
+        event.encoded_bytes,
+        bounds,
+        conservative_allocation_schema(),
+        _PIPE_KERNEL_CAPACITY_BYTES,
+    )
+    if layout.counting_pass_peak_bytes != event.counting_pass_peak_bytes:
+        raise AuditInfrastructureError(
+            "worker result payload counting declaration differs"
+        )
+
+    cold_slot_bytes = aggregator.cold_slot_reserved_bytes
+    cold_ownership = aggregator.take_cold_slot(
+        f"task:{event.task_id}:decode-capacity"
+    )
+    decode_ownership: CompactResultOwnership | None = None
+    owner: ConfigurationAuditOutcomeOwner | None = None
+    retained_ownership: CompactResultOwnership | None = None
+    try:
+        decode_ownership = _transition_worker_payload_to_decode(
+            cold_ownership, bounds, layout
+        )
+        if not pending.queued_ownership.released:
+            pending.queued_ownership.release()
+        owner = receive_configuration_audit_outcome(
+            pending.reservation, pending.capability, worker_outcome
+        )
+        retained_bytes = compact_result_retained_bytes(owner.outcome.result)
+        retained_ownership = decode_ownership.replace_committed(
+            retained_bytes,
+            label=f"task:{event.task_id}:retained-result",
+            semantic_event="retain-result",
+        )
+        decode_ownership = None
+        return owner, retained_ownership, cold_slot_bytes
+    except BaseException:
+        if owner is not None and owner.active:
+            owner.close()
+        for ownership in (
+            retained_ownership, decode_ownership, cold_ownership
+        ):
+            if ownership is not None and not ownership.released:
+                ownership.release()
+        raise
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedForestSample:
+    platform_kind: str
+    maximum_observed_resident_bytes: int
+    accounting_complete: bool
+    surviving_processes: tuple[int, ...]
+
+
+def _combine_owned_generation_memory(
+    parent_resident_bytes: int,
+    live_slot_resident_bytes: Mapping[int, int],
+    archived_generations: tuple[tuple[int, int, int], ...] | list[tuple[int, int, int]],
+) -> int:
+    if (
+        not isinstance(parent_resident_bytes, int)
+        or isinstance(parent_resident_bytes, bool)
+        or parent_resident_bytes < 0
+        or not isinstance(live_slot_resident_bytes, Mapping)
+    ):
+        raise AuditInfrastructureError("owned generation memory sample is invalid")
+    slot_maxima: dict[int, int] = {}
+    for worker_index, resident in live_slot_resident_bytes.items():
+        _bounded_wire_int(worker_index, "worker memory slot", (1 << 32) - 1)
+        if not isinstance(resident, int) or isinstance(resident, bool) or resident < 0:
+            raise AuditInfrastructureError("owned generation memory sample is invalid")
+        slot_maxima[worker_index] = resident
+    for worker_index, generation, resident in archived_generations:
+        _bounded_wire_int(worker_index, "worker memory slot", (1 << 32) - 1)
+        _bounded_wire_int(generation, "worker memory generation", (1 << 64) - 1)
+        if not isinstance(resident, int) or isinstance(resident, bool) or resident < 0:
+            raise AuditInfrastructureError("owned generation memory sample is invalid")
+        slot_maxima[worker_index] = max(
+            slot_maxima.get(worker_index, 0), resident
+        )
+    return parent_resident_bytes + sum(slot_maxima.values())
+
+
+def _native_descendant_processes(
+    root_pid: int,
+) -> tuple[tuple[int, str, int], ...]:
+    """Return complete live descendants with PID/start token/residency."""
+    _bounded_wire_int(root_pid, "worker root PID", (1 << 32) - 1)
+    from gpu_capability_process_tree import native_process_resident_bytes
+
+    parents: dict[int, int] = {}
+    start_tokens: dict[int, str] = {}
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessEntry32(ctypes.Structure):
+            _fields_ = (
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = (
+            wintypes.DWORD, wintypes.DWORD
+        )
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = (
+            wintypes.HANDLE, ctypes.POINTER(ProcessEntry32)
+        )
+        kernel32.Process32NextW.argtypes = (
+            wintypes.HANDLE, ctypes.POINTER(ProcessEntry32)
+        )
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        invalid = ctypes.c_void_p(-1).value
+        if snapshot == invalid:
+            raise AuditInfrastructureError(
+                "native process-tree enumeration failed"
+            )
+        try:
+            entry = ProcessEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while ok:
+                parents[int(entry.th32ProcessID)] = int(
+                    entry.th32ParentProcessID
+                )
+                ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+
+        def windows_start_token(pid: int) -> str:
+            handle = kernel32.OpenProcess(0x0400, False, pid)
+            if not handle:
+                raise AuditInfrastructureError(
+                    "native process start identity is unavailable"
+                )
+            try:
+                creation = wintypes.FILETIME()
+                exit_time = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                if not kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(kernel),
+                    ctypes.byref(user),
+                ):
+                    raise AuditInfrastructureError(
+                        "native process start identity is unavailable"
+                    )
+                value = (int(creation.dwHighDateTime) << 32) | int(
+                    creation.dwLowDateTime
+                )
+                return f"windows-filetime-{value}"
+            finally:
+                kernel32.CloseHandle(handle)
+
+        start_token = windows_start_token
+    elif sys.platform.startswith("linux"):
+        for stat_path in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                text = stat_path.read_text(encoding="ascii")
+                close = text.rfind(")")
+                fields = text[close + 2:].split()
+                pid = int(stat_path.parent.name)
+                parents[pid] = int(fields[1])
+                start_tokens[pid] = f"linux-start-{fields[19]}"
+            except (OSError, ValueError, IndexError):
+                continue
+
+        def start_token(pid: int) -> str:
+            token = start_tokens.get(pid)
+            if token is None:
+                raise AuditInfrastructureError(
+                    "native process start identity is unavailable"
+                )
+            return token
+    else:
+        return ()
+
+    descendants: set[int] = set()
+    frontier = {root_pid}
+    while frontier:
+        children = {
+            pid for pid, parent_pid in parents.items()
+            if parent_pid in frontier and pid not in descendants
+        }
+        descendants.update(children)
+        frontier = children
+    result = []
+    for pid in sorted(descendants):
+        try:
+            result.append((
+                pid, start_token(pid), native_process_resident_bytes(pid)
+            ))
+        except AuditInfrastructureError:
+            if parents.get(pid) is not None:
+                raise
+    return tuple(result)
+
+
+def _owned_process_identity(platform_kind: str, pid: int, token: str):
+    from gpu_capability_process_tree import OwnedProcessIdentity
+
+    return OwnedProcessIdentity(platform_kind, pid, token)
+
+
+def _worker_scratch_parent() -> Path:
+    if sys.platform.startswith("linux"):
+        shared_memory = Path("/dev/shm")
+        if shared_memory.is_dir() and os.access(shared_memory, os.W_OK):
+            return shared_memory
+    return Path(tempfile.gettempdir())
+
+
+class _LinuxGenerationLifecycle:
+    """Bind each spawned generation to a Task-6 rendezvous-owned cgroup leaf."""
+
+    def __init__(self, client, deadline: float) -> None:
+        if (
+            not all(callable(getattr(client, name, None)) for name in (
+                "create_leaf", "acknowledge_leaf", "release_leaf"
+            ))
+            or not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+        ):
+            raise AuditInfrastructureError("Linux generation lifecycle is invalid")
+        self.client = client
+        self.deadline = float(deadline)
+        self.live: dict[tuple[int, int], LinuxWorkerContainment] = {}
+        self.run_path: Path | None = None
+        self.service_root: Path | None = None
+        self.baseline_run_events: dict[str, int] | None = None
+        self.baseline_service_events: dict[str, int] | None = None
+
+    @staticmethod
+    def _read_events(path: Path) -> dict[str, int]:
+        try:
+            values = {
+                name: int(value)
+                for name, value in (
+                    line.split() for line in path.read_text(
+                        encoding="ascii"
+                    ).splitlines()
+                )
+            }
+        except (OSError, ValueError) as error:
+            raise AuditInfrastructureError(
+                "Linux cgroup events are unavailable"
+            ) from error
+        if not {"oom", "oom_kill", "max"}.issubset(values):
+            raise AuditInfrastructureError("Linux cgroup events are incomplete")
+        return values
+
+    @staticmethod
+    def _read_integer(path: Path) -> int:
+        try:
+            value = int(path.read_text(encoding="ascii").strip())
+        except (OSError, ValueError) as error:
+            raise AuditInfrastructureError(
+                f"Linux cgroup {path.name} is unavailable"
+            ) from error
+        if value < 0:
+            raise AuditInfrastructureError(
+                f"Linux cgroup {path.name} is invalid"
+            )
+        return value
+
+    def create_generation(self, worker_index: int,
+                          generation: int) -> LinuxWorkerContainment:
+        key = (worker_index, generation)
+        if key in self.live:
+            raise AuditInfrastructureError("Linux generation leaf is duplicated")
+        carrier = self.client.create_leaf(
+            worker_index, generation, self.deadline
+        )
+        if not isinstance(carrier, LinuxWorkerContainment):
+            raise AuditInfrastructureError("Linux generation leaf carrier is invalid")
+        run_path = Path(carrier.cgroup_run_path)
+        if self.run_path is None:
+            self.run_path = run_path
+            self.service_root = run_path.parent
+            if run_path.exists():
+                self.baseline_run_events = self._read_events(
+                    run_path / "memory.events"
+                )
+                self.baseline_service_events = self._read_events(
+                    self.service_root / "memory.events"
+                )
+            elif sys.platform.startswith("linux"):
+                raise AuditInfrastructureError(
+                    "Linux generation run cgroup is unavailable"
+                )
+        elif self.run_path != run_path:
+            raise AuditInfrastructureError("Linux generation run cgroup differs")
+        self.live[key] = carrier
+        return carrier
+
+    def accept_worker_contained(self, event: WorkerContained,
+                                carrier: LinuxWorkerContainment) -> None:
+        key = (event.worker_index, event.generation)
+        if self.live.get(key) is not carrier:
+            raise AuditInfrastructureError("Linux worker containment carrier differs")
+        self.client.acknowledge_leaf(
+            event.worker_index,
+            event.generation,
+            event.worker_pid,
+            carrier,
+            self.deadline,
+        )
+
+    @staticmethod
+    def _force_empty(carrier: LinuxWorkerContainment, deadline: float) -> None:
+        leaf = Path(carrier.cgroup_leaf_path)
+        try:
+            (leaf / "cgroup.kill").write_text("1", encoding="ascii")
+        except OSError as error:
+            raise AuditInfrastructureError(
+                "Linux generation cgroup kill failed"
+            ) from error
+        while time.monotonic() < deadline:
+            try:
+                members = (leaf / "cgroup.procs").read_text(
+                    encoding="ascii"
+                ).split()
+            except OSError as error:
+                raise AuditInfrastructureError(
+                    "Linux generation cgroup membership is unavailable"
+                ) from error
+            if not members:
+                return
+            time.sleep(0.01)
+        raise AuditInfrastructureError("Linux generation cgroup cleanup timed out")
+
+    def release_generation(self, worker_index: int, generation: int,
+                           carrier: LinuxWorkerContainment, deadline: float,
+                           *, force: bool) -> None:
+        key = (worker_index, generation)
+        if self.live.get(key) is not carrier:
+            raise AuditInfrastructureError("Linux generation leaf differs")
+        if force:
+            self._force_empty(carrier, deadline)
+        self.client.release_leaf(worker_index, generation, deadline)
+        del self.live[key]
+
+    def memory_measurements(self, *, require_empty: bool) -> LinuxRunMemoryMeasurements:
+        if (
+            self.run_path is None
+            or self.service_root is None
+            or self.baseline_run_events is None
+            or self.baseline_service_events is None
+        ):
+            raise AuditInfrastructureError("Linux cgroup accounting is unavailable")
+        run_events = self._read_events(self.run_path / "memory.events")
+        service_events = self._read_events(
+            self.service_root / "memory.events"
+        )
+
+        def delta(current, baseline, name):
+            value = current[name] - baseline[name]
+            if value < 0:
+                raise AuditInfrastructureError("Linux cgroup event counter regressed")
+            return value
+
+        survivors = 0
+        for carrier in self.live.values():
+            try:
+                survivors += len((
+                    Path(carrier.cgroup_leaf_path) / "cgroup.procs"
+                ).read_text(encoding="ascii").split())
+            except OSError as error:
+                raise AuditInfrastructureError(
+                    "Linux generation cgroup membership is unavailable"
+                ) from error
+        values = LinuxRunMemoryMeasurements(
+            self._read_integer(self.run_path / "memory.current"),
+            self._read_integer(self.run_path / "memory.peak"),
+            self._read_integer(self.run_path / "memory.max"),
+            self._read_integer(self.run_path / "memory.high"),
+            delta(run_events, self.baseline_run_events, "oom"),
+            delta(run_events, self.baseline_run_events, "oom_kill"),
+            delta(run_events, self.baseline_run_events, "max"),
+            delta(service_events, self.baseline_service_events, "oom"),
+            delta(service_events, self.baseline_service_events, "oom_kill"),
+            delta(service_events, self.baseline_service_events, "max"),
+            survivors,
+            True,
+        )
+        if any((
+            values.cgroup_oom_count_delta,
+            values.cgroup_oom_kill_count_delta,
+            values.cgroup_max_event_count_delta,
+            values.service_root_oom_count_delta,
+            values.service_root_oom_kill_count_delta,
+            values.service_root_max_event_count_delta,
+        )):
+            raise AuditInfrastructureError("Linux cgroup memory event increased")
+        if require_empty and survivors:
+            raise AuditInfrastructureError("Linux cgroup survivors remain")
+        return values
+
+    def seal_task_phase(self, archived_generation_count: int) -> LinuxPhaseSnapshot:
+        if self.live:
+            raise AuditInfrastructureError("Linux generation leaves remain")
+        return LinuxPhaseSnapshot(
+            "linux",
+            "tasks",
+            self.memory_measurements(require_empty=True),
+            archived_generation_count,
+        )
+
+
+class _MacOSGenerationLifecycle:
+    """Own Task-6 registered worker/compiler PGIDs through reconciliation."""
+
+    def __init__(
+        self,
+        accountant,
+        configurations: tuple[PreprocessConfiguration, ...],
+        deadline: float,
+        *,
+        provider=None,
+        permit_authority=None,
+    ) -> None:
+        if (
+            not callable(getattr(accountant, "register_group", None))
+            or not callable(getattr(accountant, "reconcile_group", None))
+            or not callable(getattr(accountant, "memory_measurements", None))
+            or not isinstance(configurations, tuple)
+            or not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+        ):
+            raise AuditInfrastructureError("macOS generation lifecycle is invalid")
+        if provider is None or permit_authority is None:
+            from gpu_capability_process_tree import (
+                MacOSExecPermitAuthority,
+                MacOSLibprocProvider,
+            )
+
+            provider = MacOSLibprocProvider()
+            by_identity = {
+                (
+                    configuration.compiler_capability.executable_identity,
+                    configuration.compiler_capability.executable_sha256,
+                ): configuration.compiler_capability_digest
+                for configuration in configurations
+            }
+
+            def verify_executable(identity, digest):
+                fingerprint = by_identity.get((identity, digest))
+                if fingerprint is None:
+                    raise AuditInfrastructureError(
+                        "unregistered or untrusted macOS compiler exec"
+                    )
+                return fingerprint
+
+            permit_authority = MacOSExecPermitAuthority(
+                accountant,
+                tuple(sorted(set(by_identity.values()))),
+                executable_verifier=verify_executable,
+            )
+        self.accountant = accountant
+        self.provider = provider
+        self.permit_authority = permit_authority
+        self.deadline = float(deadline)
+        self.worker_groups: dict[tuple[int, int], int] = {}
+        self.compiler_groups: dict[tuple[int, int, int], list[int]] = {}
+
+    def accept_worker_session(self, report: MacOSWorkerSessionReported) -> None:
+        key = (report.worker_index, report.generation)
+        if key in self.worker_groups:
+            raise AuditInfrastructureError("macOS worker PGID is duplicated")
+        identity, _resident, _parent = self.provider._identity_and_residency(
+            report.pid, report.pgid
+        )
+        expected = _owned_process_identity(
+            "macos", report.pid, report.bsd_start_identity
+        )
+        if identity != expected:
+            raise AuditInfrastructureError("macOS worker session identity differs")
+        self.accountant.register_group(
+            report.pgid, identity,
+            f"worker:{report.worker_index}:{report.generation}",
+        )
+        self.worker_groups[key] = report.pgid
+
+    def permit_compiler(self, report: CompilerPgidReported) -> CompilerExecPermit:
+        permit = self.permit_authority.permit_compiler(report)
+        key = (report.worker_index, report.generation, report.task_id)
+        groups = self.compiler_groups.setdefault(key, [])
+        if report.pgid in groups:
+            raise AuditInfrastructureError("macOS compiler PGID is duplicated")
+        groups.append(report.pgid)
+        return permit
+
+    def reconcile_task(self, worker_index: int, generation: int,
+                       task_id: int) -> None:
+        key = (worker_index, generation, task_id)
+        for pgid in self.compiler_groups.pop(key, []):
+            self.accountant.reconcile_group(pgid, self.provider)
+
+    def observe(self) -> None:
+        self.provider.observe(self.accountant, _current_process_rss_bytes())
+
+    def _kill_and_wait_empty(self, pgid: int, deadline: float) -> None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        reconcile_survivors = getattr(self.provider, "reconcile_survivors", None)
+        if not callable(reconcile_survivors):
+            return
+        while time.monotonic() < deadline:
+            if not reconcile_survivors(self.accountant, pgid):
+                return
+            time.sleep(0.01)
+        raise AuditInfrastructureError("macOS PGID cleanup timed out")
+
+    def release_generation(self, worker_index: int, generation: int,
+                           _carrier, deadline: float, *, force: bool) -> None:
+        remaining = [key for key in self.compiler_groups
+                     if key[:2] == (worker_index, generation)]
+        for key in remaining:
+            if force:
+                for pgid in self.compiler_groups[key]:
+                    self._kill_and_wait_empty(pgid, deadline)
+            self.reconcile_task(*key)
+        pgid = self.worker_groups.pop((worker_index, generation), None)
+        if pgid is None:
+            raise AuditInfrastructureError("macOS worker PGID is unavailable")
+        if force:
+            self._kill_and_wait_empty(pgid, deadline)
+        if time.monotonic() >= deadline:
+            raise AuditInfrastructureError("macOS PGID reconciliation deadline exceeded")
+        self.accountant.reconcile_group(pgid, self.provider)
+
+    def seal_task_phase(self, archived_generation_count: int) -> MacOSPhaseSnapshot:
+        if self.worker_groups or self.compiler_groups:
+            raise AuditInfrastructureError("macOS registered PGID survivors remain")
+        self.observe()
+        return MacOSPhaseSnapshot(
+            "macos",
+            "tasks",
+            self.accountant.memory_measurements(),
+            archived_generation_count,
+        )
+
+
+class GenerationReactor:
+    """Single parent reader for every live generation's bounded outputs."""
+
+    def __init__(
+        self,
+        *,
+        configurations: tuple[PreprocessConfiguration, ...],
+        dependency_roots: DependencyRootAuthority,
+        production_snapshot,
+        cache_root: Path,
+        limits: AuditLimits,
+        engine: str,
+        runtime_contract: WorkerRuntimeContract,
+        run_accountant,
+        capability_registry,
+        result_budget: CompactResultMemoryBudget,
+        worker_count: int,
+    ) -> None:
+        self.configurations = configurations
+        self.dependency_roots = dependency_roots
+        self.production_snapshot = production_snapshot
+        self.cache_root = cache_root
+        self.limits = limits
+        self.engine = engine
+        self.runtime_contract = runtime_contract
+        self.run_accountant = run_accountant
+        self.capability_registry = capability_registry
+        self.result_budget = result_budget
+        self.compact_accounting_observer = result_budget.observer
+        maximum_encoded = _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+        maximum_bounds = CompactResultPreparseBounds(
+            maximum_encoded,
+            conservative_allocation_schema().json_decoded_fixed_bytes
+            + conservative_allocation_schema().json_decoded_multiplier
+            * maximum_encoded,
+            limits.compact_result_bytes,
+        )
+        self.maximum_queued_counting_bytes = _transport_allocation_bound(
+            maximum_encoded,
+            maximum_bounds,
+            conservative_allocation_schema(),
+            _PIPE_KERNEL_CAPACITY_BYTES,
+        ).counting_pass_peak_bytes
+        self.context = multiprocessing.get_context("spawn")
+        self.cancel_event = self.context.Event()
+        self.states: list[_GenerationState | None] = [None] * worker_count
+        self.next_generations = [0] * worker_count
+        self.publication_requests: collections.deque[
+            tuple[int, int, str]
+        ] = collections.deque()
+        self.active_publication: tuple[int, int, str] | None = None
+        self.archived_generation_telemetry: list[tuple[int, int, int]] = []
+        self.archived_scratch_roots: list[Path] = []
+        self.audit_launch_count = 0
+        self.worker_pids: list[int] = []
+        self.registry_generation_duplicates: dict[
+            tuple[int, int], tuple[tuple[str, object], ...]
+        ] = {}
+        self.deferred_events: collections.deque[
+            tuple[_GenerationState, object]
+        ] = collections.deque()
+        self.task_phase_snapshot = None
+        self._accounting_stop = threading.Event()
+        self._accounting_lock = threading.Lock()
+        self._accounting_error: BaseException | None = None
+        self._accounting_thread = None
+        self._closed = False
+        self.native_lifecycle = None
+        if sys.platform.startswith("linux"):
+            client = getattr(run_accountant, "rendezvous_client", run_accountant)
+            hello = getattr(client, "hello", None)
+            if not callable(hello):
+                raise AuditInfrastructureError(
+                    "Linux cgroup rendezvous accountant is unavailable"
+                )
+            hello(runtime_contract.pipeline_deadline)
+            self.native_lifecycle = _LinuxGenerationLifecycle(
+                client, runtime_contract.pipeline_deadline
+            )
+        elif sys.platform == "darwin":
+            self.native_lifecycle = _MacOSGenerationLifecycle(
+                run_accountant, configurations, runtime_contract.pipeline_deadline
+            )
+        try:
+            if os.name == "nt" and callable(
+                getattr(self.run_accountant, "observe", None)
+            ):
+                self._accounting_thread = threading.Thread(
+                    target=self._pump_windows_accounting,
+                    name="gpu-audit-job-accounting",
+                    daemon=True,
+                )
+                self._accounting_thread.start()
+            for worker_index in range(worker_count):
+                self.spawn_next_generation(worker_index)
+            self._wait_all_ready()
+        except BaseException as error:
+            try:
+                self.abort_and_reap(time.monotonic() + _FAILURE_REAP_SECONDS)
+            except BaseException as cleanup_error:
+                error.add_note(
+                    f"worker startup cleanup also failed: {cleanup_error}"
+                )
+            raise
+
+    def _pump_windows_accounting(self) -> None:
+        observe = self.run_accountant.observe
+        while not self._accounting_stop.is_set():
+            try:
+                with self._accounting_lock:
+                    observe(_current_process_rss_bytes())
+            except BaseException as error:
+                self._accounting_error = error
+                self.cancel_event.set()
+                return
+            self._accounting_stop.wait(0.001)
+
+    def _stop_accounting_pump(self) -> None:
+        self._accounting_stop.set()
+        thread = self._accounting_thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+            if thread.is_alive():
+                raise AuditInfrastructureError(
+                    "Windows Job accounting pump did not stop"
+                )
+        if self._accounting_error is not None:
+            raise AuditInfrastructureError(
+                "Windows Job accounting pump failed"
+            ) from self._accounting_error
+
+    @property
+    def live_generation_count(self) -> int:
+        return sum(state is not None for state in self.states)
+
+    @property
+    def has_pending_tasks(self) -> bool:
+        return any(
+            state is not None and state.pending is not None
+            for state in self.states
+        )
+
+    @property
+    def has_expected_retirement(self) -> bool:
+        return any(
+            state is not None and state.expects_retire
+            for state in self.states
+        )
+
+    def idle_states(self) -> tuple[_GenerationState, ...]:
+        return tuple(
+            state for state in self.states
+            if state is not None and state.ready and state.pending is None
+            and not state.expects_retire
+        )
+
+    def spawn_next_generation(self, worker_index: int) -> _GenerationState:
+        if self.states[worker_index] is not None:
+            raise AuditInfrastructureError(
+                "replacement generation slot is not empty"
+            )
+        if time.monotonic() >= self.runtime_contract.pipeline_deadline:
+            raise AuditInfrastructureError(
+                "pipeline deadline exceeded before replacement generation"
+            )
+        generation = self.next_generations[worker_index]
+        self.next_generations[worker_index] += 1
+        setup_cleanups: list[tuple[str, object]] = []
+
+        def own_pair(pair, label):
+            first, second = pair
+            setup_cleanups.append((label, first.close))
+            setup_cleanups.append((label, second.close))
+            return first, second
+
+        def remove_setup_scratch(path):
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                pass
+
+        native_carrier = None
+        try:
+            startup_receiver, startup_sender = own_pair(
+                BoundedFrameChannel.create(TASK_MAX_BYTES),
+                "startup channel setup cleanup",
+            )
+            task_receiver, task_sender = own_pair(
+                BoundedFrameChannel.create(TASK_MAX_BYTES),
+                "task channel setup cleanup",
+            )
+            command_receiver, command_sender = own_pair(
+                BoundedFrameChannel.create(COMMAND_MAX_BYTES),
+                "command channel setup cleanup",
+            )
+            event_receiver, event_sender = own_pair(
+                BoundedFrameChannel.create(CONTROL_MAX_BYTES),
+                "event channel setup cleanup",
+            )
+            payload_receiver, payload_sender = own_pair(
+                BoundedPayloadChannel.create(),
+                "payload channel setup cleanup",
+            )
+            scratch_root = Path(tempfile.mkdtemp(
+                prefix=f".gpu-capability-worker-{worker_index}-{generation}-",
+                dir=_worker_scratch_parent(),
+            ))
+            setup_cleanups.append((
+                "worker scratch setup cleanup",
+                lambda path=scratch_root: remove_setup_scratch(path),
+            ))
+            scratch_root = scratch_root.resolve()
+            capability_transfer_parent = None
+            capability_transfer_child = None
+            if os.name != "nt":
+                capability_transfer_parent, capability_transfer_child = own_pair(
+                    socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET),
+                    "capability socket setup cleanup",
+                )
+            platform_kind = (
+                "windows" if os.name == "nt"
+                else ("macos" if sys.platform == "darwin" else "linux")
+            )
+            from gpu_capability_process_tree import OwnedProcessIdentity, OwnedProcessTree
+
+            tree = OwnedProcessTree(
+                platform_kind, f"audit-worker-{worker_index}-{generation}"
+            )
+            native_carrier = (
+                self.native_lifecycle.create_generation(worker_index, generation)
+                if isinstance(self.native_lifecycle, _LinuxGenerationLifecycle)
+                else None
+            )
+            if native_carrier is not None:
+                setup_cleanups.append((
+                    "native generation setup cleanup",
+                    lambda carrier=native_carrier: self.native_lifecycle.release_generation(
+                        worker_index,
+                        generation,
+                        carrier,
+                        time.monotonic() + _FAILURE_REAP_SECONDS,
+                        force=True,
+                    ),
+                ))
+            process = self.context.Process(
+                target=_audit_worker_generation_main,
+                args=(
+                    worker_index,
+                    generation,
+                    startup_receiver,
+                    task_receiver,
+                    command_receiver,
+                    event_sender,
+                    payload_sender,
+                    capability_transfer_child,
+                    native_carrier,
+                    str(scratch_root),
+                    self.cancel_event,
+                    str(self.cache_root),
+                    self.runtime_contract.pipeline_deadline,
+                    self.runtime_contract.maximum_tasks_per_worker,
+                    self.runtime_contract.recycle_rss_bytes,
+                ),
+                name=f"gpu-audit-{worker_index}-{generation}",
+            )
+        except BaseException as setup_error:
+            for label, cleanup in reversed(setup_cleanups):
+                try:
+                    cleanup()
+                except BaseException as cleanup_error:
+                    setup_error.add_note(f"{label} also failed: {cleanup_error}")
+            raise setup_error
+        generation_job_created = False
+        generation_duplicates: list[
+            tuple[str, _GenerationCompilerCapabilityDuplicate]
+        ] = []
+        release_generation = None
+        state = None
+        try:
+            duplicate_for_generation = getattr(
+                self.capability_registry,
+                "duplicate_for_generation",
+                None,
+            )
+            transfer_duplicate = getattr(
+                self.capability_registry,
+                "transfer_duplicate_to_child",
+                None,
+            )
+            acknowledge_generation = getattr(
+                self.capability_registry,
+                "acknowledge_generation",
+                None,
+            )
+            release_generation = getattr(
+                self.capability_registry,
+                "release_generation",
+                None,
+            )
+            if not all(callable(value) for value in (
+                duplicate_for_generation,
+                transfer_duplicate,
+                acknowledge_generation,
+                release_generation,
+            )):
+                raise AuditInfrastructureError(
+                    "compiler capability registry lifecycle is invalid"
+                )
+            for digest in sorted({
+                configuration.compiler_capability_digest
+                for configuration in self.configurations
+            }):
+                duplicate = duplicate_for_generation(
+                    digest, worker_index, generation
+                )
+                if (
+                    not isinstance(
+                        duplicate, _GenerationCompilerCapabilityDuplicate
+                    )
+                    or duplicate.digest != digest
+                    or duplicate.worker_index != worker_index
+                    or duplicate.generation != generation
+                    or duplicate.closed
+                ):
+                    raise AuditInfrastructureError(
+                        "compiler capability generation duplicate differs"
+                    )
+                generation_duplicates.append((digest, duplicate))
+            create_generation_job = getattr(
+                self.run_accountant, "create_generation_job", None
+            )
+            if callable(create_generation_job):
+                with self._accounting_lock:
+                    create_generation_job(worker_index, generation)
+                generation_job_created = True
+            process.start()
+            if capability_transfer_child is not None:
+                capability_transfer_child.close()
+            if not isinstance(process.pid, int) or process.pid <= 0:
+                raise AuditInfrastructureError(
+                    "worker process identity is unavailable"
+                )
+            identity = OwnedProcessIdentity(
+                platform_kind,
+                process.pid,
+                f"spawn-{process.pid}-{generation}-{time.monotonic_ns()}",
+            )
+            tree.register(identity, None, "audit-worker")
+            assign_generation_process = getattr(
+                self.run_accountant, "assign_generation_process", None
+            )
+            if callable(assign_generation_process):
+                with self._accounting_lock:
+                    assign_generation_process(
+                        worker_index,
+                        generation,
+                        int(process.sentinel),
+                        process.pid,
+                        f"worker:{worker_index}:{generation}",
+                    )
+            state = _GenerationState(
+                worker_index,
+                generation,
+                process,
+                tree,
+                identity,
+                startup_sender,
+                task_sender,
+                command_sender,
+                event_receiver,
+                payload_receiver,
+                scratch_root,
+                native_carrier,
+            )
+            self.states[worker_index] = state
+            self.registry_generation_duplicates[(
+                worker_index, generation
+            )] = tuple(generation_duplicates)
+            self.worker_pids.append(process.pid)
+            startup_receiver.close()
+            task_receiver.close()
+            command_receiver.close()
+            event_sender.close()
+            payload_sender.close()
+            capability_sources: dict[str, CompilerExecutableCapability] = {}
+            for configuration in self.configurations:
+                existing = capability_sources.setdefault(
+                    configuration.compiler_capability_digest,
+                    configuration.compiler_capability,
+                )
+                if existing is not configuration.compiler_capability:
+                    raise AuditInfrastructureError(
+                        "compiler capability generation source differs"
+                    )
+            transfer_cookie = os.urandom(32).hex()
+            transferred_handles: dict[str, tuple[int, ...]] = {}
+            duplicate_sources = dict(generation_duplicates)
+            if os.name == "nt":
+                for digest, duplicate in duplicate_sources.items():
+                    transferred_handles[digest] = (
+                        _duplicate_windows_capability_streams(
+                            process,
+                            duplicate.streams,
+                        )
+                    )
+            bootstrap = _encode_worker_bootstrap(
+                self.configurations,
+                self.dependency_roots,
+                self.production_snapshot,
+                self.limits,
+                self.engine,
+                self.runtime_contract.pipeline_deadline,
+                transfer_cookie=transfer_cookie,
+                transferred_handles=transferred_handles,
+            )
+            try:
+                startup_sender.send_bytes_before(
+                    bootstrap,
+                    self.runtime_contract.pipeline_deadline,
+                    cancel_event=self.cancel_event,
+                )
+                if os.name != "nt":
+                    _send_posix_capability_streams(
+                        capability_transfer_parent,
+                        tuple(
+                            stream
+                            for digest in sorted(duplicate_sources)
+                            for stream in duplicate_sources[digest].streams
+                        ),
+                        transfer_cookie,
+                        self.runtime_contract.pipeline_deadline,
+                        self.cancel_event,
+                    )
+                for _digest, duplicate in generation_duplicates:
+                    transfer_duplicate(duplicate, process)
+            except BaseException as startup_error:
+                if event_receiver.poll(1.0):
+                    failure = decode_control_message(
+                        event_receiver.receive_bytes_before(
+                            time.monotonic() + 1.0
+                        )
+                    )
+                    if isinstance(failure, WorkerFailure):
+                        raise AuditInfrastructureError(
+                            failure.diagnostic
+                        ) from startup_error
+                raise
+            startup_sender.close()
+            if capability_transfer_parent is not None:
+                capability_transfer_parent.close()
+            return state
+        except BaseException as spawn_error:
+            def note_cleanup(label, action):
+                try:
+                    action()
+                except BaseException as cleanup_error:
+                    spawn_error.add_note(f"{label} also failed: {cleanup_error}")
+
+            note_cleanup("worker cancellation cleanup", self.cancel_event.set)
+            for endpoint in (
+                startup_receiver, startup_sender, task_receiver, task_sender,
+                command_receiver, command_sender, event_receiver, event_sender,
+            ):
+                note_cleanup("worker endpoint cleanup", endpoint.close)
+            for endpoint in (payload_receiver, payload_sender):
+                note_cleanup("worker payload endpoint cleanup", endpoint.close)
+            for endpoint in (
+                capability_transfer_parent, capability_transfer_child
+            ):
+                if endpoint is not None:
+                    note_cleanup(
+                        "compiler capability transfer endpoint cleanup",
+                        endpoint.close,
+                    )
+            alive = None
+            if process.pid is not None:
+                try:
+                    alive = process.is_alive()
+                except BaseException as cleanup_error:
+                    spawn_error.add_note(
+                        f"worker liveness cleanup also failed: {cleanup_error}"
+                    )
+            if alive is not False:
+                note_cleanup("worker termination cleanup", process.terminate)
+            if process.pid is not None:
+                note_cleanup(
+                    "worker join cleanup", lambda: process.join(timeout=1.0)
+                )
+                still_alive = None
+                try:
+                    still_alive = process.is_alive()
+                except BaseException as cleanup_error:
+                    spawn_error.add_note(
+                        "worker post-join liveness cleanup also failed: "
+                        f"{cleanup_error}"
+                    )
+                if still_alive is not False:
+                    note_cleanup("worker kill cleanup", process.kill)
+                    note_cleanup(
+                        "worker post-kill join cleanup",
+                        lambda: process.join(timeout=1.0),
+                    )
+            try:
+                shutil.rmtree(scratch_root)
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                spawn_error.add_note(
+                    f"worker scratch cleanup also failed: {cleanup_error}"
+                )
+            if generation_job_created:
+                archive_generation_job = getattr(
+                    self.run_accountant, "archive_generation_job", None
+                )
+                if callable(archive_generation_job):
+                    try:
+                        with self._accounting_lock:
+                            archive_generation_job(
+                                worker_index,
+                                generation,
+                                time.monotonic() + _FAILURE_REAP_SECONDS,
+                            )
+                    except BaseException as cleanup_error:
+                        spawn_error.add_note(
+                            "generation accounting cleanup also failed: "
+                            f"{cleanup_error}"
+                        )
+            if generation_duplicates and callable(release_generation):
+                try:
+                    release_generation(worker_index, generation)
+                except BaseException as cleanup_error:
+                    spawn_error.add_note(
+                        "compiler capability generation cleanup also failed: "
+                        f"{cleanup_error}"
+                    )
+            if native_carrier is not None and isinstance(
+                self.native_lifecycle, _LinuxGenerationLifecycle
+            ):
+                try:
+                    self.native_lifecycle.release_generation(
+                        worker_index,
+                        generation,
+                        native_carrier,
+                        time.monotonic() + _FAILURE_REAP_SECONDS,
+                        force=True,
+                    )
+                except BaseException as cleanup_error:
+                    spawn_error.add_note(
+                        f"Linux generation cleanup also failed: {cleanup_error}"
+                    )
+            if state is not None and self.states[worker_index] is state:
+                self.states[worker_index] = None
+            self.registry_generation_duplicates.pop(
+                (worker_index, generation), None
+            )
+            if process.pid in self.worker_pids:
+                self.worker_pids.remove(process.pid)
+            raise spawn_error
+
+    def _wait_all_ready(self) -> None:
+        while any(
+            state is not None and not state.ready for state in self.states
+        ):
+            state, event = self._next_event_raw()
+            if isinstance(event, WorkerContained):
+                if isinstance(self.native_lifecycle, _LinuxGenerationLifecycle):
+                    if not state.contained:
+                        raise AuditInfrastructureError(
+                            "Linux worker containment acknowledgement differs"
+                        )
+                else:
+                    if state.contained or event.worker_pid != state.process.pid:
+                        raise AuditInfrastructureError(
+                            "worker containment acknowledgement differs"
+                        )
+                    state.contained = True
+            elif isinstance(event, MacOSWorkerSessionReported):
+                if (
+                    not isinstance(
+                        self.native_lifecycle, _MacOSGenerationLifecycle
+                    )
+                    or not state.contained
+                    or event.pid != state.process.pid
+                    or event.pgid != state.process.pid
+                ):
+                    raise AuditInfrastructureError(
+                        "macOS worker session acknowledgement differs"
+                    )
+            elif isinstance(event, WorkerCapabilitiesAccepted):
+                expected_digests = tuple(sorted({
+                    configuration.compiler_capability_digest
+                    for configuration in self.configurations
+                }))
+                if (
+                    not state.contained
+                    or state.capabilities_accepted
+                    or state.ready
+                    or event.capability_digests != expected_digests
+                ):
+                    raise AuditInfrastructureError(
+                        "worker compiler capability acceptance differs"
+                    )
+                acknowledge_generation = getattr(
+                    self.capability_registry,
+                    "acknowledge_generation",
+                    None,
+                )
+                if not callable(acknowledge_generation):
+                    raise AuditInfrastructureError(
+                        "compiler capability registry acknowledgement is invalid"
+                    )
+                acknowledge_generation(
+                    state.worker_index,
+                    state.generation,
+                    event.capability_digests,
+                )
+                self.registry_generation_duplicates.pop(
+                    (state.worker_index, state.generation), None
+                )
+                state.capabilities_accepted = True
+            elif isinstance(event, WorkerEngineReady):
+                expected_digests = tuple(sorted({
+                    configuration.compiler_capability_digest
+                    for configuration in self.configurations
+                }))
+                if (
+                    not state.contained
+                    or not state.capabilities_accepted
+                    or state.ready
+                    or event.worker_pid != state.process.pid
+                    or event.audit_engine_fingerprint != self.engine
+                    or event.capability_digests != expected_digests
+                ):
+                    raise AuditInfrastructureError(
+                        "worker audit engine fingerprint readiness differs"
+                    )
+                state.ready = True
+            elif isinstance(event, WorkerFailure):
+                raise AuditInfrastructureError(event.diagnostic)
+            elif state.ready:
+                self.deferred_events.append((state, event))
+            else:
+                raise AuditInfrastructureError(
+                    "worker emitted task event before readiness"
+                )
+
+    def _sample_owned_forest(self) -> _OwnedForestSample:
+        from gpu_capability_process_tree import (
+            OwnedProcessIdentity, native_process_resident_bytes,
+        )
+
+        parent_resident = _current_process_rss_bytes()
+        if isinstance(self.native_lifecycle, _LinuxGenerationLifecycle):
+            memory = self.native_lifecycle.memory_measurements(
+                require_empty=False
+            )
+            return _OwnedForestSample(
+                "linux",
+                memory.cgroup_peak_accounted_memory_bytes,
+                memory.accounting_complete,
+                tuple(
+                    state.process.pid for state in self.states
+                    if state is not None and state.process.is_alive()
+                ),
+            )
+        if isinstance(self.native_lifecycle, _MacOSGenerationLifecycle):
+            self.native_lifecycle.observe()
+            memory = self.native_lifecycle.accountant.memory_measurements()
+            return _OwnedForestSample(
+                "macos",
+                memory.maximum_observed_aggregate_resident_bytes,
+                memory.known_unreconciled_descendant_count == 0,
+                tuple(
+                    state.process.pid for state in self.states
+                    if state is not None and state.process.is_alive()
+                ),
+            )
+        observe_run = getattr(self.run_accountant, "observe", None)
+        authoritative_windows_resident = None
+        if callable(observe_run) and os.name == "nt":
+            if self._accounting_error is not None:
+                raise AuditInfrastructureError(
+                    "Windows Job accounting pump failed"
+                ) from self._accounting_error
+            authoritative_windows_resident = getattr(
+                self.run_accountant,
+                "_simultaneous_peak",
+                None,
+            )
+        surviving = []
+        live_slot_resident: dict[int, int] = {}
+        accounting_complete = True
+        platform_kind = (
+            "windows" if os.name == "nt"
+            else ("macos" if sys.platform == "darwin" else "linux")
+        )
+        for state in self.states:
+            if state is None or not state.process.is_alive():
+                continue
+            surviving.append(state.process.pid)
+            try:
+                resident = native_process_resident_bytes(state.process.pid)
+                state.tree.observe_resident_bytes(
+                    state.identity,
+                    current_bytes=resident,
+                    peak_bytes=max(resident, state.maximum_resident_bytes),
+                )
+                descendants = _native_descendant_processes(state.process.pid)
+                observed_pids = {pid for pid, _token, _resident in descendants}
+                for pid, token, descendant_resident in descendants:
+                    identity = state.active_descendants.get(pid)
+                    if identity is None:
+                        identity = OwnedProcessIdentity(
+                            platform_kind, pid, token
+                        )
+                        state.tree.register(
+                            identity, state.identity, "audit-compiler-descendant"
+                        )
+                        state.active_descendants[pid] = identity
+                    elif identity.native_start_identity != token:
+                        raise AuditInfrastructureError(
+                            "owned process start identity changed"
+                        )
+                    state.tree.observe_resident_bytes(
+                        identity,
+                        current_bytes=descendant_resident,
+                        peak_bytes=descendant_resident,
+                    )
+                for pid in tuple(state.active_descendants):
+                    if pid in observed_pids:
+                        continue
+                    identity = state.active_descendants.pop(pid)
+                    state.tree.mark_exited(identity)
+                    state.tree.reap(identity)
+                generation_resident = resident + sum(
+                    value[2] for value in descendants
+                )
+                state.maximum_resident_bytes = max(
+                    state.maximum_resident_bytes, generation_resident
+                )
+                live_slot_resident[state.worker_index] = generation_resident
+            except AuditInfrastructureError:
+                accounting_complete = False
+        total = _combine_owned_generation_memory(
+            parent_resident,
+            live_slot_resident,
+            self.archived_generation_telemetry,
+        )
+        if authoritative_windows_resident is not None:
+            total = authoritative_windows_resident
+        return _OwnedForestSample(
+            platform_kind,
+            total,
+            accounting_complete,
+            tuple(surviving),
+        )
+
+    def next_event(self) -> tuple[_GenerationState, object]:
+        if self.deferred_events:
+            return self.deferred_events.popleft()
+        return self._next_event_raw()
+
+    def _next_event_raw(self) -> tuple[_GenerationState, object]:
+        while True:
+            if time.monotonic() >= self.runtime_contract.pipeline_deadline:
+                raise AuditInfrastructureError("pipeline deadline exceeded")
+            for state in self.states:
+                if state is None:
+                    continue
+                if state.event_receiver.poll(0):
+                    payload = state.event_receiver.receive_bytes_before(
+                        self.runtime_contract.pipeline_deadline,
+                        worker_alive=state.process.is_alive,
+                    )
+                    event = decode_control_message(payload)
+                    if (
+                        event.worker_index != state.worker_index
+                        or event.generation != state.generation
+                    ):
+                        raise AuditInfrastructureError(
+                            "worker control generation differs"
+                        )
+                    if (
+                        isinstance(event, WorkerContained)
+                        and isinstance(
+                            self.native_lifecycle, _LinuxGenerationLifecycle
+                        )
+                    ):
+                        if state.contained or event.worker_pid != state.process.pid:
+                            raise AuditInfrastructureError(
+                                "Linux worker containment acknowledgement differs"
+                            )
+                        self.native_lifecycle.accept_worker_contained(
+                            event, state.native_carrier
+                        )
+                        state.contained = True
+                    elif isinstance(event, MacOSWorkerSessionReported):
+                        if (
+                            not isinstance(
+                                self.native_lifecycle,
+                                _MacOSGenerationLifecycle,
+                            )
+                            or state.contained
+                            or event.pid != state.process.pid
+                            or event.pgid != state.process.pid
+                        ):
+                            raise AuditInfrastructureError(
+                                "macOS worker session acknowledgement differs"
+                            )
+                        self.native_lifecycle.accept_worker_session(event)
+                        state.contained = True
+                    elif isinstance(event, CompilerPgidReported):
+                        if (
+                            state.pending is None
+                            or not isinstance(
+                                self.native_lifecycle,
+                                _MacOSGenerationLifecycle,
+                            )
+                            or event.task_id != state.pending.ordinal
+                        ):
+                            raise AuditInfrastructureError(
+                                "macOS compiler PGID task differs"
+                            )
+                        permit = self.native_lifecycle.permit_compiler(event)
+                        self._send_command(state, permit)
+                    if isinstance(event, WorkerPayloadReady):
+                        if state.pending is None:
+                            raise AuditInfrastructureError(
+                                "worker result payload task is unavailable"
+                            )
+                        _validate_worker_payload_ready_receipt(
+                            event, state.pending
+                        )
+                        if isinstance(
+                            self.native_lifecycle, _MacOSGenerationLifecycle
+                        ):
+                            self.native_lifecycle.reconcile_task(
+                                state.worker_index,
+                                state.generation,
+                                state.pending.ordinal,
+                            )
+                    sample = self._sample_owned_forest()
+                    _enforce_platform_memory_contract(
+                        sample, self.result_budget
+                    )
+                    return state, event
+                if not state.process.is_alive() and state.process.exitcode is not None:
+                    raise AuditInfrastructureError(
+                        "worker exited before WorkerStopped"
+                    )
+            if self.cancel_event.is_set():
+                raise AuditInfrastructureError("worker audit was cancelled")
+            sample = self._sample_owned_forest()
+            _enforce_platform_memory_contract(sample, self.result_budget)
+            time.sleep(min(
+                0.01,
+                max(0.0, self.runtime_contract.pipeline_deadline - time.monotonic()),
+            ))
+
+    def send_task(
+        self,
+        state: _GenerationState,
+        ordinal: int,
+        configuration: PreprocessConfiguration,
+        slot: CompactResultSlot,
+    ) -> bool:
+        if state.pending is not None or not state.ready or state.expects_retire:
+            raise AuditInfrastructureError("worker generation is not idle")
+        task_id = f"audit-{ordinal}-{configuration.digest[:16]}"
+        if self.maximum_queued_counting_bytes > (
+            self.result_budget.maximum_bytes - self.result_budget.live_bytes
+        ):
+            return False
+        queued_ownership = self.result_budget.reserve(
+            self.maximum_queued_counting_bytes,
+            label=f"task:{task_id}:queued-transport",
+            semantic_event="reserve-dispatch",
+        ).commit()
+        reservation = None
+        capability = None
+        try:
+            reservation = PerTaskCompactReservation(
+                task_id, state.generation, slot.worst_case_live_bytes
+            )
+            capability = reservation.issue_worker_transport_capability(
+                task_id,
+                state.generation,
+                configuration.digest,
+                self.engine,
+                state.worker_index,
+            )
+            task = ConfigurationAuditTask(
+                task_id,
+                state.generation,
+                configuration,
+                self.dependency_roots,
+                reservation,
+            )
+            frame = encode_task_frame(
+                ordinal, state.worker_index, task, capability
+            )
+            state.task_sender.send_bytes_before(
+                frame,
+                self.runtime_contract.pipeline_deadline,
+                cancel_event=self.cancel_event,
+            )
+        except BaseException:
+            if (
+                reservation is not None
+                and capability is not None
+                and not reservation.released
+            ):
+                reservation.release_worker_transport_capability(
+                    capability, "worker-dispatch-failure"
+                )
+            if not queued_ownership.released:
+                queued_ownership.release()
+            raise
+        state.pending = _PendingCoordinatorTask(
+            ordinal,
+            configuration,
+            task_id,
+            reservation,
+            capability,
+            queued_ownership,
+        )
+        state.launch_events.clear()
+        return True
+
+    def _send_command(self, state: _GenerationState, message) -> None:
+        state.command_sender.send_bytes_before(
+            encode_control_message(message),
+            self.runtime_contract.pipeline_deadline,
+            cancel_event=self.cancel_event,
+        )
+
+    def grant_next_publication(self) -> None:
+        if self.active_publication is not None:
+            return
+        while self.publication_requests:
+            worker_index, generation, task_id = self.publication_requests.popleft()
+            state = self.states[worker_index]
+            if state is None or state.generation != generation:
+                continue
+            pending = state.pending
+            if pending is None or pending.task_id != task_id:
+                raise AuditInfrastructureError(
+                    "root publication request task differs"
+                )
+            self._send_command(
+                state, WorkerPayloadPermit(worker_index, generation, task_id)
+            )
+            pending.queued_ownership.record_semantic(
+                "activate-publication"
+            )
+            self.active_publication = (worker_index, generation, task_id)
+            return
+
+    def handle_task_event(
+        self,
+        state: _GenerationState,
+        event,
+        aggregator: StreamingResultAggregator,
+    ) -> tuple[str, int] | None:
+        pending = state.pending
+        if isinstance(event, CompilerPgidReported):
+            if (
+                pending is None
+                or not isinstance(
+                    self.native_lifecycle, _MacOSGenerationLifecycle
+                )
+                or event.task_id != pending.ordinal
+                or event.pgid not in self.native_lifecycle.compiler_groups.get(
+                    (state.worker_index, state.generation, pending.ordinal), ()
+                )
+            ):
+                raise AuditInfrastructureError(
+                    "macOS compiler PGID task differs"
+                )
+            return None
+        if isinstance(event, CompilerLaunchEvent):
+            if pending is None or event.task_id != pending.task_id:
+                raise AuditInfrastructureError(
+                    "audit compiler launch task differs"
+                )
+            state.launch_events.append(event)
+            if len(state.launch_events) > 2:
+                raise AuditInfrastructureError(
+                    "audit compiler launch protocol differs"
+                )
+            return None
+        if isinstance(event, CachePublicationRequested):
+            if pending is None or event.task_id != pending.task_id:
+                raise AuditInfrastructureError(
+                    "root publication request task differs"
+                )
+            request = (state.worker_index, state.generation, event.task_id)
+            if request == self.active_publication or request in self.publication_requests:
+                raise AuditInfrastructureError(
+                    "root publication request was duplicated"
+                )
+            if len(self.publication_requests) >= len(self.states):
+                raise AuditInfrastructureError(
+                    "root publication request queue exceeds workers"
+                )
+            self.publication_requests.append(request)
+            self.grant_next_publication()
+            return None
+        if isinstance(event, WorkerPayloadReady):
+            if pending is None or event.task_id != pending.task_id:
+                raise AuditInfrastructureError(
+                    "worker result payload task differs"
+                )
+            active = (state.worker_index, state.generation, event.task_id)
+            if self.active_publication != active:
+                raise AuditInfrastructureError(
+                    "worker result payload publication differs"
+                )
+            _validate_worker_payload_ready_receipt(event, pending)
+            if tuple(item.purpose for item in state.launch_events) != (
+                CompilerLaunchPurpose.AUDIT_DISCOVERY,
+                CompilerLaunchPurpose.AUDIT_ACCEPTED,
+            ):
+                raise AuditInfrastructureError(
+                    "audit compiler launch protocol differs"
+                )
+            pending.queued_ownership.record_semantic(
+                "release-publication"
+            )
+            self.active_publication = None
+            self._send_command(
+                state,
+                WorkerPayloadPermit(
+                    state.worker_index, state.generation, pending.task_id
+                ),
+            )
+            pending.queued_ownership.record_semantic("send-pipe")
+            # Publication capacity is generation-bound but independent from
+            # the current payload receive/decode.  Advance the FIFO before
+            # waiting on payload bytes so another worker cannot be stranded.
+            self.grant_next_publication()
+            owner = None
+            retained = None
+            cold_slot_bytes = 0
+            try:
+                worker_outcome = state.payload_receiver.receive_transport_before(
+                    pending.capability,
+                    self.runtime_contract.pipeline_deadline,
+                    cancel_event=self.cancel_event,
+                    worker_alive=state.process.is_alive,
+                )
+                owner, retained, cold_slot_bytes = (
+                    _decode_authenticated_worker_payload(
+                        event, pending, worker_outcome, aggregator
+                    )
+                )
+                outcome = owner.outcome
+                aggregator.accept_validated_result(
+                    pending.configuration, outcome.result, retained
+                )
+            except BaseException as error:
+                _release_rejected_worker_transport(
+                    pending.reservation,
+                    pending.capability,
+                    error,
+                    "worker payload reactor",
+                )
+                raise
+            finally:
+                if retained is not None and not retained.released:
+                    retained.release()
+                if owner is not None and owner.active:
+                    owner.close()
+            aggregator.reserve_cold_slot(
+                CompactResultColdSlot(cold_slot_bytes)
+            )
+            state.pending = None
+            state.tasks_completed += 1
+            self.audit_launch_count += 2
+            state.expects_retire = (
+                state.tasks_completed
+                >= self.runtime_contract.maximum_tasks_per_worker
+            ) or (
+                self.runtime_contract.recycle_rss_bytes > 0
+                and state.maximum_resident_bytes
+                >= self.runtime_contract.recycle_rss_bytes
+            )
+            self.grant_next_publication()
+            return None
+        if isinstance(event, WorkerRetire):
+            if state.pending is not None or (
+                not state.expects_retire and event.reason != "resident-memory"
+            ):
+                raise AuditInfrastructureError(
+                    "worker retired with outstanding work"
+                )
+            state.expects_retire = True
+            self._send_command(
+                state,
+                WorkerRetireAck(state.worker_index, state.generation),
+            )
+            worker_index = state.worker_index
+            self._archive_generation(state, require_stopped=False)
+            return ("retired", worker_index)
+        if isinstance(event, WorkerFailure):
+            raise AuditInfrastructureError(event.diagnostic)
+        raise AuditInfrastructureError("invalid worker protocol message")
+
+    def _archive_generation(
+        self, state: _GenerationState, *, require_stopped: bool
+    ) -> None:
+        if require_stopped == state.expects_retire:
+            raise AuditInfrastructureError(
+                "worker generation shutdown protocol differs"
+            )
+        remaining = self.runtime_contract.pipeline_deadline - time.monotonic()
+        if remaining <= 0:
+            raise AuditInfrastructureError("pipeline deadline exceeded during reap")
+        state.process.join(timeout=remaining)
+        if state.process.is_alive():
+            raise AuditInfrastructureError("worker generation did not exit")
+        if state.process.exitcode != 0:
+            raise AuditInfrastructureError(
+                "worker generation exited unsuccessfully"
+            )
+        if self.native_lifecycle is not None:
+            self.native_lifecycle.release_generation(
+                state.worker_index,
+                state.generation,
+                state.native_carrier,
+                self.runtime_contract.pipeline_deadline,
+                force=False,
+            )
+        from gpu_capability_process_tree import native_process_resident_bytes
+
+        for pid, identity in tuple(state.active_descendants.items()):
+            try:
+                native_process_resident_bytes(pid)
+            except AuditInfrastructureError:
+                state.tree.mark_exited(identity)
+                state.tree.reap(identity)
+                state.active_descendants.pop(pid)
+            else:
+                raise AuditInfrastructureError(
+                    "worker process-tree survivors remain"
+                )
+        state.tree.mark_exited(state.identity)
+        state.tree.reap(state.identity)
+        if state.tree.surviving_owned_process_count != 0:
+            raise AuditInfrastructureError(
+                "worker process-tree survivors remain"
+            )
+        self.registry_generation_duplicates.pop(
+            (state.worker_index, state.generation), None
+        )
+        release_generation = getattr(
+            self.capability_registry, "release_generation", None
+        )
+        if callable(release_generation):
+            release_generation(state.worker_index, state.generation)
+        self.archived_generation_telemetry.append((
+            state.worker_index, state.generation, state.maximum_resident_bytes
+        ))
+        try:
+            shutil.rmtree(state.scratch_root)
+        except FileNotFoundError:
+            pass
+        self.archived_scratch_roots.append(state.scratch_root)
+        archive_generation_job = getattr(
+            self.run_accountant, "archive_generation_job", None
+        )
+        if callable(archive_generation_job):
+            with self._accounting_lock:
+                archive_generation_job(
+                    state.worker_index,
+                    state.generation,
+                    self.runtime_contract.pipeline_deadline,
+                )
+        for endpoint in (
+            state.startup_sender, state.task_sender, state.command_sender,
+            state.event_receiver,
+        ):
+            endpoint.close()
+        try:
+            state.payload_receiver.close()
+        except BaseException:
+            pass
+        self.states[state.worker_index] = None
+
+    def shutdown_reap(self, deadline: float) -> None:
+        if self._closed:
+            return
+        for state in tuple(self.states):
+            if state is None:
+                continue
+            if state.pending is not None:
+                raise AuditInfrastructureError(
+                    "normal shutdown has outstanding worker task"
+                )
+            state.task_sender.send_bytes_before(
+                encode_control_message(
+                    WorkerStop(state.worker_index, state.generation)
+                ),
+                deadline,
+            )
+        remaining = sum(state is not None for state in self.states)
+        while remaining:
+            state, event = self.next_event()
+            if not isinstance(event, WorkerStopped):
+                raise AuditInfrastructureError(
+                    "worker exited before WorkerStopped"
+                )
+            self._archive_generation(state, require_stopped=True)
+            remaining -= 1
+        self._stop_accounting_pump()
+        if isinstance(self.native_lifecycle, _LinuxGenerationLifecycle):
+            self.task_phase_snapshot = self.native_lifecycle.seal_task_phase(
+                len(self.archived_generation_telemetry)
+            )
+        elif isinstance(self.native_lifecycle, _MacOSGenerationLifecycle):
+            self.task_phase_snapshot = self.native_lifecycle.seal_task_phase(
+                len(self.archived_generation_telemetry)
+            )
+        seal_phase = getattr(self.run_accountant, "seal_phase", None)
+        snapshot = getattr(self.run_accountant, "snapshot", None)
+        if callable(seal_phase):
+            seal_phase(deadline, _current_process_rss_bytes())
+        if callable(snapshot):
+            self.task_phase_snapshot = snapshot()
+        self._closed = True
+
+    def abort_and_reap(self, deadline: float) -> None:
+        cleanup_errors: list[tuple[str, BaseException]] = []
+
+        def attempt(label, action):
+            try:
+                return action()
+            except BaseException as cleanup_error:
+                cleanup_errors.append((label, cleanup_error))
+                return None
+
+        attempt("worker cancellation", self.cancel_event.set)
+        for state in tuple(self.states):
+            if state is None:
+                continue
+            alive = attempt("worker liveness", state.process.is_alive)
+            if alive is not False:
+                attempt("worker termination", state.process.terminate)
+            remaining = max(0.0, deadline - time.monotonic())
+            attempt(
+                "worker join",
+                lambda: state.process.join(timeout=remaining),
+            )
+            still_alive = attempt("worker post-join liveness", state.process.is_alive)
+            if still_alive is not False:
+                attempt("worker kill", state.process.kill)
+                attempt(
+                    "worker post-kill join",
+                    lambda: state.process.join(timeout=max(
+                        0.0, deadline - time.monotonic()
+                    )),
+                )
+            if self.native_lifecycle is not None:
+                attempt(
+                    "native generation release",
+                    lambda: self.native_lifecycle.release_generation(
+                        state.worker_index,
+                        state.generation,
+                        state.native_carrier,
+                        deadline,
+                        force=True,
+                    ),
+                )
+            archive_generation_job = getattr(
+                self.run_accountant, "archive_generation_job", None
+            )
+            if callable(archive_generation_job):
+                def archive():
+                    with self._accounting_lock:
+                        archive_generation_job(
+                            state.worker_index, state.generation, deadline
+                        )
+
+                attempt("generation accounting archive", archive)
+            pending = state.pending
+            if pending is not None and not pending.reservation.released:
+                attempt(
+                    "worker transport reservation release",
+                    lambda: pending.reservation.release_worker_transport_capability(
+                        pending.capability, "worker-failure"
+                    ),
+                )
+            self.registry_generation_duplicates.pop(
+                (state.worker_index, state.generation), None
+            )
+            release_generation = getattr(
+                self.capability_registry, "release_generation", None
+            )
+            if callable(release_generation):
+                attempt(
+                    "compiler capability generation release",
+                    lambda: release_generation(
+                        state.worker_index, state.generation
+                    ),
+                )
+
+            def remove_scratch():
+                try:
+                    shutil.rmtree(state.scratch_root)
+                except FileNotFoundError:
+                    pass
+
+            attempt("worker scratch removal", remove_scratch)
+            self.archived_scratch_roots.append(state.scratch_root)
+            if (
+                pending is not None
+                and not pending.queued_ownership.released
+            ):
+                attempt(
+                    "queued transport ownership release",
+                    pending.queued_ownership.release,
+                )
+            for endpoint in (
+                state.startup_sender, state.task_sender,
+                state.command_sender, state.event_receiver,
+            ):
+                attempt("worker endpoint close", endpoint.close)
+            attempt("worker payload endpoint close", state.payload_receiver.close)
+            self.states[state.worker_index] = None
+        self.publication_requests.clear()
+        self.active_publication = None
+        attempt("accounting pump stop", self._stop_accounting_pump)
+        self._closed = True
+        if cleanup_errors:
+            error = AuditInfrastructureError(
+                "generation cleanup is incomplete"
+            )
+            for label, additional in cleanup_errors:
+                error.add_note(f"{label} failed: {additional}")
+            raise error from cleanup_errors[0][1]
+
+
+def _enforce_platform_memory_contract(tree_sample, compact_observer) -> None:
+    if (
+        getattr(tree_sample, "platform_kind", None)
+        not in {"windows", "linux", "macos"}
+        or not isinstance(getattr(tree_sample, "accounting_complete", None), bool)
+        or not tree_sample.accounting_complete
+    ):
+        raise AuditInfrastructureError("process-tree memory contract is incomplete")
+    resident = getattr(tree_sample, "maximum_observed_resident_bytes", None)
+    if (
+        not isinstance(resident, int)
+        or isinstance(resident, bool)
+        or resident < 0
+    ):
+        raise AuditInfrastructureError("process-tree memory contract is invalid")
+    compact_peak = getattr(compact_observer, "peak_live_bytes", None)
+    if (
+        not isinstance(compact_peak, int)
+        or isinstance(compact_peak, bool)
+        or compact_peak < 0
+        or compact_peak > (128 << 20)
+    ):
+        raise AuditInfrastructureError("compact result memory limit exceeded")
+    if (
+        tree_sample.platform_kind in {"windows", "linux"}
+        and resident >= _PROCESS_TREE_MEMORY_LIMIT_BYTES
+    ):
+        raise AuditInfrastructureError("process-tree memory contract exceeded")
+
 _WORKER_INDEX: int | None = None
 _WORKER_GENERATION: int | None = None
 _WORKER_PRODUCTION: Mapping[PurePosixPath, FileIdentity] | None = None
@@ -99,6 +4800,10 @@ _WORKER_LIMITS: AuditLimits | None = None
 _WORKER_CANCEL_EVENT: object | None = None
 _WORKER_ENGINE: str | None = None
 _WORKER_CACHE: object | None = None
+_WORKER_CAPABILITIES: Mapping[str, object] | None = None
+_WORKER_MAXIMUM_TASKS: int = 1
+_WORKER_RECYCLE_RSS_BYTES: int = 0
+_WORKER_PREATTESTED_ENGINE: str | None = None
 
 
 class _WorkerRssSampler:
@@ -107,6 +4812,273 @@ class _WorkerRssSampler:
 
 
 _WORKER_RSS: object = _WorkerRssSampler()
+
+
+class _ScheduledAuditSession:
+    """Parent-owned deterministic result and worker/resource lifecycle."""
+
+    def __init__(
+        self,
+        *,
+        aggregate: StreamingAuditSummary,
+        cache_hits: int,
+        cache_misses: int,
+        inspection_probe_invocations: int,
+        audit_compiler_invocations: int,
+        runtime_contract: WorkerRuntimeContract,
+        cache_root: Path,
+        result_budget: CompactResultMemoryBudget,
+        compact_accounting_observer: CompactAccountingObserver,
+        run_accountant,
+        capability_registry,
+        reactor=None,
+    ) -> None:
+        self._aggregate = aggregate
+        self._aggregate_consumed = False
+        self.cache_hits = cache_hits
+        self.cache_misses = cache_misses
+        self.inspection_probe_invocations = inspection_probe_invocations
+        self.audit_compiler_invocations = audit_compiler_invocations
+        self.expected_audit_compiler_invocations = 2 * cache_misses
+        self.runtime_contract = runtime_contract
+        self.cache_root = cache_root
+        self.result_budget = result_budget
+        self.compact_accounting_observer = compact_accounting_observer
+        self.run_accountant = run_accountant
+        self.capability_registry = capability_registry
+        self.compact_result_peak_live_bytes = result_budget.peak_live_bytes
+        self.reactor = reactor
+        self.worker_pids = (
+            () if reactor is None else tuple(reactor.worker_pids)
+        )
+        self._shutdown = reactor is None
+
+    def consume_aggregate(self) -> StreamingAuditSummary:
+        if self._aggregate_consumed:
+            raise AuditInfrastructureError("scheduled aggregate was already consumed")
+        self._aggregate_consumed = True
+        return self._aggregate
+
+    def shutdown_reap(self, deadline: float) -> None:
+        if (
+            not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or not math.isfinite(deadline)
+        ):
+            raise AuditInfrastructureError("worker shutdown deadline is invalid")
+        if self._shutdown:
+            return
+        self.reactor.shutdown_reap(deadline)
+        self._shutdown = True
+
+
+def schedule_configuration_audits(
+    source_root: Path,
+    configurations: tuple[PreprocessConfiguration, ...],
+    dependency_roots: DependencyRootAuthority,
+    capability_registry,
+    initial_digest_map,
+    prepared_cache,
+    limits: AuditLimits,
+    engine: str,
+    runtime_contract: WorkerRuntimeContract,
+    *,
+    inspection_probe_invocations: int,
+    run_accountant,
+    compact_observer: CompactAccountingObserver,
+) -> _ScheduledAuditSession:
+    """Validate all warm entries before creating any native worker resource."""
+    if (
+        not isinstance(source_root, Path)
+        or not isinstance(configurations, tuple)
+        or not configurations
+        or len(configurations) > 251
+        or any(not isinstance(value, PreprocessConfiguration)
+               for value in configurations)
+        or len({value.digest for value in configurations}) != len(configurations)
+        or not isinstance(limits, AuditLimits)
+        or not isinstance(runtime_contract, WorkerRuntimeContract)
+        or not isinstance(inspection_probe_invocations, int)
+        or isinstance(inspection_probe_invocations, bool)
+        or inspection_probe_invocations < 0
+        or not callable(getattr(prepared_cache, "load_many", None))
+        or not isinstance(engine, str)
+        or not engine
+        or not isinstance(compact_observer, CompactAccountingObserver)
+    ):
+        raise AuditInfrastructureError("audit scheduler inputs are invalid")
+    if time.monotonic() >= runtime_contract.pipeline_deadline:
+        raise AuditInfrastructureError("pipeline deadline exceeded before scheduling")
+    authority = validate_dependency_root_authority(dependency_roots)
+    if any(
+        value.dependency_root_authority_digest
+        != authority.portable_authority_digest
+        for value in configurations
+    ):
+        raise AuditInfrastructureError("scheduler dependency-root authority differs")
+    from gpu_capability_source_audit import _attest_loaded_audit_engine
+
+    loaded_engine = _attest_loaded_audit_engine(engine)
+    result_budget = CompactResultMemoryBudget(
+        maximum_bytes=128 << 20, observer=compact_observer
+    )
+    aggregator = StreamingResultAggregator(configurations, result_budget, limits)
+    slot_template = maximum_compact_result_slot(
+        limits,
+        conservative_allocation_schema(),
+        _PIPE_KERNEL_CAPACITY_BYTES,
+    )
+    if slot_template.worst_case_live_bytes > (128 << 20):
+        raise AuditInfrastructureError(
+            "single compact-result slot exceeds 128 MiB"
+        )
+    maximum_cold_slot = CompactResultColdSlot(
+        slot_template.worst_case_live_bytes
+    )
+    try:
+        batch = prepared_cache.load_many(
+            configurations,
+            authority,
+            loaded_engine,
+            initial_digest_map,
+            result_budget,
+            aggregator,
+            maximum_cold_slot,
+            runtime_contract.pipeline_deadline,
+        )
+        if not hasattr(batch, "misses") or not hasattr(batch, "hit_count"):
+            raise AuditInfrastructureError("audit cache batch is invalid")
+        cache_root = getattr(prepared_cache, "root", source_root)
+        if not isinstance(cache_root, Path):
+            cache_root = source_root
+        if not batch.misses:
+            aggregate = aggregator.finish()
+            return _ScheduledAuditSession(
+                aggregate=aggregate,
+                cache_hits=batch.hit_count,
+                cache_misses=0,
+                inspection_probe_invocations=inspection_probe_invocations,
+                audit_compiler_invocations=0,
+                runtime_contract=runtime_contract,
+                cache_root=cache_root,
+                result_budget=result_budget,
+                compact_accounting_observer=compact_observer,
+                run_accountant=run_accountant,
+                capability_registry=capability_registry,
+            )
+
+        miss_digests = {configuration.digest for configuration in batch.misses}
+        if len(miss_digests) != len(batch.misses) or not miss_digests.issubset(
+            {configuration.digest for configuration in configurations}
+        ):
+            raise AuditInfrastructureError("audit cache batch misses are invalid")
+        worker_count = min(runtime_contract.workers, len(batch.misses))
+        reactor = GenerationReactor(
+            configurations=configurations,
+            dependency_roots=authority,
+            production_snapshot=initial_digest_map,
+            cache_root=cache_root,
+            limits=limits,
+            engine=loaded_engine,
+            runtime_contract=runtime_contract,
+            run_accountant=run_accountant,
+            capability_registry=capability_registry,
+            result_budget=result_budget,
+            worker_count=worker_count,
+        )
+        ordinals = {
+            configuration.digest: ordinal
+            for ordinal, configuration in enumerate(configurations)
+        }
+        remaining = collections.deque(sorted(
+            (
+                (ordinals[configuration.digest], configuration)
+                for configuration in batch.misses
+            ),
+            key=lambda item: item[0],
+        ))
+        try:
+            while (
+                remaining
+                or reactor.has_pending_tasks
+                or reactor.has_expected_retirement
+            ):
+                next_unaggregated = aggregator.next_unaggregated_ordinal
+                upper = next_unaggregated + worker_count - 1
+                idle = collections.deque(reactor.idle_states())
+                while remaining and idle and remaining[0][0] <= upper:
+                    ordinal, configuration = remaining[0]
+                    state = idle[0]
+                    if not reactor.send_task(
+                        state, ordinal, configuration, slot_template
+                    ):
+                        if not reactor.has_pending_tasks:
+                            raise AuditInfrastructureError(
+                                "remaining compact task cannot be admitted"
+                            )
+                        break
+                    remaining.popleft()
+                    idle.popleft()
+                if (
+                    remaining
+                    and not reactor.has_pending_tasks
+                    and not reactor.has_expected_retirement
+                    and (not reactor.idle_states()
+                         or remaining[0][0] > upper)
+                ):
+                    raise AuditInfrastructureError(
+                        "remaining compact task cannot be admitted"
+                    )
+                if not (
+                    remaining
+                    or reactor.has_pending_tasks
+                    or reactor.has_expected_retirement
+                ):
+                    break
+                state, event = reactor.next_event()
+                transition = reactor.handle_task_event(
+                    state, event, aggregator
+                )
+                if transition is not None:
+                    _kind, worker_index = transition
+                    if remaining or reactor.has_pending_tasks:
+                        reactor.spawn_next_generation(worker_index)
+                        reactor._wait_all_ready()
+                if (
+                    (remaining or reactor.has_pending_tasks)
+                    and reactor.live_generation_count == 0
+                ):
+                    reactor.spawn_next_generation(0)
+                    reactor._wait_all_ready()
+            if reactor.audit_launch_count != 2 * len(batch.misses):
+                raise AuditInfrastructureError(
+                    "audit compiler invocation accounting differs"
+                )
+            aggregate = aggregator.finish()
+        except BaseException as error:
+            try:
+                reactor.abort_and_reap(time.monotonic() + _FAILURE_REAP_SECONDS)
+            except BaseException as cleanup_error:
+                error.add_note(
+                    f"worker emergency cleanup also failed: {cleanup_error}"
+                )
+            raise
+        return _ScheduledAuditSession(
+            aggregate=aggregate,
+            cache_hits=batch.hit_count,
+            cache_misses=len(batch.misses),
+            inspection_probe_invocations=inspection_probe_invocations,
+            audit_compiler_invocations=reactor.audit_launch_count,
+            runtime_contract=runtime_contract,
+            cache_root=cache_root,
+            result_budget=result_budget,
+            compact_accounting_observer=compact_observer,
+            run_accountant=run_accountant,
+            capability_registry=capability_registry,
+            reactor=reactor,
+        )
+    except BaseException:
+        raise
 
 
 def _check_dependency_budget(
@@ -512,12 +5484,13 @@ def run_bounded_preprocessor(
     )
     if not command.arguments:
         raise AuditInfrastructureError("rewritten preprocess command is empty")
-    try:
-        requested_executable = Path(command.arguments[0]).resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise AuditInfrastructureError("compiler executable launch path is unavailable") from error
-    if os.path.normcase(str(requested_executable)) != os.path.normcase(
-        str(capability.executable_identity.canonical)
+    requested_executable = Path(command.arguments[0])
+    if (
+        not requested_executable.is_absolute()
+        or os.path.normcase(os.path.normpath(str(requested_executable)))
+        != os.path.normcase(os.path.normpath(
+            str(capability.executable_identity.canonical)
+        ))
     ):
         raise AuditInfrastructureError("compiler launch does not consume the held capability")
     containment = _ProcessContainment()
@@ -581,16 +5554,9 @@ def run_bounded_preprocessor(
     failure: tuple[str, int | str, float] | None = None
     try:
         try:
-            launch_arguments = command.arguments
-            launch_options: dict[str, object] = {}
-            if capability.platform_kind == "linux":
-                executable_fd = getattr(capability_owner, "executable_fd", None)
-                if not isinstance(executable_fd, int):
-                    raise AuditInfrastructureError("exact compiler executable fd is unavailable")
-                launch_arguments = (
-                    f"/proc/self/fd/{executable_fd}", *command.arguments[1:]
-                )
-                launch_options["pass_fds"] = (executable_fd,)
+            launch_arguments, launch_options = _held_compiler_launch(
+                capability, command.arguments
+            )
             prepared_arguments = containment.prepare_command(launch_arguments)
             now = time.monotonic()
             if cancel_event is not None and cancel_event.is_set():
@@ -1258,12 +6224,18 @@ def validate_production_dependency_snapshots(
 
 
 class _AuditLaunchContext:
-    __slots__ = ("_control_endpoint", "_task", "_deadline")
+    __slots__ = (
+        "_control_endpoint", "_command_endpoint", "_task", "_deadline",
+        "_macos_authorizations",
+    )
 
-    def __init__(self, control_endpoint, task: ConfigurationAuditTask, deadline: float) -> None:
+    def __init__(self, control_endpoint, command_endpoint,
+                 task: ConfigurationAuditTask, deadline: float) -> None:
         self._control_endpoint = control_endpoint
+        self._command_endpoint = command_endpoint
         self._task = task
         self._deadline = deadline
+        self._macos_authorizations = 0
 
     @property
     def task_id(self) -> str:
@@ -1272,6 +6244,65 @@ class _AuditLaunchContext:
     @property
     def generation(self) -> int:
         return self._task.generation
+
+    @property
+    def macos_launch_deadline(self) -> float:
+        return self._deadline
+
+    @property
+    def macos_launch_cancel_event(self):
+        return _WORKER_CANCEL_EVENT
+
+    def authorize_macos_compiler_exec(
+        self, process_start: ProcessStartIdentity,
+    ) -> CompilerExecPermit:
+        if (
+            process_start.platform_kind != "macos"
+            or not isinstance(_WORKER_INDEX, int)
+            or isinstance(_WORKER_INDEX, bool)
+            or _WORKER_INDEX < 0
+            or self._macos_authorizations >= 2
+        ):
+            raise AuditInfrastructureError(
+                "macOS compiler exec authorization is invalid"
+            )
+        match = re.fullmatch(
+            r"audit-([0-9]+)-[0-9a-f]{16}", self._task.task_id
+        )
+        if match is None:
+            raise AuditInfrastructureError(
+                "macOS compiler exec task identity is invalid"
+            )
+        task_ordinal = int(match.group(1))
+        purpose = (
+            CompilerLaunchPurpose.AUDIT_DISCOVERY,
+            CompilerLaunchPurpose.AUDIT_ACCEPTED,
+        )[self._macos_authorizations]
+        capability = self._task.configuration.compiler_capability
+        report = CompilerPgidReported(
+            _WORKER_INDEX,
+            self._task.generation,
+            task_ordinal,
+            purpose,
+            process_start.pid,
+            process_start.pid,
+            process_start.native_start_token,
+            capability.executable_identity,
+            capability.executable_sha256,
+            capability.capability_digest,
+        )
+        _send_control_frame_before(
+            self._control_endpoint, report, self._deadline
+        )
+        permit = self._command_endpoint.receive_macos_exec_permit(
+            self._task,
+            task_ordinal,
+            process_start.pid,
+            _WORKER_CANCEL_EVENT,
+            self._deadline,
+        )
+        self._macos_authorizations += 1
+        return permit
 
     def register_compiler_process_launch(
         self, event: CompilerLaunchEvent, carrier: CompilerProcessHandleCarrier
@@ -1427,8 +6458,14 @@ def audit_configuration_worker(
             audit_preprocessed_view,
         )
 
-        engine = _attest_loaded_audit_engine(_WORKER_ENGINE)
-        launch_context = _AuditLaunchContext(control_endpoint, task, deadline)
+        engine = (
+            _WORKER_ENGINE
+            if _WORKER_PREATTESTED_ENGINE == _WORKER_ENGINE
+            else _attest_loaded_audit_engine(_WORKER_ENGINE)
+        )
+        launch_context = _AuditLaunchContext(
+            control_endpoint, command_endpoint, task, deadline
+        )
         view, discovery, preprocess_stages = stabilize_and_parse_configuration(
             task.configuration,
             dependency_roots,
@@ -1456,6 +6493,17 @@ def audit_configuration_worker(
             reservation,
         )
         del view
+        set_publication_context = getattr(
+            control_endpoint, "set_publication_context", None
+        )
+        if callable(set_publication_context):
+            set_publication_context(
+                task.task_id,
+                task.generation,
+                task.configuration.digest,
+                engine,
+                discovery.dependencies,
+            )
         _send_control_frame_before(
             control_endpoint,
             CachePublicationRequested(

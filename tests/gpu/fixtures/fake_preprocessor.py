@@ -96,6 +96,8 @@ def main() -> int:
             "discovery-mutate-restore",
             "swap-root-restore",
             "allocation-hold",
+            "cpu-burn",
+            "coordinator-crash",
         ),
         required=True,
     )
@@ -108,6 +110,9 @@ def main() -> int:
     parser.add_argument("--allocation-bytes", type=int, default=0)
     parser.add_argument("--allocation-ready-file", type=Path)
     parser.add_argument("--allocation-release-file", type=Path)
+    parser.add_argument("--cpu-burn-seconds", type=float, default=0.0)
+    parser.add_argument("--cpu-ready-directory", type=Path)
+    parser.add_argument("--cpu-release-file", type=Path)
     parser.add_argument("--outside-path", type=Path)
     parser.add_argument("--invocation-counter", type=Path)
     parser.add_argument("--extra-dependency", type=Path)
@@ -210,6 +215,41 @@ def main() -> int:
                 time.sleep(0.01)
         else:
             time.sleep(options.sleep_seconds)
+
+    if options.fixture_mode in {"cpu-burn", "dense"} and (
+        options.fixture_mode == "cpu-burn" or options.cpu_burn_seconds > 0
+    ):
+        if not 0.0 <= options.cpu_burn_seconds <= 5.0:
+            raise SystemExit("cpu-burn requires bounded --cpu-burn-seconds")
+        if options.cpu_ready_directory is None:
+            ready_value = os.environ.get("OLR_CPU_READY_DIRECTORY")
+            options.cpu_ready_directory = (
+                None if ready_value is None else Path(ready_value)
+            )
+        if options.cpu_release_file is None:
+            release_value = os.environ.get("OLR_CPU_RELEASE_FILE")
+            options.cpu_release_file = (
+                None if release_value is None else Path(release_value)
+            )
+        if options.cpu_ready_directory is not None:
+            options.cpu_ready_directory.mkdir(parents=True, exist_ok=True)
+            (options.cpu_ready_directory / f"{os.getpid()}-{invocation}.ready").write_text(
+                "ready", encoding="ascii"
+            )
+        if options.cpu_release_file is not None:
+            deadline = time.monotonic() + 10.0
+            while not options.cpu_release_file.exists():
+                if time.monotonic() >= deadline:
+                    raise SystemExit("cpu-burn release timed out")
+                time.sleep(0.005)
+        finish = time.process_time() + options.cpu_burn_seconds
+        accumulator = 1
+        while time.process_time() < finish:
+            accumulator = (accumulator * 1_103_515_245 + 12_345) & 0xFFFFFFFF
+        del accumulator
+
+    if options.fixture_mode == "coordinator-crash":
+        return 86
 
     if options.stderr_bytes:
         prefix = b"BEGIN-OF-STDERR|"

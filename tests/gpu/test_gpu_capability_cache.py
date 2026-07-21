@@ -46,6 +46,7 @@ from gpu_capability_cache import (  # noqa: E402
 from gpu_capability_model import (  # noqa: E402
     AuditResultFinding,
     AuditInfrastructureError,
+    CompactAccountingObserver,
     CompactResultColdSlot,
     CompactResultDraftBounds,
     CompactResultMemoryBudget,
@@ -5279,8 +5280,7 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             )
         prepare.assert_not_called()
 
-    @unittest.skipIf(os.name == "nt", "POSIX held-handle mutation semantics")
-    def test_final_held_rehash_detects_changed_bytes_without_reopen(self):
+    def test_final_held_rehash_detects_drift_without_false_hit(self):
         cache = ConfigurationAuditCache(self.cache_root)
         cache.publish(
             self.configuration,
@@ -5296,11 +5296,10 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             nonlocal calls
             digest = original_hash(handle)
             calls += 1
-            if calls == 1:
-                self.main_path.write_bytes(b"changed dependency bytes")
-            return digest
+            return digest if calls == 1 else "0" * 64
 
-        budget = CompactResultMemoryBudget()
+        observer = CompactAccountingObserver()
+        budget = CompactResultMemoryBudget(observer=observer)
         aggregator = StreamingResultAggregator(
             (self.configuration,), budget, capability_cache.AuditLimits()
         )
@@ -5318,6 +5317,10 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             )
         self.assertEqual((batch.hit_count, batch.misses), (0, (self.configuration,)))
         self.assertEqual(opened.call_count, 1)
+        self.assertFalse(any(
+            event == "retain-hit"
+            for event, _delta, _label, _owner in observer.semantic_events
+        ))
 
     @unittest.skipIf(os.name == "nt", "POSIX held-handle restoration semantics")
     def test_exact_restoration_before_final_held_rehash_is_equivalent(self):
@@ -5442,7 +5445,8 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             self.publication_permit,
             self.pipeline_deadline,
         )
-        budget = CompactResultMemoryBudget()
+        observer = CompactAccountingObserver()
+        budget = CompactResultMemoryBudget(observer=observer)
         aggregator = StreamingResultAggregator(
             (self.configuration,), budget, capability_cache.AuditLimits()
         )
@@ -5457,6 +5461,22 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             )
         self.assertEqual((batch.hit_count, batch.misses), (1, ()))
         self.assertEqual(decoded.call_count, 1)
+        self.assertEqual(
+            tuple(
+                (event, delta)
+                for event, delta, _label, _owner in observer.semantic_events
+            ),
+            (
+                (
+                    "retain-hit",
+                    capability_cache.compact_result_retained_bytes(self.result),
+                ),
+                (
+                    "release-result",
+                    -capability_cache.compact_result_retained_bytes(self.result),
+                ),
+            ),
+        )
 
     def test_decoded_result_charge_outlives_every_cache_reference(self):
         cache = ConfigurationAuditCache(self.cache_root)

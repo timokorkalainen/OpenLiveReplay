@@ -55,14 +55,14 @@ from gpu_capability_source_audit import (  # noqa: E402
 
 
 class AuditEngineFingerprintTests(unittest.TestCase):
-    def test_task6_stage_and_module_roots_are_exact(self):
+    def test_task7_stage_and_module_roots_are_exact(self):
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_GRAPH_SCHEMA_BYTES,
-            b"olr-gpu-capability-live-graph-v5",
+            b"olr-gpu-capability-live-graph-v6",
         )
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-6-worker-decision-contract",
+            b"task-7-spawn-process-coordinator",
         )
         self.assertEqual(
             tuple(module.__name__ for module in capability_audit._AUDIT_ENGINE_TARGET_MODULES),
@@ -94,7 +94,17 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             "gpu_capability_model.CompilerLaunchEvent",
             "gpu_capability_runner.audit_configuration_worker",
             "gpu_capability_runner.validate_production_dependency_snapshots",
-            "gpu_capability_runner._bounded_compact_result_draft",
+                "gpu_capability_runner._bounded_compact_result_draft",
+            "gpu_capability_runner.GenerationReactor",
+            "gpu_capability_runner.BoundedFrameChannel",
+            "gpu_capability_runner.encode_control_message",
+            "gpu_capability_runner.decode_control_message",
+            "gpu_capability_runner.encode_task_frame",
+            "gpu_capability_runner.decode_task_frame",
+            "gpu_capability_runner.schedule_configuration_audits",
+            "gpu_capability_runner._transport_allocation_bound",
+            "gpu_capability_model.WorkerPayloadReady",
+            "gpu_capability_model.WorkerStop",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, names)
@@ -146,12 +156,13 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             dict(capability_audit._PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY),
             {
                 "gpu_capability_command.py": 1,
+                "gpu_capability_runner.py": 1,
                 "test_gpu_capability_audit_lanes.py": 1,
                 "test_gpu_capability_cache.py": 2,
                 "test_gpu_capability_command.py": 1,
                 "test_gpu_capability_model.py": 1,
                 "test_gpu_capability_provenance.py": 1,
-                "test_gpu_capability_runner.py": 4,
+                "test_gpu_capability_runner.py": 7,
             },
         )
         source_directory = Path(__file__).resolve().parent
@@ -230,6 +241,17 @@ class AuditEngineFingerprintTests(unittest.TestCase):
                 AuditInfrastructureError, "Enum member mapping is invalid"
             ):
                 capability_audit.audit_engine_fingerprint()
+
+    def test_live_semantic_encoder_supports_python_314_slice_constants(self):
+        encoder = capability_audit._LiveSemanticEncoder(
+            frozenset(module.__name__ for module in (
+                capability_model, capability_audit
+            ))
+        )
+        self.assertNotEqual(
+            encoder.encode(slice(None, 4, None)),
+            encoder.encode(slice(1, 4, 2)),
+        )
 
     def test_nested_code_globals_are_followed_recursively(self):
         def fixture_outer():
@@ -464,7 +486,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             self.assertIn(expected, names)
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-6-worker-decision-contract",
+            b"task-7-spawn-process-coordinator",
         )
 
     def test_decision_graph_is_exhaustive_and_rebinding_changes_fingerprint(self):
@@ -726,13 +748,13 @@ print(recomputed)
             self.assertEqual(fingerprint(first), fingerprint(second))
             mutated = (second / "gpu_capability_source_audit.py").read_text(encoding="utf-8")
             self.assertIn(
-                'AUDIT_ENGINE_STAGE_BYTES = b"task-6-worker-decision-contract"',
+                'AUDIT_ENGINE_STAGE_BYTES = b"task-7-spawn-process-coordinator"',
                 mutated,
             )
             (second / "gpu_capability_source_audit.py").write_text(
                 mutated.replace(
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-6-worker-decision-contract"',
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-6-worker-decision-contract-mutated"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-7-spawn-process-coordinator"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-7-spawn-process-coordinator-mutated"',
                     1,
                 ),
                 encoding="utf-8",

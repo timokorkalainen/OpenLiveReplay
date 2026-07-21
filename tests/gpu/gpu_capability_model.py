@@ -206,6 +206,8 @@ class _FilesystemGenerationObserver:
                 if len(payload) - offset < 16:
                     raise AuditInfrastructureError("Linux inotify event stream is invalid")
                 _watch, mask, _cookie, name_length = struct.unpack_from("iIII", payload, offset)
+                name_start = offset + 16
+                name = payload[name_start:name_start + name_length].rstrip(b"\0")
                 offset += 16 + name_length
                 if offset > len(payload):
                     raise AuditInfrastructureError("Linux inotify event stream is invalid")
@@ -213,7 +215,10 @@ class _FilesystemGenerationObserver:
                     raise AuditInfrastructureError("Linux inotify generation event overflow")
                 if mask & (0x00002000 | 0x00008000):
                     raise AuditInfrastructureError("Linux inotify generation watch was lost")
-                raise AuditInfrastructureError("Linux inotify generation change observed")
+                raise AuditInfrastructureError(
+                    "Linux inotify generation change observed: "
+                    f"mask=0x{mask:08x}, name={name!r}"
+                )
 
     def _close_no_raise(self) -> list[BaseException]:
         if self._closed:
@@ -1130,6 +1135,309 @@ class WorkerRuntimeContract:
             raise AuditInfrastructureError("worker runtime contract is invalid")
 
 
+def _validate_worker_generation_identity(
+    worker_index: object, generation: object, label: str
+) -> None:
+    if (
+        not isinstance(worker_index, int)
+        or isinstance(worker_index, bool)
+        or worker_index < 0
+        or worker_index > (1 << 32) - 1
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+        or generation > (1 << 64) - 1
+    ):
+        raise AuditInfrastructureError(f"{label} generation is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerCapabilitiesAccepted:
+    worker_index: int
+    generation: int
+    capability_digests: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _validate_worker_generation_identity(
+            self.worker_index,
+            self.generation,
+            "worker capability acceptance",
+        )
+        if (
+            not isinstance(self.capability_digests, tuple)
+            or not self.capability_digests
+            or tuple(sorted(set(self.capability_digests)))
+            != self.capability_digests
+        ):
+            raise AuditInfrastructureError(
+                "worker capability acceptance is invalid"
+            )
+        for digest in self.capability_digests:
+            _validate_digest(digest, "worker accepted compiler capability")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerEngineReady:
+    worker_index: int
+    generation: int
+    worker_pid: int
+    audit_engine_fingerprint: str
+    capability_digests: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _validate_worker_generation_identity(
+            self.worker_index, self.generation, "worker engine readiness"
+        )
+        if (
+            not isinstance(self.worker_pid, int)
+            or isinstance(self.worker_pid, bool)
+            or self.worker_pid <= 0
+            or not isinstance(self.capability_digests, tuple)
+            or tuple(sorted(set(self.capability_digests)))
+            != self.capability_digests
+        ):
+            raise AuditInfrastructureError("worker engine readiness is invalid")
+        _validate_digest(
+            self.audit_engine_fingerprint, "worker audit engine fingerprint"
+        )
+        for digest in self.capability_digests:
+            _validate_digest(digest, "worker compiler capability")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerStop:
+    worker_index: int
+    generation: int
+
+    def __post_init__(self) -> None:
+        _validate_worker_generation_identity(
+            self.worker_index, self.generation, "worker stop"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerStopped:
+    worker_index: int
+    generation: int
+
+    def __post_init__(self) -> None:
+        _validate_worker_generation_identity(
+            self.worker_index, self.generation, "worker stopped"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRetire:
+    worker_index: int
+    generation: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        _validate_worker_generation_identity(
+            self.worker_index, self.generation, "worker retirement"
+        )
+        if (
+            not isinstance(self.reason, str)
+            or not self.reason
+            or len(self.reason.encode("utf-8")) > 1024
+        ):
+            raise AuditInfrastructureError("worker retirement reason is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRetireAck:
+    worker_index: int
+    generation: int
+
+    def __post_init__(self) -> None:
+        _validate_worker_generation_identity(
+            self.worker_index, self.generation, "worker retirement acknowledgement"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerFailure:
+    worker_index: int
+    generation: int
+    task_id: str | None
+    diagnostic: str
+
+    def __post_init__(self) -> None:
+        _validate_worker_generation_identity(
+            self.worker_index, self.generation, "worker failure"
+        )
+        if (
+            self.task_id is not None
+            and (not isinstance(self.task_id, str) or not self.task_id)
+        ) or (
+            not isinstance(self.diagnostic, str)
+            or not self.diagnostic
+            or len(self.diagnostic.encode("utf-8")) > 4096
+        ):
+            raise AuditInfrastructureError("worker failure diagnostic is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPayloadReady:
+    worker_index: int
+    generation: int
+    task_id: str
+    configuration_digest: str
+    audit_engine_fingerprint: str
+    pipe_nonce: str
+    serial: int
+    nonce: str
+    encoded_bytes: int
+    encoded_sha256: str
+    charged_bytes: int
+    conservative_decoded_bytes: int
+    conservative_retained_bytes: int
+    counting_pass_peak_bytes: int
+    stdout_bytes: int
+    stages: WorkerStageTimings
+
+    def __post_init__(self) -> None:
+        _validate_worker_generation_identity(
+            self.worker_index, self.generation, "worker payload readiness"
+        )
+        if (
+            not isinstance(self.task_id, str)
+            or not self.task_id
+            or not isinstance(self.serial, int)
+            or isinstance(self.serial, bool)
+            or self.serial <= 0
+            or self.serial > (1 << 64) - 1
+            or not isinstance(self.encoded_bytes, int)
+            or isinstance(self.encoded_bytes, bool)
+            or self.encoded_bytes <= 0
+            or self.encoded_bytes > (4 << 20)
+            or not isinstance(self.charged_bytes, int)
+            or isinstance(self.charged_bytes, bool)
+            or self.charged_bytes <= 0
+            or not isinstance(self.conservative_decoded_bytes, int)
+            or isinstance(self.conservative_decoded_bytes, bool)
+            or self.conservative_decoded_bytes < self.encoded_bytes
+            or not isinstance(self.conservative_retained_bytes, int)
+            or isinstance(self.conservative_retained_bytes, bool)
+            or self.conservative_retained_bytes < 0
+            or not isinstance(self.counting_pass_peak_bytes, int)
+            or isinstance(self.counting_pass_peak_bytes, bool)
+            or self.counting_pass_peak_bytes <= 0
+            or not isinstance(self.stdout_bytes, int)
+            or isinstance(self.stdout_bytes, bool)
+            or self.stdout_bytes < 0
+            or not isinstance(self.stages, WorkerStageTimings)
+        ):
+            raise AuditInfrastructureError("worker result payload is invalid")
+        _validate_digest(
+            self.configuration_digest, "worker result payload configuration"
+        )
+        _validate_digest(
+            self.audit_engine_fingerprint, "worker result payload engine"
+        )
+        _validate_digest(self.pipe_nonce, "worker result payload pipe")
+        _validate_digest(self.nonce, "worker result payload nonce")
+        _validate_digest(self.encoded_sha256, "worker result payload")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPayloadPermit:
+    worker_index: int
+    generation: int
+    task_id: str
+
+    def __post_init__(self) -> None:
+        _validate_worker_generation_identity(
+            self.worker_index, self.generation, "worker payload permit"
+        )
+        if not isinstance(self.task_id, str) or not self.task_id:
+            raise AuditInfrastructureError("worker result payload permit is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CompactResultPreparseBounds:
+    encoded_bytes: int
+    conservative_decoded_bytes: int
+    conservative_retained_bytes: int
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            for value in (
+                self.encoded_bytes,
+                self.conservative_decoded_bytes,
+                self.conservative_retained_bytes,
+            )
+        ) or self.encoded_bytes > (4 << 20):
+            raise AuditInfrastructureError(
+                "compact result preparse bounds are invalid"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class CompactResultTransportAllocation:
+    counting_pass_peak_bytes: int
+    canonical_encoder_scratch_bytes: int
+    sender_payload_bytes: int
+    pipe_frame_bytes: int
+    pipe_kernel_capacity_bytes: int
+    receiver_payload_bytes: int
+    json_decoded_transient_bytes: int
+    retained_result_bytes: int
+    permit_reservation_bytes: int
+    decode_reservation_bytes: int
+    peak_pending_bytes: int
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(getattr(self, field_info.name), int)
+            or isinstance(getattr(self, field_info.name), bool)
+            or getattr(self, field_info.name) < 0
+            for field_info in dataclasses.fields(self)
+        ):
+            raise AuditInfrastructureError(
+                "compact result transport allocation is invalid"
+            )
+        if self.permit_reservation_bytes != (
+            self.canonical_encoder_scratch_bytes
+            + self.sender_payload_bytes
+            + self.pipe_frame_bytes
+            + self.pipe_kernel_capacity_bytes
+            + self.receiver_payload_bytes
+        ) or self.decode_reservation_bytes != (
+            self.receiver_payload_bytes
+            + self.json_decoded_transient_bytes
+            + self.retained_result_bytes
+        ) or self.peak_pending_bytes != max(
+            self.counting_pass_peak_bytes,
+            self.permit_reservation_bytes,
+            self.decode_reservation_bytes,
+        ):
+            raise AuditInfrastructureError(
+                "compact result transport allocation differs"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class CompactResultSlot:
+    worst_case_live_bytes: int
+    included_components: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.worst_case_live_bytes, int)
+            or isinstance(self.worst_case_live_bytes, bool)
+            or self.worst_case_live_bytes < 0
+            or self.worst_case_live_bytes > _COMPACT_RESULT_MAXIMUM_LIVE_BYTES
+            or not isinstance(self.included_components, tuple)
+            or any(not isinstance(value, str) or not value
+                   for value in self.included_components)
+        ):
+            raise AuditInfrastructureError("compact result slot is invalid")
+
+
 @dataclass(frozen=True, slots=True)
 class PilotRuntimeParameters:
     maximum_tasks_per_worker: int
@@ -2026,10 +2334,394 @@ class CompactResultReservationOwnership:
 _COMPACT_RESULT_MAXIMUM_LIVE_BYTES = 128 * 1024 * 1024
 
 
+class CompactAccountingObserver:
+    """Run-scoped logical compact-byte transition ledger."""
+
+    __slots__ = (
+        "_live_bytes", "_peak_live_bytes", "_events", "_semantic_events",
+        "_owners", "_owner_budgets", "_budgets", "_next_budget_id",
+        "_next_owner_id", "_semantic_transaction_id",
+        "_semantic_transaction_events", "_lock"
+    )
+
+    _SEMANTIC_EVENTS = frozenset({
+        "retain-hit",
+        "reserve-dispatch",
+        "activate-publication",
+        "release-publication",
+        "send-pipe",
+        "decode",
+        "retain-result",
+        "release-result",
+    })
+
+    def __init__(self) -> None:
+        self._live_bytes = 0
+        self._peak_live_bytes = 0
+        self._events: list[tuple[str, int, str]] = []
+        self._semantic_events: list[tuple[str, int, str, int]] = []
+        self._owners: dict[int, tuple[int, str, int, str, str]] = {}
+        self._owner_budgets: dict[int, int] = {}
+        self._budgets: set[int] = set()
+        self._next_budget_id = 0
+        self._next_owner_id = 0
+        self._semantic_transaction_id = 0
+        self._semantic_transaction_events: list[
+            tuple[str, int, str, int]
+        ] | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def live_bytes(self) -> int:
+        with self._lock:
+            return self._live_bytes
+
+    @property
+    def peak_live_bytes(self) -> int:
+        with self._lock:
+            return self._peak_live_bytes
+
+    @property
+    def events(self) -> tuple[tuple[str, int, str], ...]:
+        with self._lock:
+            return tuple(self._events)
+
+    @property
+    def semantic_events(self) -> tuple[tuple[str, int, str, int], ...]:
+        with self._lock:
+            return tuple(self._semantic_events)
+
+    def register_budget(self) -> int:
+        with self._lock:
+            self._next_budget_id += 1
+            budget_id = self._next_budget_id
+            self._budgets.add(budget_id)
+            return budget_id
+
+    def begin_semantic_transaction(self) -> int:
+        with self._lock:
+            if self._semantic_transaction_events is not None:
+                raise AuditInfrastructureError(
+                    "compact accounting semantic transaction overlaps"
+                )
+            self._semantic_transaction_id += 1
+            self._semantic_transaction_events = []
+            return self._semantic_transaction_id
+
+    def finish_semantic_transaction(self, transaction_id: int, *, commit: bool) -> None:
+        if (
+            not isinstance(transaction_id, int)
+            or isinstance(transaction_id, bool)
+            or transaction_id <= 0
+            or not isinstance(commit, bool)
+        ):
+            raise AuditInfrastructureError(
+                "compact accounting semantic transaction is invalid"
+            )
+        with self._lock:
+            pending = self._semantic_transaction_events
+            if (
+                pending is None
+                or transaction_id != self._semantic_transaction_id
+            ):
+                raise AuditInfrastructureError(
+                    "compact accounting semantic transaction is unavailable"
+                )
+            if commit:
+                self._semantic_events.extend(pending)
+            self._semantic_transaction_events = None
+
+    def _append_semantic_locked(
+        self, event: tuple[str, int, str, int]
+    ) -> None:
+        pending = self._semantic_transaction_events
+        if pending is None:
+            self._semantic_events.append(event)
+        else:
+            pending.append(event)
+
+    def allocate_owner(self, budget_id: int) -> int:
+        if (
+            not isinstance(budget_id, int)
+            or isinstance(budget_id, bool)
+            or budget_id <= 0
+        ):
+            raise AuditInfrastructureError(
+                "compact accounting budget identity is invalid"
+            )
+        with self._lock:
+            if budget_id not in self._budgets:
+                raise AuditInfrastructureError(
+                    "compact accounting budget identity is unavailable"
+                )
+            self._next_owner_id += 1
+            owner_id = self._next_owner_id
+            self._owner_budgets[owner_id] = budget_id
+            return owner_id
+
+    def discard_unobserved_owner(self, budget_id: int, owner_id: int) -> None:
+        with self._lock:
+            if owner_id in self._owners:
+                raise AuditInfrastructureError(
+                    "compact accounting semantic owner is already active"
+                )
+            if self._owner_budgets.get(owner_id) != budget_id:
+                raise AuditInfrastructureError(
+                    "compact accounting semantic owner budget differs"
+                )
+            del self._owner_budgets[owner_id]
+
+    def transition(
+        self,
+        event: str,
+        delta_bytes: int,
+        label: str,
+        *,
+        owner_id: int,
+        previous_owner_id: int | None = None,
+        budget_id: int | None = None,
+        semantic_event: str | None = None,
+    ) -> None:
+        if (
+            event not in {"reserve", "commit", "release", "replace"}
+            or not isinstance(delta_bytes, int)
+            or isinstance(delta_bytes, bool)
+            or not isinstance(label, str)
+            or not label
+            or not isinstance(owner_id, int)
+            or isinstance(owner_id, bool)
+            or owner_id <= 0
+            or (
+                budget_id is not None
+                and (
+                    not isinstance(budget_id, int)
+                    or isinstance(budget_id, bool)
+                    or budget_id <= 0
+                )
+            )
+            or (
+                semantic_event is not None
+                and semantic_event not in self._SEMANTIC_EVENTS
+            )
+            or (
+                previous_owner_id is not None
+                and (
+                    not isinstance(previous_owner_id, int)
+                    or isinstance(previous_owner_id, bool)
+                    or previous_owner_id <= 0
+                )
+            )
+        ):
+            raise AuditInfrastructureError(
+                "compact accounting transition is invalid"
+            )
+        with self._lock:
+            owner_budget = self._owner_budgets.get(owner_id)
+            if budget_id is None:
+                budget_id = owner_budget
+            if (
+                budget_id not in self._budgets
+                or owner_budget != budget_id
+                or (
+                    previous_owner_id is not None
+                    and self._owner_budgets.get(previous_owner_id) != budget_id
+                )
+            ):
+                raise AuditInfrastructureError(
+                    "compact accounting cross-budget semantic owner differs"
+                )
+            if event == "reserve":
+                if owner_id in self._owners or previous_owner_id is not None:
+                    raise AuditInfrastructureError(
+                        "compact accounting semantic owner overlaps"
+                    )
+                if semantic_event not in {None, "reserve-dispatch"}:
+                    raise AuditInfrastructureError(
+                        "compact accounting semantic transition differs"
+                    )
+                owner_bytes = delta_bytes
+                owner_state = "reserved"
+                owner_phase = (
+                    "dispatch-reserved"
+                    if semantic_event == "reserve-dispatch"
+                    else "plain"
+                )
+            elif event == "commit":
+                current = self._owners.get(owner_id)
+                if (
+                    current is None
+                    or current[3] != "reserved"
+                    or delta_bytes != 0
+                    or previous_owner_id is not None
+                    or semantic_event is not None
+                ):
+                    raise AuditInfrastructureError(
+                        "compact accounting semantic owner is unavailable"
+                    )
+                owner_bytes = current[0]
+                owner_state = "committed"
+                owner_phase = current[4]
+            elif event == "release":
+                current = self._owners.get(owner_id)
+                if (
+                    current is None
+                    or delta_bytes != -current[0]
+                    or previous_owner_id is not None
+                    or (
+                        semantic_event is not None
+                        and (
+                            semantic_event != "release-result"
+                            or current[3] != "committed"
+                            or current[4] not in {
+                                "hit-retained", "result-retained"
+                            }
+                        )
+                    )
+                ):
+                    raise AuditInfrastructureError(
+                        "compact accounting semantic owner underflows or transition differs"
+                    )
+                owner_bytes = 0
+            else:
+                previous = self._owners.get(previous_owner_id)
+                if (
+                    previous is None
+                    or previous[3] != "committed"
+                    or owner_id in self._owners
+                    or owner_id == previous_owner_id
+                ):
+                    raise AuditInfrastructureError(
+                        "compact accounting semantic owner replacement overlaps"
+                    )
+                owner_bytes = previous[0] + delta_bytes
+                if owner_bytes < 0:
+                    raise AuditInfrastructureError(
+                        "compact accounting semantic owner replacement underflows"
+                    )
+                if semantic_event is None:
+                    owner_phase = previous[4]
+                elif semantic_event == "decode" and previous[4] == "plain":
+                    owner_phase = "decode"
+                elif (
+                    semantic_event == "retain-result"
+                    and previous[4] == "decode"
+                ):
+                    owner_phase = "result-retained"
+                else:
+                    raise AuditInfrastructureError(
+                        "compact accounting semantic replacement transition differs"
+                    )
+                owner_state = "committed"
+            next_live = self._live_bytes + delta_bytes
+            if next_live < 0 or next_live > _COMPACT_RESULT_MAXIMUM_LIVE_BYTES:
+                raise AuditInfrastructureError(
+                    "compact accounting ownership overlaps or underflows"
+                )
+            if event == "release":
+                del self._owners[owner_id]
+                del self._owner_budgets[owner_id]
+            elif event == "replace":
+                del self._owners[previous_owner_id]
+                del self._owner_budgets[previous_owner_id]
+                self._owners[owner_id] = (
+                    owner_bytes, label, budget_id, owner_state, owner_phase
+                )
+            elif event == "reserve":
+                self._owners[owner_id] = (
+                    owner_bytes, label, budget_id, owner_state, owner_phase
+                )
+            elif event == "commit":
+                self._owners[owner_id] = (
+                    owner_bytes, label, budget_id, owner_state, owner_phase
+                )
+            self._live_bytes = next_live
+            self._peak_live_bytes = max(self._peak_live_bytes, next_live)
+            self._events.append((event, delta_bytes, label))
+            if semantic_event is not None:
+                self._append_semantic_locked(
+                    (semantic_event, delta_bytes, label, owner_id)
+                )
+
+    def record_semantic(
+        self,
+        semantic_event: str,
+        delta_bytes: int,
+        label: str,
+        *,
+        owner_id: int,
+        budget_id: int,
+    ) -> None:
+        if (
+            semantic_event not in self._SEMANTIC_EVENTS
+            or not isinstance(delta_bytes, int)
+            or isinstance(delta_bytes, bool)
+            or not isinstance(label, str)
+            or not label
+            or not isinstance(owner_id, int)
+            or isinstance(owner_id, bool)
+            or owner_id <= 0
+            or not isinstance(budget_id, int)
+            or isinstance(budget_id, bool)
+            or budget_id <= 0
+        ):
+            raise AuditInfrastructureError(
+                "compact accounting semantic transition is invalid"
+            )
+        with self._lock:
+            current = self._owners.get(owner_id)
+            allowed = {
+                ("plain", "retain-hit"): "hit-retained",
+                (
+                    "dispatch-reserved", "activate-publication"
+                ): "publication-active",
+                (
+                    "publication-active", "release-publication"
+                ): "publication-released",
+                ("publication-released", "send-pipe"): "pipe-sent",
+            }
+            next_phase = (
+                None
+                if current is None
+                else allowed.get((current[4], semantic_event))
+            )
+            expected_delta = (
+                current[0]
+                if current is not None and semantic_event == "retain-hit"
+                else 0
+            )
+            if (
+                current is None
+                or current[3] != "committed"
+                or next_phase is None
+                or current[2] != budget_id
+                or self._owner_budgets.get(owner_id) != budget_id
+                or delta_bytes != expected_delta
+                or any(
+                    event == semantic_event and event_owner == owner_id
+                    for event, _delta, _label, event_owner
+                    in self._semantic_events
+                )
+            ):
+                raise AuditInfrastructureError(
+                    "compact accounting semantic owner is unavailable"
+                )
+            self._owners[owner_id] = (
+                current[0], current[1], current[2], current[3], next_phase
+            )
+            self._append_semantic_locked(
+                (semantic_event, delta_bytes, label, owner_id)
+            )
+
+
 class CompactResultMemoryBudget:
     """Exact single-owner accounting for compact audit objects and indices."""
 
-    def __init__(self, maximum_bytes: int = _COMPACT_RESULT_MAXIMUM_LIVE_BYTES) -> None:
+    def __init__(
+        self,
+        maximum_bytes: int = _COMPACT_RESULT_MAXIMUM_LIVE_BYTES,
+        *,
+        observer: CompactAccountingObserver | None = None,
+    ) -> None:
         if (
             not isinstance(maximum_bytes, int)
             or isinstance(maximum_bytes, bool)
@@ -2037,11 +2729,24 @@ class CompactResultMemoryBudget:
             or maximum_bytes > _COMPACT_RESULT_MAXIMUM_LIVE_BYTES
         ):
             raise AuditInfrastructureError("compact result memory limit is invalid")
+        if observer is not None and not isinstance(
+            observer, CompactAccountingObserver
+        ):
+            raise AuditInfrastructureError("compact accounting observer is invalid")
         self.maximum_bytes = maximum_bytes
+        self.observer = observer
         self._reserved_bytes = 0
         self._committed_bytes = 0
         self._peak_live_bytes = 0
         self._lock = threading.Lock()
+        self._next_owner_id = 0
+        self._budget_id = (
+            0 if observer is None else observer.register_budget()
+        )
+
+    @property
+    def budget_id(self) -> int:
+        return self._budget_id
 
     @property
     def reserved_bytes(self) -> int:
@@ -2063,7 +2768,13 @@ class CompactResultMemoryBudget:
         with self._lock:
             return self._peak_live_bytes
 
-    def reserve(self, byte_count: int, *, label: str = "compact result") -> "CompactResultOwnership":
+    def reserve(
+        self,
+        byte_count: int,
+        *,
+        label: str = "compact result",
+        semantic_event: str | None = None,
+    ) -> "CompactResultOwnership":
         if (
             not isinstance(byte_count, int)
             or isinstance(byte_count, bool)
@@ -2079,20 +2790,71 @@ class CompactResultMemoryBudget:
                     f"{label} exceeds aggregate 128 MiB compact result limit"
                 )
             self._reserved_bytes += byte_count
+            if self.observer is None:
+                self._next_owner_id += 1
+                owner_id = self._next_owner_id
+            else:
+                owner_id = self.observer.allocate_owner(self._budget_id)
             self._peak_live_bytes = max(
                 self._peak_live_bytes,
                 self._reserved_bytes + self._committed_bytes,
             )
-        return CompactResultOwnership(self, byte_count, "reserved", label)
+        if self.observer is not None:
+            try:
+                self.observer.transition(
+                    "reserve", byte_count, label, owner_id=owner_id,
+                    budget_id=self._budget_id,
+                    semantic_event=semantic_event,
+                )
+            except BaseException:
+                with self._lock:
+                    self._reserved_bytes -= byte_count
+                self.observer.discard_unobserved_owner(
+                    self._budget_id, owner_id
+                )
+                raise
+        return CompactResultOwnership(
+            self, byte_count, "reserved", label, owner_id
+        )
 
-    def _commit(self, byte_count: int) -> None:
+    def _commit(self, byte_count: int, label: str, owner_id: int) -> None:
         with self._lock:
             if byte_count > self._reserved_bytes:
                 raise AuditInfrastructureError("compact result reservation accounting underflow")
             self._reserved_bytes -= byte_count
             self._committed_bytes += byte_count
+        if self.observer is not None:
+            try:
+                self.observer.transition(
+                    "commit", 0, label, owner_id=owner_id,
+                    budget_id=self._budget_id,
+                )
+            except BaseException:
+                with self._lock:
+                    self._reserved_bytes += byte_count
+                    self._committed_bytes -= byte_count
+                raise
 
-    def _release(self, byte_count: int, state: str) -> None:
+    def _record_semantic(
+        self,
+        label: str,
+        owner_id: int,
+        semantic_event: str,
+        delta_bytes: int,
+    ) -> None:
+        if self.observer is not None:
+            self.observer.record_semantic(
+                semantic_event,
+                delta_bytes,
+                label,
+                owner_id=owner_id,
+                budget_id=self._budget_id,
+            )
+
+    def _release(
+        self, byte_count: int, state: str, label: str, owner_id: int,
+        semantic_event: str | None = None,
+    ) -> None:
         with self._lock:
             if state == "reserved":
                 if byte_count > self._reserved_bytes:
@@ -2108,8 +2870,30 @@ class CompactResultMemoryBudget:
                 self._committed_bytes -= byte_count
             else:
                 raise AuditInfrastructureError("compact result ownership state is invalid")
+        if self.observer is not None:
+            try:
+                self.observer.transition(
+                    "release", -byte_count, label, owner_id=owner_id,
+                    budget_id=self._budget_id,
+                    semantic_event=semantic_event,
+                )
+            except BaseException:
+                with self._lock:
+                    if state == "reserved":
+                        self._reserved_bytes += byte_count
+                    else:
+                        self._committed_bytes += byte_count
+                raise
 
-    def _replace_committed(self, old_bytes: int, new_bytes: int) -> None:
+    def _replace_committed(
+        self,
+        old_bytes: int,
+        new_bytes: int,
+        label: str,
+        old_label: str,
+        old_owner_id: int,
+        semantic_event: str | None = None,
+    ) -> int:
         with self._lock:
             if old_bytes > self._committed_bytes:
                 raise AuditInfrastructureError(
@@ -2123,16 +2907,42 @@ class CompactResultMemoryBudget:
                     "replacement exceeds aggregate 128 MiB compact result limit"
                 )
             self._committed_bytes += new_bytes - old_bytes
+            if self.observer is None:
+                self._next_owner_id += 1
+                new_owner_id = self._next_owner_id
+            else:
+                new_owner_id = self.observer.allocate_owner(self._budget_id)
             self._peak_live_bytes = max(
                 self._peak_live_bytes,
                 self._reserved_bytes + self._committed_bytes,
             )
+        if self.observer is not None:
+            try:
+                self.observer.transition(
+                    "replace",
+                    new_bytes - old_bytes,
+                    label,
+                    owner_id=new_owner_id,
+                    previous_owner_id=old_owner_id,
+                    budget_id=self._budget_id,
+                    semantic_event=semantic_event,
+                )
+            except BaseException:
+                with self._lock:
+                    self._committed_bytes -= new_bytes - old_bytes
+                self.observer.discard_unobserved_owner(
+                    self._budget_id, new_owner_id
+                )
+                raise
+        return new_owner_id
 
 
 class CompactResultOwnership:
     """Linear ownership token; commit and release are each permitted once."""
 
-    __slots__ = ("_budget", "byte_count", "_state", "label")
+    __slots__ = (
+        "_budget", "byte_count", "_state", "label", "_owner_id"
+    )
 
     def __init__(
         self,
@@ -2140,15 +2950,21 @@ class CompactResultOwnership:
         byte_count: int,
         state: str,
         label: str,
+        owner_id: int,
     ) -> None:
         self._budget = budget
         self.byte_count = byte_count
         self._state = state
         self.label = label
+        self._owner_id = owner_id
 
     @property
     def budget(self) -> CompactResultMemoryBudget:
         return self._budget
+
+    @property
+    def owner_id(self) -> int:
+        return self._owner_id
 
     @property
     def committed(self) -> bool:
@@ -2161,18 +2977,33 @@ class CompactResultOwnership:
     def commit(self) -> "CompactResultOwnership":
         if self._state != "reserved":
             raise AuditInfrastructureError("compact result ownership cannot be committed")
-        self._budget._commit(self.byte_count)
+        self._budget._commit(self.byte_count, self.label, self._owner_id)
         self._state = "committed"
         return self
 
-    def release(self) -> None:
+    def record_semantic(
+        self, semantic_event: str, *, delta_bytes: int = 0
+    ) -> None:
+        if self._state != "committed":
+            raise AuditInfrastructureError(
+                "compact result semantic ownership is unavailable"
+            )
+        self._budget._record_semantic(
+            self.label, self._owner_id, semantic_event, delta_bytes
+        )
+
+    def release(self, *, semantic_event: str | None = None) -> None:
         if self._state == "released":
             raise AuditInfrastructureError("compact result ownership was already released")
-        self._budget._release(self.byte_count, self._state)
+        self._budget._release(
+            self.byte_count, self._state, self.label, self._owner_id,
+            semantic_event,
+        )
         self._state = "released"
 
     def replace_committed(
-        self, byte_count: int, *, label: str
+        self, byte_count: int, *, label: str,
+        semantic_event: str | None = None,
     ) -> "CompactResultOwnership":
         if (
             self._state != "committed"
@@ -2185,14 +3016,28 @@ class CompactResultOwnership:
             raise AuditInfrastructureError(
                 "compact result ownership replacement is invalid"
             )
-        self._budget._replace_committed(self.byte_count, byte_count)
+        new_owner_id = self._budget._replace_committed(
+            self.byte_count,
+            byte_count,
+            label,
+            self.label,
+            self._owner_id,
+            semantic_event,
+        )
         self._state = "released"
-        return CompactResultOwnership(self._budget, byte_count, "committed", label)
+        return CompactResultOwnership(
+            self._budget, byte_count, "committed", label, new_owner_id
+        )
 
     def __del__(self) -> None:
         try:
             if self._state != "released":
-                self._budget._release(self.byte_count, self._state)
+                self._budget._release(
+                    self.byte_count,
+                    self._state,
+                    self.label,
+                    self._owner_id,
+                )
                 self._state = "released"
         except Exception:
             pass
@@ -4360,6 +5205,14 @@ class StreamingResultAggregator:
         return len(self._accepted)
 
     @property
+    def next_unaggregated_ordinal(self) -> int:
+        """Lowest configuration ordinal not yet accepted into the aggregate."""
+        for ordinal, configuration in enumerate(self._expected):
+            if configuration.digest not in self._accepted:
+                return ordinal
+        return len(self._expected)
+
+    @property
     def budget(self) -> CompactResultMemoryBudget:
         return self._budget
 
@@ -4380,6 +5233,23 @@ class StreamingResultAggregator:
             label="batch retained result limit cold slot",
         ).commit()
         return slot.worst_case_live_bytes
+
+    def take_cold_slot(self, label: str) -> CompactResultOwnership:
+        """Move the single cold capacity owner to one authenticated decode."""
+        if not isinstance(label, str) or not label:
+            raise AuditInfrastructureError(
+                "compact result cold slot transfer is invalid"
+            )
+        ownership = self._cold_ownership
+        if ownership is None or ownership.released:
+            raise AuditInfrastructureError(
+                "compact result cold slot is unavailable"
+            )
+        transferred = ownership.replace_committed(
+            ownership.byte_count, label=label
+        )
+        self._cold_ownership = None
+        return transferred
 
     def ownership_for_cold_result(
         self, result: ConfigurationAuditResult
@@ -4450,7 +5320,7 @@ class StreamingResultAggregator:
         finally:
             result = None
         if not caller_retains_ownership:
-            ownership.release()
+            ownership.release(semantic_event="release-result")
 
     def _accept_validated_result_impl(
         self,

@@ -1226,6 +1226,45 @@ def runtime_contract_from_platform_decision(
         decision.recycle_rss_bytes, pipeline_deadline)
 
 
+def schedule_decision_configuration_audits(
+    *,
+    decision: PlatformWorkerDecision,
+    pipeline_deadline: float,
+    source_root: Path,
+    configurations: tuple[PreprocessConfiguration, ...],
+    dependency_roots: DependencyRootAuthority,
+    capability_registry: object,
+    initial_digest_map: Mapping[object, object],
+    prepared_cache: object,
+    limits: AuditLimits,
+    expected_audit_engine_fingerprint: str,
+    inspection_probe_invocations: int,
+    run_accountant: object,
+    compact_observer: object,
+):
+    """Decision-run entry that freezes runtime parameters before scheduling."""
+
+    runtime_contract = runtime_contract_from_platform_decision(
+        decision, pipeline_deadline
+    )
+    from gpu_capability_runner import schedule_configuration_audits
+
+    return schedule_configuration_audits(
+        source_root,
+        configurations,
+        dependency_roots,
+        capability_registry,
+        initial_digest_map,
+        prepared_cache,
+        limits,
+        expected_audit_engine_fingerprint,
+        runtime_contract,
+        inspection_probe_invocations=inspection_probe_invocations,
+        run_accountant=run_accountant,
+        compact_observer=compact_observer,
+    )
+
+
 def load_platform_worker_decision(
     path: Path, expected_platform: str, expected_key: WorkerDecisionKey,
 ) -> PlatformWorkerDecision:
@@ -1297,9 +1336,23 @@ class RealCalibrationRunner:
         raise AuditInfrastructureError(
             "real calibration runner integration belongs to Task 10")
 
-    def run(self, **_kwargs: object) -> object:
-        raise AuditInfrastructureError(
-            "real calibration runner integration belongs to Task 10")
+    def run(self, *, kind: str, **kwargs: object) -> object:
+        """Execute one already-prepared decision-bound scheduler run.
+
+        Task 10 owns native decision production and the full calibration
+        lifecycle.  Task 7 nevertheless owns the real scheduling boundary, so
+        an accepted decision must enter the scheduler here instead of through a
+        test-only wrapper.
+        """
+
+        decision = kwargs.get("decision")
+        if (
+            kind != "decision-audit"
+            or getattr(decision, "platform_kind", None) != self.platform_kind
+        ):
+            raise AuditInfrastructureError(
+                "real calibration runner operation is invalid")
+        return schedule_decision_configuration_audits(**kwargs)
 
 
 def _calibrate_platform_worker_count_with_runner(

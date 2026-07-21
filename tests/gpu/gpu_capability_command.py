@@ -9,6 +9,7 @@ import os
 import platform
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -30,6 +31,7 @@ from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
     CompilerExecutableCapability,
+    CompilerExecPermit,
     CompilerFamily,
     CompilerLaunchEvent,
     CompilerLaunchPurpose,
@@ -520,6 +522,271 @@ class _ParentCompilerLaunchObserver:
 _parent_compiler_launch_observer = _ParentCompilerLaunchObserver()
 
 
+_MACOS_EXEC_GATE_MAX_BYTES = 4096
+_MACOS_EXEC_GATE_SCHEMA = "olr-gpu-macos-compiler-exec-gate-v1"
+
+
+def _macos_exec_gate_payload(kind: str, token: str, pid: int, pgid: int,
+                             start_identity: str) -> bytes:
+    payload = json.dumps(
+        {
+            "kind": kind,
+            "pgid": pgid,
+            "pid": pid,
+            "schema": _MACOS_EXEC_GATE_SCHEMA,
+            "start_identity": start_identity,
+            "token": token,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    if not (0 < len(payload) <= _MACOS_EXEC_GATE_MAX_BYTES):
+        raise AuditInfrastructureError("macOS compiler exec gate payload is invalid")
+    return payload
+
+
+def _decode_macos_exec_gate_payload(payload: bytes, *, expected_kind: str,
+                                    token: str) -> tuple[int, int, str]:
+    try:
+        value = json.loads(payload.decode("ascii"))
+        if (
+            not isinstance(value, dict)
+            or set(value) != {
+                "kind", "pgid", "pid", "schema", "start_identity", "token"
+            }
+            or value["kind"] != expected_kind
+            or value["schema"] != _MACOS_EXEC_GATE_SCHEMA
+            or value["token"] != token
+            or not isinstance(value["pid"], int)
+            or isinstance(value["pid"], bool)
+            or value["pid"] <= 0
+            or not isinstance(value["pgid"], int)
+            or isinstance(value["pgid"], bool)
+            or value["pgid"] != value["pid"]
+            or not isinstance(value["start_identity"], str)
+            or not value["start_identity"]
+            or json.dumps(
+                value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            ).encode("ascii") != payload
+        ):
+            raise ValueError("invalid")
+        return value["pid"], value["pgid"], value["start_identity"]
+    except (KeyError, TypeError, ValueError, UnicodeError,
+            json.JSONDecodeError) as error:
+        raise AuditInfrastructureError(
+            "macOS compiler exec permit is invalid"
+        ) from error
+
+
+def _write_length_prefixed_fd(descriptor: int, payload: bytes) -> None:
+    frame = struct.pack(">I", len(payload)) + payload
+    offset = 0
+    while offset < len(frame):
+        written = os.write(descriptor, frame[offset:])
+        if written <= 0:
+            raise AuditInfrastructureError("macOS compiler exec gate write failed")
+        offset += written
+
+
+def _read_length_prefixed_fd(descriptor: int, deadline: float | None = None,
+                             cancel_event=None) -> bytes:
+    def read_exact(count: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < count:
+            if cancel_event is not None and cancel_event.is_set():
+                raise AuditInfrastructureError(
+                    "macOS compiler exec permit was cancelled"
+                )
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AuditInfrastructureError(
+                        "macOS compiler exec permit deadline exceeded"
+                    )
+                readable, _writable, _errors = select.select(
+                    (descriptor,), (), (), min(remaining, 0.05)
+                )
+                if not readable:
+                    continue
+            chunk = os.read(descriptor, count - len(chunks))
+            if not chunk:
+                raise AuditInfrastructureError(
+                    "macOS compiler exec permit channel closed"
+                )
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    length = struct.unpack(">I", read_exact(4))[0]
+    if not (0 < length <= _MACOS_EXEC_GATE_MAX_BYTES):
+        raise AuditInfrastructureError("macOS compiler exec permit is invalid")
+    return read_exact(length)
+
+
+def _native_macos_self_start_identity() -> tuple[int, int, str]:
+    pid = os.getpid()
+    pgid = os.getpgrp()
+
+    class _SelfProcess:
+        pass
+
+    process = _SelfProcess()
+    process.pid = pid
+    token = _native_process_start_token(process, "macos")
+    return pid, pgid, token.removeprefix("macos-proc:")
+
+
+def _run_macos_compiler_exec_gate(report_descriptor: int,
+                                   permit_descriptor: int, token: str,
+                                   command: tuple[str, ...]) -> None:
+    if (
+        not isinstance(report_descriptor, int)
+        or not isinstance(permit_descriptor, int)
+        or not isinstance(token, str)
+        or re.fullmatch(r"[0-9a-f]{64}", token) is None
+        or not isinstance(command, tuple)
+        or not command
+        or any(not isinstance(item, str) or not item for item in command)
+    ):
+        raise AuditInfrastructureError("macOS compiler exec gate input is invalid")
+    pid, pgid, start_identity = _native_macos_self_start_identity()
+    report = _macos_exec_gate_payload(
+        "report", token, pid, pgid, start_identity
+    )
+    try:
+        _write_length_prefixed_fd(report_descriptor, report)
+    finally:
+        os.close(report_descriptor)
+    permit = _read_length_prefixed_fd(permit_descriptor)
+    os.close(permit_descriptor)
+    actual = _decode_macos_exec_gate_payload(
+        permit, expected_kind="permit", token=token
+    )
+    if actual != (pid, pgid, start_identity):
+        raise AuditInfrastructureError("macOS compiler exec permit is invalid")
+    os.execvpe(command[0], command, dict(os.environ))
+    raise AuditInfrastructureError("macOS compiler exec returned unexpectedly")
+
+
+def _audit_task_ordinal(task_id: str | None) -> int:
+    match = re.fullmatch(r"audit-([0-9]+)-[0-9a-f]{16}", task_id or "")
+    if match is None:
+        raise AuditInfrastructureError("macOS compiler exec permit task is invalid")
+    return int(match.group(1))
+
+
+def _validate_macos_compiler_exec_permit(
+    permit: object,
+    process_start: ProcessStartIdentity,
+    *,
+    worker_index: int | None,
+    task_id: str | None,
+    generation: int | None,
+) -> None:
+    if (
+        not isinstance(permit, CompilerExecPermit)
+        or permit.worker_index != worker_index
+        or permit.generation != generation
+        or permit.task_id != _audit_task_ordinal(task_id)
+        or permit.pgid != process_start.pid
+    ):
+        raise AuditInfrastructureError("macOS compiler exec permit differs")
+
+
+class _MacOSCompilerExecGate:
+    """Start a session leader, register it, and permit compiler exec once."""
+
+    def __init__(self, command, environment, launch_options) -> None:
+        if sys.platform != "darwin":
+            raise AuditInfrastructureError("macOS compiler exec gate requires macOS")
+        self._token = secrets.token_hex(32)
+        report_read, report_write = os.pipe()
+        permit_read, permit_write = os.pipe()
+        self._report_read = report_read
+        self._report_write = report_write
+        self._permit_read = permit_read
+        self._permit_write = permit_write
+        self.command = (
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--macos-compiler-exec-gate",
+            str(report_write),
+            str(permit_read),
+            self._token,
+            *tuple(command),
+        )
+        self.environment = dict(environment)
+        options = dict(launch_options)
+        inherited = tuple(options.get("pass_fds", ()))
+        options["pass_fds"] = tuple(sorted(set(
+            (*inherited, report_write, permit_read)
+        )))
+        self.launch_options = options
+
+    def authorize(self, process, observer, *, worker_index, task_id,
+                  generation) -> ProcessStartIdentity:
+        os.close(self._report_write)
+        self._report_write = -1
+        os.close(self._permit_read)
+        self._permit_read = -1
+        deadline = getattr(observer, "macos_launch_deadline", None)
+        if (
+            not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or time.monotonic() >= deadline
+        ):
+            raise AuditInfrastructureError(
+                "macOS compiler exec permit deadline is invalid"
+            )
+        payload = _read_length_prefixed_fd(
+            self._report_read,
+            float(deadline),
+            getattr(observer, "macos_launch_cancel_event", None),
+        )
+        pid, pgid, start_identity = _decode_macos_exec_gate_payload(
+            payload, expected_kind="report", token=self._token
+        )
+        if pid != process.pid or pgid != process.pid:
+            raise AuditInfrastructureError("macOS compiler exec report differs")
+        process_start = ProcessStartIdentity(
+            "macos", pid, start_identity, secrets.token_hex(32)
+        )
+        authorize = getattr(observer, "authorize_macos_compiler_exec", None)
+        if not callable(authorize):
+            raise AuditInfrastructureError(
+                "macOS compiler exec permit authority is unavailable"
+            )
+        permit = authorize(process_start)
+        _validate_macos_compiler_exec_permit(
+            permit,
+            process_start,
+            worker_index=worker_index,
+            task_id=task_id,
+            generation=generation,
+        )
+        _write_length_prefixed_fd(
+            self._permit_write,
+            _macos_exec_gate_payload(
+                "permit", self._token, pid, pgid, start_identity
+            ),
+        )
+        os.close(self._permit_write)
+        self._permit_write = -1
+        return process_start
+
+    def close(self) -> None:
+        for name in (
+            "_report_read", "_report_write", "_permit_read", "_permit_write"
+        ):
+            descriptor = getattr(self, name, -1)
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                setattr(self, name, -1)
+
+
 def launch_compiler_process(
     prepared_arguments,
     *,
@@ -543,19 +810,47 @@ def launch_compiler_process(
         _parent_compiler_launch_observer
         if launch_observer is None else launch_observer
     )
-    process = subprocess.Popen(
-        prepared_arguments,
-        cwd=str(cwd), env=dict(environment), shell=False,
-        stdin=stdin, stdout=stdout, stderr=stderr,
-        **dict(launch_options), **containment.popen_arguments,
-    )
+    gate = None
+    effective_arguments = prepared_arguments
+    effective_environment = dict(environment)
+    effective_launch_options = dict(launch_options)
+    if platform_kind == "macos" and callable(
+        getattr(observer, "authorize_macos_compiler_exec", None)
+    ):
+        gate = _MacOSCompilerExecGate(
+            prepared_arguments, effective_environment, effective_launch_options
+        )
+        effective_arguments = gate.command
+        effective_environment = gate.environment
+        effective_launch_options = gate.launch_options
+    try:
+        process = subprocess.Popen(
+            effective_arguments,
+            cwd=str(cwd), env=effective_environment, shell=False,
+            stdin=stdin, stdout=stdout, stderr=stderr,
+            **effective_launch_options, **containment.popen_arguments,
+        )
+    except BaseException:
+        if gate is not None:
+            gate.close()
+        raise
     carrier = None
     try:
         containment.attach(process)
-        identity = ProcessStartIdentity(
-            platform_kind, process.pid,
-            _native_process_start_token(process, platform_kind),
-            secrets.token_hex(32),
+        identity = (
+            gate.authorize(
+                process,
+                observer,
+                worker_index=worker_index,
+                task_id=task_id,
+                generation=generation,
+            )
+            if gate is not None
+            else ProcessStartIdentity(
+                platform_kind, process.pid,
+                _native_process_start_token(process, platform_kind),
+                secrets.token_hex(32),
+            )
         )
         event = CompilerLaunchEvent(
             purpose, identity, worker_index=worker_index,
@@ -569,6 +864,8 @@ def launch_compiler_process(
             )
         register(event, carrier)
         containment.release(process)
+        if gate is not None:
+            gate.close()
         return process, carrier
     except BaseException as launch_error:
         try:
@@ -597,6 +894,13 @@ def launch_compiler_process(
                     launch_error.add_note(
                         f"compiler process carrier abort detail: {cleanup_note}"
                     )
+        if gate is not None:
+            try:
+                gate.close()
+            except BaseException as cleanup_error:
+                launch_error.add_note(
+                    f"macOS compiler exec gate cleanup also failed: {cleanup_error}"
+                )
         raise
 
 
@@ -1693,6 +1997,46 @@ def _probe_compiler_version(
             probe_directory.cleanup()
 
 
+def _held_compiler_launch(
+    capability: CompilerExecutableCapability,
+    prepared_arguments: tuple[str, ...],
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Select the executable through the already-held native capability.
+
+    POSIX executes the transferred descriptor path.  Windows CreateProcess
+    necessarily accepts a name; the parent registry retains non-write/delete
+    shared handles through generation reap, so this is the attested locked
+    name and the child performs no path lookup or identity refresh.
+    """
+
+    if (
+        not isinstance(capability, CompilerExecutableCapability)
+        or not isinstance(prepared_arguments, tuple)
+        or not prepared_arguments
+        or any(not isinstance(value, str) for value in prepared_arguments)
+    ):
+        raise AuditInfrastructureError("held compiler launch is invalid")
+    owner = capability.native_owner
+    if not isinstance(owner, _CompilerCapabilityOwner):
+        raise AuditInfrastructureError("held compiler launch owner is invalid")
+    if capability.platform_kind == "windows":
+        return (
+            (str(capability.executable_identity.canonical), *prepared_arguments[1:]),
+            {},
+        )
+    executable_fd = owner.executable_fd
+    if capability.platform_kind == "linux":
+        executable = f"/proc/self/fd/{executable_fd}"
+    elif capability.platform_kind == "macos":
+        executable = f"/dev/fd/{executable_fd}"
+    else:
+        raise AuditInfrastructureError("held compiler launch platform is invalid")
+    return (
+        (executable, *prepared_arguments[1:]),
+        {"pass_fds": (executable_fd,)},
+    )
+
+
 def _run_probe_command(
     capability: CompilerExecutableCapability,
     arguments: tuple[str, ...],
@@ -1710,14 +2054,9 @@ def _run_probe_command(
     if not callable(validate):
         raise AuditInfrastructureError("compiler probe capability owner is invalid")
     validate(content=False, deadline=pipeline_deadline)
-    command = (str(compiler), *arguments)
-    launch_options = {}
-    if capability.platform_kind == "linux":
-        executable_fd = getattr(owner, "executable_fd", None)
-        if not isinstance(executable_fd, int):
-            raise AuditInfrastructureError("exact compiler probe executable fd is unavailable")
-        command = (f"/proc/self/fd/{executable_fd}", *arguments)
-        launch_options["pass_fds"] = (executable_fd,)
+    command, launch_options = _held_compiler_launch(
+        capability, (str(compiler), *arguments)
+    )
     containment = _ProbeContainment()
     with tempfile.TemporaryFile(mode="w+b") as stdout_stream, tempfile.TemporaryFile(
         mode="w+b"
@@ -3245,8 +3584,10 @@ class _CompilerCapabilityOwner:
         alias_snapshots: tuple[tuple[int, int | None, int, int, int, str], ...],
         directory_paths: tuple[Path, ...],
         directory_snapshots: tuple[tuple[int, int | None, int], ...],
-        observer: _FilesystemGenerationObserver,
+        observer: _FilesystemGenerationObserver | None,
         dependency_root_authority: DependencyRootAuthority,
+        *,
+        validate_paths: bool = True,
     ) -> None:
         self.streams = streams
         self.file_paths = file_paths
@@ -3258,6 +3599,7 @@ class _CompilerCapabilityOwner:
         self.directory_snapshots = directory_snapshots
         self.observer = observer
         self.dependency_root_authority = dependency_root_authority
+        self.validate_paths = validate_paths
         self._closed = False
         self._lock = threading.Lock()
 
@@ -3283,7 +3625,8 @@ class _CompilerCapabilityOwner:
         _check_capability_budget(deadline, cancel_event)
         if self._closed:
             raise AuditInfrastructureError("compiler executable capability is closed")
-        self.observer.drain()
+        if self.observer is not None:
+            self.observer.drain()
         for stream, path, expected in zip(
             self.streams, self.file_paths, self.file_snapshots
         ):
@@ -3298,7 +3641,10 @@ class _CompilerCapabilityOwner:
             )
             if (
                 opened_snapshot[:4] != expected[:4]
-                or _regular_file_snapshot(path) != expected
+                or (
+                    self.validate_paths
+                    and _regular_file_snapshot(path) != expected
+                )
             ):
                 raise AuditInfrastructureError(
                     "compiler executable changed during compiler version probe: "
@@ -3312,15 +3658,25 @@ class _CompilerCapabilityOwner:
                 raise AuditInfrastructureError(
                     "compiler executable capability content changed"
                 )
-        for path, expected in zip(self.directory_paths, self.directory_snapshots):
-            _check_capability_budget(deadline, cancel_event)
-            if _directory_snapshot(path) != expected:
-                raise AuditInfrastructureError("compiler executable path chain changed")
-        for path, expected in zip(self.alias_paths, self.alias_snapshots):
-            _check_capability_budget(deadline, cancel_event)
-            if _symlink_snapshot(path) != expected:
-                raise AuditInfrastructureError("compiler runtime symlink changed")
-        self.observer.drain()
+        if self.validate_paths:
+            for path, expected in zip(
+                self.directory_paths, self.directory_snapshots
+            ):
+                _check_capability_budget(deadline, cancel_event)
+                if _directory_snapshot(path) != expected:
+                    raise AuditInfrastructureError(
+                        "compiler executable path chain changed"
+                    )
+            for path, expected in zip(
+                self.alias_paths, self.alias_snapshots
+            ):
+                _check_capability_budget(deadline, cancel_event)
+                if _symlink_snapshot(path) != expected:
+                    raise AuditInfrastructureError(
+                        "compiler runtime symlink changed"
+                    )
+        if self.observer is not None:
+            self.observer.drain()
 
     def close(self) -> None:
         with self._lock:
@@ -3328,10 +3684,11 @@ class _CompilerCapabilityOwner:
                 return
             self._closed = True
             errors: list[BaseException] = []
-            try:
-                self.observer.close()
-            except BaseException as error:
-                errors.append(error)
+            if self.observer is not None:
+                try:
+                    self.observer.close()
+                except BaseException as error:
+                    errors.append(error)
             for stream in reversed(self.streams):
                 try:
                     stream.close()
@@ -5201,3 +5558,26 @@ def make_configuration(
         compiler_capability_digest=compiler_capability.capability_digest,
         compiler_capability=compiler_capability,
     )
+
+
+def _command_main(arguments: tuple[str, ...]) -> int:
+    if len(arguments) >= 5 and arguments[0] == "--macos-compiler-exec-gate":
+        try:
+            report_descriptor = int(arguments[1])
+            permit_descriptor = int(arguments[2])
+        except ValueError as error:
+            raise AuditInfrastructureError(
+                "macOS compiler exec gate descriptors are invalid"
+            ) from error
+        _run_macos_compiler_exec_gate(
+            report_descriptor,
+            permit_descriptor,
+            arguments[3],
+            tuple(arguments[4:]),
+        )
+        return 0
+    raise AuditInfrastructureError("gpu capability command operation is invalid")
+
+
+if __name__ == "__main__":
+    raise SystemExit(_command_main(tuple(sys.argv[1:])))
