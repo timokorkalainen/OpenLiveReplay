@@ -17,6 +17,14 @@ static FrameHandle video(int feed, qint64 pts, uchar y) {
     return f;
 }
 
+static FrameHandle videoWithGeneration(int feed, qint64 pts, uchar y, uint64_t gpuGeneration,
+                                       qint64 decodedSequence) {
+    FrameHandle frame = video(feed, pts, y);
+    frame.metadata().gpuGeneration = gpuGeneration;
+    frame.metadata().decodedSequence = decodedSequence;
+    return frame;
+}
+
 static uchar yAt(const OutputBusFrame& frame, qsizetype offset) {
     return uchar(MediaVideoFrameView(frame.video).planeY.at(offset));
 }
@@ -138,65 +146,182 @@ private:
     std::thread m_setterThread;
 };
 
-class SlowSubmitSink final : public IOutputSink {
+class RuntimeResetDuringSubmitSink final : public IOutputSink {
 public:
+    explicit RuntimeResetDuringSubmitSink(int blockedSubmit = 1) : m_blockedSubmit(blockedSubmit) {}
     OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
-
     bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
-        QMutexLocker locker(&m_mutex);
-        m_active = assignment.enabled && assignment.kind == kind() && rate.isValid();
-        m_frames.clear();
-        m_submitCount = 0;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_active = assignment.enabled && rate.isValid();
         return m_active;
     }
-
     void stop() override {
-        QMutexLocker locker(&m_mutex);
+        std::lock_guard<std::mutex> lock(m_mutex);
         m_active = false;
-        m_submitStarted.wakeAll();
+        m_release = true;
+        m_releaseCv.notify_all();
     }
-
     bool isActive() const override {
-        QMutexLocker locker(&m_mutex);
+        std::lock_guard<std::mutex> lock(m_mutex);
         return m_active;
     }
-
     bool submit(const OutputBusFrame& frame) override {
-        {
-            QMutexLocker locker(&m_mutex);
-            if (!m_active) return false;
-            m_frames.append(frame);
-            ++m_submitCount;
-            m_submitStarted.wakeAll();
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (!m_active) return false;
+        m_frames.append(frame);
+        ++m_submitCount;
+        if (m_submitCount != m_blockedSubmit) return true;
+
+        m_entered = true;
+        m_enteredCv.notify_all();
+        if (!m_releaseCv.wait_for(lock, std::chrono::seconds(2), [this]() { return m_release; })) {
+            m_diagnosticTimeout = true;
+            return false;
         }
-        QThread::msleep(80);
+        m_resetReturnedBeforeRelease = m_resetReturned;
         return true;
     }
 
-    bool waitForSubmits(int count, int timeoutMs) const {
-        QElapsedTimer timer;
-        timer.start();
-        QMutexLocker locker(&m_mutex);
-        while (m_submitCount < count) {
-            const qint64 remainingMs = qint64(timeoutMs) - timer.elapsed();
-            if (remainingMs <= 0) return false;
-            m_submitStarted.wait(&m_mutex, static_cast<unsigned long>(remainingMs));
-        }
-        return true;
+    bool waitUntilEntered() {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_enteredCv.wait_for(lock, std::chrono::seconds(2), [this]() { return m_entered; });
     }
-
+    void markResetReturned() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_resetReturned = true;
+        m_resetReturnedCv.notify_all();
+    }
+    bool waitForResetReturned() {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_resetReturnedCv.wait_for(lock, std::chrono::seconds(2),
+                                          [this]() { return m_resetReturned; });
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_release = true;
+        m_releaseCv.notify_all();
+    }
+    bool resetReturnedBeforeRelease() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_resetReturnedBeforeRelease;
+    }
+    bool diagnosticTimeout() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_diagnosticTimeout;
+    }
     QVector<OutputBusFrame> frames() const {
-        QMutexLocker locker(&m_mutex);
+        std::lock_guard<std::mutex> lock(m_mutex);
         return m_frames;
     }
 
 private:
-    mutable QMutex m_mutex;
-    mutable QWaitCondition m_submitStarted;
+    const int m_blockedSubmit = 1;
+    mutable std::mutex m_mutex;
+    std::condition_variable m_enteredCv;
+    std::condition_variable m_releaseCv;
+    std::condition_variable m_resetReturnedCv;
     bool m_active = false;
     int m_submitCount = 0;
+    bool m_entered = false;
+    bool m_release = false;
+    bool m_resetReturned = false;
+    bool m_resetReturnedBeforeRelease = false;
+    bool m_diagnosticTimeout = false;
     QVector<OutputBusFrame> m_frames;
 };
+
+struct DeferredResetScenarioResult {
+    bool activeLeaseEntered = false;
+    bool resetsReturnedBeforeRelease = false;
+    bool followerRegisteredBeforeRelease = false;
+    bool sinkObservedResetReturnBeforeRelease = false;
+    bool diagnosticTimeout = false;
+    int appliedResetsBeforeRelease = -1;
+    int appliedResetsAtFollowerSnapshot = -1;
+    int finalAppliedResets = -1;
+    QVector<OutputBusFrame> frames;
+};
+
+static DeferredResetScenarioResult runDeferredResetScenario(bool holdLastActiveLease) {
+    DeferredResetScenarioResult result;
+
+    OutputFrameCache initialCache(1, 4, 4);
+    initialCache.insertVideoFrame(videoWithGeneration(0, 100, 41, 7, 701));
+    OutputFrameCache activeCache(1, 4, 4);
+    if (!holdLastActiveLease) activeCache.insertVideoFrame(videoWithGeneration(0, 140, 82, 7, 702));
+    OutputFrameCache followerCache(1, 4, 4);
+    followerCache.insertVideoFrame(videoWithGeneration(0, 500, 123, 8, 801));
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    RuntimeResetDuringSubmitSink sink(2);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    std::atomic<int> snapshotStage{0};
+    std::atomic<int> appliedResetsAtFollowerSnapshot{-1};
+    runtime.setSnapshotProvider([&]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.state.playing = true;
+        snapshot.state.selectedFeedIndex = 0;
+        const int stage = snapshotStage.load(std::memory_order_acquire);
+        if (stage == 0) {
+            snapshot.cache = initialCache;
+            snapshot.state.playheadMs = 100;
+            snapshot.state.gpuGeneration = 7;
+        } else if (stage == 1) {
+            snapshot.cache = activeCache;
+            snapshot.state.playheadMs = 140;
+            snapshot.state.gpuGeneration = 7;
+        } else {
+            appliedResetsAtFollowerSnapshot.store(runtime.playEpochResetCountForTest(),
+                                                  std::memory_order_release);
+            snapshot.cache = followerCache;
+            snapshot.state.playheadMs = 500;
+            snapshot.state.gpuGeneration = 8;
+        }
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+    runtime.setIdentitySkip(false);
+
+    runtime.dispatchImmediate();
+    snapshotStage.store(1, std::memory_order_release);
+    std::thread activeDispatch([&]() { runtime.dispatchImmediate(); });
+    result.activeLeaseEntered = sink.waitUntilEntered();
+
+    std::thread resetter([&]() {
+        runtime.resetPlayEpoch();
+        runtime.resetPlayEpoch();
+        runtime.resetPlayEpoch();
+        sink.markResetReturned();
+    });
+    result.resetsReturnedBeforeRelease = sink.waitForResetReturned();
+    if (result.resetsReturnedBeforeRelease)
+        result.appliedResetsBeforeRelease = runtime.playEpochResetCountForTest();
+
+    snapshotStage.store(2, std::memory_order_release);
+    std::thread followerDispatch([&]() { runtime.dispatchImmediate(); });
+    // The synchronous seed request has completed and the blocked active request is the sole
+    // registered baseline. Reaching two therefore proves the follower queued behind that lease.
+    result.followerRegisteredBeforeRelease =
+        runtime.waitForImmediateDispatchRequestsForTest(2, 2000);
+
+    sink.release();
+    activeDispatch.join();
+    resetter.join();
+    followerDispatch.join();
+
+    result.sinkObservedResetReturnBeforeRelease = sink.resetReturnedBeforeRelease();
+    result.diagnosticTimeout = sink.diagnosticTimeout();
+    result.appliedResetsAtFollowerSnapshot =
+        appliedResetsAtFollowerSnapshot.load(std::memory_order_acquire);
+    result.finalAppliedResets = runtime.playEpochResetCountForTest();
+    result.frames = sink.frames();
+    return result;
+}
 
 class TestOutputRuntime : public QObject {
     Q_OBJECT
@@ -215,6 +340,10 @@ private slots:
     void recordGpuBudgetSurfacesInStats();
     void injectedGpuRhiContextIsReusedAndReplaceable();
     void dispatchSubmitsWithoutHoldingRuntimeMutex();
+    void resetRejectsSnapshotCapturedBeforeLeaseRecheck();
+    void playEpochResetDefersWithoutBlockingActiveDispatch();
+    void multiplePlayEpochResetsCoalesceBeforeNextLease();
+    void multiplePlayEpochResetsCoalesceBeforeNextHoldLastLease();
     void immediateDispatchPreemptsCatchUpBurstAfterCurrentTick();
     void pgmCriticalImmediateDispatchSubmitsPreviewAndReportsPgmIdentity();
     void endpointReconfigurationDiscardsPreReconfigSnapshot();
@@ -761,6 +890,185 @@ void TestOutputRuntime::dispatchSubmitsWithoutHoldingRuntimeMutex() {
              "sinks can block on fences while submitting");
 }
 
+void TestOutputRuntime::resetRejectsSnapshotCapturedBeforeLeaseRecheck() {
+    OutputFrameCache staleCache(1, 4, 4);
+    staleCache.insertVideoFrame(videoWithGeneration(0, 100, 35, 11, 1101));
+    OutputFrameCache currentCache(1, 4, 4);
+    currentCache.insertVideoFrame(videoWithGeneration(0, 500, 95, 12, 1201));
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    std::atomic<int> snapshotCalls{0};
+    std::mutex snapshotMutex;
+    std::condition_variable snapshotCapturedCv;
+    std::condition_variable snapshotReleaseCv;
+    bool snapshotCaptured = false;
+    bool releaseSnapshot = false;
+    bool diagnosticTimeout = false;
+    runtime.setSnapshotProvider([&]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.state.playing = true;
+        snapshot.state.selectedFeedIndex = 0;
+        const int call = snapshotCalls.fetch_add(1, std::memory_order_acq_rel);
+        if (call == 0) {
+            snapshot.cache = staleCache;
+            snapshot.state.playheadMs = 100;
+            snapshot.state.gpuGeneration = 11;
+            std::unique_lock<std::mutex> lock(snapshotMutex);
+            snapshotCaptured = true;
+            snapshotCapturedCv.notify_all();
+            if (!snapshotReleaseCv.wait_for(lock, std::chrono::seconds(2),
+                                            [&]() { return releaseSnapshot; }))
+                diagnosticTimeout = true;
+        } else {
+            snapshot.cache = currentCache;
+            snapshot.state.playheadMs = 500;
+            snapshot.state.gpuGeneration = 12;
+        }
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    std::thread dispatch([&]() { runtime.dispatchDueTicksForTest(0); });
+    bool capturedBeforeReset = false;
+    {
+        std::unique_lock<std::mutex> lock(snapshotMutex);
+        capturedBeforeReset = snapshotCapturedCv.wait_for(lock, std::chrono::seconds(2),
+                                                          [&]() { return snapshotCaptured; });
+    }
+    if (capturedBeforeReset) runtime.resetPlayEpoch();
+    {
+        std::lock_guard<std::mutex> lock(snapshotMutex);
+        releaseSnapshot = true;
+        snapshotReleaseCv.notify_all();
+    }
+    dispatch.join();
+
+    QVERIFY2(capturedBeforeReset, "snapshot provider did not reach the capture barrier");
+    QVERIFY2(!diagnosticTimeout, "snapshot provider timed out waiting for deterministic release");
+    QCOMPARE(snapshotCalls.load(std::memory_order_acquire), 2);
+    const QVector<OutputBusFrame> frames = sink.frames();
+    QCOMPARE(frames.size(), 1);
+    QCOMPARE(frames.first().outputFrameIndex, qint64(0));
+    QCOMPARE(frames.first().sampledPlayheadMs, qint64(500));
+    QCOMPARE(videoPts(frames.first()), qint64(500));
+    QCOMPARE(frames.first().video.metadata().gpuGeneration, uint64_t(12));
+    QCOMPARE(frames.first().video.metadata().decodedSequence, qint64(1201));
+    QCOMPARE(yAt(frames.first(), 0), uchar(95));
+}
+
+void TestOutputRuntime::playEpochResetDefersWithoutBlockingActiveDispatch() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 105));
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    RuntimeResetDuringSubmitSink sink;
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state.playheadMs = 100;
+        snapshot.state.playing = true;
+        snapshot.state.selectedFeedIndex = 0;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    std::thread dispatch([&]() { runtime.dispatchDueTicksForTest(0); });
+    const bool entered = sink.waitUntilEntered();
+    std::thread resetter([&]() {
+        runtime.resetPlayEpoch();
+        sink.markResetReturned();
+    });
+    const bool resetReturned = sink.waitForResetReturned();
+    sink.release();
+    dispatch.join();
+    resetter.join();
+
+    QVERIFY2(entered, "sink submit did not reach the active-dispatch barrier");
+    QVERIFY2(resetReturned, "resetPlayEpoch did not return before the release barrier");
+    QVERIFY2(!sink.diagnosticTimeout(), "sink timed out waiting for deterministic release");
+    QVERIFY2(sink.resetReturnedBeforeRelease(),
+             "resetPlayEpoch must invalidate the active snapshot and defer the epoch clear "
+             "without blocking the seek commit behind sink submission");
+}
+
+void TestOutputRuntime::multiplePlayEpochResetsCoalesceBeforeNextLease() {
+    const DeferredResetScenarioResult result = runDeferredResetScenario(false);
+
+    QVERIFY2(result.activeLeaseEntered, "active real-frame lease did not reach submit barrier");
+    QVERIFY2(result.resetsReturnedBeforeRelease,
+             "three resets did not return while the real-frame lease remained active");
+    QVERIFY2(result.followerRegisteredBeforeRelease,
+             "follower immediate request did not raise the registered count from the active "
+             "real-frame baseline of one to two before release");
+    QVERIFY2(result.sinkObservedResetReturnBeforeRelease,
+             "sink did not observe reset completion before its release barrier");
+    QVERIFY2(!result.diagnosticTimeout, "real-frame lease hit the diagnostic timeout");
+    QCOMPARE(result.appliedResetsBeforeRelease, 0);
+    QCOMPARE(result.appliedResetsAtFollowerSnapshot, 1);
+    QCOMPARE(result.finalAppliedResets, 1);
+    QCOMPARE(result.frames.size(), 3);
+
+    const OutputBusFrame& active = result.frames.at(1);
+    QCOMPARE(active.outputFrameIndex, qint64(1));
+    QCOMPARE(active.sampledPlayheadMs, qint64(140));
+    QCOMPARE(videoPts(active), qint64(140));
+    QCOMPARE(active.video.metadata().gpuGeneration, uint64_t(7));
+    QCOMPARE(active.video.metadata().decodedSequence, qint64(702));
+
+    const OutputBusFrame& follower = result.frames.at(2);
+    QCOMPARE(follower.outputFrameIndex, qint64(2));
+    QCOMPARE(follower.sampledPlayheadMs, qint64(500));
+    QCOMPARE(videoPts(follower), qint64(500));
+    QCOMPARE(follower.video.metadata().gpuGeneration, uint64_t(8));
+    QCOMPARE(follower.video.metadata().decodedSequence, qint64(801));
+}
+
+void TestOutputRuntime::multiplePlayEpochResetsCoalesceBeforeNextHoldLastLease() {
+    const DeferredResetScenarioResult result = runDeferredResetScenario(true);
+
+    QVERIFY2(result.activeLeaseEntered, "active hold-last lease did not reach submit barrier");
+    QVERIFY2(result.resetsReturnedBeforeRelease,
+             "three resets did not return while the hold-last lease remained active");
+    QVERIFY2(result.followerRegisteredBeforeRelease,
+             "follower immediate request did not raise the registered count from the active "
+             "hold-last baseline of one to two before release");
+    QVERIFY2(result.sinkObservedResetReturnBeforeRelease,
+             "hold-last sink did not observe reset completion before release");
+    QVERIFY2(!result.diagnosticTimeout, "hold-last lease hit the diagnostic timeout");
+    QCOMPARE(result.appliedResetsBeforeRelease, 0);
+    QCOMPARE(result.appliedResetsAtFollowerSnapshot, 1);
+    QCOMPARE(result.finalAppliedResets, 1);
+    QCOMPARE(result.frames.size(), 3);
+
+    const OutputBusFrame& held = result.frames.at(1);
+    QCOMPARE(held.outputFrameIndex, qint64(1));
+    QCOMPARE(held.sampledPlayheadMs, qint64(140));
+    QCOMPARE(videoPts(held), qint64(100));
+    QVERIFY(!held.video.metadata().key.isPlaceholder);
+    QCOMPARE(held.video.metadata().gpuGeneration, uint64_t(7));
+    QCOMPARE(held.video.metadata().decodedSequence, qint64(701));
+
+    const OutputBusFrame& follower = result.frames.at(2);
+    QCOMPARE(follower.outputFrameIndex, qint64(2));
+    QCOMPARE(follower.sampledPlayheadMs, qint64(500));
+    QCOMPARE(videoPts(follower), qint64(500));
+    QCOMPARE(follower.video.metadata().gpuGeneration, uint64_t(8));
+    QCOMPARE(follower.video.metadata().decodedSequence, qint64(801));
+}
+
 void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() {
     OutputFrameCache cache(1, 4, 4);
     cache.insertVideoFrame(video(0, 100, 40));
@@ -774,7 +1082,7 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
     assignment.kind = OutputTargetKind::QtPreview;
     assignment.enabled = true;
 
-    SlowSubmitSink sink;
+    RuntimeResetDuringSubmitSink sink(2);
     OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
     runtime.setSnapshotProvider([&]() {
         OutputRuntimeSnapshot snapshot;
@@ -791,35 +1099,26 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
     runtime.dispatchDueTicksForTest(0);
 
     std::thread catchUpThread([&]() { runtime.dispatchDueTicksForTest(1000); });
-
-    QVERIFY2(sink.waitForSubmits(2, 1000), "scheduled catch-up must enter its first tick");
+    const bool catchUpEntered = sink.waitUntilEntered();
     playheadMs.store(200, std::memory_order_release);
 
-    QElapsedTimer timer;
-    timer.start();
-    runtime.dispatchImmediate();
-    [[maybe_unused]] const qint64 immediateElapsedMs = timer.elapsed();
+    std::thread immediateThread([&]() { runtime.dispatchImmediate(); });
+    const bool immediateQueued = runtime.waitForImmediateDispatchRequestsForTest(1, 2000);
+    sink.release();
 
     catchUpThread.join();
+    immediateThread.join();
 
     const QVector<OutputBusFrame> frames = sink.frames();
-    // Preemption is proven structurally by the frame count below; this latency bound is a
-    // coarse "did not wait for the whole burst" guard. The full non-preempted burst is
-    // m_maxCatchUpTicks (8) * SlowSubmitSink 80ms = 640ms, so a value well under that still
-    // catches a preemption regression while tolerating CI scheduling jitter (msleep can
-    // overrun under load, which made a tight 250ms bound flaky). Under ThreadSanitizer the
-    // instrumented handoff and the SlowSubmitSink msleeps dominate and inflate this
-    // wall-clock far past the budget on slower/contended runners (1-2.8 s observed on CI),
-    // so gate the timing guard out under TSan and rely on the timing-free structural check.
-#if !defined(__SANITIZE_THREAD__) && !(defined(__has_feature) && __has_feature(thread_sanitizer))
-    QVERIFY2(immediateElapsedMs < 500,
-             qPrintable(QStringLiteral("immediate dispatch waited %1 ms behind catch-up")
-                            .arg(immediateElapsedMs)));
-#endif
-    QVERIFY2(frames.size() <= 4,
-             qPrintable(QStringLiteral("immediate dispatch allowed %1 stale catch-up frames")
-                            .arg(frames.size())));
+    QVERIFY2(catchUpEntered, "scheduled catch-up did not reach its active-submit barrier");
+    QVERIFY2(immediateQueued, "immediate dispatch did not register before catch-up release");
+    QVERIFY2(!sink.diagnosticTimeout(), "catch-up submit timed out waiting for release");
+    QCOMPARE(frames.size(), 3);
+    QCOMPARE(frames.at(1).sampledPlayheadMs, qint64(100));
+    QCOMPARE(videoPts(frames.at(1)), qint64(100));
+    QCOMPARE(frames.at(2).outputFrameIndex, qint64(2));
     QCOMPARE(frames.last().sampledPlayheadMs, qint64(200));
+    QCOMPARE(videoPts(frames.last()), qint64(200));
 }
 
 void TestOutputRuntime::pgmCriticalImmediateDispatchSubmitsPreviewAndReportsPgmIdentity() {
@@ -831,7 +1130,7 @@ void TestOutputRuntime::pgmCriticalImmediateDispatchSubmitsPreviewAndReportsPgmI
     state.playing = false;
     state.selectedFeedIndex = 0;
 
-    SlowSubmitSink previewSink;
+    ThreadSafeCollectingSink previewSink(OutputTargetKind::QtPreview);
     ThreadSafeCollectingSink pgmSink(OutputTargetKind::Ndi);
     OutputRuntime runtime(FrameRate::fromFraction(60, 1), 1, 4, 4);
     runtime.setSnapshotProvider([cache, state]() {
@@ -870,7 +1169,7 @@ void TestOutputRuntime::pgmCriticalImmediateDispatchSubmitsPreviewAndReportsPgmI
     QCOMPARE(report.requiredIdentity.sourcePtsMs, qint64(1000));
     QVERIFY(!report.requiredIdentity.videoPlaceholder);
     QCOMPARE(pgmSink.frameCount(), 1);
-    QVERIFY(previewSink.waitForSubmits(1, 10));
+    QCOMPARE(previewSink.frameCount(), 1);
     QCOMPARE(report.submittedFrames.size(), 2);
     QCOMPARE(report.submittedFrames.at(0).assignment.id, QStringLiteral("pgm-ndi"));
     QCOMPARE(report.submittedFrames.at(1).assignment.id, QStringLiteral("pgm-preview"));

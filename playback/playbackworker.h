@@ -203,6 +203,13 @@ public:
     void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
     void resetOutputPlayEpoch();
 #ifdef OLR_UNIT_TEST
+    class OutputCommitBarrierForTest {
+    public:
+        virtual ~OutputCommitBarrierForTest() = default;
+        virtual void enterAndWait() = 0;
+    };
+
+    void setOutputCommitBarrierForTest(OutputCommitBarrierForTest* barrier);
     void setResidencyWindowParamsForTest(const ResidencyWindowParams& params);
     static int64_t liveGrowthFileSizeForTest(int64_t avioSize, const QString& filePath);
     static int64_t liveEofRecoveryAnchorMsForTest(int64_t playheadMs, int64_t newestBeforeEofMs,
@@ -253,11 +260,38 @@ private:
         Displayable,
     };
 
+    enum class OutputCacheAction : uint8_t { Keep, Publish, MergeStagingAndPublish };
+    enum class PostCommitDispatch : uint8_t { None, Output, Preview, PgmCritical };
+
+    struct OutputCommit {
+        qint64 playheadMs = 0;
+        uint64_t seekGeneration = 0;
+        uint64_t gpuGeneration = 0;
+        OutputCacheAction cacheAction = OutputCacheAction::Keep;
+        OutputCoverageMode coverageMode = OutputCoverageMode::StrictSeek;
+        bool requireCurrentSeek = true;
+        bool clearSeekTarget = false;
+        bool guardPlayheadCache = false;
+        // When false, the commit skips the coverage/displayable gate and commits at
+        // playheadMs unconditionally (used by a scheduled cut that has deferred to its
+        // bound: the cut must land on air even if a feed is not yet displayable).
+        bool requireCoverage = true;
+        PostCommitDispatch dispatch = PostCommitDispatch::None;
+    };
+
+    struct OutputCommitResult {
+        bool committed = false;
+        qint64 committedPlayheadMs = 0;
+        uint64_t committedGeneration = 0;
+        PostCommitDispatch dispatch = PostCommitDispatch::None;
+    };
+
     struct SeekRequestResult {
         qint64 clampedTargetMs = 0;
         int moveDir = 1;
         uint64_t generation = 0;
         bool committedFromPublishedCache = false;
+        PostCommitDispatch dispatch = PostCommitDispatch::None;
         qint64 publishNs = 0;
     };
 
@@ -266,6 +300,7 @@ private:
         qint64 targetMs = -1;
         bool waiting = false;
         bool completed = false;
+        bool pgmDispatchAttempted = false;
         bool submittedPgm = false;
         OutputFrameIdentity pgmIdentity;
         QString message;
@@ -307,21 +342,42 @@ private:
     bool
     outputFeedCoversPlayheadLocked(int feedIndex, int64_t playheadMs, uint64_t gpuGeneration,
                                    OutputCoverageMode mode = OutputCoverageMode::StrictSeek) const;
+    bool outputCacheCoversPlayheadInCacheLocked(const OutputFrameCache& cache, int64_t playheadMs,
+                                                uint64_t gpuGeneration,
+                                                OutputCoverageMode mode) const;
     bool outputCacheCoversPlayheadLocked(
         int64_t playheadMs, uint64_t gpuGeneration,
         OutputCoverageMode mode = OutputCoverageMode::OperatorSeek) const;
+    std::optional<qint64> outputCacheDisplayablePlayheadInCacheLocked(const OutputFrameCache& cache,
+                                                                      qint64 playheadMs,
+                                                                      uint64_t gpuGeneration) const;
     std::optional<qint64> outputCacheDisplayablePlayheadLocked(qint64 playheadMs,
                                                                uint64_t gpuGeneration) const;
+    std::optional<qint64>
+    validatedOutputCommitPlayheadLocked(const OutputCommit& commit,
+                                        const OutputFrameCache* coverageCache) const;
+    OutputCommitResult commitOutputStateLocked(const OutputCommit& commit);
+    // Whether a still-in-flight operator PGM obligation should be (re)dispatched at a
+    // reposition commit. The per-packet early-completion (tryComplete) is one-shot via
+    // OperatorSeekCompletionState::pgmDispatchAttempted, but the final reposition commit
+    // makes the last PGM attempt for the SAME seek, so a transient early miss does not
+    // strand the operator's take-to-air. Caller holds m_mutex.
+    bool operatorPgmObligationAvailableLocked(uint64_t generation) const;
+    OutputCommitResult commitFullRepositionOutputStateLocked(
+        const OutputCommit& commit, std::unique_ptr<OutputFrameCache>& liveSaved, qint64 keepFrom,
+        qint64 keepTo, qint64 keepAudioFromSample, bool sanitizeForDeviceLoss);
     bool outputCacheCoversPlayhead(int64_t playheadMs) const;
-    bool publishOutputCacheIfCoversPlayhead(int64_t playheadMs);
     bool pausedPlayheadNeedsWork(int64_t playheadMs);
     SeekRequestResult requestSeekTo(qint64 timestampMs, int directionHint,
                                     bool registerOperatorTransaction);
     OutputDispatchReport dispatchPgmAfterSeekCommit(qint64 targetMs);
+    OutputDispatchReport dispatchPgmCommitObligation(qint64 targetMs, uint64_t generation);
     void completeOperatorSeekTransaction(uint64_t generation, qint64 targetMs,
                                          const OutputDispatchReport& report);
     bool hasOperatorSeekTransaction(uint64_t generation);
     bool tryCompleteOperatorSeekFromCurrentOutputCache(qint64 targetMs, uint64_t generation);
+    void maybeCompleteOperatorSeekAfterDecodedPacket(qint64 targetMs, uint64_t generation,
+                                                     bool& operatorPgmCompletedEarly);
     bool allowDisplayableFallbackForReposition(uint64_t generation);
     int64_t windowLeadMs() const;
     int64_t windowTrailMs() const;
@@ -368,8 +424,8 @@ private:
     void shutdownOutputGraph();
     void rebuildOutputEndpoints();
     OutputRuntimeSnapshot makeOutputSnapshot() const;
-    void refreshOutputAfterSeekCommit(bool resetPlayEpoch = true);
-    void refreshPreviewAfterSeekCommit(bool resetPlayEpoch = false);
+    void refreshOutputAfterSeekCommit();
+    void refreshPreviewAfterSeekCommit();
     // Snapshot m_outputCache into the published immutable slot. Caller must hold
     // m_bufferMutex.
     void publishOutputCacheLocked();
@@ -443,8 +499,8 @@ private:
     bool stagingGpuSurfacesIdle() const;
     // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
     // staging -> active, republishes, re-bases the transport playhead. MUST be
-    // called holding m_bufferMutex (invoked from makeOutputSnapshot).
-    void maybeFireScheduledCut(qint64 dispatcherNextIndex);
+    // called holding m_mutex -> m_bufferMutex (invoked from makeOutputSnapshot).
+    PostCommitDispatch maybeFireScheduledCut(qint64 dispatcherNextIndex);
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
@@ -556,6 +612,17 @@ private:
     // maybeFireScheduledCut (under m_bufferMutex); written by scheduleCutAtFrame.
     std::atomic<qint64> m_scheduledCutFrame{-1};
     std::atomic<int64_t> m_scheduledCutTargetMs{-1};
+    // A scheduled program cut must land on air. When the promoted staging cache is not
+    // yet displayable at the post-cut playhead the fire defers (retries next tick), but
+    // only up to kMaxScheduledCutDeferredTicks; after that it fires unconditionally (a
+    // brief placeholder or hold-last frame on a lagging feed is acceptable, an
+    // indefinitely-deferred cut is not). The bound is kept small because
+    // CutSchedule::playheadAfterCut advances the post-cut playhead each deferred tick
+    // while staging stays pinned to the armed target, so waiting longer yields a staler
+    // forced frame, not a fresher one. Counted and reset on the output thread under
+    // m_bufferMutex.
+    static constexpr int kMaxScheduledCutDeferredTicks = 3;
+    int m_scheduledCutDeferredTicks = 0;
     // Safe re-arm queue: a Recall (armNextCut, UI thread) that arrives while a cut
     // is already in flight stores the LATEST target here instead of dropping it or
     // (unsafely) resetting the staging state mid-cut. The run loop applies it via
@@ -607,6 +674,9 @@ private:
     // (replaces the per-tick deep copy in makeOutputSnapshot).
     SharedCacheSlot m_publishedCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
+#ifdef OLR_UNIT_TEST
+    OutputCommitBarrierForTest* m_outputCommitBarrierForTest = nullptr;
+#endif
     int m_outputRuntimeImmediateDispatches = 0;
     QWaitCondition m_outputRuntimeImmediateDispatchesIdle;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;

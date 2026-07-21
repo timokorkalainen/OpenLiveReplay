@@ -34,3 +34,19 @@ race:*OutputRuntime::dispatchImmediate*
 race:*OutputRuntime::setEndpoints*
 race:*OutputRuntime::setSnapshotProvider*
 race:*OutputRuntime::stopRuntime*
+
+# Same QtTsan QBasicMutex fast-path shim defect as the OutputRuntime block above, but on
+# PlaybackWorker::m_mutex. earlyOperatorCommitCannotExposeStaleEpoch drives the output snapshot
+# provider (makeOutputSnapshot, which briefly locks then releases m_mutex) from the main thread
+# while the async seekToAndWaitForPgm and tryCompleteOperatorSeekFromCurrentOutputCache threads
+# contend on the same mutex. Under that contention the shim drops the unlock annotation for
+# makeOutputSnapshot's release, so TSan still believes the main thread owns m_mutex and flags the
+# test's next m_mutex acquisition as a synthetic "double lock" (summary frame
+# QtTsan::mutexPostLock). m_mutex is a non-recursive QMutex that is genuinely released before every
+# re-acquire (a real double lock would deadlock, not abort), the only re-entrant snapshot path runs
+# after that release, there is no lock-order inversion, and the path is exercised race-free under
+# ASan and release builds. TSan reports this against the test-body stack (the *OutputRuntime* rule
+# above does not catch it), so this keys on the test that establishes the contended interleaving;
+# scoping it to that one test keeps any genuine future m_mutex double-lock elsewhere in
+# PlaybackWorker visible to TSan.
+mutex:*earlyOperatorCommitCannotExposeStaleEpoch*

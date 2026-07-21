@@ -31,18 +31,16 @@ bool createD3D11Device(D3DDeviceKind kind, ComPtr<ID3D11Device>* device,
                        ComPtr<ID3D11DeviceContext>* context) {
     if (!device || !context) return false;
 
-    const std::array<D3D_FEATURE_LEVEL, 4> levels{D3D_FEATURE_LEVEL_11_1,
-                                                  D3D_FEATURE_LEVEL_11_0,
-                                                  D3D_FEATURE_LEVEL_10_1,
-                                                  D3D_FEATURE_LEVEL_10_0};
+    const std::array<D3D_FEATURE_LEVEL, 4> levels{D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+                                                  D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
     const D3D_DRIVER_TYPE driverType =
         kind == D3DDeviceKind::Warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
     const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     D3D_FEATURE_LEVEL created = D3D_FEATURE_LEVEL_10_0;
 
-    HRESULT hr = D3D11CreateDevice(nullptr, driverType, nullptr, flags, levels.data(),
-                                   UINT(levels.size()), D3D11_SDK_VERSION, &*device, &created,
-                                   &*context);
+    HRESULT hr =
+        D3D11CreateDevice(nullptr, driverType, nullptr, flags, levels.data(), UINT(levels.size()),
+                          D3D11_SDK_VERSION, &*device, &created, &*context);
     if (hr == E_INVALIDARG) {
         hr = D3D11CreateDevice(nullptr, driverType, nullptr, flags, levels.data() + 1,
                                UINT(levels.size() - 1), D3D11_SDK_VERSION, &*device, &created,
