@@ -331,7 +331,7 @@ Muxer::ensureHeaderWrittenForPacket(const PacketCarrierGuard& packetGuard,
     if (m_headerWritten) return HeaderCommitStatus::Written;
     if (!m_outCtx) return HeaderCommitStatus::Failed;
 #ifdef OLR_UNIT_TEST
-    auto beforeCommit = std::move(m_beforeHeaderCommitForTest);
+    auto beforeCommit = std::exchange(m_beforeHeaderCommitForTest, nullptr);
     if (beforeCommit) beforeCommit();
 #endif
     // The final candidate read is the header-commit linearization point. The
@@ -648,7 +648,7 @@ void Muxer::writerLoop() {
             const QString acceptedCandidate = m_acceptedStartTimecodeCandidate;
             lk.unlock();
 #ifdef OLR_UNIT_TEST
-            auto snapshotHook = std::move(m_afterCandidateSnapshotForTest);
+            auto snapshotHook = std::exchange(m_afterCandidateSnapshotForTest, nullptr);
             if (snapshotHook) snapshotHook();
 #endif
             if (m_writerRunning.load(std::memory_order_acquire) && acceptedCandidate.isEmpty() &&
@@ -703,7 +703,7 @@ void Muxer::writerLoop() {
                                          : CandidateWindowState::TentativeCandidate;
             lk.unlock();
 #ifdef OLR_UNIT_TEST
-            auto publicationHook = std::move(m_beforeCandidatePublicationForTest);
+            auto publicationHook = std::exchange(m_beforeCandidatePublicationForTest, nullptr);
             if (publicationHook) publicationHook();
 #endif
             const bool publishedCandidate =
@@ -765,7 +765,7 @@ void Muxer::writerLoop() {
             lk.unlock();
         }
 #ifdef OLR_UNIT_TEST
-        auto afterPublicationHook = std::move(m_afterCandidatePublicationForTest);
+        auto afterPublicationHook = std::exchange(m_afterCandidatePublicationForTest, nullptr);
         if (afterPublicationHook) afterPublicationHook();
 #endif
 

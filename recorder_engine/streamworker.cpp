@@ -664,7 +664,7 @@ ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForSession(uint64_t sessi
 #endif
         imported = importGpuVideoFrameForEncode(nativeDecodedImage, metadata, false);
 #ifdef OLR_UNIT_TEST
-    auto afterImport = std::move(m_afterGpuImportForTest);
+    auto afterImport = std::exchange(m_afterGpuImportForTest, nullptr);
     if (afterImport) afterImport();
 #endif
     {

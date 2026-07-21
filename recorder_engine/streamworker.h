@@ -20,6 +20,7 @@
 #include <optional>
 #include <deque>
 #include <thread>
+#include <utility>
 
 #include "recordingclock.h"
 #include "muxer.h"
@@ -447,16 +448,23 @@ private:
     // One-shot seam for exercising the real write-rejection branch after frame
     // selection and encoding. Success-path tests leave it empty and use the real
     // asynchronous Muxer writer/completion unchanged.
+    //
+    // std::exchange(..., nullptr) — NOT a bare std::move — is what makes this
+    // one-shot. A moved-from std::function is only "valid but unspecified": libc++
+    // leaves a small-buffer-optimised target callable, so a bare move would fire
+    // the hook again on the next tick (rotating the carrier a second time and
+    // dropping the following frame). exchange guarantees the source is cleared on
+    // every platform.
     void runBeforeMuxPacketWriteForTest() {
-        auto hook = std::move(m_beforeMuxPacketWriteForTest);
+        auto hook = std::exchange(m_beforeMuxPacketWriteForTest, nullptr);
         if (hook) hook();
     }
     void runBeforeMuxEvidenceSubmissionForTest() {
-        auto hook = std::move(m_beforeMuxEvidenceSubmissionForTest);
+        auto hook = std::exchange(m_beforeMuxEvidenceSubmissionForTest, nullptr);
         if (hook) hook();
     }
     void runBeforeGpuFallbackTryForTest() {
-        auto hook = std::move(m_beforeGpuFallbackTryForTest);
+        auto hook = std::exchange(m_beforeGpuFallbackTryForTest, nullptr);
         if (hook) hook();
     }
     std::function<void()> m_beforeMuxPacketWriteForTest;
