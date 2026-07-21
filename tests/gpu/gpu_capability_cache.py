@@ -46,6 +46,7 @@ from gpu_capability_model import (
     PerTaskCompactReservation,
     StreamingResultAggregator,
     WorkerStageTimings,
+    compact_result_conservative_decoded_bytes,
     compact_result_retained_bytes,
     decode_local_dependency_digest,
     encode_local_dependency_digest,
@@ -56,6 +57,39 @@ from gpu_capability_model import (
     validate_dependency_root_authority,
     _HeldCompilerCapabilityMismatch,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCacheRootAuthority:
+    """Immutable local identity shared by prepared result/inspection caches."""
+
+    resolved_root: Path
+    device: int
+    inode: int | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.resolved_root, Path)
+            or not self.resolved_root.is_absolute()
+            or not isinstance(self.device, int)
+            or isinstance(self.device, bool)
+            or (
+                self.inode is not None
+                and (
+                    not isinstance(self.inode, int)
+                    or isinstance(self.inode, bool)
+                )
+            )
+        ):
+            raise AuditInfrastructureError("cache root authority is invalid")
+
+
+def _public_cache_root_authority(
+    root: Path, identity: tuple[int, int | None]
+) -> PreparedCacheRootAuthority:
+    return PreparedCacheRootAuthority(
+        root.resolve(strict=True), identity[0], identity[1]
+    )
 
 
 _SCHEMA = 1
@@ -69,7 +103,12 @@ _DEFAULT_CACHE_OPERATION_SECONDS = 240.0
 AUDIT_CACHE_SCHEMA_BYTES = b"olr-gpu-capability-audit-cache-v1"
 _AUDIT_CACHE_MAXIMUM_BYTES = 472 * 1024 * 1024
 _AUDIT_CACHE_MAXIMUM_ENTRIES = 1024
+_AUDIT_CACHE_ROOT_NON_INSPECTION_MAXIMUM_ENTRIES = 64
+_AUDIT_CACHE_PREPARE_MAXIMUM_NAMESPACE_ENTRIES = (
+    4 * _AUDIT_CACHE_MAXIMUM_ENTRIES + 1
+)
 _INSPECTION_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+_COMPILER_INSPECTION_MAX_BYTES = 512 * 1024
 _CACHE_ROOT_OVERHEAD_RESERVE = 8 * 1024 * 1024
 _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES = 4 * 1024 * 1024
 _AUDIT_TRANSPORT_HEADER_FORMAT = "<8s32s32s32sQQ32sI32sIQ32sQdddd"
@@ -1540,6 +1579,116 @@ _CACHE_ENTRY_FILES = frozenset(
 )
 
 
+class _AuditCacheMeasurementDeadline(AuditInfrastructureError):
+    pass
+
+
+def _check_measurement_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise _AuditCacheMeasurementDeadline(
+            "audit cache measurement deadline exceeded"
+        )
+
+
+def _next_scandir_entry(entries, deadline: float):
+    _check_measurement_deadline(deadline)
+    try:
+        entry = next(entries)
+    except StopIteration:
+        _check_measurement_deadline(deadline)
+        return None
+    _check_measurement_deadline(deadline)
+    return entry
+
+
+def _inspection_root_entry_kind(name: str) -> str | None:
+    record_prefix = ".compiler-inspection-"
+    record_suffix = ".json"
+    if name.startswith(record_prefix) and name.endswith(record_suffix):
+        key = name[len(record_prefix) : -len(record_suffix)]
+        if len(key) == 64 and all(
+            character in "0123456789abcdef" for character in key
+        ):
+            return "record"
+    temporary_prefix = ".tmp-inspection-"
+    if name.startswith(temporary_prefix):
+        nonce = name[len(temporary_prefix) :]
+        if len(nonce) == 32 and all(
+            character in "0123456789abcdef" for character in nonce
+        ):
+            return "temporary"
+    return None
+
+
+def _shared_cache_root_namespace_usage(
+    root: Path, deadline: float
+) -> tuple[int, int]:
+    """Stream the shared root and prove its inspection/noninspection envelope."""
+
+    non_inspection_count = 0
+    inspection_bytes = 0
+    with os.scandir(root) as entries:
+        while True:
+            entry = _next_scandir_entry(entries, deadline)
+            if entry is None:
+                break
+            if (
+                len(entry.name) == 64
+                and all(
+                    character in "0123456789abcdef"
+                    for character in entry.name
+                )
+            ):
+                raise AuditInfrastructureError(
+                    "legacy full-view partition is present in compact audit cache root"
+                )
+            if _inspection_root_entry_kind(entry.name) == "record":
+                try:
+                    metadata = _regular_unlinked_file(Path(entry.path))
+                except OSError as error:
+                    raise AuditInfrastructureError(
+                        "compiler inspection record namespace is unsafe"
+                    ) from error
+                size = int(metadata.st_size)
+                if size <= 0 or size > _COMPILER_INSPECTION_MAX_BYTES:
+                    raise AuditInfrastructureError(
+                        "compiler inspection record size is invalid"
+                    )
+                inspection_bytes += size
+                if inspection_bytes > _INSPECTION_MAX_TOTAL_BYTES:
+                    raise AuditInfrastructureError(
+                        "compiler inspection cache partition exceeded"
+                    )
+                _check_measurement_deadline(deadline)
+                continue
+            non_inspection_count += 1
+            if (
+                non_inspection_count
+                > _AUDIT_CACHE_ROOT_NON_INSPECTION_MAXIMUM_ENTRIES
+            ):
+                raise AuditInfrastructureError(
+                    "audit cache root namespace entry bound exceeded"
+                )
+    return inspection_bytes, non_inspection_count
+
+
+def _release_locked_carrier(
+    stream, anchor, errors: list[BaseException]
+) -> None:
+    try:
+        _PublicationGuard._unlock(stream)
+    except BaseException as error:
+        errors.append(error)
+    try:
+        stream.close()
+    except BaseException as error:
+        errors.append(error)
+    try:
+        anchor.close()
+    except BaseException as error:
+        errors.append(error)
+
+
 class _HeldDirectory:
     """Verified non-reparse directory held against replacement while inspected."""
 
@@ -1630,9 +1779,58 @@ class _HeldDirectory:
         self._fd = fd
         return self
 
-    def delete_known_files(self) -> None:
+    def verify(self) -> None:
+        _require(self.identity is not None, "held directory identity is unavailable")
+        current = _ordinary_directory(self.path)
+        if _directory_identity(current) != self.identity:
+            raise _UnsafeCacheNamespaceError(
+                "cache directory changed while held"
+            )
+        if self._fd is not None:
+            opened = os.fstat(self._fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or _directory_identity(opened) != self.identity
+            ):
+                raise _UnsafeCacheNamespaceError(
+                    "held cache directory changed"
+                )
+
+    def scandir(self):
+        """Enumerate relative to the held descriptor where the platform allows it."""
+
+        self.verify()
+        return os.scandir(self.path if os.name == "nt" else self._fd)
+
+    def bounded_names(self, deadline: float) -> tuple[str, ...]:
+        """Read at most three names, enough to reject a two-carrier entry."""
+
+        names: list[str] = []
+        with self.scandir() as entries:
+            while len(names) < 3:
+                entry = _next_scandir_entry(entries, deadline)
+                if entry is None:
+                    break
+                names.append(entry.name)
+        _check_measurement_deadline(deadline)
+        self.verify()
+        return tuple(names)
+
+    def delete_known_files(self, deadline: float | None = None) -> None:
+        if deadline is None:
+            names = os.listdir(self.path if os.name == "nt" else self._fd)
+        else:
+            names = []
+            with self.scandir() as entries:
+                while len(names) <= len(_CACHE_ENTRY_FILES):
+                    entry = _next_scandir_entry(entries, deadline)
+                    if entry is None:
+                        break
+                    names.append(entry.name)
+            _check_measurement_deadline(deadline)
+        if len(names) > len(_CACHE_ENTRY_FILES):
+            raise OSError("cache directory contains too many paths")
         if os.name == "nt":
-            names = os.listdir(self.path)
             metadata = [(name, (self.path / name).lstat()) for name in names]
             if any(
                 name not in _CACHE_ENTRY_FILES
@@ -1647,7 +1845,6 @@ class _HeldDirectory:
             return
 
         _require(self._fd is not None, "held directory descriptor is unavailable")
-        names = os.listdir(self._fd)
         metadata = [
             (name, os.stat(name, dir_fd=self._fd, follow_symlinks=False))
             for name in names
@@ -1678,6 +1875,7 @@ def _remove_held_flat_directory(
     *,
     after_hold: Callable[[Path], None] | None = None,
     expected_identity: tuple[int, int | None] | None = None,
+    deadline: float | None = None,
 ) -> bool:
     try:
         with _HeldDirectory(path) as held:
@@ -1685,7 +1883,7 @@ def _remove_held_flat_directory(
                 return False
             if after_hold is not None:
                 after_hold(path)
-            held.delete_known_files()
+            held.delete_known_files(deadline)
         path.rmdir()
         return True
     except OSError:
@@ -1697,7 +1895,6 @@ def _after_cleanup_quarantine(_path: Path) -> None:
 
 
 _COMPILER_INSPECTION_SCHEMA = "olr-gpu-compiler-inspection-cache-v3"
-_COMPILER_INSPECTION_MAX_BYTES = 512 * 1024
 
 
 def _inspection_environment_digest(environment) -> str:
@@ -1859,6 +2056,10 @@ class CompilerInspectionCache:
             raise AuditInfrastructureError("compiler inspection cache root is unavailable") from error
         self.root = root
         self._root_identity = _directory_identity(metadata)
+
+    @property
+    def root_identity(self) -> PreparedCacheRootAuthority:
+        return _public_cache_root_authority(self.root, self._root_identity)
 
     def _assert_root(self) -> None:
         try:
@@ -2097,23 +2298,12 @@ class CompilerInspectionCache:
         temporary = self.root / f".tmp-inspection-{uuid.uuid4().hex}"
         temporary_identity: tuple[int, int | None, int, int] | None = None
         path = self._path(key)
-        with self._key_lock(
-            key, operation_deadline, cancel_event
-        ):
-            try:
+        try:
+            with self._root_lock(operation_deadline, cancel_event):
                 self._assert_root()
-                with temporary.open("xb") as stream:
-                    try:
-                        stream.write(encoded)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    finally:
-                        temporary_identity = _file_identity_tuple(
-                            os.fstat(stream.fileno())
-                        )
-                self._assert_root()
+                existing_size = 0
                 try:
-                    _regular_unlinked_file(path)
+                    existing_metadata = _regular_unlinked_file(path)
                 except FileNotFoundError:
                     pass
                 except OSError as error:
@@ -2121,6 +2311,7 @@ class CompilerInspectionCache:
                         "compiler inspection cache namespace is unsafe"
                     ) from error
                 else:
+                    existing_size = int(existing_metadata.st_size)
                     winner = self.load(
                         compiler,
                         compiler_family,
@@ -2138,43 +2329,59 @@ class CompilerInspectionCache:
                             raise AuditInfrastructureError(
                                 "concurrent compiler inspection winner differs"
                             )
-                        if _file_identity_tuple(
-                            _regular_unlinked_file(temporary)
-                        ) != temporary_identity:
-                            raise AuditInfrastructureError(
-                                "compiler inspection publication temporary was replaced"
-                            )
-                        temporary.unlink()
                         return winner
+                inspection_bytes, _non_inspection_count = (
+                    _shared_cache_root_namespace_usage(
+                        self.root, operation_deadline
+                    )
+                )
+                projected_bytes = inspection_bytes - existing_size + len(encoded)
+                if (
+                    projected_bytes < 0
+                    or projected_bytes > _INSPECTION_MAX_TOTAL_BYTES
+                ):
+                    raise AuditInfrastructureError(
+                        "compiler inspection cache partition exceeded"
+                    )
+                with temporary.open("xb") as stream:
+                    try:
+                        stream.write(encoded)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    finally:
+                        temporary_identity = _file_identity_tuple(
+                            os.fstat(stream.fileno())
+                        )
+                self._assert_root()
                 os.replace(temporary, path)
                 self._assert_root()
-            except BaseException as error:
-                cleanup_failure: BaseException | None = None
-                if temporary_identity is not None:
-                    try:
-                        current_identity = _file_identity_tuple(
-                            _regular_unlinked_file(temporary)
+        except BaseException as error:
+            cleanup_failure: BaseException | None = None
+            if temporary_identity is not None:
+                try:
+                    current_identity = _file_identity_tuple(
+                        _regular_unlinked_file(temporary)
+                    )
+                    if current_identity != temporary_identity:
+                        cleanup_failure = AuditInfrastructureError(
+                            "compiler inspection publication temporary was replaced"
                         )
-                        if current_identity != temporary_identity:
-                            cleanup_failure = AuditInfrastructureError(
-                                "compiler inspection publication temporary was replaced"
-                            )
-                        else:
-                            temporary.unlink()
-                    except FileNotFoundError:
-                        pass
-                    except OSError as cleanup_error:
-                        cleanup_failure = cleanup_error
-                if cleanup_failure is not None:
-                    raise AuditInfrastructureError(
-                        "cannot remove compiler inspection publication temporary "
-                        f"after {type(error).__name__}: {error}"
-                    ) from cleanup_failure
-                if isinstance(error, AuditInfrastructureError):
-                    raise
-                if not isinstance(error, OSError):
-                    raise
-                raise AuditInfrastructureError("cannot publish compiler inspection") from error
+                    else:
+                        temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    cleanup_failure = cleanup_error
+            if cleanup_failure is not None:
+                raise AuditInfrastructureError(
+                    "cannot remove compiler inspection publication temporary "
+                    f"after {type(error).__name__}: {error}"
+                ) from cleanup_failure
+            if isinstance(error, AuditInfrastructureError):
+                raise
+            if not isinstance(error, OSError):
+                raise
+            raise AuditInfrastructureError("cannot publish compiler inspection") from error
         return inspection
 
 
@@ -2258,12 +2465,23 @@ def _decode_audit_result_payload(
     *,
     configuration_digest: str,
     engine: str,
+    deadline: float | None = None,
 ) -> ConfigurationAuditResult:
     if (
         not isinstance(payload, bytes)
         or len(payload) > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+        or (
+            deadline is not None
+            and (
+                not isinstance(deadline, (int, float))
+                or isinstance(deadline, bool)
+                or not math.isfinite(float(deadline))
+            )
+        )
     ):
         raise ValueError("encoded compact audit result limit exceeded")
+    if deadline is not None:
+        _check_measurement_deadline(float(deadline))
     cursor = _CanonicalAuditResultCursor(payload)
     limits = AuditLimits()
     cursor.expect(b'{"audit_engine_fingerprint":')
@@ -2276,6 +2494,8 @@ def _decode_audit_result_payload(
     dependencies: list[DependencyDigest] = []
     previous_dependency_key: tuple[str, str, str] | None = None
     while cursor.payload[cursor.offset:cursor.offset + 1] != b"]":
+        if deadline is not None:
+            _check_measurement_deadline(float(deadline))
         if dependencies:
             cursor.expect(b",")
         if len(dependencies) >= limits.compact_result_dependencies:
@@ -2338,6 +2558,8 @@ def _decode_audit_result_payload(
     findings: list[AuditResultFinding] = []
     previous_finding_key: tuple[str, int, str, str] | None = None
     while cursor.payload[cursor.offset:cursor.offset + 1] != b"]":
+        if deadline is not None:
+            _check_measurement_deadline(float(deadline))
         if findings:
             cursor.expect(b",")
         if len(findings) >= limits.compact_result_findings:
@@ -2369,6 +2591,8 @@ def _decode_audit_result_payload(
     reached: list[PurePosixPath] = []
     previous_reached: str | None = None
     while cursor.payload[cursor.offset:cursor.offset + 1] != b"]":
+        if deadline is not None:
+            _check_measurement_deadline(float(deadline))
         if reached:
             cursor.expect(b",")
         if len(reached) >= limits.compact_result_reached:
@@ -2393,6 +2617,8 @@ def _decode_audit_result_payload(
     cursor.expect(b"}")
     if cursor.offset != len(payload):
         raise ValueError("compact audit result has trailing data")
+    if deadline is not None:
+        _check_measurement_deadline(float(deadline))
     return ConfigurationAuditResult(
         configuration_digest,
         engine,
@@ -2505,13 +2731,24 @@ def _preparse_audit_result_payload(
     *,
     configuration_digest: str,
     engine: str,
+    deadline: float | None = None,
 ) -> _AuditResultMetadata:
     """Validate canonical structure while retaining dependency metadata only."""
     if (
         not isinstance(payload, bytes)
         or len(payload) > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+        or (
+            deadline is not None
+            and (
+                not isinstance(deadline, (int, float))
+                or isinstance(deadline, bool)
+                or not math.isfinite(float(deadline))
+            )
+        )
     ):
         raise ValueError("encoded compact audit result limit exceeded")
+    if deadline is not None:
+        _check_measurement_deadline(float(deadline))
     cursor = _CanonicalAuditResultCursor(payload)
     limits = AuditLimits()
     cursor.expect(b'{"audit_engine_fingerprint":')
@@ -2525,6 +2762,8 @@ def _preparse_audit_result_payload(
     dependency_retained_bytes = 0
     previous_dependency_key: tuple[str, str, str] | None = None
     while cursor.payload[cursor.offset:cursor.offset + 1] != b"]":
+        if deadline is not None:
+            _check_measurement_deadline(float(deadline))
         if dependencies:
             cursor.expect(b",")
         if len(dependencies) >= limits.compact_result_dependencies:
@@ -2594,6 +2833,8 @@ def _preparse_audit_result_payload(
     finding_retained_bytes = 0
     previous_finding_key: tuple[str, int, str, str] | None = None
     while cursor.payload[cursor.offset:cursor.offset + 1] != b"]":
+        if deadline is not None:
+            _check_measurement_deadline(float(deadline))
         if finding_count:
             cursor.expect(b",")
         if finding_count >= limits.compact_result_findings:
@@ -2628,6 +2869,8 @@ def _preparse_audit_result_payload(
     reached_retained_bytes = 0
     previous_reached: str | None = None
     while cursor.payload[cursor.offset:cursor.offset + 1] != b"]":
+        if deadline is not None:
+            _check_measurement_deadline(float(deadline))
         if reached_count:
             cursor.expect(b",")
         if reached_count >= limits.compact_result_reached:
@@ -2658,6 +2901,8 @@ def _preparse_audit_result_payload(
     )
     if retained > limits.compact_result_bytes:
         raise AuditInfrastructureError("per-entry decoded result limit exceeded")
+    if deadline is not None:
+        _check_measurement_deadline(float(deadline))
     return _AuditResultMetadata(tuple(dependencies), retained)
 
 
@@ -3257,6 +3502,36 @@ class ConfigurationAuditLoadBatch:
     hit_count: int
     misses: tuple[PreprocessConfiguration, ...]
     cold_slot_reserved_bytes: int
+    maximum_encoded_result_bytes: int = 0
+    maximum_conservative_decoded_bytes: int = 0
+    maximum_conservative_retained_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        measurements = (
+            self.maximum_encoded_result_bytes,
+            self.maximum_conservative_decoded_bytes,
+            self.maximum_conservative_retained_bytes,
+        )
+        if (
+            not isinstance(self.hit_count, int)
+            or isinstance(self.hit_count, bool)
+            or self.hit_count < 0
+            or not isinstance(self.misses, tuple)
+            or not isinstance(self.cold_slot_reserved_bytes, int)
+            or isinstance(self.cold_slot_reserved_bytes, bool)
+            or self.cold_slot_reserved_bytes < 0
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in measurements
+            )
+            or (self.hit_count > 0 and any(value <= 0 for value in measurements))
+            or (self.hit_count == 0 and any(value != 0 for value in measurements))
+        ):
+            raise AuditInfrastructureError(
+                "configuration audit cache batch measurements are invalid"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3315,6 +3590,96 @@ class _TracebackLifetimeOwnerships:
         return False
 
 
+def _canonical_audit_manifest_bytes(key: str, payload: bytes) -> bytes:
+    document = {
+        "schema": AUDIT_CACHE_SCHEMA_BYTES.decode("ascii"),
+        "key": key,
+        "payload_bytes": len(payload),
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    return json.dumps(
+        document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+
+
+def _measurement_payload_is_authentic(
+    payload: bytes, key: str, deadline: float
+) -> bool:
+    try:
+        _check_measurement_deadline(deadline)
+        cursor = _CanonicalAuditResultCursor(payload)
+        cursor.expect(b'{"audit_engine_fingerprint":')
+        engine = cursor.string()
+        cursor.expect(b',"configuration_digest":')
+        configuration_digest = cursor.string()
+        if audit_cache_key(configuration_digest, engine) != key:
+            return False
+        _preparse_audit_result_payload(
+            payload,
+            configuration_digest=configuration_digest,
+            engine=engine,
+            deadline=deadline,
+        )
+        return True
+    except _AuditCacheMeasurementDeadline:
+        raise
+    except (
+        AuditInfrastructureError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        RecursionError,
+        json.JSONDecodeError,
+    ):
+        return False
+
+
+def _audit_carriers_are_authentic(
+    manifest_payload: bytes,
+    payload: bytes,
+    key: str,
+    deadline: float,
+) -> bool:
+    try:
+        manifest = _strict_json_document(manifest_payload)
+        return (
+            tuple(sorted(manifest))
+            == ("key", "payload_bytes", "payload_sha256", "schema")
+            and manifest.get("schema")
+            == AUDIT_CACHE_SCHEMA_BYTES.decode("ascii")
+            and manifest.get("key") == key
+            and isinstance(manifest.get("payload_bytes"), int)
+            and not isinstance(manifest.get("payload_bytes"), bool)
+            and manifest.get("payload_bytes") == len(payload)
+            and isinstance(manifest.get("payload_sha256"), str)
+            and manifest.get("payload_sha256")
+            == hashlib.sha256(payload).hexdigest()
+            and manifest_payload == _canonical_audit_manifest_bytes(key, payload)
+            and _measurement_payload_is_authentic(payload, key, deadline)
+        )
+    except _AuditCacheMeasurementDeadline:
+        raise
+    except (
+        AuditInfrastructureError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        RecursionError,
+        json.JSONDecodeError,
+    ):
+        return False
+
+
+def _before_measure_bucket_hold(_path: Path) -> None:
+    """Test seam for deterministic bucket replacement coverage."""
+
+
+def _before_measure_entry_hold(_path: Path) -> None:
+    """Test seam for deterministic entry replacement coverage."""
+
+
 class ConfigurationAuditCache:
     """Atomic compact-result cache with held-handle dependency validation."""
 
@@ -3346,10 +3711,19 @@ class ConfigurationAuditCache:
         self.maximum_bytes = maximum_bytes
         self.maximum_entries = maximum_entries
         self._root_identity = _directory_identity(metadata)
+        self._prepared = False
         self._publication_lock = threading.Lock()
         self.observed_entry_key: str | None = None
         self.observed_lane: int | None = None
         self.observed_manifest_key: str | None = None
+
+    @property
+    def is_prepared(self) -> bool:
+        return self._prepared
+
+    @property
+    def root_identity(self) -> PreparedCacheRootAuthority:
+        return _public_cache_root_authority(self.root, self._root_identity)
 
     @staticmethod
     def _operation_deadline(pipeline_deadline: float) -> float:
@@ -3394,6 +3768,97 @@ class ConfigurationAuditCache:
             namespace_path=self.root / ".preprocess-root.lock",
         )
 
+    @contextlib.contextmanager
+    def _all_key_lanes_barrier(self, deadline: float):
+        held: list[tuple[object, object]] = []
+        release_errors: list[BaseException] = []
+        primary_error: BaseException | None = None
+        with self._root_lock(deadline) as namespace:
+            _require(
+                namespace.stream is not None,
+                "audit cache lock namespace stream is unavailable",
+            )
+            _require(
+                namespace.anchor_stream is not None,
+                "audit cache lock namespace anchor is unavailable",
+            )
+            _ensure_lock_namespace_ledger(
+                namespace.path,
+                namespace.stream,
+                namespace.anchor_stream,
+            )
+            try:
+                for lane in range(_LOCK_NAMESPACE_LANE_COUNT):
+                    namespace._check_budget()
+                    path = self.root / f".preprocess-key-{lane}.lock"
+                    stream = None
+                    anchor = None
+                    acquired = False
+                    try:
+                        stream, anchor = _open_lock_carrier_pair(path, (1,))
+                        _bind_lock_lane_generation(namespace.stream, path, stream)
+                        acquired = _PublicationGuard._lock(
+                            stream, blocking=False
+                        )
+                        while not acquired:
+                            namespace._check_budget()
+                            time.sleep(
+                                min(
+                                    0.01,
+                                    max(0.0, deadline - time.monotonic()),
+                                )
+                            )
+                            acquired = _PublicationGuard._lock(
+                                stream, blocking=False
+                            )
+                        _SharedCacheFileLock._assert_carrier_at(
+                            path, stream, anchor, (1,)
+                        )
+                        held.append((stream, anchor))
+                        stream = None
+                        anchor = None
+                    finally:
+                        if acquired and stream is not None:
+                            _require(
+                                anchor is not None,
+                                "audit cache lane anchor is unavailable",
+                            )
+                            _release_locked_carrier(
+                                stream, anchor, release_errors
+                            )
+                            stream = None
+                            anchor = None
+                        else:
+                            if stream is not None:
+                                stream.close()
+                            if anchor is not None:
+                                anchor.close()
+                    if release_errors:
+                        raise AuditInfrastructureError(
+                            "audit cache barrier setup release failed"
+                        ) from release_errors[0]
+                self._assert_root()
+                yield
+            except BaseException as error:
+                primary_error = error
+                raise
+            finally:
+                for stream, anchor in reversed(held):
+                    _release_locked_carrier(stream, anchor, release_errors)
+                held.clear()
+                if release_errors:
+                    cleanup_error = AuditInfrastructureError(
+                        "audit cache barrier release failed"
+                    )
+                    for error in release_errors:
+                        cleanup_error.add_note(
+                            f"barrier carrier release failed: {error!r}"
+                        )
+                    if primary_error is not None:
+                        primary_error.add_note(str(cleanup_error))
+                    else:
+                        raise cleanup_error from release_errors[0]
+
     @property
     def _results_root(self) -> Path:
         return self.root / _AUDIT_RESULTS_DIRECTORY
@@ -3405,26 +3870,21 @@ class ConfigurationAuditCache:
     def _access_path(self, key: str) -> Path:
         return self._results_root / key[:2] / f".access-{key}"
 
-    def _assert_no_full_view_partition(self) -> None:
-        with os.scandir(self.root) as entries:
-            for entry in entries:
-                if (
-                    len(entry.name) == 64
-                    and all(character in "0123456789abcdef" for character in entry.name)
-                ):
-                    raise AuditInfrastructureError(
-                        "legacy full-view partition is present in compact audit cache root"
-                    )
+    def _assert_no_full_view_partition(self, deadline: float) -> None:
+        _shared_cache_root_namespace_usage(self.root, deadline)
 
-    def _prepare_locked(self) -> None:
+    def _prepare_locked(self, deadline: float) -> tuple[int, int | None]:
+        _check_measurement_deadline(deadline)
         self._assert_root()
-        self._assert_no_full_view_partition()
+        self._assert_no_full_view_partition(deadline)
         marker = self.root / _AUDIT_ROOT_MARKER
         marker_payload: bytes | None = None
         try:
             with _HeldCacheFile(marker) as held:
+                _check_measurement_deadline(deadline)
                 _require(held.stream is not None, "held cache marker stream is unavailable")
                 payload = held.stream.read(len(AUDIT_CACHE_SCHEMA_BYTES) + 1)
+                _check_measurement_deadline(deadline)
                 held.verify()
             marker_payload = payload
             if marker_payload != AUDIT_CACHE_SCHEMA_BYTES:
@@ -3434,12 +3894,14 @@ class ConfigurationAuditCache:
             temporary_identity: tuple[int, int] | None = None
             try:
                 with temporary.open("xb") as stream:
+                    _check_measurement_deadline(deadline)
                     temporary_identity = _file_ownership_identity(
                         os.fstat(stream.fileno())
                     )
                     stream.write(AUDIT_CACHE_SCHEMA_BYTES)
                     stream.flush()
                     os.fsync(stream.fileno())
+                    _check_measurement_deadline(deadline)
                 try:
                     os.link(temporary, marker)
                 except FileExistsError:
@@ -3458,10 +3920,12 @@ class ConfigurationAuditCache:
         if marker_payload is None:
             try:
                 with _HeldCacheFile(marker) as held:
+                    _check_measurement_deadline(deadline)
                     _require(held.stream is not None, "held cache marker stream is unavailable")
                     marker_payload = held.stream.read(
                         len(AUDIT_CACHE_SCHEMA_BYTES) + 1
                     )
+                    _check_measurement_deadline(deadline)
                     held.verify()
             except OSError as error:
                 raise AuditInfrastructureError("audit cache root marker is unsafe") from error
@@ -3469,18 +3933,51 @@ class ConfigurationAuditCache:
             raise AuditInfrastructureError("audit cache root marker is invalid")
         try:
             self._results_root.mkdir(exist_ok=True)
-            _ordinary_directory(self._results_root)
+            results_identity = _directory_identity(
+                _ordinary_directory(self._results_root)
+            )
         except OSError as error:
             raise AuditInfrastructureError("audit cache results namespace is unsafe") from error
         now = time.time()
+        bucket_count = 0
+        namespace_entry_count = 0
         with os.scandir(self._results_root) as bucket_entries:
-            for bucket_entry in bucket_entries:
+            while True:
+                bucket_entry = _next_scandir_entry(bucket_entries, deadline)
+                if bucket_entry is None:
+                    break
+                bucket_count += 1
+                if bucket_count > 256:
+                    raise AuditInfrastructureError(
+                        "audit cache result bucket bound exceeded"
+                    )
+                if (
+                    len(bucket_entry.name) != 2
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in bucket_entry.name
+                    )
+                ):
+                    raise AuditInfrastructureError(
+                        "audit cache result bucket name is invalid"
+                    )
                 bucket = Path(bucket_entry.path)
                 metadata = bucket_entry.stat(follow_symlinks=False)
                 if _is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
                     raise AuditInfrastructureError("audit cache result bucket is unsafe")
                 with os.scandir(bucket) as raw_entries:
-                    for raw in raw_entries:
+                    while True:
+                        raw = _next_scandir_entry(raw_entries, deadline)
+                        if raw is None:
+                            break
+                        namespace_entry_count += 1
+                        if (
+                            namespace_entry_count
+                            > _AUDIT_CACHE_PREPARE_MAXIMUM_NAMESPACE_ENTRIES
+                        ):
+                            raise AuditInfrastructureError(
+                                "audit cache namespace entry bound exceeded"
+                            )
                         if not raw.name.startswith(".tmp-"):
                             continue
                         temporary = Path(raw.path)
@@ -3495,25 +3992,218 @@ class ConfigurationAuditCache:
                         if now - temporary_metadata.st_mtime > _INCOMPLETE_SECONDS:
                             if _temporary_publication_is_active(temporary):
                                 continue
-                            if not _remove_held_flat_directory(temporary):
+                            _check_measurement_deadline(deadline)
+                            if not _remove_held_flat_directory(
+                                temporary, deadline=deadline
+                            ):
                                 raise AuditInfrastructureError(
                                     "cannot clean audit cache crash temporary"
                                 )
+        if _directory_identity(_ordinary_directory(self._results_root)) != results_identity:
+            raise AuditInfrastructureError("audit cache results root was replaced")
+        _check_measurement_deadline(deadline)
+        return results_identity
 
     def prepare(self, pipeline_deadline: float) -> None:
         deadline = self._operation_deadline(pipeline_deadline)
         try:
             with self._root_lock(deadline):
-                self._prepare_locked()
+                self._prepare_locked(deadline)
+            self._prepared = True
         except AuditInfrastructureError:
             raise
         except OSError as error:
             raise AuditInfrastructureError("audit cache namespace is unsafe") from error
 
+    def measure(self, pipeline_deadline: float) -> tuple[int, int]:
+        """Measure one coherent snapshot of authenticated compact results."""
+
+        deadline = self._operation_deadline(pipeline_deadline)
+        try:
+            with self._all_key_lanes_barrier(deadline):
+                results_identity = self._prepare_locked(deadline)
+                total_bytes = 0
+                total_entries = 0
+                with _HeldDirectory(self._results_root) as results_held:
+                    if results_held.identity != results_identity:
+                        raise AuditInfrastructureError(
+                            "audit cache results root was replaced"
+                        )
+                    with results_held.scandir() as raw_buckets:
+                        while True:
+                            raw_bucket = _next_scandir_entry(
+                                raw_buckets, deadline
+                            )
+                            if raw_bucket is None:
+                                break
+                            if (
+                                len(raw_bucket.name) != 2
+                                or any(
+                                    character not in "0123456789abcdef"
+                                    for character in raw_bucket.name
+                                )
+                            ):
+                                raise AuditInfrastructureError(
+                                    "audit cache result bucket name is invalid"
+                                )
+                            bucket = self._results_root / raw_bucket.name
+                            bucket_generation = _directory_identity(
+                                _ordinary_directory(bucket)
+                            )
+                            bucket_metadata = raw_bucket.stat(follow_symlinks=False)
+                            if _is_link(bucket_metadata) or not stat.S_ISDIR(
+                                bucket_metadata.st_mode
+                            ):
+                                raise AuditInfrastructureError(
+                                    "audit cache result bucket is unsafe"
+                                )
+                            _before_measure_bucket_hold(bucket)
+                            with _HeldDirectory(bucket) as bucket_held:
+                                if bucket_held.identity != bucket_generation:
+                                    raise AuditInfrastructureError(
+                                        "audit cache result bucket was replaced"
+                                    )
+                                with bucket_held.scandir() as raw_entries:
+                                    while True:
+                                        raw_entry = _next_scandir_entry(
+                                            raw_entries, deadline
+                                        )
+                                        if raw_entry is None:
+                                            break
+                                        name = raw_entry.name
+                                        if name.startswith(
+                                            (".access-", ".tmp-", ".quarantine-")
+                                        ):
+                                            continue
+                                        entry = bucket / name
+                                        entry_generation = _directory_identity(
+                                            _ordinary_directory(entry)
+                                        )
+                                        entry_metadata = raw_entry.stat(
+                                            follow_symlinks=False
+                                        )
+                                        if (
+                                            len(name) != 64
+                                            or any(
+                                                character not in "0123456789abcdef"
+                                                for character in name
+                                            )
+                                            or name[:2] != raw_bucket.name
+                                            or _is_link(entry_metadata)
+                                            or not stat.S_ISDIR(entry_metadata.st_mode)
+                                        ):
+                                            raise AuditInfrastructureError(
+                                                "audit cache entry namespace is unsafe"
+                                            )
+                                        try:
+                                            _before_measure_entry_hold(entry)
+                                            with _HeldDirectory(entry) as entry_held:
+                                                if (
+                                                    entry_held.identity
+                                                    != entry_generation
+                                                ):
+                                                    raise AuditInfrastructureError(
+                                                        "audit cache entry was replaced"
+                                                    )
+                                                names = entry_held.bounded_names(
+                                                    deadline
+                                                )
+                                                if (
+                                                    len(names) != 2
+                                                    or "manifest.json" not in names
+                                                    or "payload.json" not in names
+                                                ):
+                                                    continue
+                                                with _HeldCacheFile(
+                                                    entry / "manifest.json"
+                                                ) as manifest_held:
+                                                    _require(
+                                                        manifest_held.stream is not None,
+                                                        "held audit manifest stream is unavailable",
+                                                    )
+                                                    _require(
+                                                        manifest_held.identity is not None,
+                                                        "held audit manifest identity is unavailable",
+                                                    )
+                                                    manifest_bytes = manifest_held.identity[2]
+                                                    if (
+                                                        manifest_bytes
+                                                        > _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES
+                                                    ):
+                                                        continue
+                                                    manifest_payload = (
+                                                        manifest_held.stream.read(
+                                                            _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES
+                                                            + 1
+                                                        )
+                                                    )
+                                                    manifest_held.verify()
+                                                with _HeldCacheFile(
+                                                    entry / "payload.json"
+                                                ) as payload_held:
+                                                    _require(
+                                                        payload_held.stream is not None,
+                                                        "held audit payload stream is unavailable",
+                                                    )
+                                                    _require(
+                                                        payload_held.identity is not None,
+                                                        "held audit payload identity is unavailable",
+                                                    )
+                                                    payload_bytes = payload_held.identity[2]
+                                                    if (
+                                                        payload_bytes
+                                                        > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+                                                    ):
+                                                        continue
+                                                    payload = payload_held.stream.read(
+                                                        _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+                                                        + 1
+                                                    )
+                                                    payload_held.verify()
+                                                if not _audit_carriers_are_authentic(
+                                                    manifest_payload,
+                                                    payload,
+                                                    name,
+                                                    deadline,
+                                                ):
+                                                    continue
+                                                entry_held.verify()
+                                                total_bytes += (
+                                                    manifest_bytes + payload_bytes
+                                                )
+                                                total_entries += 1
+                                        except FileNotFoundError:
+                                            continue
+                                        except _UnsafeCacheNamespaceError as error:
+                                            raise AuditInfrastructureError(
+                                                "audit cache entry namespace is unsafe"
+                                            ) from error
+                                        except (
+                                            UnicodeError,
+                                            ValueError,
+                                            TypeError,
+                                            KeyError,
+                                            RecursionError,
+                                            json.JSONDecodeError,
+                                        ):
+                                            continue
+                                bucket_held.verify()
+                    results_held.verify()
+                self._prepared = True
+                return total_bytes, total_entries
+        except AuditInfrastructureError:
+            raise
+        except _UnsafeCacheNamespaceError as error:
+            raise AuditInfrastructureError(
+                "audit cache measurement namespace is unsafe"
+            ) from error
+        except OSError as error:
+            raise AuditInfrastructureError("audit cache measurement failed") from error
+
     def _prepare_for_operation(self, deadline: float) -> None:
         try:
             with self._root_lock(deadline):
-                self._prepare_locked()
+                self._prepare_locked(deadline)
         except AuditInfrastructureError:
             raise
         except OSError as error:
@@ -3530,21 +4220,14 @@ class ConfigurationAuditCache:
 
     def _manifest_bytes(self, key: str, payload: bytes) -> bytes:
         self.observed_manifest_key = key
-        document = {
-            "schema": AUDIT_CACHE_SCHEMA_BYTES.decode("ascii"),
-            "key": key,
-            "payload_bytes": len(payload),
-            "payload_sha256": hashlib.sha256(payload).hexdigest(),
-        }
-        return json.dumps(
-            document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-        ).encode("ascii")
+        return _canonical_audit_manifest_bytes(key, payload)
 
     def _read_authenticated_entry(
         self,
         configuration: PreprocessConfiguration,
         key: str,
         engine: str,
+        deadline: float,
     ) -> tuple[_AuditCacheCandidate, ConfigurationAuditResult] | None:
         entry = self._entry_path(key)
         manifest_payload = None
@@ -3554,8 +4237,9 @@ class ConfigurationAuditCache:
         candidate = None
         normal_exit = False
         try:
+            _check_measurement_deadline(deadline)
             with _HeldDirectory(entry) as held_directory:
-                names = frozenset(os.listdir(entry))
+                names = frozenset(held_directory.bounded_names(deadline))
                 if names != frozenset({"manifest.json", "payload.json"}):
                     raise _UnsafeCacheNamespaceError(
                         "audit cache entry carrier set is invalid"
@@ -3570,6 +4254,7 @@ class ConfigurationAuditCache:
                     manifest_payload = manifest_held.stream.read(
                         _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES + 1
                     )
+                    _check_measurement_deadline(deadline)
                     manifest_held.verify()
                     manifest_identity = manifest_held.identity
                 if len(manifest_payload) > _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES:
@@ -3587,6 +4272,7 @@ class ConfigurationAuditCache:
                     payload = payload_held.stream.read(
                         _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES + 1
                     )
+                    _check_measurement_deadline(deadline)
                     payload_held.verify()
                     payload_identity = payload_held.identity
                 if (
@@ -3606,7 +4292,10 @@ class ConfigurationAuditCache:
                         payload,
                         configuration_digest=configuration.digest,
                         engine=engine,
+                        deadline=deadline,
                     )
+                except _AuditCacheMeasurementDeadline:
+                    raise
                 except AuditInfrastructureError:
                     normal_exit = True
                     return None
@@ -3661,6 +4350,7 @@ class ConfigurationAuditCache:
         key: str,
         engine: str,
         result_budget: CompactResultMemoryBudget,
+        deadline: float,
     ) -> _AuditCacheCandidate | None:
         """Authenticate one entry and retain only charged dependency metadata."""
         entry = self._entry_path(key)
@@ -3674,8 +4364,9 @@ class ConfigurationAuditCache:
         candidate = None
         normal_exit = False
         try:
+            _check_measurement_deadline(deadline)
             with _HeldDirectory(entry) as held_directory:
-                if frozenset(os.listdir(entry)) != frozenset(
+                if frozenset(held_directory.bounded_names(deadline)) != frozenset(
                     {"manifest.json", "payload.json"}
                 ):
                     raise _UnsafeCacheNamespaceError(
@@ -3701,6 +4392,7 @@ class ConfigurationAuditCache:
                     manifest_payload = manifest_held.stream.read(
                         _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES + 1
                     )
+                    _check_measurement_deadline(deadline)
                     manifest_held.verify()
                     manifest_identity = manifest_held.identity
                 if len(manifest_payload) > _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES:
@@ -3730,6 +4422,7 @@ class ConfigurationAuditCache:
                         label="compact result metadata preparse workspace",
                     ).commit()
                     payload = payload_held.stream.read(payload_size + 1)
+                    _check_measurement_deadline(deadline)
                     payload_held.verify()
                     payload_identity = payload_held.identity
                 payload_sha256 = hashlib.sha256(payload).hexdigest()
@@ -3747,6 +4440,7 @@ class ConfigurationAuditCache:
                     payload,
                     configuration_digest=configuration.digest,
                     engine=engine,
+                    deadline=deadline,
                 )
                 metadata_bytes = (
                     512
@@ -3917,7 +4611,9 @@ class ConfigurationAuditCache:
         self._prepare_for_operation(deadline)
         key = audit_cache_key(configuration.digest, engine)
         with self._key_lock(key, deadline):
-            loaded = self._read_authenticated_entry(configuration, key, engine)
+            loaded = self._read_authenticated_entry(
+                configuration, key, engine, deadline
+            )
         if loaded is None:
             return None
         candidate, result = loaded
@@ -4017,7 +4713,7 @@ class ConfigurationAuditCache:
                     key = audit_cache_key(configuration.digest, engine)
                     with self._key_lock(key, deadline):
                         candidate = self._read_authenticated_candidate_metadata(
-                            configuration, key, engine, result_budget
+                            configuration, key, engine, result_budget, deadline
                         )
                     if candidate is None:
                         misses.add(configuration.digest)
@@ -4148,7 +4844,7 @@ class ConfigurationAuditCache:
                         ).commit()
                         with self._key_lock(candidate.key, deadline):
                             decoded = self._read_authenticated_entry(
-                                configuration, candidate.key, engine
+                                configuration, candidate.key, engine, deadline
                             )
                         release_decode_workspace = True
                         decode_workspace.release()
@@ -4250,9 +4946,38 @@ class ConfigurationAuditCache:
                     hit_count = 0
                     if aggregator.cold_slot_reserved_bytes == 0:
                         aggregator.reserve_cold_slot(maximum_cold_slot)
+                    maximum_encoded_result_bytes = 0
+                    maximum_conservative_decoded_bytes = 0
+                    maximum_conservative_retained_bytes = 0
                 else:
                     for digest in accepted_digests:
                         self._record_access(candidates[digest].key)
+                    accepted_candidates = tuple(
+                        candidates[digest] for digest in accepted_digests
+                    )
+                    maximum_encoded_result_bytes = max(
+                        (
+                            candidate.payload_identity[2]
+                            for candidate in accepted_candidates
+                        ),
+                        default=0,
+                    )
+                    maximum_conservative_decoded_bytes = max(
+                        (
+                            compact_result_conservative_decoded_bytes(
+                                candidate.payload_identity[2]
+                            )
+                            for candidate in accepted_candidates
+                        ),
+                        default=0,
+                    )
+                    maximum_conservative_retained_bytes = max(
+                        (
+                            candidate.decoded_result_bytes
+                            for candidate in accepted_candidates
+                        ),
+                        default=0,
+                    )
                     commit_semantics = True
 
                 ordered_misses = tuple(
@@ -4263,6 +4988,9 @@ class ConfigurationAuditCache:
                     hit_count,
                     ordered_misses,
                     aggregator.cold_slot_reserved_bytes,
+                    maximum_encoded_result_bytes,
+                    maximum_conservative_decoded_bytes,
+                    maximum_conservative_retained_bytes,
                 )
                 candidate = None
                 decoded_candidate = None
@@ -4302,7 +5030,10 @@ class ConfigurationAuditCache:
                 )
             raise load_error
 
-    def _remove_audit_entry(self, entry: Path, key: str) -> bool:
+    def _remove_audit_entry(
+        self, entry: Path, key: str, deadline: float
+    ) -> bool:
+        _check_measurement_deadline(deadline)
         quarantine = entry.with_name(f".quarantine-{key}-{uuid.uuid4().hex}")
         try:
             identity = _directory_identity(_ordinary_directory(entry))
@@ -4312,7 +5043,7 @@ class ConfigurationAuditCache:
         except OSError:
             return False
         removed = _remove_held_flat_directory(
-            quarantine, expected_identity=identity
+            quarantine, expected_identity=identity, deadline=deadline
         )
         if removed:
             try:
@@ -4323,107 +5054,225 @@ class ConfigurationAuditCache:
                 return False
         return removed
 
+    def _inspect_cleanup_entry(
+        self, entry: Path, key: str, deadline: float
+    ) -> tuple[bool, int, tuple[int, int | None], float] | None:
+        try:
+            entry_metadata = _ordinary_directory(entry)
+            generation = _directory_identity(entry_metadata)
+            with _HeldDirectory(entry) as held:
+                if held.identity != generation:
+                    raise AuditInfrastructureError(
+                        "audit cache cleanup entry was replaced"
+                    )
+                names = held.bounded_names(deadline)
+                if (
+                    len(names) != 2
+                    or "manifest.json" not in names
+                    or "payload.json" not in names
+                ):
+                    return False, 0, generation, entry_metadata.st_mtime
+                with _HeldCacheFile(entry / "manifest.json") as manifest_held:
+                    _require(
+                        manifest_held.stream is not None
+                        and manifest_held.identity is not None,
+                        "held audit manifest is unavailable",
+                    )
+                    manifest_size = manifest_held.identity[2]
+                    if manifest_size > _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES:
+                        return False, 0, generation, entry_metadata.st_mtime
+                    manifest_payload = manifest_held.stream.read(
+                        _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES + 1
+                    )
+                    manifest_held.verify()
+                with _HeldCacheFile(entry / "payload.json") as payload_held:
+                    _require(
+                        payload_held.stream is not None
+                        and payload_held.identity is not None,
+                        "held audit payload is unavailable",
+                    )
+                    payload_size = payload_held.identity[2]
+                    if payload_size > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES:
+                        return False, 0, generation, entry_metadata.st_mtime
+                    payload = payload_held.stream.read(
+                        _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES + 1
+                    )
+                    payload_held.verify()
+                authentic = _audit_carriers_are_authentic(
+                    manifest_payload, payload, key, deadline
+                )
+                held.verify()
+                return (
+                    authentic,
+                    manifest_size + payload_size,
+                    generation,
+                    entry_metadata.st_mtime,
+                )
+        except FileNotFoundError:
+            return None
+        except _UnsafeCacheNamespaceError as error:
+            raise AuditInfrastructureError(
+                "audit cache cleanup entry namespace is unsafe"
+            ) from error
+
     def cleanup(self, now: float, pipeline_deadline: float) -> None:
         if not isinstance(now, (int, float)) or isinstance(now, bool):
             raise AuditInfrastructureError("audit cache cleanup time is invalid")
         deadline = self._operation_deadline(pipeline_deadline)
         self._prepare_for_operation(deadline)
-        complete: list[tuple[float, int, str, Path]] = []
-        for raw_bucket in os.scandir(self._results_root):
-            if (
-                len(raw_bucket.name) != 2
-                or any(character not in "0123456789abcdef" for character in raw_bucket.name)
-            ):
-                raise AuditInfrastructureError("audit cache result bucket name is invalid")
-            bucket = Path(raw_bucket.path)
-            metadata = raw_bucket.stat(follow_symlinks=False)
-            if _is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
-                raise AuditInfrastructureError("audit cache result bucket is unsafe")
-            for raw_entry in os.scandir(bucket):
-                name = raw_entry.name
-                if name.startswith((".access-", ".tmp-", ".quarantine-")):
-                    continue
-                entry = Path(raw_entry.path)
-                metadata = raw_entry.stat(follow_symlinks=False)
-                if (
-                    len(name) != 64
-                    or any(character not in "0123456789abcdef" for character in name)
-                    or name[:2] != raw_bucket.name
-                    or _is_link(metadata)
-                    or not stat.S_ISDIR(metadata.st_mode)
-                ):
-                    raise AuditInfrastructureError("audit cache entry namespace is unsafe")
-                size = 0
-                authentic = False
-                try:
-                    names = frozenset(os.listdir(entry))
-                    if names != frozenset({"manifest.json", "payload.json"}):
-                        raise ValueError("carrier set")
-                    manifest_path = entry / "manifest.json"
-                    payload_path = entry / "payload.json"
-                    manifest_metadata = _regular_unlinked_file(manifest_path)
-                    payload_metadata = _regular_unlinked_file(payload_path)
+        complete: list[
+            tuple[float, int, str, Path, tuple[int, int | None]]
+        ] = []
+        candidate_count = 0
+        with _HeldDirectory(self._results_root) as results_held:
+            with results_held.scandir() as raw_buckets:
+                while True:
+                    raw_bucket = _next_scandir_entry(raw_buckets, deadline)
+                    if raw_bucket is None:
+                        break
                     if (
-                        manifest_metadata.st_size
-                        > _AUDIT_RESULT_MANIFEST_MAXIMUM_BYTES
-                        or payload_metadata.st_size
-                        > _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES
+                        len(raw_bucket.name) != 2
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in raw_bucket.name
+                        )
                     ):
-                        raise ValueError("entry size")
-                    manifest_payload = manifest_path.read_bytes()
-                    payload = payload_path.read_bytes()
-                    manifest = _strict_json_document(manifest_payload)
-                    authentic = (
-                        manifest.get("schema")
-                        == AUDIT_CACHE_SCHEMA_BYTES.decode("ascii")
-                        and manifest.get("key") == name
-                        and manifest.get("payload_bytes") == len(payload)
-                        and manifest.get("payload_sha256")
-                        == hashlib.sha256(payload).hexdigest()
-                    )
-                    size = int(manifest_metadata.st_size + payload_metadata.st_size)
-                except _UnsafeCacheNamespaceError as error:
-                    raise AuditInfrastructureError(
-                        "audit cache entry namespace is unsafe"
-                    ) from error
-                except (OSError, ValueError, TypeError, UnicodeError):
-                    authentic = False
-                if not authentic:
-                    if now - metadata.st_mtime > _INCOMPLETE_SECONDS:
-                        with self._key_lock(name, deadline):
-                            if not self._remove_audit_entry(entry, name):
-                                raise AuditInfrastructureError(
-                                    "cannot remove incomplete audit cache entry"
+                        raise AuditInfrastructureError(
+                            "audit cache result bucket name is invalid"
+                        )
+                    bucket = self._results_root / raw_bucket.name
+                    with _HeldDirectory(bucket) as bucket_held:
+                        with bucket_held.scandir() as raw_entries:
+                            while True:
+                                raw_entry = _next_scandir_entry(
+                                    raw_entries, deadline
                                 )
-                    continue
-                try:
-                    last_access = _regular_unlinked_file(
-                        self._access_path(name)
-                    ).st_mtime
-                    size += 1
-                except FileNotFoundError:
-                    last_access = metadata.st_mtime
-                except OSError as error:
-                    raise AuditInfrastructureError(
-                        "audit cache access namespace is unsafe"
-                    ) from error
-                if now - last_access > _COMPLETE_SECONDS:
-                    with self._key_lock(name, deadline):
-                        if not self._remove_audit_entry(entry, name):
-                            raise AuditInfrastructureError(
-                                "cannot remove expired audit cache entry"
-                            )
-                    continue
-                complete.append((last_access, size, name, entry))
+                                if raw_entry is None:
+                                    break
+                                name = raw_entry.name
+                                if name.startswith(
+                                    (".access-", ".tmp-", ".quarantine-")
+                                ):
+                                    continue
+                                if (
+                                    len(name) != 64
+                                    or any(
+                                        character not in "0123456789abcdef"
+                                        for character in name
+                                    )
+                                    or name[:2] != raw_bucket.name
+                                ):
+                                    raise AuditInfrastructureError(
+                                        "audit cache entry namespace is unsafe"
+                                    )
+                                candidate_count += 1
+                                if candidate_count > _AUDIT_CACHE_MAXIMUM_ENTRIES:
+                                    raise AuditInfrastructureError(
+                                        "audit cache cleanup entry bound exceeded"
+                                    )
+                                entry = bucket / name
+                                inspected = self._inspect_cleanup_entry(
+                                    entry, name, deadline
+                                )
+                                if inspected is None:
+                                    continue
+                                authentic, size, generation, entry_mtime = inspected
+                                if not authentic:
+                                    if now - entry_mtime > _INCOMPLETE_SECONDS:
+                                        with self._key_lock(name, deadline):
+                                            current = self._inspect_cleanup_entry(
+                                                entry, name, deadline
+                                            )
+                                            if (
+                                                current is None
+                                                or current[0]
+                                                or current[2] != generation
+                                            ):
+                                                continue
+                                            if not self._remove_audit_entry(
+                                                entry, name, deadline
+                                            ):
+                                                raise AuditInfrastructureError(
+                                                    "cannot remove incomplete audit cache entry"
+                                                )
+                                    continue
+                                try:
+                                    last_access = _regular_unlinked_file(
+                                        self._access_path(name)
+                                    ).st_mtime
+                                    size += 1
+                                except FileNotFoundError:
+                                    last_access = entry_mtime
+                                except OSError as error:
+                                    raise AuditInfrastructureError(
+                                        "audit cache access namespace is unsafe"
+                                    ) from error
+                                if now - last_access > _COMPLETE_SECONDS:
+                                    with self._key_lock(name, deadline):
+                                        current = self._inspect_cleanup_entry(
+                                            entry, name, deadline
+                                        )
+                                        if (
+                                            current is None
+                                            or not current[0]
+                                            or current[1] not in (size, size - 1)
+                                            or current[2] != generation
+                                        ):
+                                            continue
+                                        try:
+                                            current_access = _regular_unlinked_file(
+                                                self._access_path(name)
+                                            ).st_mtime
+                                        except FileNotFoundError:
+                                            current_access = current[3]
+                                        if (
+                                            current_access != last_access
+                                            or now - current_access
+                                            <= _COMPLETE_SECONDS
+                                        ):
+                                            continue
+                                        if not self._remove_audit_entry(
+                                            entry, name, deadline
+                                        ):
+                                            raise AuditInfrastructureError(
+                                                "cannot remove expired audit cache entry"
+                                            )
+                                    continue
+                                complete.append(
+                                    (last_access, size, name, entry, generation)
+                                )
+                        bucket_held.verify()
+            results_held.verify()
         total_bytes = sum(item[1] for item in complete)
         total_entries = len(complete)
-        for _access, size, key, entry in sorted(complete):
-            if total_bytes <= self.maximum_bytes and total_entries <= self.maximum_entries:
+        for last_access, size, key, entry, generation in sorted(complete):
+            _check_measurement_deadline(deadline)
+            if (
+                total_bytes <= self.maximum_bytes
+                and total_entries <= self.maximum_entries
+            ):
                 break
             with self._key_lock(key, deadline):
-                if self._remove_audit_entry(entry, key):
+                current = self._inspect_cleanup_entry(entry, key, deadline)
+                if (
+                    current is None
+                    or not current[0]
+                    or current[1] not in (size, size - 1)
+                    or current[2] != generation
+                ):
+                    continue
+                try:
+                    current_access = _regular_unlinked_file(
+                        self._access_path(key)
+                    ).st_mtime
+                except FileNotFoundError:
+                    current_access = current[3]
+                if current_access != last_access:
+                    continue
+                if self._remove_audit_entry(entry, key, deadline):
                     total_bytes -= size
                     total_entries -= 1
+
 
     def publish(
         self,
@@ -4494,7 +5343,10 @@ class ConfigurationAuditCache:
             with self._key_lock(key, deadline):
                 with self._publication_lock:
                     existing = self._read_authenticated_entry(
-                        configuration, key, result.audit_engine_fingerprint
+                        configuration,
+                        key,
+                        result.audit_engine_fingerprint,
+                        deadline,
                     )
                     if existing is not None:
                         _candidate, winner = existing
@@ -4503,7 +5355,9 @@ class ConfigurationAuditCache:
                                 "concurrent audit result winner differs"
                             )
                         if not _remove_held_flat_directory(
-                            temporary, expected_identity=temporary_identity
+                            temporary,
+                            expected_identity=temporary_identity,
+                            deadline=deadline,
                         ):
                             raise AuditInfrastructureError(
                                 "cannot remove losing audit result temporary"
@@ -4529,14 +5383,19 @@ class ConfigurationAuditCache:
                         os.rename(temporary, entry)
                     except FileExistsError:
                         existing = self._read_authenticated_entry(
-                            configuration, key, result.audit_engine_fingerprint
+                            configuration,
+                            key,
+                            result.audit_engine_fingerprint,
+                            deadline,
                         )
                         if existing is None or existing[1] != result:
                             raise AuditInfrastructureError(
                                 "concurrent audit result winner differs"
                             )
                         if not _remove_held_flat_directory(
-                            temporary, expected_identity=temporary_identity
+                            temporary,
+                            expected_identity=temporary_identity,
+                            deadline=deadline,
                         ):
                             raise AuditInfrastructureError(
                                 "cannot remove losing audit result temporary"
@@ -4544,7 +5403,9 @@ class ConfigurationAuditCache:
                         return existing[1]
                     finally:
                         if stale is not None and not _remove_held_flat_directory(
-                            stale, expected_identity=stale_identity
+                            stale,
+                            expected_identity=stale_identity,
+                            deadline=deadline,
                         ):
                             raise AuditInfrastructureError(
                                 "cannot remove stale audit result entry"

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import enum
 import hashlib
 import hmac
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -799,10 +800,16 @@ def _measure_audit_buffer_layout(tokens) -> _MeasuredAuditBufferLayout:
         schema.checked_add(measured_value)
     if character_count > 0xFFFFFFFF or run_count > 0xFFFFFFFF:
         raise AuditInfrastructureError("normalized audit mapping exceeds unsigned 32-bit range")
-    # CompactTokenSequence reserves identity zero for the absent sentinel and
-    # interns every referenced real identity.  Treat duplicate origin keys as
-    # distinct here: this is a capacity bound, not an allocation-heavy set.
-    origin_count = max(0, len(identities) - 1)
+    # Synthetic packed fixtures may reserve identity zero as an unused absent
+    # sentinel; live PreprocessedStreamBuilder views contain only real
+    # identities.  Exclude only that proved-unused sentinel without allocating
+    # an attacker-scaled set during premeasurement.
+    unused_absent_sentinel = bool(
+        identities
+        and identities[0] is None
+        and all(identity_id != 0 for identity_id in identity_ids)
+    )
+    origin_count = len(identities) - int(unused_absent_sentinel)
     mapping_bytes = schema.checked_multiply(
         schema.checked_add(
             schema.checked_multiply(run_count, AuditBuffer._RUN_COLUMN_COUNT), 1
@@ -4995,50 +5002,142 @@ def _raw_lane_translation(path: PurePosixPath, source: str) \
     ), findings
 
 
-def audit_raw_sources(sources: Mapping[PurePosixPath, str]) -> list[Finding]:
+def _check_policy_deadline(pipeline_deadline: float | None) -> None:
+    if pipeline_deadline is None:
+        return
+    if (
+        not isinstance(pipeline_deadline, (int, float))
+        or isinstance(pipeline_deadline, bool)
+        or not math.isfinite(float(pipeline_deadline))
+        or time.monotonic() >= pipeline_deadline
+    ):
+        raise AuditInfrastructureError("GPU capability policy deadline exceeded")
+
+
+def audit_raw_sources(
+    sources: Mapping[PurePosixPath, str],
+    *,
+    workspace=None,
+    sink=None,
+    provenance: str = "raw-source",
+    pipeline_deadline: float | None = None,
+) -> list[Finding]:
     """Audit source facts that preprocessing may erase, across every branch."""
 
+    if workspace is not None and sink is None:
+        raise AuditInfrastructureError(
+            "bounded raw policy workspace requires a sink"
+        )
     findings: list[Finding] = []
     for path, source in sources.items():
+        _check_policy_deadline(pipeline_deadline)
         if not is_production_path(path):
             continue
-        translated, directive_findings = _raw_lane_translation(path, source)
-        findings.extend(directive_findings)
-        findings.extend(phase_two_capability_findings(path, source, translated))
-        findings.extend(audit_capability_uses(
-            path,
-            translated.text,
-            compiler_view=True,
-            compiler_translation_text=translated,
-        ))
+        scratch = (
+            None
+            if workspace is None
+            else workspace.reserve_policy_scratch(
+                len(source), source_only=False
+            )
+        )
+        try:
+            path_findings: list[Finding] = []
+            _check_policy_deadline(pipeline_deadline)
+            translated, directive_findings = _raw_lane_translation(path, source)
+            _check_policy_deadline(pipeline_deadline)
+            path_findings.extend(directive_findings)
+            path_findings.extend(phase_two_capability_findings(
+                path, source, translated
+            ))
+            _check_policy_deadline(pipeline_deadline)
+            path_findings.extend(audit_capability_uses(
+                path,
+                translated.text,
+                compiler_view=True,
+                compiler_translation_text=translated,
+            ))
+            _check_policy_deadline(pipeline_deadline)
+            if sink is None:
+                findings.extend(path_findings)
+            else:
+                for finding in path_findings:
+                    sink(finding, provenance)
+                path_findings.clear()
+                directive_findings = None
+                translated = None
+        finally:
+            if scratch is not None:
+                workspace.release_policy_scratch(scratch)
     if REGISTRY_HEADER in sources:
-        translated, _unused = _raw_lane_translation(
-            REGISTRY_HEADER, sources[REGISTRY_HEADER]
+        _check_policy_deadline(pipeline_deadline)
+        source = sources[REGISTRY_HEADER]
+        scratch = (
+            None if workspace is None else workspace.reserve_policy_scratch(
+                len(source), source_only=False
+            )
         )
-        findings.extend(audit_public_member(
-            REGISTRY_HEADER,
-            translated.text,
-            "GpuRetireRegistry",
-            r"\bregisterRetire\s*\(",
-            "GpuRetireRegistry::registerRetire()",
-            pretokenized=True,
-        ))
+        try:
+            translated, _unused = _raw_lane_translation(REGISTRY_HEADER, source)
+            _check_policy_deadline(pipeline_deadline)
+            header_findings = audit_public_member(
+                REGISTRY_HEADER,
+                translated.text,
+                "GpuRetireRegistry",
+                r"\bregisterRetire\s*\(",
+                "GpuRetireRegistry::registerRetire()",
+                pretokenized=True,
+            )
+            _check_policy_deadline(pipeline_deadline)
+            if sink is None:
+                findings.extend(header_findings)
+            else:
+                for finding in header_findings:
+                    sink(finding, provenance)
+                header_findings.clear()
+                translated = None
+        finally:
+            if scratch is not None:
+                workspace.release_policy_scratch(scratch)
     if OP_SCOPE_HEADER in sources:
-        translated, _unused = _raw_lane_translation(
-            OP_SCOPE_HEADER, sources[OP_SCOPE_HEADER]
+        _check_policy_deadline(pipeline_deadline)
+        source = sources[OP_SCOPE_HEADER]
+        scratch = (
+            None if workspace is None else workspace.reserve_policy_scratch(
+                len(source), source_only=False
+            )
         )
-        findings.extend(audit_public_member(
-            OP_SCOPE_HEADER,
-            translated.text,
-            "GpuOpScope",
-            r"\btrack\s*\(",
-            "GpuOpScope::track()",
-            pretokenized=True,
-        ))
-    return sorted(
+        try:
+            translated, _unused = _raw_lane_translation(OP_SCOPE_HEADER, source)
+            _check_policy_deadline(pipeline_deadline)
+            header_findings = audit_public_member(
+                OP_SCOPE_HEADER,
+                translated.text,
+                "GpuOpScope",
+                r"\btrack\s*\(",
+                "GpuOpScope::track()",
+                pretokenized=True,
+            )
+            _check_policy_deadline(pipeline_deadline)
+            if sink is None:
+                findings.extend(header_findings)
+            else:
+                for finding in header_findings:
+                    sink(finding, provenance)
+                header_findings.clear()
+                translated = None
+        finally:
+            if scratch is not None:
+                workspace.release_policy_scratch(scratch)
+    if sink is not None:
+        _check_policy_deadline(pipeline_deadline)
+        return []
+    _check_policy_deadline(pipeline_deadline)
+    result = sorted(
         set(findings),
         key=lambda item: (item.path.as_posix(), item.line, item.expression, item.reason),
     )
+    _check_policy_deadline(pipeline_deadline)
+    return result
 
 
 _MACRO_LIKE_IDENTIFIER = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
@@ -6100,21 +6199,69 @@ def _source_only_unknown_macro_findings(
     return findings
 
 
-def audit_source_only(path: PurePosixPath, source: str) -> list[Finding]:
+def audit_source_only(
+    path: PurePosixPath,
+    source: str,
+    *,
+    workspace=None,
+    sink=None,
+    provenance: str = "source-only",
+    pipeline_deadline: float | None = None,
+) -> list[Finding]:
     """Conservatively audit one path without claiming compiler coverage."""
 
+    _check_policy_deadline(pipeline_deadline)
     if not is_production_path(path):
         return []
-    translated = translate_source(source)
-    findings = list(audit_raw_sources({path: source}))
-    findings.extend(guarded_macro_composition_findings(
-        path, translated, source_only=True
-    ))
-    findings.extend(_source_only_unknown_macro_findings(path, translated))
-    return sorted(
-        set(findings),
-        key=lambda item: (item.path.as_posix(), item.line, item.expression, item.reason),
+    if workspace is not None and sink is None:
+        raise AuditInfrastructureError(
+            "bounded source-only policy workspace requires a sink"
+        )
+    scratch = (
+        None
+        if workspace is None
+        else workspace.reserve_policy_scratch(len(source), source_only=True)
     )
+    try:
+        _check_policy_deadline(pipeline_deadline)
+        translated = translate_source(source)
+        _check_policy_deadline(pipeline_deadline)
+        findings = list(audit_raw_sources(
+            {path: source}, workspace=workspace, sink=sink,
+            provenance=provenance,
+            pipeline_deadline=pipeline_deadline,
+        ))
+        _check_policy_deadline(pipeline_deadline)
+        composition_findings = guarded_macro_composition_findings(
+            path, translated, source_only=True
+        )
+        _check_policy_deadline(pipeline_deadline)
+        unknown_findings = _source_only_unknown_macro_findings(path, translated)
+        _check_policy_deadline(pipeline_deadline)
+        if sink is not None:
+            for finding in composition_findings:
+                sink(finding, provenance)
+            composition_findings.clear()
+            for finding in unknown_findings:
+                sink(finding, provenance)
+            unknown_findings.clear()
+            findings.clear()
+            translated = None
+            _check_policy_deadline(pipeline_deadline)
+            return []
+        findings.extend(composition_findings)
+        findings.extend(unknown_findings)
+        result = sorted(
+            set(findings),
+            key=lambda item: (
+                item.path.as_posix(), item.line, item.expression, item.reason
+            ),
+        )
+        _check_policy_deadline(pipeline_deadline)
+        return result
+    finally:
+        if scratch is not None:
+            workspace.release_policy_scratch(scratch)
 
 
 def audit_pipeline(
@@ -6145,6 +6292,183 @@ def audit_pipeline(
             for finding in audit_source_only(path, source)
         )
     return aggregate_findings(observations), coverage
+
+
+def premeasure_streaming_policy_growth(
+    sources: Mapping[PurePosixPath, str],
+    compact_finding_count: int,
+    *,
+    configuration_provenance_count: int = 0,
+    authoritative_paths: tuple[PurePosixPath, ...] = (),
+    path_render_bytes: int = AuditLimits().compact_result_path_bytes,
+    pipeline_deadline: float | None = None,
+) -> int:
+    """Conservatively own policy observations, findings and provenance fan-out."""
+
+    if (
+        not isinstance(sources, Mapping)
+        or not isinstance(compact_finding_count, int)
+        or isinstance(compact_finding_count, bool)
+        or compact_finding_count < 0
+        or not isinstance(configuration_provenance_count, int)
+        or isinstance(configuration_provenance_count, bool)
+        or configuration_provenance_count < 0
+        or not isinstance(authoritative_paths, tuple)
+        or not isinstance(path_render_bytes, int)
+        or isinstance(path_render_bytes, bool)
+        or path_render_bytes <= 0
+    ):
+        raise AuditInfrastructureError(
+            "streaming policy growth inputs are invalid"
+        )
+    schema = conservative_allocation_schema()
+    _check_policy_deadline(pipeline_deadline)
+    for path in authoritative_paths:
+        if not isinstance(path, PurePosixPath):
+            raise AuditInfrastructureError(
+                "streaming policy growth inputs are invalid"
+            )
+    spellings = (
+        "nativeHandle",
+        "GpuSyncReadScope",
+        "GpuReadLease",
+        "GpuSurface",
+        "GpuRetireRegistry",
+        "registerRetire",
+        "GpuOpScope",
+        "track",
+        "withRead",
+        "read",
+        "complete",
+    )
+    candidate_count = 0
+    directive_count = 0
+    phase_two_count = 0
+    capability_source_characters = 0
+    path_bytes = schema.checked_multiply(len(sources), path_render_bytes)
+    source_characters = 0
+    maximum_raw_source_characters = 0
+    maximum_source_only_characters = 0
+    for path, source in sources.items():
+        _check_policy_deadline(pipeline_deadline)
+        if not isinstance(path, PurePosixPath) or not isinstance(source, str):
+            raise AuditInfrastructureError(
+                "streaming policy growth source is invalid"
+            )
+        source_characters = schema.checked_add(
+            source_characters, len(source)
+        )
+        maximum_raw_source_characters = max(
+            maximum_raw_source_characters, len(source)
+        )
+        maximum_source_only_characters = max(
+            maximum_source_only_characters, len(source)
+        )
+        capability_occurrences = 0
+        for spelling in spellings:
+            _check_policy_deadline(pipeline_deadline)
+            occurrences = source.count(spelling)
+            _check_policy_deadline(pipeline_deadline)
+            capability_occurrences = schema.checked_add(
+                capability_occurrences, occurrences
+            )
+            candidate_count = schema.checked_add(
+                candidate_count, occurrences
+            )
+        if capability_occurrences:
+            capability_source_characters = schema.checked_add(
+                capability_source_characters, len(source)
+            )
+        directive_count = schema.checked_add(
+            directive_count, source.count("#")
+        )
+        _check_policy_deadline(pipeline_deadline)
+        phase_two_count = schema.checked_add(
+            phase_two_count,
+            source.count("\\\n"),
+            source.count("\\\r\n"),
+        )
+        in_macro = False
+        macro_length = 0
+        index = 0
+        while index < len(source):
+            _check_policy_deadline(pipeline_deadline)
+            chunk_end = min(len(source), index + (64 * 1024))
+            while index < chunk_end:
+                character = source[index]
+                macro_character = character == "_" or character.isupper()
+                macro_continuation = macro_character or character.isdigit()
+                if not in_macro and macro_character:
+                    in_macro = True
+                    macro_length = 1
+                elif in_macro and macro_continuation:
+                    macro_length += 1
+                elif in_macro:
+                    if macro_length >= 3:
+                        candidate_count = schema.checked_add(candidate_count, 1)
+                    in_macro = False
+                    macro_length = 0
+                index += 1
+        if in_macro and macro_length >= 3:
+            candidate_count = schema.checked_add(candidate_count, 1)
+        _check_policy_deadline(pipeline_deadline)
+    policy_finding_upper = schema.checked_add(
+        schema.checked_multiply(candidate_count, 16),
+        # One capability root can feed an attacker-sized alias/event graph.
+        # A character count is a strict upper bound on lexical graph nodes.
+        capability_source_characters,
+        # Raw directive validation and source-only conditional state can each
+        # emit several diagnostics for one source-authored directive.
+        schema.checked_multiply(directive_count, 8),
+        # Phase-two splice reconstruction is observed by both policy lanes.
+        schema.checked_multiply(phase_two_count, 16),
+        schema.checked_multiply(len(sources), 8),
+    )
+    observation_count = schema.checked_add(
+        policy_finding_upper, compact_finding_count
+    )
+    provenance_count = schema.checked_add(
+        policy_finding_upper,
+        configuration_provenance_count,
+    )
+    value = schema.checked_add(
+        65536,
+        # Both policy lanes tokenize one source at a time.  Own their maximum
+        # live grammar state from source length, independently of whether a
+        # source happens to contain a capability spelling.  The source-only
+        # lane carries the richer alias/scope/event grammar; these closed
+        # per-character bounds exceed measured CPython peaks with headroom.
+        schema.checked_multiply(
+            maximum_raw_source_characters, schema.object_bound(0)
+        ),
+        schema.checked_multiply(
+            maximum_source_only_characters, schema.object_bound(8)
+        ),
+        schema.checked_multiply(len(sources), schema.object_bound(8)),
+        schema.checked_multiply(path_bytes, 4),
+        schema.list_bound(observation_count),
+        schema.checked_multiply(
+            observation_count, schema.tuple_bound(2)
+        ),
+        schema.dict_bound(observation_count),
+        schema.list_bound(provenance_count),
+        schema.tuple_bound(provenance_count),
+        schema.checked_multiply(
+            observation_count, schema.object_bound(4)
+        ),
+        schema.string_objects_bound(
+            schema.checked_add(
+                schema.checked_multiply(source_characters, 4),
+                schema.checked_multiply(path_bytes, 4),
+                schema.checked_multiply(provenance_count, 64),
+            ),
+            schema.checked_add(
+                schema.checked_multiply(observation_count, 4),
+                provenance_count,
+            ),
+        ),
+    )
+    return value
 
 
 def audit_sources(sources: Mapping[PurePosixPath, str]) -> list[Finding]:
@@ -8110,8 +8434,8 @@ def run_correctness_only_cli(args: argparse.Namespace) -> None:
         "correctness-only native decision preparation belongs to Task 10")
 
 
-AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v6"
-AUDIT_ENGINE_STAGE_BYTES = b"task-7-spawn-process-coordinator"
+AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v7"
+AUDIT_ENGINE_STAGE_BYTES = b"task-8-stream-findings-coverage"
 DECISION_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-decision-live-graph-v1"
 _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "gpu_capability_command.py": 1,
@@ -8121,7 +8445,7 @@ _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "test_gpu_capability_command.py": 1,
     "test_gpu_capability_model.py": 1,
     "test_gpu_capability_provenance.py": 1,
-    "test_gpu_capability_runner.py": 7,
+    "test_gpu_capability_runner.py": 8,
 })
 _AUDIT_ENGINE_TARGET_MODULES = (
     _gpu_capability_model,
@@ -9090,7 +9414,9 @@ def profile_compiler_view(
         raise AuditInfrastructureError(
             f"profile source has no compile configuration: {source}"
         )
-    production = enumerate_production_identities(root)
+    production = enumerate_production_identities(
+        root, profile_limits, deadline
+    )
     configuration = matches[0]
     build_started = time.perf_counter()
     view, _discovery, _stages = (

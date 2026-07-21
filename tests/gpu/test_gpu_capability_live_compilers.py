@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 import shutil
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -22,7 +23,10 @@ from gpu_capability_model import (  # noqa: E402
     enumerate_production_identities,
     build_dependency_root_authority,
 )
-from gpu_capability_runner import collect_configurations, preprocess_all  # noqa: E402
+from gpu_capability_reference_fixture import (  # noqa: E402
+    reference_preprocess_all as preprocess_all,
+)
+from gpu_capability_runner import collect_configurations  # noqa: E402
 from gpu_capability_provenance import (  # noqa: E402
     parse_gcc_dependencies,
     validate_dependency_identities,
@@ -429,7 +433,9 @@ def _run_live_fixture_impl(
             raise AuditInfrastructureError(
                 "live compiler capability omitted a runtime ancestor guard"
             )
-        production = enumerate_production_identities(root)
+        production = enumerate_production_identities(
+            root, AuditLimits(), time.monotonic() + 30.0
+        )
         cache = PreprocessCache(root / "gpu-capability-cache")
         remaining_seconds = budget.remaining_seconds()
         views, coverage = preprocess_all(
@@ -953,7 +959,9 @@ FORWARD(lease.safe)();
             source = root / "playback" / "gpu" / "fixture.cpp"
             source.parent.mkdir(parents=True)
             source.write_text("lease.safe();\n", encoding="utf-8")
-            production = enumerate_production_identities(root)
+            production = enumerate_production_identities(
+                root, AuditLimits(), time.monotonic() + 30.0
+            )
             depfile = root / "fixture.d"
             depfile.write_text(
                 f"fixture.o: {source.as_posix()}\n", encoding="utf-8"

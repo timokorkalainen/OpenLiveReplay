@@ -1675,7 +1675,9 @@ class ProductionIdentityTests(unittest.TestCase):
             self.write(root, "recorder_engine/include/b.hpp", "alpha\nbeta".encode("utf-8"))
             self.write(root, "playback/ignored.txt", b"not production source")
 
-            identities = enumerate_production_identities(root)
+            identities = enumerate_production_identities(
+                root, AuditLimits(), time.monotonic() + 30.0
+            )
 
             self.assertEqual(
                 tuple(identities),
@@ -1695,7 +1697,9 @@ class ProductionIdentityTests(unittest.TestCase):
             root = Path(directory)
             self.write(root, "playback/a.cpp", b"int x;\n")
             with mock.patch.object(Path, "exists", return_value=False):
-                identities = enumerate_production_identities(root)
+                identities = enumerate_production_identities(
+                    root, AuditLimits(), time.monotonic() + 30.0
+                )
             self.assertIn(PurePosixPath("playback/a.cpp"), identities)
 
     def test_rejects_source_root_symlink_before_following_it(self):
@@ -1710,7 +1714,9 @@ class ProductionIdentityTests(unittest.TestCase):
                 self.skipTest(f"directory symlinks unavailable: {error}")
 
             with self.assertRaisesRegex(AuditInfrastructureError, "source root.*symlink"):
-                enumerate_production_identities(alias)
+                enumerate_production_identities(
+                    alias, AuditLimits(), time.monotonic() + 30.0
+                )
 
     @unittest.skipUnless(os.name == "nt", "requires Windows directory junctions")
     def test_rejects_source_root_junction_before_following_it(self):
@@ -1728,7 +1734,9 @@ class ProductionIdentityTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     AuditInfrastructureError, "source root.*reparse"
                 ):
-                    enumerate_production_identities(alias)
+                    enumerate_production_identities(
+                        alias, AuditLimits(), time.monotonic() + 30.0
+                    )
             finally:
                 if alias.exists():
                     os.rmdir(alias)
@@ -1750,7 +1758,10 @@ class ProductionIdentityTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     AuditInfrastructureError, "source root.*reparse"
                 ):
-                    enumerate_production_identities(alias / "repo")
+                    enumerate_production_identities(
+                        alias / "repo", AuditLimits(),
+                        time.monotonic() + 30.0,
+                    )
             finally:
                 if alias.exists():
                     os.rmdir(alias)
@@ -1762,7 +1773,9 @@ class ProductionIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 AuditInfrastructureError, r"playback/bad\.cpp.*UTF-8"
             ):
-                enumerate_production_identities(root)
+                enumerate_production_identities(
+                    root, AuditLimits(), time.monotonic() + 30.0
+                )
 
     def test_rejects_duplicate_filesystem_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1775,9 +1788,12 @@ class ProductionIdentityTests(unittest.TestCase):
             except OSError as error:
                 self.skipTest(f"hard links unavailable: {error}")
             with self.assertRaisesRegex(
-                AuditInfrastructureError, r"recorder_engine/alias\.cpp.*aliases.*playback/original\.cpp"
+                AuditInfrastructureError,
+                r"playback/original\.cpp.*unsafe",
             ):
-                enumerate_production_identities(root)
+                enumerate_production_identities(
+                    root, AuditLimits(), time.monotonic() + 30.0
+                )
 
     def test_walk_rejects_symlink_without_following_it(self):
         class FakeEntry:
@@ -1796,13 +1812,22 @@ class ProductionIdentityTests(unittest.TestCase):
             production.mkdir()
             alias = production / "alias.cpp"
             metadata = SimpleNamespace(st_mode=stat.S_IFLNK, st_file_attributes=0)
+            entries = mock.MagicMock()
+            entries.__next__.side_effect = (FakeEntry(alias), StopIteration)
             with mock.patch(
-                "gpu_capability_model.os.scandir", return_value=[FakeEntry(alias)]
+                "gpu_capability_model.os.scandir", return_value=entries
             ), mock.patch("gpu_capability_model.os.stat", return_value=metadata):
                 with self.assertRaisesRegex(
                     AuditInfrastructureError, r"playback/alias\.cpp.*symlink"
                 ):
-                    list(_walk_production_entries(production, root))
+                    list(_walk_production_entries(
+                        production,
+                        root,
+                        AuditLimits(),
+                        time.monotonic() + 30.0,
+                        [0],
+                    ))
+            entries.close.assert_called_once_with()
 
     def test_rejects_non_regular_production_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1816,7 +1841,9 @@ class ProductionIdentityTests(unittest.TestCase):
                     "gpu_capability_model._walk_production_entries",
                     return_value=iter(((fifo, fake_metadata),)),
                 ):
-                    enumerate_production_identities(root)
+                    enumerate_production_identities(
+                        root, AuditLimits(), time.monotonic() + 30.0
+                    )
 
     def test_walk_rejects_reparse_points_without_following_them(self):
         class FakeEntry:
@@ -1835,13 +1862,22 @@ class ProductionIdentityTests(unittest.TestCase):
             production.mkdir()
             alias = production / "alias.cpp"
             metadata = SimpleNamespace(st_mode=stat.S_IFREG, st_file_attributes=0x400)
+            entries = mock.MagicMock()
+            entries.__next__.side_effect = (FakeEntry(alias), StopIteration)
             with mock.patch(
-                "gpu_capability_model.os.scandir", return_value=[FakeEntry(alias)]
+                "gpu_capability_model.os.scandir", return_value=entries
             ), mock.patch("gpu_capability_model.os.stat", return_value=metadata):
                 with self.assertRaisesRegex(
                     AuditInfrastructureError, r"playback/alias\.cpp.*reparse"
                 ):
-                    list(_walk_production_entries(production, root))
+                    list(_walk_production_entries(
+                        production,
+                        root,
+                        AuditLimits(),
+                        time.monotonic() + 30.0,
+                        [0],
+                    ))
+            entries.close.assert_called_once_with()
 
     def test_casefold_collision_logic_names_both_paths(self):
         seen: dict[str, PurePosixPath] = {}

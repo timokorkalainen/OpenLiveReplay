@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import codecs
 import dataclasses
 import hashlib
 import json
@@ -17,7 +18,8 @@ from array import array
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Callable, overload
+from types import MappingProxyType
+from typing import Callable, Literal, overload
 
 
 UINT32_MAX = (1 << 32) - 1
@@ -25,6 +27,7 @@ _SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", 
 _TRANSLATION_UNIT_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".mm"})
 _PRODUCTION_ROOTS = ("playback", "recorder_engine")
 _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_PRODUCTION_TRAVERSAL_PATH_CHARACTERS = 1024
 
 
 class AuditInfrastructureError(RuntimeError):
@@ -319,6 +322,10 @@ class AuditLimits:
     compact_result_path_bytes: int = 16 * 1024
     compact_result_expression_bytes: int = 64 * 1024
     compact_result_reason_bytes: int = 64 * 1024
+    production_raw_per_file_bytes: int = 8 * 1024 * 1024
+    production_raw_aggregate_bytes: int = 64 * 1024 * 1024
+    production_decoded_transient_bytes: int = 256 * 1024 * 1024
+    production_decoded_retained_bytes: int = 128 * 1024 * 1024
     workers: int = field(default_factory=_default_worker_count)
 
 
@@ -1135,6 +1142,132 @@ class WorkerRuntimeContract:
             raise AuditInfrastructureError("worker runtime contract is invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalAuditContentSummary:
+    """Bounded public audit content; detailed evidence never escapes the pipeline."""
+
+    canonical_sha256: str
+    configuration_digests: tuple[str, ...]
+    finding_count: int
+    authoritative_path_count: int
+    source_only_path_count: int
+
+    def __post_init__(self) -> None:
+        _validate_digest(self.canonical_sha256, "canonical audit content")
+        if (
+            not isinstance(self.configuration_digests, tuple)
+            or len(self.configuration_digests) > 251
+            or tuple(sorted(set(self.configuration_digests)))
+            != self.configuration_digests
+        ):
+            raise AuditInfrastructureError(
+                "canonical audit configuration digests are invalid"
+            )
+        for digest in self.configuration_digests:
+            _validate_digest(digest, "canonical audit configuration")
+        for value in (
+            self.finding_count,
+            self.authoritative_path_count,
+            self.source_only_path_count,
+        ):
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise AuditInfrastructureError(
+                    "canonical audit content count is invalid"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingAuditMeasurements:
+    pipeline_started_at: float
+    elapsed_seconds: float
+    configuration_count: int
+    cache_hits: int
+    cache_misses: int
+    inspection_probe_invocations: int
+    audit_compiler_invocations: int
+    stdout_bytes: int
+    memory: PlatformRunMemoryMeasurements
+    cache_bytes: int
+    cache_entries: int
+    compact_result_peak_live_bytes: int
+    compact_result_retained_bytes: int
+    maximum_encoded_result_bytes: int
+    maximum_conservative_decoded_bytes: int
+    maximum_conservative_retained_bytes: int
+    runtime_contract: WorkerRuntimeContract
+    cache_root: Path
+    worker_counts_started: tuple[int, ...]
+    included_stages: tuple[str, ...]
+    inspection_phase_snapshot: NativePhaseSnapshot
+    task_phase_snapshot: NativePhaseSnapshot
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.pipeline_started_at, (int, float))
+            or isinstance(self.pipeline_started_at, bool)
+            or not math.isfinite(self.pipeline_started_at)
+            or not isinstance(self.elapsed_seconds, (int, float))
+            or isinstance(self.elapsed_seconds, bool)
+            or not math.isfinite(self.elapsed_seconds)
+            or self.elapsed_seconds < 0
+            or not isinstance(self.runtime_contract, WorkerRuntimeContract)
+            or not isinstance(self.cache_root, Path)
+            or not isinstance(self.worker_counts_started, tuple)
+            or not isinstance(self.included_stages, tuple)
+        ):
+            raise AuditInfrastructureError("streaming audit measurements are invalid")
+        for value in (
+            self.configuration_count,
+            self.cache_hits,
+            self.cache_misses,
+            self.inspection_probe_invocations,
+            self.audit_compiler_invocations,
+            self.stdout_bytes,
+            self.cache_bytes,
+            self.cache_entries,
+            self.compact_result_peak_live_bytes,
+            self.compact_result_retained_bytes,
+            self.maximum_encoded_result_bytes,
+            self.maximum_conservative_decoded_bytes,
+            self.maximum_conservative_retained_bytes,
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise AuditInfrastructureError(
+                    "streaming audit measurement count is invalid"
+                )
+        if self.cache_hits + self.cache_misses != self.configuration_count:
+            raise AuditInfrastructureError(
+                "streaming audit cache counts disagree"
+            )
+        _ = self.memory_backend
+
+    @property
+    def memory_backend(self) -> Literal["windows", "linux", "macos"]:
+        if type(self.memory) is WindowsRunMemoryMeasurements:
+            return "windows"
+        if type(self.memory) is LinuxRunMemoryMeasurements:
+            return "linux"
+        if type(self.memory) is MacOSRunMemoryMeasurements:
+            return "macos"
+        raise AuditInfrastructureError("streaming audit memory backend is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CompilerAuditRun:
+    summary: CanonicalAuditContentSummary
+    measurements: StreamingAuditMeasurements
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.summary, CanonicalAuditContentSummary) or not isinstance(
+            self.measurements, StreamingAuditMeasurements
+        ):
+            raise AuditInfrastructureError("compiler audit summary is invalid")
+
+
 def _validate_worker_generation_identity(
     worker_index: object, generation: object, label: str
 ) -> None:
@@ -1374,6 +1507,21 @@ class CompactResultPreparseBounds:
             raise AuditInfrastructureError(
                 "compact result preparse bounds are invalid"
             )
+
+
+def compact_result_conservative_decoded_bytes(encoded_bytes: int) -> int:
+    """Task-7 canonical JSON decode bound shared by transport and cache hits."""
+
+    if (
+        not isinstance(encoded_bytes, int)
+        or isinstance(encoded_bytes, bool)
+        or encoded_bytes < 0
+        or encoded_bytes > (4 << 20)
+    ):
+        raise AuditInfrastructureError(
+            "compact result encoded byte count is invalid"
+        )
+    return max(encoded_bytes, 8192 + 9 * encoded_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2334,6 +2482,10 @@ class CompactResultReservationOwnership:
 _COMPACT_RESULT_MAXIMUM_LIVE_BYTES = 128 * 1024 * 1024
 
 
+def _before_compact_atomic_release(_index: int) -> None:
+    """Fault-injection boundary before an all-or-nothing aggregate release."""
+
+
 class CompactAccountingObserver:
     """Run-scoped logical compact-byte transition ledger."""
 
@@ -2642,6 +2794,56 @@ class CompactAccountingObserver:
                     (semantic_event, delta_bytes, label, owner_id)
                 )
 
+    def release_many_atomic(
+        self,
+        releases: tuple[tuple[int, int, str, int], ...],
+    ) -> None:
+        """Validate every owner before publishing one indivisible ledger update."""
+
+        if (
+            not isinstance(releases, tuple)
+            or not releases
+            or any(
+                not isinstance(item, tuple)
+                or len(item) != 4
+                for item in releases
+            )
+        ):
+            raise AuditInfrastructureError(
+                "compact atomic release is invalid"
+            )
+        with self._lock:
+            total = 0
+            seen: set[int] = set()
+            for index, (owner_id, byte_count, label, budget_id) in enumerate(
+                releases
+            ):
+                current = self._owners.get(owner_id)
+                if (
+                    owner_id in seen
+                    or current is None
+                    or current[0] != byte_count
+                    or current[2] != budget_id
+                    or self._owner_budgets.get(owner_id) != budget_id
+                    or not isinstance(label, str)
+                    or not label
+                ):
+                    raise AuditInfrastructureError(
+                        "compact atomic release owner differs"
+                    )
+                seen.add(owner_id)
+                total += byte_count
+                _before_compact_atomic_release(index)
+            if total > self._live_bytes:
+                raise AuditInfrastructureError(
+                    "compact atomic release underflows"
+                )
+            for owner_id, byte_count, label, _budget_id in releases:
+                del self._owners[owner_id]
+                del self._owner_budgets[owner_id]
+                self._events.append(("release", -byte_count, label))
+            self._live_bytes -= total
+
     def record_semantic(
         self,
         semantic_event: str,
@@ -2936,6 +3138,136 @@ class CompactResultMemoryBudget:
                 raise
         return new_owner_id
 
+    def owns(self, ownership: object) -> bool:
+        return (
+            isinstance(ownership, CompactBudgetOwnership)
+            and ownership.budget is self
+            and not ownership.released
+            and all(
+                token.budget is self
+                and token.committed
+                and not token.released
+                for token in ownership.ownerships
+            )
+        )
+
+    def prevalidate_aggregate_release(
+        self, ownership: "CompactBudgetOwnership"
+    ) -> None:
+        if not self.owns(ownership):
+            raise AuditInfrastructureError(
+                "compact aggregate ownership is invalid"
+            )
+        tokens = ownership.ownerships
+        pending = ownership._pending_growth
+        if pending is not None:
+            if (
+                pending.budget is not self
+                or pending.released
+                or pending in tokens
+            ):
+                raise AuditInfrastructureError(
+                    "compact aggregate pending growth is invalid"
+                )
+            tokens = (*tokens, pending)
+        committed = sum(
+            token.byte_count for token in tokens if token.committed
+        )
+        reserved = sum(
+            token.byte_count
+            for token in tokens
+            if not token.committed and not token.released
+        )
+        with self._lock:
+            if (
+                committed > self._committed_bytes
+                or reserved > self._reserved_bytes
+            ):
+                raise AuditInfrastructureError(
+                    "compact aggregate ownership accounting underflow"
+                )
+
+    def reserve_aggregate_growth(
+        self, ownership: "CompactBudgetOwnership", growth: int
+    ) -> None:
+        if not self.owns(ownership) or ownership._pending_growth is not None:
+            raise AuditInfrastructureError(
+                "compact aggregate growth ownership is invalid"
+            )
+        if not isinstance(growth, int) or isinstance(growth, bool) or growth < 0:
+            raise AuditInfrastructureError("compact aggregate growth is invalid")
+        ownership._pending_growth = self.reserve(
+            growth, label="final policy aggregate growth"
+        )
+
+    def commit_aggregate_growth(
+        self, ownership: "CompactBudgetOwnership"
+    ) -> None:
+        if not self.owns(ownership) or ownership._pending_growth is None:
+            raise AuditInfrastructureError(
+                "compact aggregate growth ownership is invalid"
+            )
+        pending = ownership._pending_growth
+        pending.commit()
+        ownership._ownerships = (*ownership._ownerships, pending)
+        ownership._pending_growth = None
+
+    def release_aggregate_after_summary(
+        self, ownership: "CompactBudgetOwnership"
+    ) -> None:
+        self.prevalidate_aggregate_release(ownership)
+        tokens = ownership.ownerships
+        pending = ownership._pending_growth
+        if pending is not None:
+            tokens = (*tokens, pending)
+        committed = sum(
+            token.byte_count for token in tokens if token.committed
+        )
+        reserved = sum(
+            token.byte_count
+            for token in tokens
+            if not token.committed and not token.released
+        )
+        with self._lock:
+            if ownership.released or any(
+                token._state not in {"reserved", "committed"}
+                for token in tokens
+            ):
+                raise AuditInfrastructureError(
+                    "compact aggregate ownership changed before release"
+                )
+            if (
+                committed > self._committed_bytes
+                or reserved > self._reserved_bytes
+            ):
+                raise AuditInfrastructureError(
+                    "compact aggregate ownership accounting underflow"
+                )
+            if self.observer is not None:
+                self.observer.release_many_atomic(tuple(
+                    (
+                        token.owner_id,
+                        token.byte_count,
+                        token.label,
+                        self._budget_id,
+                    )
+                    for token in tokens
+                ))
+            self._committed_bytes -= committed
+            self._reserved_bytes -= reserved
+            ownership._released = True
+            for token in tokens:
+                token._state = "released"
+            ownership._pending_growth = None
+
+    @property
+    def remaining_bytes(self) -> int:
+        return self.maximum_bytes - self.live_bytes
+
+    @property
+    def retained_bytes(self) -> int:
+        return self.committed_bytes
+
 
 class CompactResultOwnership:
     """Linear ownership token; commit and release are each permitted once."""
@@ -3041,6 +3373,49 @@ class CompactResultOwnership:
                 self._state = "released"
         except Exception:
             pass
+
+
+class CompactBudgetOwnership:
+    """One linear aggregate token over a prevalidated set of compact charges."""
+
+    __slots__ = ("_budget", "_ownerships", "_released", "_pending_growth")
+
+    def __init__(
+        self,
+        budget: CompactResultMemoryBudget,
+        ownerships: tuple[CompactResultOwnership, ...],
+    ) -> None:
+        if (
+            not isinstance(budget, CompactResultMemoryBudget)
+            or not isinstance(ownerships, tuple)
+            or not ownerships
+            or any(
+                not isinstance(token, CompactResultOwnership)
+                or token.budget is not budget
+                or not token.committed
+                for token in ownerships
+            )
+            or len({id(token) for token in ownerships}) != len(ownerships)
+        ):
+            raise AuditInfrastructureError(
+                "compact aggregate ownership is invalid"
+            )
+        self._budget = budget
+        self._ownerships = ownerships
+        self._released = False
+        self._pending_growth: CompactResultOwnership | None = None
+
+    @property
+    def budget(self) -> CompactResultMemoryBudget:
+        return self._budget
+
+    @property
+    def ownerships(self) -> tuple[CompactResultOwnership, ...]:
+        return self._ownerships
+
+    @property
+    def released(self) -> bool:
+        return self._released
 
 
 @dataclass(frozen=True, slots=True)
@@ -3953,30 +4328,435 @@ def _check_casefold_collision(
     seen[folded] = relative
 
 
-def _walk_production_entries(directory: Path, root: Path) -> Iterator[tuple[Path, os.stat_result]]:
-    try:
-        entries = sorted(os.scandir(directory), key=lambda entry: entry.name.casefold())
-    except OSError as error:
-        relative = _display_relative(directory, root)
-        raise AuditInfrastructureError(f"{relative}: cannot enumerate production path: {error}") from error
+class _EnumerationProductionMemoryBudget:
+    __slots__ = ("current_bytes", "peak_bytes", "_by_category")
 
-    for entry in entries:
-        path = Path(entry.path)
-        relative = _display_relative(path, root)
+    def __init__(self) -> None:
+        self.current_bytes = 0
+        self.peak_bytes = 0
+        self._by_category: dict[str, int] = {}
+
+    def reserve(self, category: str, byte_count: int, category_limit: int):
+        current = self._by_category.get(category, 0)
+        shared_nonraw_bytes = (
+            self._by_category.get("decoded-retained", 0) + byte_count
+            if category == "decoded-transient"
+            else byte_count
+        )
+        if (
+            category not in {"raw", "decoded-transient", "decoded-retained"}
+            or not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+            or byte_count > category_limit - current
+            or (
+                category == "decoded-transient"
+                and shared_nonraw_bytes > category_limit
+            )
+        ):
+            raise AuditInfrastructureError(
+                f"production {category.replace('-', ' ')} limit exceeded"
+            )
+        self._by_category[category] = current + byte_count
+        self.current_bytes += byte_count
+        self.peak_bytes = max(self.peak_bytes, self.current_bytes)
+        return _EnumerationProductionReservation(self, category, byte_count)
+
+    def preflight_transfer(
+        self, category: str, byte_count: int, category_limit: int
+    ):
+        if (
+            category != "decoded-retained"
+            or not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+            or byte_count > category_limit - self._by_category.get(category, 0)
+        ):
+            raise AuditInfrastructureError(
+                "production decoded retained limit exceeded"
+            )
+        return _EnumerationPendingReservation(self, category, byte_count)
+
+    def commit_split_transfer(
+        self, old, pending, remaining_transient_bytes: int
+    ):
+        if (
+            old.released
+            or old._budget is not self
+            or old.category != "decoded-transient"
+            or pending._budget is not self
+            or pending.committed
+            or not isinstance(remaining_transient_bytes, int)
+            or isinstance(remaining_transient_bytes, bool)
+            or remaining_transient_bytes < 0
+            or remaining_transient_bytes + pending.byte_count != old.byte_count
+        ):
+            raise AuditInfrastructureError(
+                "production allocation transfer is invalid"
+            )
+        old_current = self._by_category.get(old.category, 0)
+        if old.byte_count > old_current:
+            raise AuditInfrastructureError(
+                "production allocation ownership underflow"
+            )
+        self._by_category[old.category] = (
+            old_current - old.byte_count + remaining_transient_bytes
+        )
+        self._by_category[pending.category] = (
+            self._by_category.get(pending.category, 0) + pending.byte_count
+        )
+        old.released = True
+        pending.committed = True
+        return (
+            _EnumerationProductionReservation(
+                self, old.category, remaining_transient_bytes
+            ),
+            _EnumerationProductionReservation(
+                self, pending.category, pending.byte_count
+            ),
+        )
+
+    def _release(self, category: str, byte_count: int) -> None:
+        current = self._by_category.get(category, 0)
+        if byte_count > current or byte_count > self.current_bytes:
+            raise AuditInfrastructureError(
+                "production allocation ownership underflow"
+            )
+        self._by_category[category] = current - byte_count
+        self.current_bytes -= byte_count
+
+
+class _EnumerationProductionReservation:
+    __slots__ = ("_budget", "category", "byte_count", "released")
+
+    def __init__(self, budget, category: str, byte_count: int) -> None:
+        self._budget = budget
+        self.category = category
+        self.byte_count = byte_count
+        self.released = False
+
+    def absorb(self, other) -> None:
+        if (
+            self.released
+            or other.released
+            or self._budget is not other._budget
+            or self.category != other.category
+        ):
+            raise AuditInfrastructureError(
+                "production allocation growth ownership differs"
+            )
+        self.byte_count += other.byte_count
+        other.released = True
+
+    def release(self) -> None:
+        if self.released:
+            raise AuditInfrastructureError(
+                "production allocation ownership was already released"
+            )
+        self._budget._release(self.category, self.byte_count)
+        self.released = True
+
+
+class _EnumerationPendingReservation:
+    __slots__ = ("_budget", "category", "byte_count", "committed")
+
+    def __init__(self, budget, category: str, byte_count: int) -> None:
+        self._budget = budget
+        self.category = category
+        self.byte_count = byte_count
+        self.committed = False
+
+
+def _enumerated_structure_bound(source_count: int) -> int:
+    from gpu_capability_source_audit import (
+        conservative_allocation_schema as policy_allocation_schema,
+    )
+
+    schema = policy_allocation_schema()
+    return schema.checked_add(
+        4096,
+        schema.checked_multiply(3, schema.list_bound(source_count)),
+        schema.checked_multiply(3, schema.dict_bound(source_count)),
+        schema.checked_multiply(
+            source_count,
+            schema.checked_add(
+                schema.object_bound(10),
+                schema.object_bound(6),
+                schema.object_bound(4),
+                schema.tuple_bound(2),
+                schema.string_bound(64),
+                schema.bytes_objects_bound(0, 1),
+            ),
+        ),
+        schema.checked_multiply(5, schema.object_bound(8)),
+    )
+
+
+def _enumeration_scan_scratch_bound(size: int) -> int:
+    from gpu_capability_source_audit import (
+        conservative_allocation_schema as policy_allocation_schema,
+    )
+
+    schema = policy_allocation_schema()
+    chunk = min(size, 64 * 1024)
+    return schema.checked_add(
+        schema.bytes_objects_bound(chunk, 2),
+        schema.string_bound(chunk),
+        schema.object_bound(16),
+    )
+
+
+def _enumeration_traversal_scratch_bound(entry_count: int) -> int:
+    from gpu_capability_source_audit import (
+        conservative_allocation_schema as policy_allocation_schema,
+    )
+
+    schema = policy_allocation_schema()
+    return schema.checked_add(
+        schema.list_bound(entry_count),
+        schema.checked_multiply(
+            entry_count,
+            schema.checked_add(
+                schema.object_bound(8),
+                schema.string_bound(_PRODUCTION_TRAVERSAL_PATH_CHARACTERS),
+            ),
+        ),
+    )
+
+
+def _production_enumeration_allocation_event(_event: str) -> None:
+    """Fault-injection/ordering seam for enumeration-owned structures."""
+
+
+class _EnumeratedProductionTable:
+    __slots__ = (
+        "table", "_backing", "budget", "structure_ownership", "claimed",
+        "_closed", "_limits", "_casefolded", "_filesystem_ids",
+    )
+
+    def __init__(self, limits: AuditLimits) -> None:
+        self.table = None
+        self._backing = None
+        self._casefolded = None
+        self._filesystem_ids = None
+        self.budget = _EnumerationProductionMemoryBudget()
+        self.structure_ownership = None
+        self.claimed = False
+        self._closed = False
+        self._limits = limits
         try:
-            # DirEntry.stat() on Windows may omit the volume/file index fields;
-            # os.stat() supplies the stable identity needed to detect hard links.
-            metadata = os.stat(path, follow_symlinks=False)
+            _production_enumeration_allocation_event(
+                "reserve-enumeration-structure"
+            )
+            self.structure_ownership = self.budget.reserve(
+                "decoded-retained",
+                _enumerated_structure_bound(0),
+                limits.production_decoded_retained_bytes,
+            )
+            _production_enumeration_allocation_event(
+                "construct-enumeration-table"
+            )
+            self._backing = {}
+            self._casefolded = {}
+            self._filesystem_ids = {}
+        except BaseException:
+            self.close()
+            raise
+
+    def insert(self, path: PurePosixPath, identity: FileIdentity) -> None:
+        folded = path.as_posix().casefold()
+        previous_case = self._casefolded.get(folded)
+        filesystem_id = (
+            (identity.device, identity.inode)
+            if identity.device is not None and identity.inode is not None
+            else None
+        )
+        previous_identity = (
+            None
+            if filesystem_id is None
+            else self._filesystem_ids.get(filesystem_id)
+        )
+        if (
+            self._closed
+            or self.table is not None
+            or path in self._backing
+            or (previous_case is not None and previous_case != path)
+            or previous_identity is not None
+        ):
+            if previous_case is not None and previous_case != path:
+                raise AuditInfrastructureError(
+                    f"{path}: case-fold collision with production path "
+                    f"{previous_case}"
+                )
+            if previous_identity is not None:
+                raise AuditInfrastructureError(
+                    f"{path}: filesystem identity aliases production path "
+                    f"{previous_identity}"
+                )
+            raise AuditInfrastructureError(
+                "production enumeration table insertion differs"
+            )
+        target = _enumerated_structure_bound(len(self._backing) + 1)
+        additional = target - self.structure_ownership.byte_count
+        growth = self.budget.reserve(
+            "decoded-retained",
+            additional,
+            self._limits.production_decoded_retained_bytes,
+        )
+        try:
+            _production_enumeration_allocation_event(
+                "insert-enumeration-table"
+            )
+            self._backing[path] = identity
+            self._casefolded[folded] = path
+            if filesystem_id is not None:
+                self._filesystem_ids[filesystem_id] = path
+        except BaseException:
+            self._backing.pop(path, None)
+            self._casefolded.pop(folded, None)
+            if filesystem_id is not None:
+                self._filesystem_ids.pop(filesystem_id, None)
+            growth.release()
+            raise
+        self.structure_ownership.absorb(growth)
+
+    def freeze(self) -> "_EnumeratedProductionTable":
+        if self._closed or self.table is not None:
+            raise AuditInfrastructureError(
+                "production enumeration table freeze differs"
+            )
+        _production_enumeration_allocation_event("freeze-enumeration-table")
+        ordered = sorted(
+            self._backing.items(), key=lambda item: item[0].as_posix()
+        )
+        self._backing.clear()
+        self._backing.update(ordered)
+        ordered.clear()
+        self._casefolded.clear()
+        self._filesystem_ids.clear()
+        self.table = MappingProxyType(self._backing)
+        return self
+
+    def _require_open(self) -> None:
+        if self._closed or self.table is None:
+            raise AuditInfrastructureError(
+                "production enumeration table is unavailable"
+            )
+
+    def __getitem__(self, key):
+        self._require_open()
+        return self.table[key]
+
+    def __iter__(self):
+        self._require_open()
+        return iter(self.table)
+
+    def __len__(self):
+        self._require_open()
+        return len(self.table)
+
+    def items(self):
+        self._require_open()
+        return self.table.items()
+
+    def keys(self):
+        self._require_open()
+        return self.table.keys()
+
+    def values(self):
+        self._require_open()
+        return self.table.values()
+
+    def get(self, key, default=None):
+        self._require_open()
+        return self.table.get(key, default)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._backing is not None:
+            self._backing.clear()
+        if self._casefolded is not None:
+            self._casefolded.clear()
+        if self._filesystem_ids is not None:
+            self._filesystem_ids.clear()
+        self._closed = True
+        if (
+            not self.claimed
+            and self.structure_ownership is not None
+            and not self.structure_ownership.released
+        ):
+            self.structure_ownership.release()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+
+Mapping.register(_EnumeratedProductionTable)
+
+
+def _walk_production_entries(
+    directory: Path,
+    root: Path,
+    limits: AuditLimits,
+    pipeline_deadline: float,
+    traversal_count: list[int],
+) -> Iterator[tuple[Path, os.stat_result]]:
+    pending_directories = [directory]
+    directory_index = 0
+    while directory_index < len(pending_directories):
+        current_directory = pending_directories[directory_index]
+        directory_index += 1
+        try:
+            entries = os.scandir(current_directory)
         except OSError as error:
-            raise AuditInfrastructureError(f"{relative}: cannot inspect production path: {error}") from error
-        if entry.is_symlink():
-            raise AuditInfrastructureError(f"{relative}: production path crosses a symlink")
-        if _is_reparse(metadata):
-            raise AuditInfrastructureError(f"{relative}: production path crosses a reparse point")
-        if stat.S_ISDIR(metadata.st_mode):
-            yield from _walk_production_entries(path, root)
-        else:
-            yield path, metadata
+            relative = _display_relative(current_directory, root)
+            raise AuditInfrastructureError(
+                f"{relative}: cannot enumerate production path: {error}"
+            ) from error
+        try:
+            while True:
+                _check_production_enumeration_deadline(pipeline_deadline)
+                try:
+                    entry = next(entries)
+                except StopIteration:
+                    break
+                traversal_count[0] += 1
+                if traversal_count[0] > limits.unique_dependency_handles:
+                    raise AuditInfrastructureError(
+                        "production traversal entry count limit exceeded"
+                    )
+                _check_production_enumeration_deadline(pipeline_deadline)
+                path = Path(entry.path)
+                relative = _display_relative(path, root)
+                try:
+                    metadata = os.stat(path, follow_symlinks=False)
+                except OSError as error:
+                    raise AuditInfrastructureError(
+                        f"{relative}: cannot inspect production path: {error}"
+                    ) from error
+                if entry.is_symlink():
+                    raise AuditInfrastructureError(
+                        f"{relative}: production path crosses a symlink"
+                    )
+                if _is_reparse(metadata):
+                    raise AuditInfrastructureError(
+                        f"{relative}: production path crosses a reparse point"
+                    )
+                if stat.S_ISDIR(metadata.st_mode):
+                    if len(relative.as_posix()) > _PRODUCTION_TRAVERSAL_PATH_CHARACTERS:
+                        raise AuditInfrastructureError(
+                            "production traversal path limit exceeded"
+                        )
+                    pending_directories.append(path)
+                else:
+                    yield path, metadata
+        finally:
+            entries.close()
+    pending_directories.clear()
 
 
 def _physical_line_count(source: str) -> int:
@@ -3986,9 +4766,170 @@ def _physical_line_count(source: str) -> int:
     return normalized.count("\n") + (0 if normalized.endswith("\n") else 1)
 
 
-def enumerate_production_identities(root: Path) -> dict[PurePosixPath, FileIdentity]:
+def _check_production_enumeration_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise AuditInfrastructureError("production enumeration deadline exceeded")
+
+
+def _open_enumerated_production_file(path: Path):
+    before = path.lstat()
+    if (
+        _is_reparse(before)
+        or stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or int(getattr(before, "st_nlink", 1)) != 1
+    ):
+        raise AuditInfrastructureError(
+            "production enumeration path is unsafe"
+        )
+    if os.name != "nt":
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    else:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(path),
+            0x80000000,
+            0x00000001,
+            None,
+            3,
+            0x00000080 | 0x00200000,
+            None,
+        )
+        numeric = ctypes.cast(handle, ctypes.c_void_p).value
+        if numeric in (None, ctypes.c_void_p(-1).value):
+            raise AuditInfrastructureError(
+                "production enumeration descriptor open failed"
+            )
+        try:
+            descriptor = msvcrt.open_osfhandle(int(numeric), os.O_RDONLY)
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+    try:
+        stream = os.fdopen(descriptor, "rb", closefd=True)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    try:
+        opened = os.fstat(stream.fileno())
+        after = path.lstat()
+        if (
+            any(_is_reparse(value) for value in (opened, after))
+            or any(not stat.S_ISREG(value.st_mode) for value in (opened, after))
+            or any(
+                int(getattr(value, "st_nlink", 1)) != 1
+                for value in (opened, after)
+            )
+            or len(
+                {
+                    (int(value.st_dev), int(value.st_ino))
+                    for value in (before, opened, after)
+                }
+            )
+            != 1
+        ):
+            raise AuditInfrastructureError(
+                "production enumeration generation differs"
+            )
+        return stream, opened
+    except BaseException:
+        stream.close()
+        raise
+
+
+def _scan_production_utf8_lines(
+    stream, size: int, deadline: float, limits: AuditLimits
+) -> int:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    line_count = 0
+    saw_text = False
+    pending_cr = False
+    ended_with_newline = False
+    remaining = size
+    try:
+        while remaining:
+            _check_production_enumeration_deadline(deadline)
+            block = stream.read(min(64 * 1024, remaining))
+            if not block:
+                raise AuditInfrastructureError(
+                    "production enumeration unstable read"
+                )
+            remaining -= len(block)
+            text = decoder.decode(block, final=False)
+            if _current_process_rss_bytes() > limits.rss_bytes:
+                raise AuditInfrastructureError(
+                    "production enumeration RSS limit exceeded"
+                )
+            for character in text:
+                saw_text = True
+                if pending_cr:
+                    line_count += 1
+                    pending_cr = False
+                    ended_with_newline = True
+                    if character == "\n":
+                        continue
+                if character == "\r":
+                    pending_cr = True
+                elif character == "\n":
+                    line_count += 1
+                    ended_with_newline = True
+                else:
+                    ended_with_newline = False
+            _check_production_enumeration_deadline(deadline)
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            raise AuditInfrastructureError(
+                "production enumeration decoder retained unexpected text"
+            )
+    except UnicodeDecodeError as error:
+        raise AuditInfrastructureError(
+            "production file is not valid UTF-8"
+        ) from error
+    if pending_cr:
+        line_count += 1
+        ended_with_newline = True
+    if saw_text and not ended_with_newline:
+        line_count += 1
+    _check_production_enumeration_deadline(deadline)
+    return line_count
+
+
+def enumerate_production_identities(
+    root: Path,
+    limits: AuditLimits,
+    pipeline_deadline: float,
+) -> _EnumeratedProductionTable:
     """Enumerate unambiguous canonical identities under the two production roots."""
 
+    if not isinstance(limits, AuditLimits):
+        raise AuditInfrastructureError("production enumeration limits are invalid")
+    if (
+        not isinstance(pipeline_deadline, (int, float))
+        or isinstance(pipeline_deadline, bool)
+        or not math.isfinite(float(pipeline_deadline))
+    ):
+        raise AuditInfrastructureError("production enumeration deadline is invalid")
+    _check_production_enumeration_deadline(float(pipeline_deadline))
     lexical_root = Path(root).absolute()
     current = Path(lexical_root.anchor)
     for component in lexical_root.parts[1:]:
@@ -4015,79 +4956,186 @@ def enumerate_production_identities(root: Path) -> dict[PurePosixPath, FileIdent
         canonical_root = lexical_root.resolve(strict=True)
     except OSError as error:
         raise AuditInfrastructureError(f"{lexical_root}: source root cannot be resolved: {error}") from error
-    identities: dict[PurePosixPath, FileIdentity] = {}
-    casefolded: dict[str, PurePosixPath] = {}
-    filesystem_ids: dict[tuple[int, int], PurePosixPath] = {}
+    prepared = _EnumeratedProductionTable(limits)
+    traversal_scratch = prepared.budget.reserve(
+        "decoded-transient",
+        _enumeration_traversal_scratch_bound(
+            limits.unique_dependency_handles
+        ),
+        limits.production_decoded_transient_bytes,
+    )
+    raw_total = 0
+    traversal_count = [0]
 
-    for production_root_name in _PRODUCTION_ROOTS:
-        production_root = lexical_root / production_root_name
-        try:
-            root_metadata = production_root.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as error:
-            raise AuditInfrastructureError(
-                f"{production_root_name}: cannot inspect production root: {error}"
-            ) from error
-        if production_root.is_symlink():
-            raise AuditInfrastructureError(
-                f"{production_root_name}: production path crosses a symlink"
-            )
-        if _is_reparse(root_metadata):
-            raise AuditInfrastructureError(
-                f"{production_root_name}: production path crosses a reparse point"
-            )
-        if not stat.S_ISDIR(root_metadata.st_mode):
-            raise AuditInfrastructureError(f"{production_root_name}: production root is not a directory")
-
-        for candidate, metadata in _walk_production_entries(production_root, lexical_root):
-            relative = _display_relative(candidate, lexical_root)
-            if candidate.suffix.casefold() not in _SOURCE_SUFFIXES:
+    try:
+        for production_root_name in _PRODUCTION_ROOTS:
+            production_root = lexical_root / production_root_name
+            try:
+                root_metadata = production_root.lstat()
+            except FileNotFoundError:
                 continue
-            if not stat.S_ISREG(metadata.st_mode):
-                raise AuditInfrastructureError(f"{relative}: production path is not a regular file")
-            try:
-                canonical = candidate.resolve(strict=True)
             except OSError as error:
-                raise AuditInfrastructureError(f"{relative}: production path cannot be resolved: {error}") from error
-            try:
-                canonical.relative_to(canonical_root)
-            except ValueError as error:
                 raise AuditInfrastructureError(
-                    f"{relative}: resolved production path is outside the source root"
+                    f"{production_root_name}: cannot inspect production root: {error}"
                 ) from error
+            if production_root.is_symlink():
+                raise AuditInfrastructureError(
+                    f"{production_root_name}: production path crosses a symlink"
+                )
+            if _is_reparse(root_metadata):
+                raise AuditInfrastructureError(
+                    f"{production_root_name}: production path crosses a reparse point"
+                )
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                raise AuditInfrastructureError(
+                    f"{production_root_name}: production root is not a directory"
+                )
 
-            _check_casefold_collision(relative, casefolded)
-            raw_device = getattr(metadata, "st_dev", None)
-            raw_inode = getattr(metadata, "st_ino", None)
-            device = int(raw_device) if isinstance(raw_device, int) else None
-            inode = int(raw_inode) if isinstance(raw_inode, int) and raw_inode != 0 else None
-            if device is not None and inode is not None:
-                filesystem_id = (device, inode)
-                previous = filesystem_ids.get(filesystem_id)
-                if previous is not None:
+            for candidate, metadata in _walk_production_entries(
+                production_root,
+                lexical_root,
+                limits,
+                float(pipeline_deadline),
+                traversal_count,
+            ):
+                _check_production_enumeration_deadline(
+                    float(pipeline_deadline)
+                )
+                relative = _display_relative(candidate, lexical_root)
+                if candidate.suffix.casefold() not in _SOURCE_SUFFIXES:
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
                     raise AuditInfrastructureError(
-                        f"{relative}: filesystem identity aliases production path {previous}"
+                        f"{relative}: production path is not a regular file"
                     )
-                filesystem_ids[filesystem_id] = relative
+                try:
+                    canonical = candidate.resolve(strict=True)
+                except OSError as error:
+                    raise AuditInfrastructureError(
+                        f"{relative}: production path cannot be resolved: {error}"
+                    ) from error
+                try:
+                    canonical.relative_to(canonical_root)
+                except ValueError as error:
+                    raise AuditInfrastructureError(
+                        f"{relative}: resolved production path is outside the source root"
+                    ) from error
 
-            try:
-                source = candidate.read_bytes().decode("utf-8", errors="strict")
-            except UnicodeDecodeError as error:
-                raise AuditInfrastructureError(f"{relative}: production file is not valid UTF-8") from error
-            except OSError as error:
-                raise AuditInfrastructureError(f"{relative}: production file is unreadable: {error}") from error
+                if len(prepared._backing) >= limits.unique_dependency_handles:
+                    raise AuditInfrastructureError(
+                        "production enumeration file count limit exceeded"
+                    )
+                try:
+                    stream, opened_metadata = _open_enumerated_production_file(
+                        candidate
+                    )
+                    try:
+                        size = int(opened_metadata.st_size)
+                        walk_identity = (
+                            int(metadata.st_dev), int(metadata.st_ino) or None
+                        )
+                        opened_identity = (
+                            int(opened_metadata.st_dev),
+                            int(opened_metadata.st_ino) or None,
+                        )
+                        walk_generation = (
+                            int(metadata.st_size),
+                            int(metadata.st_mtime_ns),
+                            int(getattr(metadata, "st_ctime_ns", 0)),
+                        )
+                        opened_generation = (
+                            int(opened_metadata.st_size),
+                            int(opened_metadata.st_mtime_ns),
+                            int(getattr(opened_metadata, "st_ctime_ns", 0)),
+                        )
+                        if (
+                            walk_identity != opened_identity
+                            or walk_generation[:2] != opened_generation[:2]
+                        ):
+                            raise AuditInfrastructureError(
+                                "production enumeration generation differs"
+                            )
+                        if size > limits.production_raw_per_file_bytes:
+                            raise AuditInfrastructureError(
+                                "production raw per-file limit exceeded"
+                            )
+                        if (
+                            size
+                            > limits.production_raw_aggregate_bytes - raw_total
+                        ):
+                            raise AuditInfrastructureError(
+                                "production raw aggregate limit exceeded"
+                            )
+                        raw_total += size
+                        scan_scratch = prepared.budget.reserve(
+                            "decoded-transient",
+                            _enumeration_scan_scratch_bound(size),
+                            limits.production_decoded_transient_bytes,
+                        )
+                        try:
+                            line_count = _scan_production_utf8_lines(
+                                stream, size, float(pipeline_deadline), limits
+                            )
+                        finally:
+                            scan_scratch.release()
+                        after = os.fstat(stream.fileno())
+                        path_after = candidate.lstat()
+                        if (
+                            (int(after.st_dev), int(after.st_ino) or None)
+                            != opened_identity
+                            or (
+                                int(path_after.st_dev),
+                                int(path_after.st_ino) or None,
+                            )
+                            != opened_identity
+                            or (
+                                int(after.st_size),
+                                int(after.st_mtime_ns),
+                                int(getattr(after, "st_ctime_ns", 0)),
+                            )
+                            != opened_generation
+                            or (
+                                int(path_after.st_size),
+                                int(path_after.st_mtime_ns),
+                                int(getattr(path_after, "st_ctime_ns", 0)),
+                            )
+                            != walk_generation
+                        ):
+                            raise AuditInfrastructureError(
+                                "production enumeration generation differs"
+                            )
+                    finally:
+                        stream.close()
+                except AuditInfrastructureError as error:
+                    raise AuditInfrastructureError(
+                        f"{relative}: {error}"
+                    ) from error
+                except OSError as error:
+                    raise AuditInfrastructureError(
+                        f"{relative}: production file is unreadable: {error}"
+                    ) from error
+                if _current_process_rss_bytes() > limits.rss_bytes:
+                    raise AuditInfrastructureError(
+                        "production enumeration RSS limit exceeded"
+                    )
 
-            identities[relative] = FileIdentity(
-                canonical=canonical,
-                relative=relative,
-                device=device,
-                inode=inode,
-                line_count=_physical_line_count(source),
-                production=True,
-            )
+                prepared.insert(relative, FileIdentity(
+                    canonical=canonical,
+                    relative=relative,
+                    device=opened_identity[0],
+                    inode=opened_identity[1],
+                    line_count=line_count,
+                    production=True,
+                ))
 
-    return dict(sorted(identities.items(), key=lambda item: item[0].as_posix()))
+        traversal_scratch.release()
+        traversal_scratch = None
+        return prepared.freeze()
+    except BaseException:
+        if traversal_scratch is not None and not traversal_scratch.released:
+            traversal_scratch.release()
+        prepared.close()
+        raise
 import re
 AUDIT_RESULT_SCHEMA_BYTES = b"olr-gpu-capability-audit-result-v1"
 _LOWER_HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -5095,18 +6143,32 @@ class StreamingAuditSummary:
     reached_production: tuple[PurePosixPath, ...]
     findings: tuple[AggregatedAuditResultFinding, ...]
     dependency_digests: tuple[tuple[str, str, str], ...]
-    _ownerships: tuple[CompactResultOwnership, ...] = field(
-        compare=False, repr=False
-    )
+    budget_ownership: CompactBudgetOwnership = field(compare=False, repr=False)
 
     @property
     def authoritative(self) -> frozenset[PurePosixPath]:
         return frozenset(self.reached_production)
 
+    @property
+    def ordered_configuration_digests(self) -> tuple[str, ...]:
+        return self.configurations
+
+    @property
+    def authoritative_coverage(self) -> frozenset[PurePosixPath]:
+        return self.authoritative
+
+    @property
+    def aggregated_findings(self) -> tuple[AggregatedAuditResultFinding, ...]:
+        return self.findings
+
+    @property
+    def canonical_result_digest(self) -> str:
+        return hashlib.sha256(encode_canonical_summary(self)).hexdigest()
+
     def release(self) -> None:
-        for ownership in self._ownerships:
-            if not ownership.released:
-                ownership.release()
+        self.budget_ownership.budget.release_aggregate_after_summary(
+            self.budget_ownership
+        )
 
 
 def _after_streaming_aggregate_mutation(_stage: str) -> None:
@@ -5159,6 +6221,8 @@ class StreamingResultAggregator:
         configurations: tuple[PreprocessConfiguration, ...],
         budget: CompactResultMemoryBudget,
         limits: AuditLimits,
+        *,
+        require_main_provenance: bool = False,
     ) -> None:
         if not isinstance(configurations, tuple) or any(
             not isinstance(item, PreprocessConfiguration) for item in configurations
@@ -5168,6 +6232,10 @@ class StreamingResultAggregator:
             limits, AuditLimits
         ):
             raise AuditInfrastructureError("streaming result aggregate inputs are invalid")
+        if not isinstance(require_main_provenance, bool):
+            raise AuditInfrastructureError(
+                "streaming result main provenance mode is invalid"
+            )
         digests = tuple(item.digest for item in configurations)
         if len(set(digests)) != len(digests):
             raise AuditInfrastructureError("streaming result configurations are not unique")
@@ -5199,6 +6267,7 @@ class StreamingResultAggregator:
         self._mutation_journals: list[_StreamingAggregateMutation] = []
         self._cold_ownership: CompactResultOwnership | None = None
         self._finished = False
+        self._require_main_provenance = require_main_provenance
 
     @property
     def accepted_count(self) -> int:
@@ -5266,11 +6335,22 @@ class StreamingResultAggregator:
             byte_count, label="batch retained result limit"
         ).commit()
 
-    def _growth_for(self, result: ConfigurationAuditResult) -> CompactResultGrowth:
+    def _growth_for(
+        self,
+        result: ConfigurationAuditResult,
+        additionally_reached: PurePosixPath | None = None,
+    ) -> CompactResultGrowth:
         coverage_bytes = 0
         for path in result.reached_production:
             if path.as_posix() not in self._reached:
                 coverage_bytes += 176 + len(path.as_posix().encode("utf-8"))
+        if (
+            additionally_reached is not None
+            and additionally_reached.as_posix() not in self._reached
+        ):
+            coverage_bytes += 176 + len(
+                additionally_reached.as_posix().encode("utf-8")
+            )
         finding_bytes = 0
         for finding in result.findings:
             key = _audit_finding_key(finding)
@@ -5342,6 +6422,27 @@ class StreamingResultAggregator:
             or result.configuration_digest != configuration.digest
         ):
             raise AuditInfrastructureError("streaming result configuration digest differs")
+        main = configuration.source.relative
+        main_reached = main is not None and main in result.reached_production
+        empty_main_proved = (
+            main is not None
+            and configuration.source.line_count == 0
+            and any(
+                dependency.stable_role == "production"
+                and dependency.role_relative_path == main
+                and dependency.identity == configuration.source
+                for dependency in result.dependencies
+            )
+        )
+        additional_main_coverage = (
+            main if empty_main_proved and not main_reached else None
+        )
+        if self._require_main_provenance and (
+            main is None or not (main_reached or empty_main_proved)
+        ):
+            raise AuditInfrastructureError(
+                "configuration result lacks main-source provenance"
+            )
         if (
             not isinstance(ownership, CompactResultOwnership)
             or ownership.budget is not self._budget
@@ -5353,7 +6454,7 @@ class StreamingResultAggregator:
             4096, label="aggregate growth workspace"
         ).commit()
         try:
-            growth = self._growth_for(result)
+            growth = self._growth_for(result, additional_main_coverage)
             if growth.total_bytes > self._limits.compact_aggregate_bytes:
                 raise AuditInfrastructureError(
                     "aggregate growth exceeds 128 MiB limit"
@@ -5383,6 +6484,11 @@ class StreamingResultAggregator:
                 path_key = path.as_posix()
                 if path_key not in self._reached:
                     self._reached[path_key] = path
+                    reached_keys.append(path_key)
+            if additional_main_coverage is not None:
+                path_key = additional_main_coverage.as_posix()
+                if path_key not in self._reached:
+                    self._reached[path_key] = additional_main_coverage
                     reached_keys.append(path_key)
             _after_streaming_aggregate_mutation("reached")
             for finding in result.findings:
@@ -5581,7 +6687,7 @@ class StreamingResultAggregator:
                 reached,
                 findings,
                 digests,
-                ownerships,
+                CompactBudgetOwnership(self._budget, ownerships),
             )
         except BaseException:
             if replaced_cold_bytes is not None:

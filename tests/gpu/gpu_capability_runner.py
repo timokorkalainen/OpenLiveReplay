@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import collections
 import contextlib
 import base64
@@ -31,6 +30,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 
 from gpu_capability_cache import (
+    CompilerInspectionCache,
     ConfigurationAuditCache,
     PreprocessCache,
     _AUDIT_RESULT_MAXIMUM_ENCODED_BYTES,
@@ -64,6 +64,7 @@ from gpu_capability_model import (
     AuditResultFinding,
     AuditInfrastructureError,
     AuditLimits,
+    CanonicalAuditContentSummary,
     CachePublicationPermit,
     CachePublicationRequested,
     CompactResultColdSlot,
@@ -75,6 +76,7 @@ from gpu_capability_model import (
     CompactResultTransportAllocation,
     CompactResultTransportCapability,
     CompactResultDraftBounds,
+    CompilerAuditRun,
     CompilerFamily,
     CompilerExecutableCapability,
     CompilerLaunchEvent,
@@ -103,6 +105,7 @@ from gpu_capability_model import (
     LinuxRunMemoryMeasurements,
     LinuxPhaseSnapshot,
     MacOSPhaseSnapshot,
+    MacOSRunMemoryMeasurements,
     MacOSWorkerSessionReported,
     WorkerCapabilitiesAccepted,
     WorkerFailure,
@@ -114,9 +117,14 @@ from gpu_capability_model import (
     WorkerStop,
     WorkerStopped,
     StreamingAuditSummary,
+    StreamingAuditMeasurements,
     StreamingResultAggregator,
+    WindowsPhaseSnapshot,
+    WindowsRunMemoryMeasurements,
+    compact_result_conservative_decoded_bytes,
     compact_result_retained_bytes,
     _FilesystemGenerationObserver,
+    _EnumeratedProductionTable,
     _current_process_rss_bytes,
     _preprocessed_view_semantic_digest,
     enumerate_production_identities,
@@ -145,6 +153,39 @@ COMMAND_MAX_BYTES = 64 * 1024
 _PIPE_KERNEL_CAPACITY_BYTES = 64 * 1024
 _PROCESS_TREE_MEMORY_LIMIT_BYTES = 512 << 20
 _FAILURE_REAP_SECONDS = 30.0
+_PIPELINE_HARD_SECONDS = 180.0
+
+
+def _production_allocation_event(_event: str) -> None:
+    """Fault-injection/ordering boundary for production snapshot allocations."""
+
+
+def _scheduler_compiler_launch_event(_event: CompilerLaunchEvent) -> None:
+    """Test observer for authenticated parent-side compiler launch frames."""
+
+
+def _scheduler_cache_publication_event(_event: CachePublicationRequested) -> None:
+    """Test observer for authenticated parent-side cache publication requests."""
+
+
+def _scheduler_initial_digest_map_event(_initial_digest_map) -> None:
+    """Test observer for the exact outer-owned initial production map."""
+
+
+_CONDITIONALLY_SELECTED_TRANSLATION_UNITS = MappingProxyType({
+    PurePosixPath("playback/gpu/gpusurface_apple.mm"): "apple",
+    PurePosixPath("playback/gpu/gpufence_apple.mm"): "apple",
+    PurePosixPath("playback/gpu/applegpusurface_apple.mm"): "apple",
+    PurePosixPath(
+        "recorder_engine/codec/nativevideoencoder_videotoolbox.mm"
+    ): "apple",
+    PurePosixPath("playback/gpu/gpufence_win.cpp"): "windows",
+    PurePosixPath("playback/output/win/wingpuimportedge.cpp"): "windows",
+    PurePosixPath("playback/output/win/d3d11gpusurface.cpp"): "windows",
+    PurePosixPath(
+        "recorder_engine/codec/nativevideoencoder_mediafoundation.cpp"
+    ): "windows",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,12 +465,7 @@ def preparse_compact_result(
         raise AuditInfrastructureError(
             "compact result payload retained result limit exceeded"
         )
-    allocation_schema = conservative_allocation_schema()
-    decoded_bytes = max(
-        len(payload),
-        allocation_schema.json_decoded_fixed_bytes
-        + allocation_schema.json_decoded_multiplier * len(payload),
-    )
+    decoded_bytes = compact_result_conservative_decoded_bytes(len(payload))
     return CompactResultPreparseBounds(
         len(payload), decoded_bytes, retained_bytes
     )
@@ -1121,6 +1157,7 @@ def decode_control_message(payload: bytes):
             )
     except AuditInfrastructureError:
         raise
+
     except (AttributeError, KeyError, TypeError, ValueError, UnicodeError,
             json.JSONDecodeError) as error:
         raise AuditInfrastructureError("worker control frame is invalid") from error
@@ -2314,7 +2351,6 @@ def _compiler_capability_from_bootstrap(
                     pass
         raise
 
-
 def _audit_worker_generation_main(
     worker_index: int,
     generation: int,
@@ -3476,6 +3512,10 @@ class GenerationReactor:
         self.archived_generation_telemetry: list[tuple[int, int, int]] = []
         self.archived_scratch_roots: list[Path] = []
         self.audit_launch_count = 0
+        self.stdout_bytes = 0
+        self.maximum_encoded_result_bytes = 0
+        self.maximum_conservative_decoded_bytes = 0
+        self.maximum_conservative_retained_bytes = 0
         self.worker_pids: list[int] = []
         self.registry_generation_duplicates: dict[
             tuple[int, int], tuple[tuple[str, object], ...]
@@ -4408,6 +4448,7 @@ class GenerationReactor:
                     "audit compiler launch task differs"
                 )
             state.launch_events.append(event)
+            _scheduler_compiler_launch_event(event)
             if len(state.launch_events) > 2:
                 raise AuditInfrastructureError(
                     "audit compiler launch protocol differs"
@@ -4419,6 +4460,7 @@ class GenerationReactor:
                     "root publication request task differs"
                 )
             request = (state.worker_index, state.generation, event.task_id)
+            _scheduler_cache_publication_event(event)
             if request == self.active_publication or request in self.publication_requests:
                 raise AuditInfrastructureError(
                     "root publication request was duplicated"
@@ -4481,6 +4523,22 @@ class GenerationReactor:
                 outcome = owner.outcome
                 aggregator.accept_validated_result(
                     pending.configuration, outcome.result, retained
+                )
+                if event.stdout_bytes > (1 << 64) - 1 - self.stdout_bytes:
+                    raise AuditInfrastructureError(
+                        "authenticated worker stdout measurement overflows"
+                    )
+                self.stdout_bytes += event.stdout_bytes
+                self.maximum_encoded_result_bytes = max(
+                    self.maximum_encoded_result_bytes, event.encoded_bytes
+                )
+                self.maximum_conservative_decoded_bytes = max(
+                    self.maximum_conservative_decoded_bytes,
+                    event.conservative_decoded_bytes,
+                )
+                self.maximum_conservative_retained_bytes = max(
+                    self.maximum_conservative_retained_bytes,
+                    event.conservative_retained_bytes,
                 )
             except BaseException as error:
                 _release_rejected_worker_transport(
@@ -4832,8 +4890,57 @@ class _ScheduledAuditSession:
         run_accountant,
         capability_registry,
         reactor=None,
+        reorder_pending_count: int = 0,
+        cache_maximum_encoded_result_bytes: int = 0,
+        cache_maximum_conservative_decoded_bytes: int = 0,
+        cache_maximum_conservative_retained_bytes: int = 0,
     ) -> None:
-        self._aggregate = aggregate
+        if (
+            not isinstance(reorder_pending_count, int)
+            or isinstance(reorder_pending_count, bool)
+            or reorder_pending_count < 0
+        ):
+            raise AuditInfrastructureError(
+                "scheduled reorder window is invalid"
+            )
+        cache_measurements = (
+            cache_maximum_encoded_result_bytes,
+            cache_maximum_conservative_decoded_bytes,
+            cache_maximum_conservative_retained_bytes,
+        )
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            for value in cache_measurements
+        ) or (cache_hits > 0 and any(value <= 0 for value in cache_measurements)):
+            raise AuditInfrastructureError(
+                "scheduled warm-cache measurements are unavailable"
+            )
+        reactor_measurements = (
+            0 if reactor is None else getattr(reactor, "maximum_encoded_result_bytes", None),
+            0 if reactor is None else getattr(reactor, "maximum_conservative_decoded_bytes", None),
+            0 if reactor is None else getattr(reactor, "maximum_conservative_retained_bytes", None),
+        )
+        reactor_stdout = (
+            0 if reactor is None else getattr(reactor, "stdout_bytes", None)
+        )
+        if cache_misses > 0 and (
+            reactor is None
+            or not isinstance(reactor_stdout, int)
+            or isinstance(reactor_stdout, bool)
+            or reactor_stdout < 0
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+                for value in reactor_measurements
+            )
+        ):
+            raise AuditInfrastructureError(
+                "scheduled cold-miss measurements are unavailable"
+            )
+        self._aggregate: StreamingAuditSummary | None = aggregate
         self._aggregate_consumed = False
         self.cache_hits = cache_hits
         self.cache_misses = cache_misses
@@ -4848,16 +4955,64 @@ class _ScheduledAuditSession:
         self.capability_registry = capability_registry
         self.compact_result_peak_live_bytes = result_budget.peak_live_bytes
         self.reactor = reactor
+        self.stdout_bytes = reactor_stdout
+        self.maximum_encoded_result_bytes = max(
+            cache_maximum_encoded_result_bytes, reactor_measurements[0]
+        )
+        self.maximum_conservative_decoded_bytes = max(
+            cache_maximum_conservative_decoded_bytes,
+            reactor_measurements[1],
+        )
+        self.maximum_conservative_retained_bytes = max(
+            cache_maximum_conservative_retained_bytes,
+            reactor_measurements[2],
+        )
+        self._reorder_pending_count = reorder_pending_count
         self.worker_pids = (
             () if reactor is None else tuple(reactor.worker_pids)
+        )
+        reactor_states = () if reactor is None else getattr(reactor, "states", None)
+        if not isinstance(reactor_states, (tuple, list)):
+            raise AuditInfrastructureError("scheduled worker states are unavailable")
+        started_worker_count = len(reactor_states)
+        expected_worker_count = min(runtime_contract.workers, cache_misses)
+        if started_worker_count != expected_worker_count:
+            raise AuditInfrastructureError(
+                "scheduled worker count differs from cold misses"
+            )
+        self.worker_counts_started = (
+            () if started_worker_count == 0 else (started_worker_count,)
         )
         self._shutdown = reactor is None
 
     def consume_aggregate(self) -> StreamingAuditSummary:
-        if self._aggregate_consumed:
+        if self._reorder_pending_count != 0 or (
+            self.reactor is not None and self.reactor.has_pending_tasks
+        ):
+            raise AuditInfrastructureError(
+                "scheduled reorder window is not empty"
+            )
+        if self._aggregate_consumed or self._aggregate is None:
             raise AuditInfrastructureError("scheduled aggregate was already consumed")
+        aggregate = self._aggregate
+        self._aggregate = None
         self._aggregate_consumed = True
-        return self._aggregate
+        return aggregate
+
+    @property
+    def compact_result_budget(self) -> CompactResultMemoryBudget:
+        return self.result_budget
+
+    @property
+    def pending_result_reference_count(self) -> int:
+        aggregate_count = 0 if self._aggregate is None else 1
+        reactor_count = 0
+        if self.reactor is not None:
+            reactor_count = sum(
+                state is not None and state.pending is not None
+                for state in self.reactor.states
+            )
+        return aggregate_count + reactor_count
 
     def shutdown_reap(self, deadline: float) -> None:
         if (
@@ -4869,6 +5024,13 @@ class _ScheduledAuditSession:
         if self._shutdown:
             return
         self.reactor.shutdown_reap(deadline)
+        self._shutdown = True
+
+    def abort_and_reap(self, deadline: float) -> None:
+        if self._shutdown:
+            return
+        if self.reactor is not None:
+            self.reactor.abort_and_reap(deadline)
         self._shutdown = True
 
 
@@ -4888,6 +5050,7 @@ def schedule_configuration_audits(
     compact_observer: CompactAccountingObserver,
 ) -> _ScheduledAuditSession:
     """Validate all warm entries before creating any native worker resource."""
+    _scheduler_initial_digest_map_event(initial_digest_map)
     if (
         not isinstance(source_root, Path)
         or not isinstance(configurations, tuple)
@@ -4922,7 +5085,12 @@ def schedule_configuration_audits(
     result_budget = CompactResultMemoryBudget(
         maximum_bytes=128 << 20, observer=compact_observer
     )
-    aggregator = StreamingResultAggregator(configurations, result_budget, limits)
+    aggregator = StreamingResultAggregator(
+        configurations,
+        result_budget,
+        limits,
+        require_main_provenance=True,
+    )
     slot_template = maximum_compact_result_slot(
         limits,
         conservative_allocation_schema(),
@@ -4948,10 +5116,28 @@ def schedule_configuration_audits(
         )
         if not hasattr(batch, "misses") or not hasattr(batch, "hit_count"):
             raise AuditInfrastructureError("audit cache batch is invalid")
+        cache_measurements = (
+            getattr(batch, "maximum_encoded_result_bytes", None),
+            getattr(batch, "maximum_conservative_decoded_bytes", None),
+            getattr(batch, "maximum_conservative_retained_bytes", None),
+        )
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            for value in cache_measurements
+        ) or (batch.hit_count > 0 and any(value <= 0 for value in cache_measurements)):
+            raise AuditInfrastructureError(
+                "audit cache measurements are unavailable"
+            )
         cache_root = getattr(prepared_cache, "root", source_root)
         if not isinstance(cache_root, Path):
             cache_root = source_root
         if not batch.misses:
+            if aggregator.accepted_count != len(configurations):
+                raise AuditInfrastructureError(
+                    "scheduled reorder window is not empty"
+                )
             aggregate = aggregator.finish()
             return _ScheduledAuditSession(
                 aggregate=aggregate,
@@ -4965,6 +5151,10 @@ def schedule_configuration_audits(
                 compact_accounting_observer=compact_observer,
                 run_accountant=run_accountant,
                 capability_registry=capability_registry,
+                reorder_pending_count=0,
+                cache_maximum_encoded_result_bytes=cache_measurements[0],
+                cache_maximum_conservative_decoded_bytes=cache_measurements[1],
+                cache_maximum_conservative_retained_bytes=cache_measurements[2],
             )
 
         miss_digests = {configuration.digest for configuration in batch.misses}
@@ -5054,6 +5244,10 @@ def schedule_configuration_audits(
                 raise AuditInfrastructureError(
                     "audit compiler invocation accounting differs"
                 )
+            if aggregator.accepted_count != len(configurations):
+                raise AuditInfrastructureError(
+                    "scheduled reorder window is not empty"
+                )
             aggregate = aggregator.finish()
         except BaseException as error:
             try:
@@ -5076,6 +5270,10 @@ def schedule_configuration_audits(
             run_accountant=run_accountant,
             capability_registry=capability_registry,
             reactor=reactor,
+            reorder_pending_count=0,
+            cache_maximum_encoded_result_bytes=cache_measurements[0],
+            cache_maximum_conservative_decoded_bytes=cache_measurements[1],
+            cache_maximum_conservative_retained_bytes=cache_measurements[2],
         )
     except BaseException:
         raise
@@ -7024,8 +7222,13 @@ class _DependencyGenerationGuards:
                     preflight.dependencies, self._streams, self._files
                 )
             )
-        except BaseException:
-            self.close()
+        except BaseException as primary_error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"production table cleanup also failed: {cleanup_error!r}"
+                )
             raise
 
     @staticmethod
@@ -7431,7 +7634,9 @@ def load_or_preprocess(
 ) -> PreprocessedTranslationUnitView:
     """Return a validated cache hit or publish one complete compiler result."""
 
-    if not isinstance(cache, PreprocessCache):
+    if not isinstance(cache, PreprocessCache) and not callable(
+        getattr(cache, "load_many", None)
+    ):
         raise AuditInfrastructureError("preprocess cache is invalid")
     authority = validate_dependency_root_authority(
         dependency_roots,
@@ -7683,7 +7888,10 @@ def collect_configurations(
         raise AuditInfrastructureError("at least one compile database is required")
     # This validates environment keys and values before compiler probing begins.
     _environment_digest(environment)
-    production = enumerate_production_identities(lexical_root)
+    limits = AuditLimits()
+    production = enumerate_production_identities(
+        lexical_root, limits, pipeline_deadline
+    )
     if time.monotonic() >= pipeline_deadline:
         raise AuditInfrastructureError("configuration collection deadline exceeded")
     # Enumeration has already rejected every aliasing root component, so this
@@ -7695,7 +7903,6 @@ def collect_configurations(
         {_database_path(lexical_root, database) for database in databases},
         key=lambda path: (str(path).casefold(), str(path)),
     )
-    limits = AuditLimits()
     by_digest: dict[str, PreprocessConfiguration] = {}
     for database in canonical_databases:
         for entry_index, entry in _load_database_entries(database):
@@ -7732,7 +7939,9 @@ def collect_configurations(
                 raise AuditInfrastructureError(
                     f"configuration digest collision: {configuration.digest}"
                 )
-    return tuple(by_digest[digest] for digest in sorted(by_digest))
+    result = tuple(by_digest[digest] for digest in sorted(by_digest))
+    production.close()
+    return result
 
 
 def _decision_root_context(configuration: PreprocessConfiguration, database: Path,
@@ -7926,13 +8135,15 @@ def _is_windows_backend_path(path: PurePosixPath) -> bool:
 def _validated_orchestration_inputs(
     configurations: tuple[PreprocessConfiguration, ...],
     production: Mapping[PurePosixPath, FileIdentity],
-    cache: PreprocessCache,
+    cache,
     limits: AuditLimits,
 ) -> tuple[PreprocessConfiguration, ...]:
     if not isinstance(configurations, tuple) or not configurations:
         raise AuditInfrastructureError("no usable compile configurations")
-    if not isinstance(cache, PreprocessCache):
-        raise AuditInfrastructureError("preprocess cache is invalid")
+    if not isinstance(cache, (PreprocessCache, ConfigurationAuditCache)):
+        raise AuditInfrastructureError("orchestration cache is invalid")
+    if isinstance(cache, ConfigurationAuditCache) and not cache.is_prepared:
+        raise AuditInfrastructureError("result cache is not prepared")
     if not isinstance(limits, AuditLimits):
         raise AuditInfrastructureError("audit limits are invalid")
     if (
@@ -7967,6 +8178,19 @@ def _validated_orchestration_inputs(
     return tuple(by_digest[digest] for digest in sorted(by_digest))
 
 
+def _validate_pipeline_cache_authorities(
+    cache, inspection_cache
+) -> None:
+    if not isinstance(cache, ConfigurationAuditCache):
+        raise AuditInfrastructureError("result cache is invalid")
+    if not cache.is_prepared:
+        raise AuditInfrastructureError("result cache is not prepared")
+    if not isinstance(inspection_cache, CompilerInspectionCache):
+        raise AuditInfrastructureError("compiler inspection cache is invalid")
+    if cache.root_identity != inspection_cache.root_identity:
+        raise AuditInfrastructureError("inspection cache root identity mismatch")
+
+
 def _coverage_path(
     identity: FileIdentity | None,
     production: Mapping[PurePosixPath, FileIdentity],
@@ -7996,162 +8220,2157 @@ def _view_production_provenance(
     return frozenset(reached)
 
 
-def preprocess_all(
+def compute_active_sources(
     configurations: tuple[PreprocessConfiguration, ...],
-    dependency_roots: DependencyRootAuthority,
     production: Mapping[PurePosixPath, FileIdentity],
-    cache: PreprocessCache,
+) -> tuple[frozenset[PurePosixPath], frozenset[PurePosixPath]]:
+    """Select build-active translation units from the locked exact platform table."""
+
+    if (
+        not isinstance(configurations, tuple)
+        or any(
+            not isinstance(configuration, PreprocessConfiguration)
+            for configuration in configurations
+        )
+        or not isinstance(production, Mapping)
+        or any(
+            not isinstance(path, PurePosixPath)
+            or not isinstance(identity, FileIdentity)
+            or identity.relative != path
+            for path, identity in production.items()
+        )
+    ):
+        raise AuditInfrastructureError("active source inputs are invalid")
+    configured_families = frozenset(
+        configuration.family for configuration in configurations
+    )
+    has_objcpp = any(
+        _configuration_is_objcpp(configuration)
+        for configuration in configurations
+    )
+    has_windows_backend = any(
+        configuration.source.relative is not None
+        and _CONDITIONALLY_SELECTED_TRANSLATION_UNITS.get(
+            configuration.source.relative
+        ) == "windows"
+        for configuration in configurations
+    )
+    active: set[PurePosixPath] = set()
+    for path in production:
+        if path.suffix.casefold() not in {".c", ".cc", ".cpp", ".cxx", ".mm"}:
+            continue
+        selected = _CONDITIONALLY_SELECTED_TRANSLATION_UNITS.get(path)
+        if selected == "apple" and not has_objcpp:
+            continue
+        if selected == "windows" and not has_windows_backend:
+            continue
+        if selected is None and not configured_families:
+            continue
+        active.add(path)
+    configured_sources = frozenset(
+        configuration.source.relative
+        for configuration in configurations
+        if configuration.source.relative is not None
+    )
+    return frozenset(active), configured_sources
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionSourceSnapshot:
+    identity: FileIdentity
+    raw_bytes: bytes
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, FileIdentity) or not isinstance(
+            self.raw_bytes, bytes
+        ):
+            raise AuditInfrastructureError("production source snapshot is invalid")
+        if (
+            not isinstance(self.sha256, str)
+            or len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+            or hashlib.sha256(self.raw_bytes).hexdigest() != self.sha256
+        ):
+            raise AuditInfrastructureError("production source snapshot digest differs")
+
+
+class _ProductionMemoryBudget:
+    __slots__ = ("current_bytes", "peak_bytes", "_by_category")
+
+    def __init__(self) -> None:
+        self.current_bytes = 0
+        self.peak_bytes = 0
+        self._by_category: dict[str, int] = {}
+
+    def reserve(
+        self, category: str, byte_count: int, category_limit: int
+    ) -> "_ProductionReservation":
+        shared_nonraw_bytes = (
+            self._by_category.get("decoded-retained", 0) + byte_count
+            if category == "decoded-transient"
+            else byte_count
+        )
+        if (
+            category not in {"raw", "decoded-transient", "decoded-retained"}
+            or not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+            or not isinstance(category_limit, int)
+            or isinstance(category_limit, bool)
+            or category_limit < 0
+            or byte_count > category_limit - self._by_category.get(category, 0)
+            or (
+                category == "decoded-transient"
+                and shared_nonraw_bytes > category_limit
+            )
+        ):
+            raise AuditInfrastructureError(
+                f"production {category.replace('-', ' ')} limit exceeded"
+            )
+        self._by_category[category] = (
+            self._by_category.get(category, 0) + byte_count
+        )
+        self.current_bytes += byte_count
+        self.peak_bytes = max(self.peak_bytes, self.current_bytes)
+        return _ProductionReservation(self, category, byte_count)
+
+    def _release(self, category: str, byte_count: int) -> None:
+        current = self._by_category.get(category, 0)
+        if byte_count > current or byte_count > self.current_bytes:
+            raise AuditInfrastructureError(
+                "production allocation ownership underflow"
+            )
+        self._by_category[category] = current - byte_count
+        self.current_bytes -= byte_count
+
+    def preflight_transfer(
+        self, category: str, byte_count: int, category_limit: int
+    ) -> "_PendingProductionReservation":
+        if (
+            category != "decoded-retained"
+            or not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+            or byte_count > category_limit - self._by_category.get(category, 0)
+        ):
+            raise AuditInfrastructureError(
+                "production decoded retained limit exceeded"
+            )
+        return _PendingProductionReservation(self, category, byte_count)
+
+    def commit_split_transfer(
+        self,
+        old: "_ProductionReservation",
+        pending: "_PendingProductionReservation",
+        remaining_transient_bytes: int,
+    ) -> tuple["_ProductionReservation", "_ProductionReservation"]:
+        if (
+            old.released
+            or old._budget is not self
+            or old.category != "decoded-transient"
+            or pending._budget is not self
+            or pending.committed
+            or not isinstance(remaining_transient_bytes, int)
+            or isinstance(remaining_transient_bytes, bool)
+            or remaining_transient_bytes < 0
+            or remaining_transient_bytes + pending.byte_count != old.byte_count
+        ):
+            raise AuditInfrastructureError(
+                "production allocation transfer is invalid"
+            )
+        old_current = self._by_category.get(old.category, 0)
+        if old.byte_count > old_current:
+            raise AuditInfrastructureError(
+                "production allocation ownership underflow"
+            )
+        self._by_category[old.category] = (
+            old_current - old.byte_count + remaining_transient_bytes
+        )
+        self._by_category[pending.category] = (
+            self._by_category.get(pending.category, 0) + pending.byte_count
+        )
+        old.released = True
+        pending.committed = True
+        return (
+            _ProductionReservation(
+                self, old.category, remaining_transient_bytes
+            ),
+            _ProductionReservation(
+                self, pending.category, pending.byte_count
+            ),
+        )
+
+
+class _ProductionReservation:
+    __slots__ = ("_budget", "category", "byte_count", "released")
+
+    def __init__(
+        self, budget: _ProductionMemoryBudget, category: str, byte_count: int
+    ) -> None:
+        self._budget = budget
+        self.category = category
+        self.byte_count = byte_count
+        self.released = False
+
+    def release(self) -> None:
+        if self.released:
+            raise AuditInfrastructureError(
+                "production allocation ownership was already released"
+            )
+        self._budget._release(self.category, self.byte_count)
+        self.released = True
+
+    def __del__(self) -> None:
+        try:
+            if not self.released:
+                self.release()
+        except BaseException:
+            pass
+
+
+class _PendingProductionReservation:
+    __slots__ = ("_budget", "category", "byte_count", "committed")
+
+    def __init__(self, budget, category: str, byte_count: int) -> None:
+        self._budget = budget
+        self.category = category
+        self.byte_count = byte_count
+        self.committed = False
+
+
+@dataclass(frozen=True, slots=True)
+class _HeldProductionFile:
+    path: PurePosixPath
+    identity: FileIdentity
+    stream: object
+    opened_identity: tuple[int, int | None]
+    opened_generation: tuple[int, int, int]
+    initial_sha256: str
+
+
+def _open_production_descriptor(path: Path):
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise AuditInfrastructureError(
+            "production snapshot public path is unavailable"
+        ) from error
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or bool(getattr(before, "st_file_attributes", 0) & 0x400)
+        or not stat.S_ISREG(before.st_mode)
+        or int(getattr(before, "st_nlink", 1)) != 1
+    ):
+        raise AuditInfrastructureError(
+            "production snapshot public path is unsafe"
+        )
+    if os.name != "nt":
+        flags = (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(path, flags)
+    else:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(path),
+            0x80000000,
+            0x00000001,
+            None,
+            3,
+            0x00000080 | 0x00200000,
+            None,
+        )
+        numeric = ctypes.cast(handle, ctypes.c_void_p).value
+        invalid = ctypes.c_void_p(-1).value
+        if numeric in (None, invalid):
+            raise AuditInfrastructureError(
+                "production snapshot descriptor open failed"
+            )
+        try:
+            descriptor = msvcrt.open_osfhandle(int(numeric), os.O_RDONLY)
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+    try:
+        stream = os.fdopen(descriptor, "rb", closefd=True)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    try:
+        opened = os.fstat(stream.fileno())
+        after = path.lstat()
+        identities = {
+            (int(value.st_dev), int(value.st_ino))
+            for value in (before, opened, after)
+        }
+        if (
+            len(identities) != 1
+            or any(not stat.S_ISREG(value.st_mode) for value in (opened, after))
+            or any(
+                int(getattr(value, "st_nlink", 1)) != 1
+                for value in (opened, after)
+            )
+        ):
+            raise AuditInfrastructureError(
+                "production snapshot public path generation differs"
+            )
+        return stream
+    except BaseException:
+        stream.close()
+        raise
+
+
+class _ImmutableProductionMapping:
+    __slots__ = (
+        "_values", "_backing", "_budget", "_ownership", "_closed"
+    )
+
+    def __init__(self, values, budget, ownership, *, take_dict=False) -> None:
+        if take_dict:
+            if type(values) is not dict:
+                raise AuditInfrastructureError(
+                    "owned production mapping carrier is invalid"
+                )
+            owned_values = values
+        else:
+            owned_values = dict(values)
+        self._backing = owned_values
+        self._values = MappingProxyType(self._backing)
+        self._budget = budget
+        self._ownership = ownership
+        self._closed = False
+
+    def __getitem__(self, key):
+        self._require_open()
+        return self._values[key]
+
+    def __iter__(self):
+        self._require_open()
+        return iter(self._values)
+
+    def __len__(self):
+        self._require_open()
+        return len(self._values)
+
+    def items(self):
+        self._require_open()
+        return self._values.items()
+
+    def values(self):
+        self._require_open()
+        return self._values.values()
+
+    def get(self, key, default=None):
+        self._require_open()
+        return self._values.get(key, default)
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise AuditInfrastructureError("production mapping is closed")
+
+    @property
+    def allocation_budget(self) -> _ProductionMemoryBudget:
+        return self._budget
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._backing.clear()
+        self._closed = True
+        if self._ownership is not None and not self._ownership.released:
+            self._ownership.release()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+
+def _production_snapshot_structure_bound(
+    production: Mapping[PurePosixPath, FileIdentity],
+) -> int:
+    """Own every scalable snapshot carrier before opening the first file."""
+
+    from gpu_capability_source_audit import (
+        conservative_allocation_schema as policy_allocation_schema,
+    )
+
+    schema = policy_allocation_schema()
+    source_count = len(production)
+    return schema.checked_add(
+        4096,
+        schema.checked_multiply(3, schema.list_bound(source_count)),
+        schema.checked_multiply(
+            _production_snapshot_structure_dict_count(),
+            schema.dict_bound(source_count),
+        ),
+        schema.checked_multiply(
+            source_count,
+            schema.checked_add(
+                schema.object_bound(10),  # held descriptor carrier
+                schema.object_bound(6),   # dependency digest
+                schema.object_bound(4),   # final source snapshot
+                schema.tuple_bound(2),    # sorted table entry
+                schema.string_bound(64),  # digest text
+                schema.bytes_objects_bound(0, 1),
+            ),
+        ),
+        schema.checked_multiply(
+            5, schema.object_bound(8)
+        ),  # mapping proxies, prepared/held tables and raw owner
+    )
+
+
+def _production_snapshot_structure_dict_count() -> int:
+    # Frozen production table, initial digest map and finalized snapshot map
+    # coexist from the final read through the policy boundary.
+    return 3
+
+
+class _PreparedProductionTable:
+    __slots__ = (
+        "table", "_backing", "budget", "structure_ownership", "claimed",
+        "_enumerated_owner",
+    )
+
+    def __init__(self, production, limits: AuditLimits) -> None:
+        self.budget = _ProductionMemoryBudget()
+        self.structure_ownership = None
+        self.table = None
+        self._backing = None
+        self._enumerated_owner = None
+        self.claimed = False
+        descriptor_ceiling = limits.unique_dependency_handles
+        if os.name == "nt":
+            import ctypes
+
+            getmaxstdio = ctypes.cdll.msvcrt._getmaxstdio
+            getmaxstdio.restype = ctypes.c_int
+            descriptor_ceiling = min(
+                descriptor_ceiling, max(0, int(getmaxstdio()) - 64)
+            )
+        else:
+            import resource
+
+            soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft_limit != resource.RLIM_INFINITY:
+                descriptor_ceiling = min(
+                    descriptor_ceiling, max(0, int(soft_limit) - 64)
+                )
+        if len(production) > descriptor_ceiling:
+            raise AuditInfrastructureError(
+                "production snapshot descriptor ceiling exceeded"
+            )
+        if isinstance(production, _EnumeratedProductionTable):
+            if (
+                production.claimed
+                or production._closed
+                or production.table is None
+                or production.structure_ownership is None
+                or production.structure_ownership.released
+            ):
+                raise AuditInfrastructureError(
+                    "enumerated production table ownership is invalid"
+                )
+            production.claimed = True
+            self._enumerated_owner = production
+            self.budget = production.budget
+            self.structure_ownership = production.structure_ownership
+            self._backing = production._backing
+            self.table = production.table
+            return
+        structure_bytes = _production_snapshot_structure_bound(production)
+        try:
+            _production_allocation_event("reserve-snapshot-structure")
+            self.structure_ownership = self.budget.reserve(
+                "decoded-retained",
+                structure_bytes,
+                limits.production_decoded_retained_bytes,
+            )
+            _production_allocation_event("construct-frozen-table")
+            self._backing = {}
+            for path, identity in production.items():
+                self._backing[path] = identity
+            self.table = MappingProxyType(self._backing)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._backing is not None:
+            self._backing.clear()
+        if (
+            not self.claimed
+            and self.structure_ownership is not None
+            and not self.structure_ownership.released
+        ):
+            self.structure_ownership.release()
+
+
+def _prepare_production_table(production, limits) -> _PreparedProductionTable:
+    return _PreparedProductionTable(production, limits)
+
+
+class HeldProductionSnapshot:
+    """Owns the one descriptor per production path through the policy boundary."""
+
+    def __init__(
+        self,
+        production: Mapping[PurePosixPath, FileIdentity],
+        limits: AuditLimits,
+        pipeline_deadline: float,
+        prepared_table: _PreparedProductionTable | None = None,
+    ) -> None:
+        if (
+            not isinstance(production, Mapping)
+            or not isinstance(limits, AuditLimits)
+            or not isinstance(pipeline_deadline, (int, float))
+            or isinstance(pipeline_deadline, bool)
+            or not math.isfinite(pipeline_deadline)
+        ):
+            raise AuditInfrastructureError("production snapshot inputs are invalid")
+        prepared = (
+            _prepare_production_table(production, limits)
+            if prepared_table is None
+            else prepared_table
+        )
+        if prepared_table is None:
+            production = prepared.table
+        if (
+            not isinstance(prepared, _PreparedProductionTable)
+            or prepared.claimed
+            or prepared.table is not production
+            or prepared.structure_ownership is None
+            or prepared.structure_ownership.released
+        ):
+            raise AuditInfrastructureError(
+                "prepared production table ownership is invalid"
+            )
+        prepared.claimed = True
+        self._budget = prepared.budget
+        self._limits = limits
+        self._files: list[_HeldProductionFile] = []
+        self._structure_ownership = None
+        self._raw_ownerships: list[_ProductionReservation] = []
+        self._finalized_mappings: list[_ImmutableProductionMapping] = []
+        self._initial_digest_backing = None
+        self._prepared_table = prepared
+        self._closed = False
+        self._finalized = False
+        try:
+            self._structure_ownership = prepared.structure_ownership
+            _production_allocation_event("reserve-raw")
+            self._raw_ownerships.append(self._budget.reserve(
+                "raw",
+                limits.production_raw_aggregate_bytes,
+                limits.production_raw_aggregate_bytes,
+            ))
+            _production_allocation_event("construct-initial-digest-map")
+            initial: dict[PurePosixPath, DependencyDigest] = {}
+            raw_total = 0
+            for path, identity in production.items():
+                self._check_deadline(pipeline_deadline)
+                if (
+                    not isinstance(path, PurePosixPath)
+                    or not isinstance(identity, FileIdentity)
+                    or identity.relative != path
+                    or not identity.production
+                ):
+                    raise AuditInfrastructureError(
+                        "production snapshot identity table is invalid"
+                    )
+                _production_allocation_event("open")
+                stream = _open_production_descriptor(identity.canonical)
+                try:
+                    metadata = os.fstat(stream.fileno())
+                    opened_identity = (
+                        int(metadata.st_dev), int(metadata.st_ino) or None
+                    )
+                    expected_identity = (identity.device, identity.inode)
+                    if expected_identity != opened_identity:
+                        raise AuditInfrastructureError(
+                            "production snapshot generation differs"
+                        )
+                    size = int(metadata.st_size)
+                    if size > limits.production_raw_per_file_bytes:
+                        raise AuditInfrastructureError(
+                            "production raw per-file limit exceeded"
+                        )
+                    if size > limits.production_raw_aggregate_bytes - raw_total:
+                        raise AuditInfrastructureError(
+                            "production raw aggregate limit exceeded"
+                        )
+                    raw_total += size
+                    _production_allocation_event("read")
+                    raw = stream.read(size)
+                    if len(raw) != size:
+                        raise AuditInfrastructureError(
+                            "production snapshot unstable read"
+                        )
+                    after = os.fstat(stream.fileno())
+                    if self._stat_generation(after) != self._stat_generation(metadata):
+                        raise AuditInfrastructureError(
+                            "production snapshot generation differs"
+                        )
+                    digest = hashlib.sha256(raw).hexdigest()
+                    initial[path] = DependencyDigest(
+                        "production", path, identity, digest
+                    )
+                    self._files.append(_HeldProductionFile(
+                        path,
+                        identity,
+                        stream,
+                        opened_identity,
+                        self._stat_generation(metadata),
+                        digest,
+                    ))
+                    del raw
+                except BaseException:
+                    stream.close()
+                    raise
+        except BaseException:
+            self._close_no_raise()
+            raise
+        self._initial_digest_backing = initial
+        self.initial_digest_map = MappingProxyType(
+            self._initial_digest_backing
+        )
+
+    @staticmethod
+    def _stat_generation(metadata) -> tuple[int, int, int]:
+        return (
+            int(metadata.st_size),
+            int(metadata.st_mtime_ns),
+            int(metadata.st_ctime_ns),
+        )
+
+    @staticmethod
+    def _check_deadline(deadline: float) -> None:
+        if (
+            not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or not math.isfinite(deadline)
+            or time.monotonic() >= deadline
+        ):
+            raise AuditInfrastructureError("production snapshot deadline exceeded")
+
+    def __enter__(self) -> "HeldProductionSnapshot":
+        if self._closed:
+            raise AuditInfrastructureError("production snapshot is closed")
+        return self
+
+    def finalize_policy_boundary(
+        self, pipeline_deadline: float
+    ) -> Mapping[PurePosixPath, ProductionSourceSnapshot]:
+        if self._closed or self._finalized:
+            raise AuditInfrastructureError(
+                "production snapshot policy boundary is unavailable"
+            )
+        _production_allocation_event("construct-final-snapshot-map")
+        finalized: dict[PurePosixPath, ProductionSourceSnapshot] = {}
+        for held in self._files:
+            self._check_deadline(pipeline_deadline)
+            before = os.fstat(held.stream.fileno())
+            current_identity = (int(before.st_dev), int(before.st_ino) or None)
+            try:
+                path_metadata = held.identity.canonical.lstat()
+                current_canonical = held.identity.canonical.resolve(strict=True)
+            except (OSError, RuntimeError) as error:
+                raise AuditInfrastructureError(
+                    "production snapshot generation differs"
+                ) from error
+            path_identity = (
+                int(path_metadata.st_dev), int(path_metadata.st_ino) or None
+            )
+            if (
+                current_identity != held.opened_identity
+                or path_identity != held.opened_identity
+                or current_canonical != held.identity.canonical
+                or stat.S_ISLNK(path_metadata.st_mode)
+                or self._stat_generation(before) != held.opened_generation
+            ):
+                raise AuditInfrastructureError(
+                    "production snapshot generation differs"
+                )
+            held.stream.seek(0)
+            _production_allocation_event("read-final")
+            raw = held.stream.read(held.opened_generation[0])
+            after = os.fstat(held.stream.fileno())
+            if (
+                self._stat_generation(after) != held.opened_generation
+                or hashlib.sha256(raw).hexdigest() != held.initial_sha256
+            ):
+                raise AuditInfrastructureError(
+                    "production snapshot generation differs"
+                )
+            finalized[held.path] = ProductionSourceSnapshot(
+                held.identity, raw, held.initial_sha256
+            )
+        self._finalized = True
+        finalized_mapping = _ImmutableProductionMapping(
+            finalized, self._budget, None, take_dict=True
+        )
+        self._finalized_mappings.append(finalized_mapping)
+        return finalized_mapping
+
+    def release_finalized_sources(
+        self, mapping: _ImmutableProductionMapping
+    ) -> None:
+        if mapping not in self._finalized_mappings:
+            raise AuditInfrastructureError(
+                "production raw mapping ownership differs"
+            )
+        mapping.close()
+        self._finalized_mappings.remove(mapping)
+        for ownership in reversed(self._raw_ownerships):
+            if not ownership.released:
+                ownership.release()
+        self._raw_ownerships.clear()
+
+    def _close_no_raise(self) -> None:
+        for held in reversed(self._files):
+            try:
+                held.stream.close()
+            except BaseException:
+                pass
+        self._files.clear()
+        for mapping in reversed(self._finalized_mappings):
+            try:
+                mapping.close()
+            except BaseException:
+                pass
+        self._finalized_mappings.clear()
+        for ownership in reversed(self._raw_ownerships):
+            if not ownership.released:
+                try:
+                    ownership.release()
+                except BaseException:
+                    pass
+        self._raw_ownerships.clear()
+        if self._initial_digest_backing is not None:
+            self._initial_digest_backing.clear()
+        try:
+            self._prepared_table.close()
+        except BaseException:
+            pass
+        if (
+            self._structure_ownership is not None
+            and not self._structure_ownership.released
+        ):
+            try:
+                self._structure_ownership.release()
+            except BaseException:
+                pass
+        self._closed = True
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        cleanup_errors: list[BaseException] = []
+        for held in reversed(self._files):
+            try:
+                held.stream.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        self._files.clear()
+        for mapping in reversed(self._finalized_mappings):
+            try:
+                mapping.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        self._finalized_mappings.clear()
+        for ownership in reversed(self._raw_ownerships):
+            if not ownership.released:
+                try:
+                    ownership.release()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+        self._raw_ownerships.clear()
+        if self._initial_digest_backing is not None:
+            self._initial_digest_backing.clear()
+        try:
+            self._prepared_table.close()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if (
+            self._structure_ownership is not None
+            and not self._structure_ownership.released
+        ):
+            try:
+                self._structure_ownership.release()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        self._closed = True
+        if cleanup_errors and exc is None:
+            raise AuditInfrastructureError(
+                "production snapshot descriptor cleanup failed"
+            ) from cleanup_errors[0]
+        if cleanup_errors and exc is not None:
+            exc.add_note(
+                f"production snapshot cleanup also failed: {cleanup_errors[0]!r}"
+            )
+
+
+def snapshot_production_sources(
+    production: Mapping[PurePosixPath, FileIdentity],
     limits: AuditLimits,
     pipeline_deadline: float,
-) -> tuple[tuple[PreprocessedTranslationUnitView, ...], CoverageReport]:
-    """Preprocess every semantic configuration under one bounded coordinator."""
+    *,
+    prepared_table: _PreparedProductionTable | None = None,
+) -> HeldProductionSnapshot:
+    return HeldProductionSnapshot(
+        production, limits, pipeline_deadline, prepared_table
+    )
 
-    authority = validate_dependency_root_authority(dependency_roots)
+
+@dataclass(frozen=True, slots=True)
+class _ProductionDecodeAllocationBounds:
+    transient_bytes: int
+    retained_bytes: int
+    decoder_scratch_bytes: int
+
+    def __post_init__(self) -> None:
+        if (
+            any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in (
+                    self.transient_bytes,
+                    self.retained_bytes,
+                    self.decoder_scratch_bytes,
+                )
+            )
+            or self.transient_bytes
+            != self.retained_bytes + self.decoder_scratch_bytes
+        ):
+            raise AuditInfrastructureError(
+                "production decode allocation bounds are invalid"
+            )
+
+
+def _production_decode_allocation_bounds(
+    sources: Mapping[PurePosixPath, ProductionSourceSnapshot],
+) -> _ProductionDecodeAllocationBounds:
+    """Premeasure every scalable decode object from raw sizes only."""
+
+    from gpu_capability_source_audit import (
+        conservative_allocation_schema as policy_allocation_schema,
+    )
+
+    if not isinstance(sources, _ImmutableProductionMapping):
+        raise AuditInfrastructureError("production decode sources are invalid")
+    schema = policy_allocation_schema()
+    source_count = len(sources)
+    raw_total = 0
+    maximum_integer = 0
+    for path, source in sources.items():
+        if not isinstance(path, PurePosixPath) or not isinstance(
+            source, ProductionSourceSnapshot
+        ):
+            raise AuditInfrastructureError("production decode source is invalid")
+        raw_size = len(source.raw_bytes)
+        raw_total = schema.checked_add(raw_total, raw_size)
+        maximum_integer = max(maximum_integer, raw_size)
+    retained = schema.checked_add(
+        schema.string_objects_bound(raw_total, source_count),
+        schema.dict_bound(source_count),
+        schema.object_bound(4),
+    )
+    decoder_scratch = schema.checked_add(
+        schema.json_decoder_fixed_bytes,
+        schema.object_bound(32),
+        schema.dict_bound(source_count),
+        schema.list_bound(source_count),
+        schema.list_bound(source_count),
+        schema.checked_multiply(source_count, schema.tuple_bound(2)),
+        schema.checked_multiply(
+            source_count, schema.pylong_bound(maximum_integer)
+        ),
+    )
+    return _ProductionDecodeAllocationBounds(
+        schema.checked_add(retained, decoder_scratch),
+        retained,
+        decoder_scratch,
+    )
+
+
+def _probe_production_decode_schema() -> None:
+    """Fail closed if representative runtime objects exceed the closed schema."""
+
+    from gpu_capability_source_audit import (
+        conservative_allocation_schema as policy_allocation_schema,
+    )
+
+    schema = policy_allocation_schema()
     if (
-        not isinstance(pipeline_deadline, (int, float))
-        or isinstance(pipeline_deadline, bool)
-        or time.monotonic() >= pipeline_deadline
+        sys.getsizeof(0) > schema.pylong_bound(0)
+        or sys.getsizeof("") > schema.string_bound(0)
+        or sys.getsizeof([]) > schema.list_bound(0)
+        or sys.getsizeof(()) > schema.tuple_bound(0)
+        or sys.getsizeof({}) > schema.dict_bound(0)
     ):
-        raise AuditInfrastructureError("preprocess pipeline deadline exceeded")
-    ordered = _validated_orchestration_inputs(configurations, production, cache, limits)
-    if any(
-        item.dependency_root_authority_digest != authority.portable_authority_digest
-        for item in ordered
-    ):
-        raise AuditInfrastructureError("configuration dependency authority differs")
-    configured_families = frozenset(item.family for item in ordered)
-    has_objcpp = any(_configuration_is_objcpp(item) for item in ordered)
-    has_windows_backend = any(
-        item.source.relative is not None
-        and _is_windows_backend_path(item.source.relative)
-        for item in ordered
-    )
-    active = frozenset(
-        path
-        for path in production
-        if requires_compile_entry(
-            path,
-            configured_families,
-            has_objcpp,
-            has_windows_backend,
-        )
-    )
-    configured_sources = frozenset(
-        item.source.relative for item in ordered if item.source.relative is not None
-    )
-    missing_commands = sorted(active - configured_sources, key=lambda path: path.as_posix())
-    if missing_commands:
         raise AuditInfrastructureError(
-            "active source has no compile command: "
-            + ", ".join(path.as_posix() for path in missing_commands)
+            "production decode allocation schema probe failed"
         )
 
-    cancellation = threading.Event()
-    deadline = pipeline_deadline
-    views: dict[str, PreprocessedTranslationUnitView] = {}
-    failures: list[tuple[str, str]] = []
-    iterator = iter(ordered)
 
-    def execute(configuration: PreprocessConfiguration) -> PreprocessedTranslationUnitView:
-        return load_or_preprocess(
-            configuration,
-            authority,
-            production,
-            cache,
-            limits,
-            deadline,
-            cancellation,
+def _strict_utf8_code_point_count(
+    raw: bytes, pipeline_deadline: float
+) -> int:
+    index = 0
+    count = 0
+    size = len(raw)
+    next_deadline_check = 0
+    while index < size:
+        if index >= next_deadline_check:
+            HeldProductionSnapshot._check_deadline(pipeline_deadline)
+            next_deadline_check = index + (64 * 1024)
+        first = raw[index]
+        if first <= 0x7F:
+            index += 1
+        elif 0xC2 <= first <= 0xDF:
+            if index + 1 >= size or raw[index + 1] & 0xC0 != 0x80:
+                raise AuditInfrastructureError("production source is not strict UTF-8")
+            index += 2
+        elif 0xE0 <= first <= 0xEF:
+            if index + 2 >= size:
+                raise AuditInfrastructureError("production source is not strict UTF-8")
+            second, third = raw[index + 1], raw[index + 2]
+            if (
+                second & 0xC0 != 0x80
+                or third & 0xC0 != 0x80
+                or (first == 0xE0 and second < 0xA0)
+                or (first == 0xED and second >= 0xA0)
+            ):
+                raise AuditInfrastructureError("production source is not strict UTF-8")
+            index += 3
+        elif 0xF0 <= first <= 0xF4:
+            if index + 3 >= size:
+                raise AuditInfrastructureError("production source is not strict UTF-8")
+            second, third, fourth = raw[index + 1:index + 4]
+            if (
+                second & 0xC0 != 0x80
+                or third & 0xC0 != 0x80
+                or fourth & 0xC0 != 0x80
+                or (first == 0xF0 and second < 0x90)
+                or (first == 0xF4 and second >= 0x90)
+            ):
+                raise AuditInfrastructureError("production source is not strict UTF-8")
+            index += 4
+        else:
+            raise AuditInfrastructureError("production source is not strict UTF-8")
+        count += 1
+    HeldProductionSnapshot._check_deadline(pipeline_deadline)
+    return count
+
+
+def decode_validated_production_sources(
+    sources: Mapping[PurePosixPath, ProductionSourceSnapshot],
+    limits: AuditLimits,
+    pipeline_deadline: float,
+) -> Mapping[PurePosixPath, str]:
+    """Strictly decode a finalized immutable snapshot under conservative caps."""
+
+    if not isinstance(sources, _ImmutableProductionMapping) or not isinstance(
+        limits, AuditLimits
+    ):
+        raise AuditInfrastructureError("production decode inputs are invalid")
+    raw_total = 0
+    for path, source in sources.items():
+        HeldProductionSnapshot._check_deadline(pipeline_deadline)
+        if not isinstance(path, PurePosixPath) or not isinstance(
+            source, ProductionSourceSnapshot
+        ):
+            raise AuditInfrastructureError("production decode source is invalid")
+        raw_size = len(source.raw_bytes)
+        if raw_size > limits.production_raw_per_file_bytes:
+            raise AuditInfrastructureError("production raw per-file limit exceeded")
+        if raw_size > limits.production_raw_aggregate_bytes - raw_total:
+            raise AuditInfrastructureError("production raw aggregate limit exceeded")
+        raw_total += raw_size
+    bounds = _production_decode_allocation_bounds(sources)
+    if bounds.transient_bytes > limits.production_decoded_transient_bytes:
+        raise AuditInfrastructureError(
+            "production decoded transient limit exceeded"
         )
-
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(limits.workers, len(ordered)),
-        thread_name_prefix="gpu-capability-preprocess",
-    ) as executor:
-        pending: dict[
-            concurrent.futures.Future[PreprocessedTranslationUnitView],
-            PreprocessConfiguration,
-        ] = {}
-        for _ in range(min(limits.workers, len(ordered))):
-            configuration = next(iterator, None)
-            if configuration is not None:
-                pending[executor.submit(execute, configuration)] = configuration
-
-        while pending:
-            completed, _ = concurrent.futures.wait(
-                pending,
-                return_when=concurrent.futures.FIRST_COMPLETED,
+    if bounds.retained_bytes > limits.production_decoded_retained_bytes:
+        raise AuditInfrastructureError(
+            "production decoded retained limit exceeded"
+        )
+    transient = None
+    scratch = None
+    retained = None
+    retained_pending = None
+    decoded_values = None
+    try:
+        _production_allocation_event("reserve-decode")
+        transient = sources.allocation_budget.reserve(
+            "decoded-transient",
+            bounds.transient_bytes,
+            limits.production_decoded_transient_bytes,
+        )
+        _production_allocation_event("reserve-retained-strings")
+        retained_pending = sources.allocation_budget.preflight_transfer(
+            "decoded-retained",
+            bounds.retained_bytes,
+            limits.production_decoded_retained_bytes,
+        )
+        _production_allocation_event("transfer-retained-before-construction")
+        scratch, retained = sources.allocation_budget.commit_split_transfer(
+            transient, retained_pending, bounds.decoder_scratch_bytes
+        )
+        transient = None
+        retained_pending = None
+        _production_allocation_event("decode")
+        _probe_production_decode_schema()
+        for _path, source in sources.items():
+            _strict_utf8_code_point_count(
+                source.raw_bytes, pipeline_deadline
             )
-            for future in sorted(completed, key=lambda item: pending[item].digest):
-                configuration = pending.pop(future)
-                try:
-                    view = future.result()
-                    if view.configuration != configuration:
-                        raise AuditInfrastructureError(
-                            "preprocessor returned a mismatched orchestration configuration"
+        _production_allocation_event("construct-strings")
+        decoded_values = {}
+        for path, source in sources.items():
+            HeldProductionSnapshot._check_deadline(pipeline_deadline)
+            try:
+                decoded_values[path] = source.raw_bytes.decode(
+                    "utf-8", errors="strict"
+                )
+            except UnicodeDecodeError as error:
+                raise AuditInfrastructureError(
+                    f"production source is not strict UTF-8: {path}"
+                ) from error
+            HeldProductionSnapshot._check_deadline(pipeline_deadline)
+        _production_allocation_event("construct-decoded-map")
+        result = _ImmutableProductionMapping(
+            decoded_values,
+            sources.allocation_budget,
+            retained,
+            take_dict=True,
+        )
+        retained = None
+        decoded_values = None
+        if scratch is not None and not scratch.released:
+            scratch.release()
+        scratch = None
+        HeldProductionSnapshot._check_deadline(pipeline_deadline)
+        return result
+    except BaseException:
+        if decoded_values is not None:
+            decoded_values.clear()
+        if retained is not None and not retained.released:
+            retained.release()
+        if scratch is not None and not scratch.released:
+            scratch.release()
+        if transient is not None and not transient.released:
+            transient.release()
+        raise
+
+
+def bounded_uninspected_configuration_digest(
+    source_root: Path,
+    compile_commands: tuple[Path, ...],
+    launcher_environment: Mapping[str, str],
+    dependency_roots: DependencyRootAuthority,
+    pipeline_deadline: float,
+) -> str:
+    """Hash process-free raw configuration inputs before compiler inspection."""
+
+    if (
+        not isinstance(source_root, Path)
+        or not isinstance(compile_commands, tuple)
+        or not compile_commands
+        or any(not isinstance(path, Path) for path in compile_commands)
+        or not isinstance(launcher_environment, Mapping)
+        or not isinstance(dependency_roots, DependencyRootAuthority)
+    ):
+        raise AuditInfrastructureError(
+            "uninspected configuration inputs are invalid"
+        )
+    digest = hashlib.sha256()
+
+    def framed(payload: bytes) -> None:
+        digest.update(struct.pack("<Q", len(payload)))
+        digest.update(payload)
+
+    framed(b"olr-gpu-uninspected-configuration-v1")
+    framed(dependency_roots.portable_authority_digest.encode("ascii"))
+    total = 0
+    for requested in sorted(compile_commands, key=lambda path: str(path)):
+        HeldProductionSnapshot._check_deadline(pipeline_deadline)
+        database = _database_path(source_root, requested)
+        try:
+            size = database.stat().st_size
+        except OSError as error:
+            raise AuditInfrastructureError(
+                "compile database is unavailable before inspection"
+            ) from error
+        if size < 0 or size > (64 << 20) - total:
+            raise AuditInfrastructureError(
+                "uninspected compile database limit exceeded"
+            )
+        total += size
+        try:
+            payload = database.read_bytes()
+        except OSError as error:
+            raise AuditInfrastructureError(
+                "compile database is unavailable before inspection"
+            ) from error
+        if len(payload) != size:
+            raise AuditInfrastructureError(
+                "compile database changed during uninspected hashing"
+            )
+        framed(str(database).encode("utf-8"))
+        framed(payload)
+    environment_payload = json.dumps(
+        sorted((str(key), str(value)) for key, value in launcher_environment.items()),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    if len(environment_payload) > (4 << 20):
+        raise AuditInfrastructureError(
+            "uninspected launcher environment limit exceeded"
+        )
+    framed(environment_payload)
+    return digest.hexdigest()
+
+
+def emergency_cleanup_deadline() -> float:
+    return time.monotonic() + _FAILURE_REAP_SECONDS
+
+
+def _phase_snapshot(
+    memory, platform_kind: str, phase: str, archived_generation_count: int
+):
+    if platform_kind == "windows" and isinstance(
+        memory, WindowsRunMemoryMeasurements
+    ):
+        return WindowsPhaseSnapshot(
+            "windows", phase, memory, archived_generation_count
+        )
+    if platform_kind == "linux" and isinstance(memory, LinuxRunMemoryMeasurements):
+        return LinuxPhaseSnapshot(
+            "linux", phase, memory, archived_generation_count
+        )
+    if platform_kind == "macos" and isinstance(memory, MacOSRunMemoryMeasurements):
+        return MacOSPhaseSnapshot(
+            "macos", phase, memory, archived_generation_count
+        )
+    raise AuditInfrastructureError("native phase memory backend differs")
+
+
+def _accountant_memory(run_accountant):
+    direct = getattr(run_accountant, "memory_measurements", None)
+    if callable(direct):
+        return direct()
+    snapshot = getattr(run_accountant, "snapshot", None)
+    if callable(snapshot):
+        captured = snapshot()
+        convert = getattr(captured, "memory_measurements", None)
+        if callable(convert):
+            return convert()
+    raise AuditInfrastructureError("run accountant memory is unavailable")
+
+
+def _seal_accountant_phase(
+    run_accountant, phase: str, pipeline_deadline: float, platform_kind: str
+):
+    seal = getattr(run_accountant, "seal_phase", None)
+    if callable(seal):
+        try:
+            result = seal(phase, pipeline_deadline)
+        except TypeError:
+            result = seal(pipeline_deadline, _current_process_rss_bytes())
+        if isinstance(
+            result, (WindowsPhaseSnapshot, LinuxPhaseSnapshot, MacOSPhaseSnapshot)
+        ):
+            return result
+    return _phase_snapshot(
+        _accountant_memory(run_accountant), platform_kind, phase, 0
+    )
+
+
+def _begin_accountant_phase(
+    run_accountant, phase: str, deadline: float, platform_kind: str
+) -> None:
+    begin = getattr(run_accountant, "begin_phase", None)
+    if not callable(begin):
+        raise AuditInfrastructureError(
+            "run accountant phase authority is unavailable"
+        )
+    begin(phase, deadline)
+    if phase == "inspection":
+        _phase_snapshot(
+            _accountant_memory(run_accountant), platform_kind, phase, 0
+        )
+
+
+class _BoundedPolicyWorkspace:
+    """Private ledger and exact-key sink backed by one compact reservation."""
+
+    __slots__ = (
+        "capacity", "current", "peak", "finding_provenance", "_path_text",
+        "_path_render_bytes", "_schema",
+    )
+
+    def __init__(
+        self,
+        capacity: int,
+        path_render_bytes: int = AuditLimits().compact_result_path_bytes,
+    ) -> None:
+        from gpu_capability_source_audit import conservative_allocation_schema
+
+        if (
+            not isinstance(capacity, int)
+            or isinstance(capacity, bool)
+            or capacity < 0
+            or not isinstance(path_render_bytes, int)
+            or isinstance(path_render_bytes, bool)
+            or path_render_bytes <= 0
+        ):
+            raise AuditInfrastructureError("policy workspace capacity is invalid")
+        self.capacity = capacity
+        self.current = 0
+        self.peak = 0
+        self.finding_provenance = {}
+        self._path_text = {}
+        self._path_render_bytes = path_render_bytes
+        self._schema = conservative_allocation_schema()
+
+    def _reserve(self, byte_count: int) -> None:
+        if byte_count > self.capacity - self.current:
+            raise AuditInfrastructureError(
+                "policy workspace exceeds remaining compact capacity"
+            )
+        self.current += byte_count
+        self.peak = max(self.peak, self.current)
+
+    def _policy_scratch_charge(
+        self, source_characters: int, *, source_only: bool
+    ) -> int:
+        per_character = self._schema.object_bound(8 if source_only else 0)
+        return self._schema.checked_add(
+            65536,
+            self._schema.checked_multiply(source_characters, per_character),
+        )
+
+    def preflight_policy_sources(self, sources, source_only) -> None:
+        maximum = 0
+        for path, source in sources.items():
+            raw = self._policy_scratch_charge(len(source), source_only=False)
+            required = raw
+            if path in source_only:
+                required = self._schema.checked_add(
+                    raw,
+                    self._policy_scratch_charge(
+                        len(source), source_only=True
+                    ),
+                )
+            maximum = max(maximum, required)
+        if maximum > self.capacity - self.current:
+            raise AuditInfrastructureError(
+                "policy workspace preflight exceeds remaining compact capacity"
+            )
+
+    def reserve_policy_scratch(self, source_characters: int, *, source_only: bool) -> int:
+        charge = self._policy_scratch_charge(
+            source_characters, source_only=source_only
+        )
+        self._reserve(charge)
+        return charge
+
+    def release_policy_scratch(self, charge: int) -> None:
+        if not isinstance(charge, int) or charge < 0 or charge > self.current:
+            raise AuditInfrastructureError("policy workspace scratch underflows")
+        self.current -= charge
+
+    def reserve_transient(self, byte_count: int) -> int:
+        self._reserve(byte_count)
+        return byte_count
+
+    def release_transient(self, charge: int) -> None:
+        self.release_policy_scratch(charge)
+
+    def retain_path_text(self, path: PurePosixPath) -> str:
+        if not isinstance(path, PurePosixPath):
+            raise AuditInfrastructureError("policy path is invalid")
+        maximum = self._schema.checked_add(
+            self._schema.object_bound(4),
+            self._schema.dict_bound(1),
+            self._schema.string_bound(self._path_render_bytes),
+            self._schema.bytes_bound(4 * self._path_render_bytes),
+        )
+        self._reserve(maximum)
+        retained = False
+        try:
+            existing = self._path_text.get(path)
+            if existing is not None:
+                return existing
+            text = path.as_posix()
+            encoded = text.encode("utf-8")
+            encoded_length = len(encoded)
+            if (
+                not text
+                or len(text) > self._path_render_bytes
+                or encoded_length > self._path_render_bytes
+            ):
+                raise AuditInfrastructureError("policy path exceeds render bound")
+            self._path_text[path] = text
+            actual = self._schema.checked_add(
+                self._schema.dict_bound(1),
+                self._schema.string_bound(len(text)),
+            )
+            encoded = None
+            self.current -= maximum - actual
+            retained = True
+            return text
+        finally:
+            if not retained:
+                self.release_transient(maximum)
+
+    def path_text(self, path: PurePosixPath) -> str:
+        lookup_charge = self.reserve_transient(self._schema.object_bound(2))
+        try:
+            try:
+                return self._path_text[path]
+            except KeyError as error:
+                raise AuditInfrastructureError(
+                    "policy path text was not retained"
+                ) from error
+        finally:
+            self.release_transient(lookup_charge)
+
+    def record(self, finding, provenance: str) -> None:
+        from gpu_capability_source_audit import Finding
+
+        if not isinstance(finding, Finding) or not isinstance(provenance, str):
+            raise AuditInfrastructureError("policy finding sink input is invalid")
+        try:
+            path_text = self.path_text(finding.path)
+        except AuditInfrastructureError:
+            path_text = self.retain_path_text(finding.path)
+        lookup_charge = self.reserve_transient(self._schema.object_bound(2))
+        try:
+            provenances = self.finding_provenance.get(finding)
+        finally:
+            self.release_transient(lookup_charge)
+        if provenances is None:
+            key_charge = self._schema.checked_add(
+                self._schema.object_bound(8),
+                self._schema.tuple_bound(4),
+                self._schema.string_objects_bound(
+                    self._schema.checked_add(
+                        len(path_text),
+                        len(finding.expression),
+                        len(finding.reason),
+                    ),
+                    3,
+                ),
+                self._schema.dict_bound(1),
+            )
+            provenance_charge = self._schema.checked_add(
+                self._schema.dict_bound(1),
+                self._schema.string_bound(len(provenance)),
+            )
+            self._reserve(self._schema.checked_add(key_charge, provenance_charge))
+            self.finding_provenance[finding] = {provenance}
+        elif provenance not in provenances:
+            provenance_charge = self._schema.checked_add(
+                self._schema.object_bound(2),
+                self._schema.string_bound(len(provenance)),
+            )
+            self._reserve(provenance_charge)
+            provenances.add(provenance)
+
+    def reserve_finding_construction(self, finding) -> int:
+        path_text = self.path_text(finding.path)
+        return self.reserve_transient(self._schema.checked_add(
+            self._schema.object_bound(4),
+            self._schema.string_objects_bound(
+                self._schema.checked_add(
+                    len(path_text),
+                    len(finding.expression),
+                    len(finding.reason),
+                ),
+                3,
+            ),
+        ))
+
+    def sorted_findings(self):
+        charge = self.reserve_transient(
+            self._schema.checked_add(
+                self._schema.checked_multiply(
+                    2, self._schema.list_bound(len(self.finding_provenance))
+                ),
+                self._schema.checked_multiply(
+                    len(self.finding_provenance), self._schema.tuple_bound(4)
+                ),
+            )
+        )
+        try:
+            return sorted(
+                self.finding_provenance,
+                key=lambda item: (
+                    self._path_text[item.path],
+                    item.line,
+                    item.expression,
+                    item.reason,
+                ),
+            ), charge
+        except BaseException:
+            self.release_transient(charge)
+            raise
+
+    def encode_for_hash(self, value: str) -> bytes:
+        charge = self.reserve_transient(
+            self._schema.bytes_bound(4 * len(value))
+        )
+        try:
+            return value.encode("utf-8"), charge
+        except BaseException:
+            self.release_transient(charge)
+            raise
+
+    def encode_path_for_hash(self, path: PurePosixPath) -> tuple[bytes, int]:
+        return self.encode_for_hash(self.path_text(path))
+
+    def line_text(self, line: int | None) -> tuple[str, int]:
+        charge = self.reserve_transient(self._schema.string_bound(32))
+        try:
+            return str(line), charge
+        except BaseException:
+            self.release_transient(charge)
+            raise
+
+    def pack_hash_frame(self, value: int) -> tuple[bytes, int]:
+        charge = self.reserve_transient(self._schema.bytes_bound(8))
+        try:
+            return struct.pack("<Q", value), charge
+        except BaseException:
+            self.release_transient(charge)
+            raise
+
+    def update_hash_value(self, canonical, value: str) -> None:
+        encoded, encoded_charge = self.encode_for_hash(value)
+        frame = None
+        frame_charge = None
+        try:
+            frame, frame_charge = self.pack_hash_frame(len(encoded))
+            canonical.update(frame)
+            canonical.update(encoded)
+        finally:
+            frame = None
+            if frame_charge is not None:
+                self.release_transient(frame_charge)
+            encoded = None
+            self.release_transient(encoded_charge)
+
+    def update_hash_path(self, canonical, path: PurePosixPath) -> None:
+        encoded, encoded_charge = self.encode_path_for_hash(path)
+        frame = None
+        frame_charge = None
+        try:
+            frame, frame_charge = self.pack_hash_frame(len(encoded))
+            canonical.update(frame)
+            canonical.update(encoded)
+        finally:
+            frame = None
+            if frame_charge is not None:
+                self.release_transient(frame_charge)
+            encoded = None
+            self.release_transient(encoded_charge)
+
+    def sorted_paths(self, paths) -> tuple[list[PurePosixPath], int]:
+        charge = self.reserve_transient(self._schema.checked_multiply(
+            2, self._schema.list_bound(len(paths))
+        ))
+        try:
+            return sorted(paths, key=self._path_text.__getitem__), charge
+        except BaseException:
+            self.release_transient(charge)
+            raise
+
+    def clear(self) -> None:
+        self.finding_provenance.clear()
+        self._path_text.clear()
+        self.current = 0
+
+
+class BoundedCanonicalAuditContentSummaryBuilder:
+    """Build final policy state only while its compact growth owner is live."""
+
+    __slots__ = (
+        "_limits", "_budget", "_growth", "_workspace",
+        "_authoritative", "_source_only", "_released",
+    )
+
+    def __init__(
+        self, limits: AuditLimits, budget: CompactResultMemoryBudget
+    ) -> None:
+        if not isinstance(limits, AuditLimits) or not isinstance(
+            budget, CompactResultMemoryBudget
+        ):
+            raise AuditInfrastructureError("bounded summary builder is invalid")
+        self._limits = limits
+        self._budget = budget
+        self._growth = None
+        self._workspace = None
+        self._authoritative = None
+        self._source_only = None
+        self._released = False
+
+    def premeasure_policy_merge_working_state(
+        self,
+        source_text: Mapping[PurePosixPath, str],
+        aggregate: StreamingAuditSummary,
+        pipeline_deadline: float,
+    ) -> int:
+        from gpu_capability_source_audit import (
+            conservative_allocation_schema,
+            premeasure_streaming_policy_growth,
+        )
+
+        if self._growth is not None or not isinstance(
+            aggregate, StreamingAuditSummary
+        ):
+            raise AuditInfrastructureError("bounded summary premeasure is invalid")
+        HeldProductionSnapshot._check_deadline(pipeline_deadline)
+        schema = conservative_allocation_schema()
+        configuration_provenance_count = 0
+        for item in aggregate.findings:
+            configuration_provenance_count = schema.checked_add(
+                configuration_provenance_count, len(item.configurations)
+            )
+        required = premeasure_streaming_policy_growth(
+            source_text,
+            len(aggregate.findings),
+            configuration_provenance_count=configuration_provenance_count,
+            authoritative_paths=tuple(aggregate.reached_production),
+            path_render_bytes=self._limits.compact_result_path_bytes,
+            pipeline_deadline=pipeline_deadline,
+        )
+        remaining = self._budget.remaining_bytes
+        if required > remaining:
+            raise AuditInfrastructureError(
+                "policy premeasure exceeds remaining compact capacity"
+            )
+        self._growth = remaining
+        return self._growth
+
+    def _require_reserved_backing(
+        self, ownership: object
+    ) -> None:
+        if (
+            self._growth is None
+            or not self._budget.owns(ownership)
+            or ownership._pending_growth is not None
+            or not ownership.ownerships
+        ):
+            raise AuditInfrastructureError(
+                "bounded summary backing ownership is unavailable"
+            )
+        backing = ownership.ownerships[-1]
+        if (
+            backing.label != "final policy aggregate growth"
+            or not backing.committed
+            or backing.byte_count < self._growth
+        ):
+            raise AuditInfrastructureError(
+                "bounded summary backing ownership differs"
+            )
+
+    def merge_findings_into_reserved_backing_state(
+        self,
+        source_text: Mapping[PurePosixPath, str],
+        aggregate: StreamingAuditSummary,
+        production: Mapping[PurePosixPath, FileIdentity],
+        active: frozenset[PurePosixPath],
+        ownership,
+        pipeline_deadline: float,
+    ) -> None:
+        from gpu_capability_source_audit import (
+            Finding,
+            audit_raw_sources,
+            audit_source_only,
+        )
+
+        self._require_reserved_backing(ownership)
+        if self._workspace is not None or self._released:
+            raise AuditInfrastructureError("bounded summary merge is unavailable")
+        policy_sources = (
+            source_text._values
+            if isinstance(source_text, _ImmutableProductionMapping)
+            else source_text
+        )
+        workspace = _BoundedPolicyWorkspace(
+            self._growth, self._limits.compact_result_path_bytes
+        )
+        self._workspace = workspace
+        workspace._reserve(workspace._schema.checked_add(
+            workspace._schema.dict_bound(len(aggregate.reached_production)),
+            workspace._schema.dict_bound(len(production)),
+        ))
+        authoritative = frozenset(aggregate.reached_production)
+        if not authoritative.issubset(production):
+            raise AuditInfrastructureError(
+                "authoritative coverage references missing production"
+            )
+        if any(path not in authoritative for path in active):
+            raise AuditInfrastructureError(
+                "active source lacks authoritative compiler coverage"
+            )
+        source_only = frozenset(
+            path for path in production if path not in authoritative
+        )
+        for path in production:
+            workspace.retain_path_text(path)
+        for item in aggregate.findings:
+            finding_charge = workspace.reserve_finding_construction(
+                item.finding
+            )
+            try:
+                finding = Finding(
+                    item.finding.path,
+                    item.finding.line,
+                    item.finding.expression,
+                    item.finding.reason,
+                )
+                for digest in item.configurations:
+                    workspace.record(finding, digest)
+            finally:
+                workspace.release_transient(finding_charge)
+        workspace.preflight_policy_sources(policy_sources, source_only)
+        audit_raw_sources(
+            policy_sources,
+            workspace=workspace,
+            sink=workspace.record,
+            provenance="raw-source",
+            pipeline_deadline=pipeline_deadline,
+        )
+        ordered_source_only, source_sort_charge = workspace.sorted_paths(
+            source_only
+        )
+        try:
+            for path in ordered_source_only:
+                HeldProductionSnapshot._check_deadline(pipeline_deadline)
+                audit_source_only(
+                    path,
+                    policy_sources[path],
+                    workspace=workspace,
+                    sink=workspace.record,
+                    provenance="source-only",
+                    pipeline_deadline=pipeline_deadline,
+                )
+        finally:
+            ordered_source_only.clear()
+            workspace.release_transient(source_sort_charge)
+        self._authoritative = authoritative
+        self._source_only = source_only
+
+    def build_bounded_digest_and_count_summary(
+        self, aggregate: StreamingAuditSummary
+    ) -> CanonicalAuditContentSummary:
+        if (
+            self._released
+            or self._workspace is None
+            or self._authoritative is None
+            or self._source_only is None
+        ):
+            raise AuditInfrastructureError("bounded summary state is unavailable")
+        workspace = self._workspace
+        canonical_charge = workspace.reserve_transient(
+            workspace._schema.object_bound(8)
+        )
+        canonical = hashlib.sha256()
+        try:
+            for value in aggregate.configurations:
+                workspace.update_hash_value(canonical, value)
+            sorted_findings, finding_sort_charge = workspace.sorted_findings()
+            try:
+                for finding in sorted_findings:
+                    provenances = workspace.finding_provenance[finding]
+                    provenance_sort_charge = workspace.reserve_transient(
+                        workspace._schema.checked_multiply(
+                            2, workspace._schema.list_bound(len(provenances))
                         )
-                    views[configuration.digest] = view
-                except Exception as error:
-                    failures.append((configuration.digest, str(error)))
-            if failures:
-                cancellation.set()
-                continue
-            while len(pending) < limits.workers:
-                configuration = next(iterator, None)
-                if configuration is None:
-                    break
-                pending[executor.submit(execute, configuration)] = configuration
-
-    if failures:
-        details = "; ".join(
-            f"digest={digest}: {message}"
-            for digest, message in sorted(failures, key=lambda item: (item[0], item[1]))
-        )
-        raise AuditInfrastructureError(
-            f"GPU capability preprocessing configurations failed: {details}"
-        )
-
-    ordered_views = tuple(views[item.digest] for item in ordered)
-    authoritative: set[PurePosixPath] = set()
-    missing_view_sources: list[tuple[str, PurePosixPath]] = []
-    for view in ordered_views:
-        reached = _view_production_provenance(view, production)
-        authoritative.update(reached)
-        source = view.configuration.source
-        if source.relative is None:
-            raise AuditInfrastructureError("production source has no relative path")
-        if source.relative in reached:
-            continue
-        # A physically empty main source has no token whose marker can carry
-        # provenance. Its own validated configuration and manifest membership
-        # are the only complete evidence available; headers never get this
-        # exception because they are not configuration main sources.
-        if source.line_count == 0 and source in view.dependencies:
-            authoritative.add(source.relative)
-            continue
-        missing_view_sources.append((view.configuration.digest, source.relative))
-    if missing_view_sources:
-        details = ", ".join(
-            f"digest={digest} source={path.as_posix()}"
-            for digest, path in sorted(
-                missing_view_sources,
-                key=lambda item: (item[0], item[1].as_posix()),
+                    )
+                    ordered_provenances = None
+                    try:
+                        ordered_provenances = sorted(provenances)
+                        workspace.update_hash_path(canonical, finding.path)
+                        line, line_charge = workspace.line_text(finding.line)
+                        try:
+                            workspace.update_hash_value(canonical, line)
+                        finally:
+                            line = None
+                            workspace.release_transient(line_charge)
+                        workspace.update_hash_value(
+                            canonical, finding.expression
+                        )
+                        workspace.update_hash_value(canonical, finding.reason)
+                        for provenance in ordered_provenances:
+                            workspace.update_hash_value(canonical, provenance)
+                    finally:
+                        if ordered_provenances is not None:
+                            ordered_provenances.clear()
+                        workspace.release_transient(provenance_sort_charge)
+            finally:
+                sorted_findings.clear()
+                workspace.release_transient(finding_sort_charge)
+            for paths, prefix in (
+                (self._authoritative, b"A"),
+                (self._source_only, b"S"),
+            ):
+                ordered_paths, path_sort_charge = workspace.sorted_paths(paths)
+                try:
+                    for path in ordered_paths:
+                        canonical.update(prefix)
+                        workspace.update_hash_path(canonical, path)
+                finally:
+                    ordered_paths.clear()
+                    workspace.release_transient(path_sort_charge)
+            configuration_sort_charge = workspace.reserve_transient(
+                workspace._schema.checked_multiply(
+                    2,
+                    workspace._schema.list_bound(len(aggregate.configurations)),
+                )
             )
-        )
-        raise AuditInfrastructureError(
-            f"configuration view lacks main-source provenance: {details}"
-        )
-    missing_authoritative = sorted(
-        active - authoritative,
-        key=lambda path: path.as_posix(),
+            workspace._reserve(workspace._schema.checked_add(
+                workspace._schema.tuple_bound(len(aggregate.configurations)),
+                workspace._schema.string_bound(64),
+                workspace._schema.object_bound(8),
+            ))
+            ordered_configurations = None
+            try:
+                ordered_configurations = tuple(sorted(aggregate.configurations))
+                digest = canonical.hexdigest()
+                return CanonicalAuditContentSummary(
+                    digest,
+                    ordered_configurations,
+                    len(workspace.finding_provenance),
+                    len(self._authoritative),
+                    len(self._source_only),
+                )
+            finally:
+                workspace.release_transient(configuration_sort_charge)
+        finally:
+            canonical = None
+            workspace.release_transient(canonical_charge)
+
+    def release_backing_state(self) -> None:
+        if self._released:
+            return
+        if self._workspace is not None:
+            self._workspace.clear()
+        self._workspace = None
+        self._authoritative = None
+        self._source_only = None
+        self._released = True
+
+
+def _canonical_streaming_summary(
+    aggregate: StreamingAuditSummary,
+    builder: BoundedCanonicalAuditContentSummaryBuilder,
+) -> CanonicalAuditContentSummary:
+    return builder.build_bounded_digest_and_count_summary(aggregate)
+
+
+def run_compiler_audit_pipeline(
+    source_root: Path,
+    compile_commands: tuple[Path, ...],
+    launcher_environment: Mapping[str, str],
+    dependency_roots: DependencyRootAuthority,
+    capability_registry,
+    cache,
+    inspection_cache,
+    limits: AuditLimits,
+    mode: str,
+    decision_path: Path,
+    operation_deadline: float,
+    run_accountant,
+    evidence_suballocator,
+    expected_audit_engine_fingerprint: str | None = None,
+) -> CompilerAuditRun:
+    """Run the production audit without exposing full views or compact results."""
+
+    pipeline_started_at = time.monotonic()
+
+    from gpu_capability_calibration import (
+        canonical_platform_kind,
+        configuration_set_digest,
+        effective_worker_capacity,
+        finalize_platform_worker_decision,
+        linux_calibration_envelope,
+        macos_calibration_envelope,
+        platform_worker_decision_key,
+        prevalidate_platform_worker_decision,
+        runtime_contract_from_platform_decision,
+        windows_calibration_envelope,
     )
-    if missing_authoritative:
-        raise AuditInfrastructureError(
-            "active source lacks authoritative compiler coverage: "
-            + ", ".join(path.as_posix() for path in missing_authoritative)
-        )
-    source_only = frozenset(set(production) - authoritative)
-    return ordered_views, CoverageReport(
-        authoritative=frozenset(authoritative),
-        source_only=source_only,
-        configurations=tuple(item.digest for item in ordered),
+    from gpu_capability_source_audit import _attest_loaded_audit_engine
+
+    if (
+        mode not in {"cold", "warm", "audit"}
+        or not isinstance(limits, AuditLimits)
+        or not isinstance(limits.total_seconds, (int, float))
+        or isinstance(limits.total_seconds, bool)
+        or not math.isfinite(float(limits.total_seconds))
+        or limits.total_seconds <= 0.0
+        or limits.total_seconds > _PIPELINE_HARD_SECONDS
+        or not isinstance(operation_deadline, (int, float))
+        or isinstance(operation_deadline, bool)
+        or pipeline_started_at >= operation_deadline
+        or time.monotonic() >= operation_deadline
+    ):
+        raise AuditInfrastructureError("compiler audit pipeline inputs are invalid")
+    total_seconds = float(limits.total_seconds)
+    effective_deadline = min(
+        operation_deadline, pipeline_started_at + total_seconds
     )
+    if time.monotonic() >= effective_deadline:
+        raise AuditInfrastructureError("pipeline deadline expired")
+    _validate_pipeline_cache_authorities(cache, inspection_cache)
+    engine = _attest_loaded_audit_engine(expected_audit_engine_fingerprint)
+    platform_kind = canonical_platform_kind(sys.platform)
+    _begin_accountant_phase(
+        run_accountant, "inspection", effective_deadline, platform_kind
+    )
+    production = enumerate_production_identities(
+        source_root, limits, effective_deadline
+    )
+    prepared_production = _prepare_production_table(production, limits)
+    production_table = prepared_production.table
+    session_needing_abort = None
+    aggregate = None
+    summary = None
+    summary_builder = None
+    source_text = None
+    summary_reservation = None
+    summary_committed = False
+    try:
+        uninspected = bounded_uninspected_configuration_digest(
+            source_root,
+            compile_commands,
+            launcher_environment,
+            dependency_roots,
+            effective_deadline,
+        )
+        prevalidated = prevalidate_platform_worker_decision(
+            decision_path,
+            platform_kind,
+            engine,
+            uninspected,
+            effective_deadline,
+        )
+        _production_allocation_event("collect")
+        collection = collect_configurations_with_decision_records(
+            source_root,
+            compile_commands,
+            launcher_environment,
+            production_table,
+            dependency_roots,
+            capability_registry,
+            inspection_cache,
+            engine,
+            limits,
+            effective_deadline,
+            run_accountant,
+        )
+        if (
+            collection.dependency_root_authority is not dependency_roots
+            or collection.capability_registry is not capability_registry
+        ):
+            raise AuditInfrastructureError(
+                "configuration collection replaced caller authority"
+            )
+        inspection_phase = _seal_accountant_phase(
+            run_accountant, "inspection", effective_deadline, platform_kind
+        )
+        ordered = _validated_orchestration_inputs(
+            collection.configurations, production_table, cache, limits
+        )
+        active, configured_sources = compute_active_sources(
+            ordered, production_table
+        )
+        missing_commands = active - configured_sources
+        if missing_commands:
+            raise AuditInfrastructureError(
+                "active source has no compile command: "
+                + ", ".join(
+                    path.as_posix() for path in sorted(missing_commands)
+                )
+            )
+        configuration_digest = configuration_set_digest(
+            ordered, collection.decision_records, dependency_roots
+        )
+        compiler_digests = {
+            record.compiler_digest for record in collection.decision_records.values()
+        }
+        if len(compiler_digests) != 1:
+            raise AuditInfrastructureError(
+                "configuration decision compilers differ"
+            )
+        envelope = {
+            "windows": windows_calibration_envelope,
+            "linux": linux_calibration_envelope,
+            "macos": macos_calibration_envelope,
+        }[platform_kind]()
+        expected_key = platform_worker_decision_key(
+            platform_kind,
+            next(iter(compiler_digests)),
+            configuration_digest,
+            uninspected,
+            engine,
+            effective_worker_capacity(limits),
+            envelope,
+        )
+        decision = finalize_platform_worker_decision(
+            prevalidated, expected_key, effective_deadline
+        )
+        runtime_contract = runtime_contract_from_platform_decision(
+            decision, effective_deadline
+        )
+        _production_allocation_event("snapshot")
+        with snapshot_production_sources(
+            production_table,
+            limits,
+            effective_deadline,
+            prepared_table=prepared_production,
+        ) as held_sources:
+            _begin_accountant_phase(
+                run_accountant, "tasks", effective_deadline, platform_kind
+            )
+            compact_observer = CompactAccountingObserver()
+            session_needing_abort = schedule_configuration_audits(
+                source_root,
+                ordered,
+                dependency_roots,
+                capability_registry,
+                held_sources.initial_digest_map,
+                cache,
+                limits,
+                engine,
+                runtime_contract,
+                inspection_probe_invocations=(
+                    collection.inspection_probe_invocations
+                ),
+                run_accountant=run_accountant,
+                compact_observer=compact_observer,
+            )
+            aggregate = session_needing_abort.consume_aggregate()
+            if (
+                aggregate.budget_ownership.budget
+                is not session_needing_abort.compact_result_budget
+                or session_needing_abort.pending_result_reference_count != 0
+            ):
+                raise AuditInfrastructureError(
+                    "scheduled aggregate ownership differs"
+                )
+            sources = held_sources.finalize_policy_boundary(effective_deadline)
+            try:
+                source_text = decode_validated_production_sources(
+                    sources, limits, effective_deadline
+                )
+            finally:
+                held_sources.release_finalized_sources(sources)
+                sources = None
+            result_budget = session_needing_abort.compact_result_budget
+            summary_builder = BoundedCanonicalAuditContentSummaryBuilder(
+                limits, result_budget
+            )
+            growth = summary_builder.premeasure_policy_merge_working_state(
+                source_text._values,
+                aggregate,
+                effective_deadline,
+            )
+            result_budget.reserve_aggregate_growth(
+                aggregate.budget_ownership, growth
+            )
+            result_budget.commit_aggregate_growth(
+                aggregate.budget_ownership
+            )
+            summary_builder.merge_findings_into_reserved_backing_state(
+                source_text,
+                aggregate,
+                production_table,
+                active,
+                aggregate.budget_ownership,
+                effective_deadline,
+            )
+            source_text.close()
+            source_text = None
+            reserve_summary = getattr(evidence_suballocator, "reserve_summary", None)
+            commit_summary = getattr(evidence_suballocator, "commit_summary", None)
+            if not callable(reserve_summary) or not callable(commit_summary):
+                raise AuditInfrastructureError(
+                    "evidence summary suballocator is invalid"
+                )
+            if getattr(evidence_suballocator, "maximum_bytes", 524288) != 524288:
+                raise AuditInfrastructureError(
+                    "evidence summary suballocator bound differs"
+                )
+            cancel_summary = getattr(
+                evidence_suballocator, "cancel_summary", None
+            )
+            if not callable(cancel_summary):
+                raise AuditInfrastructureError(
+                    "evidence summary cancellation is invalid"
+                )
+            summary_reservation = reserve_summary(
+                len(aggregate.configurations), effective_deadline
+            )
+            result_budget.prevalidate_aggregate_release(
+                aggregate.budget_ownership
+            )
+            summary = _canonical_streaming_summary(
+                aggregate,
+                summary_builder,
+            )
+            commit_summary(summary_reservation, summary)
+            summary_committed = True
+            summary_reservation = None
+            summary_builder.release_backing_state()
+            summary_builder = None
+            result_budget.release_aggregate_after_summary(
+                aggregate.budget_ownership
+            )
+            aggregate = None
+            session_needing_abort.shutdown_reap(effective_deadline)
+            completed_session = session_needing_abort
+            session_needing_abort = None
+        task_phase = getattr(
+            getattr(completed_session, "reactor", None),
+            "task_phase_snapshot",
+            None,
+        )
+        if not isinstance(
+            task_phase,
+            (WindowsPhaseSnapshot, LinuxPhaseSnapshot, MacOSPhaseSnapshot),
+        ):
+            task_phase = _seal_accountant_phase(
+                run_accountant, "tasks", effective_deadline, platform_kind
+            )
+        cache_bytes, cache_entries = cache.measure(effective_deadline)
+        memory = _accountant_memory(run_accountant)
+        elapsed = time.monotonic() - pipeline_started_at
+        if elapsed >= total_seconds or time.monotonic() >= effective_deadline:
+            raise AuditInfrastructureError("pipeline deadline expired")
+        measurements = StreamingAuditMeasurements(
+            pipeline_started_at,
+            elapsed,
+            len(ordered),
+            completed_session.cache_hits,
+            completed_session.cache_misses,
+            completed_session.inspection_probe_invocations,
+            completed_session.audit_compiler_invocations,
+            completed_session.stdout_bytes,
+            memory,
+            cache_bytes,
+            cache_entries,
+            completed_session.result_budget.peak_live_bytes,
+            completed_session.result_budget.retained_bytes,
+            completed_session.maximum_encoded_result_bytes,
+            completed_session.maximum_conservative_decoded_bytes,
+            completed_session.maximum_conservative_retained_bytes,
+            runtime_contract,
+            completed_session.cache_root,
+            completed_session.worker_counts_started,
+            (
+                "enumerate-production",
+                "collect",
+                "snapshot",
+                "cache",
+                "schedule",
+                "finalize",
+                "decode",
+                "coverage",
+                "raw",
+                "source-only",
+                "shutdown-reap",
+            ),
+            inspection_phase,
+            task_phase,
+        )
+        return CompilerAuditRun(summary, measurements)
+    except BaseException as primary_error:
+        try:
+            prepared_production.close()
+        except BaseException as cleanup_error:
+            primary_error.add_note(
+                f"production table cleanup also failed: {cleanup_error!r}"
+            )
+        if source_text is not None:
+            try:
+                source_text.close()
+                source_text = None
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"decoded source cleanup also failed: {cleanup_error!r}"
+                )
+        if summary_builder is not None:
+            try:
+                summary_builder.release_backing_state()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"summary builder cleanup also failed: {cleanup_error!r}"
+                )
+        if summary_reservation is not None:
+            cancel_summary = getattr(
+                evidence_suballocator, "cancel_summary", None
+            )
+            if callable(cancel_summary):
+                try:
+                    cancel_summary(summary_reservation)
+                    summary_reservation = None
+                except BaseException as cleanup_error:
+                    primary_error.add_note(
+                        "summary reservation cancellation also failed: "
+                        f"{cleanup_error!r}"
+                    )
+        if aggregate is not None and not aggregate.budget_ownership.released:
+            try:
+                aggregate.release()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"aggregate ownership release also failed: {cleanup_error!r}"
+                )
+        if summary is not None and summary_committed:
+            release_summary = getattr(
+                evidence_suballocator, "release_summary", None
+            )
+            if callable(release_summary):
+                try:
+                    release_summary(summary)
+                except BaseException as cleanup_error:
+                    primary_error.add_note(
+                        f"summary ownership release also failed: {cleanup_error!r}"
+                    )
+        if session_needing_abort is not None:
+            try:
+                session_needing_abort.abort_and_reap(
+                    emergency_cleanup_deadline()
+                )
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"emergency abort/reap also failed: {cleanup_error!r}"
+                )
+        raise
+
+# Retain-all equivalence orchestration is test-only; see the reference fixture.

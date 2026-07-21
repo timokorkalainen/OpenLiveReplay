@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
+import gc
 import hashlib
 import inspect
 import json
@@ -18,6 +19,7 @@ import time
 import unittest
 import weakref
 from array import array
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType, SimpleNamespace
 from unittest import mock
@@ -37,10 +39,17 @@ from gpu_capability_command import (  # noqa: E402
     _environment_digest,
     open_compiler_executable_capability,
 )
-from gpu_capability_cache import ConfigurationAuditLoadBatch, PreprocessCache  # noqa: E402
+from gpu_capability_cache import (  # noqa: E402
+    CompilerInspectionCache,
+    ConfigurationAuditCache,
+    ConfigurationAuditLoadBatch,
+    PreprocessCache,
+)
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
+    CanonicalAuditContentSummary,
+    CompilerAuditRun,
     CompactResultColdSlot,
     CompactResultMemoryBudget,
     CompactTokenSequence,
@@ -54,16 +63,21 @@ from gpu_capability_model import (  # noqa: E402
     _FilesystemGenerationObserver,
 )
 from gpu_capability_provenance import PreprocessedStreamBuilder  # noqa: E402
+from gpu_capability_reference_fixture import (  # noqa: E402
+    reference_preprocess_all as preprocess_all,
+)
 from gpu_capability_runner import (  # noqa: E402
     ExecutionResult,
     _WindowsJob,
     collect_configurations,
     collect_configurations_with_decision_records,
+    compute_active_sources,
+    decode_validated_production_sources,
     discover_configuration,
     load_or_preprocess,
-    preprocess_all,
     preprocess_configuration,
     run_bounded_preprocessor,
+    snapshot_production_sources,
     stabilize_and_parse_configuration,
 )
 
@@ -73,6 +87,250 @@ class BoundedPreprocessorTests(unittest.TestCase):
         path = Path(__file__).resolve().with_name("gpu_capability_runner.py")
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
         self.assertFalse(any(isinstance(node, ast.Assert) for node in ast.walk(tree)))
+
+    def test_task8_production_descriptor_is_no_follow_and_bound_before_scheduling(self):
+        opener = inspect.getsource(capability_runner._open_production_descriptor)
+        self.assertIn("os.O_NOFOLLOW", opener)
+        self.assertIn("0x00200000", opener)
+        self.assertIn("path.lstat()", opener)
+        snapshot = inspect.getsource(capability_runner.HeldProductionSnapshot.__init__)
+        self.assertLess(
+            snapshot.index("_open_production_descriptor(identity.canonical)"),
+            snapshot.index("self._files.append("),
+        )
+        enumeration = inspect.getsource(
+            capability_model.enumerate_production_identities
+        )
+        self.assertNotIn("read_bytes()", enumeration)
+        self.assertNotIn('.decode("utf-8"', enumeration)
+        self.assertIn("production_raw_per_file_bytes", enumeration)
+        self.assertIn("production_raw_aggregate_bytes", enumeration)
+        self.assertIn("pipeline_deadline", enumeration)
+
+    def test_task8_enumeration_rejects_walk_to_open_swap_and_closes_stream(self):
+        replacement = self.root / "playback" / "replacement.cpp"
+        replacement.write_text("int replacement;\n", encoding="utf-8")
+        walked = self.source.lstat()
+        opened = []
+
+        def swapped_open(_path):
+            stream = replacement.open("rb")
+            opened.append(stream)
+            return stream, os.fstat(stream.fileno())
+
+        with mock.patch.object(
+            capability_model,
+            "_walk_production_entries",
+            return_value=iter(((self.source, walked),)),
+        ), mock.patch.object(
+            capability_model,
+            "_open_enumerated_production_file",
+            side_effect=swapped_open,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "generation differs"
+        ):
+            capability_model.enumerate_production_identities(
+                self.root, AuditLimits(), time.monotonic() + 10.0
+            )
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+
+    def test_task8_enumeration_streams_ignored_entries_under_a_hard_cap(self):
+        directory = self.root / "playback"
+        self.source.unlink()
+        for index in range(20):
+            (directory / f"ignored-{index:02d}.txt").write_text(
+                "ignored", encoding="utf-8"
+            )
+        with os.scandir(directory) as iterator:
+            entries = tuple(iterator)
+
+        class BoundedScandir:
+            def __init__(self):
+                self.index = 0
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.index >= len(entries):
+                    raise StopIteration
+                value = entries[self.index]
+                self.index += 1
+                return value
+
+            def close(self):
+                self.closed = True
+
+        carrier = BoundedScandir()
+        limits = dataclasses.replace(AuditLimits(), unique_dependency_handles=4)
+        with mock.patch.object(
+            capability_model.os, "scandir", return_value=carrier
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "traversal entry count"
+        ):
+            capability_model.enumerate_production_identities(
+                self.root, limits, time.monotonic() + 10.0
+            )
+        self.assertLessEqual(carrier.index, 5)
+        self.assertTrue(carrier.closed)
+
+    def test_task8_enumeration_raw_caps_are_exact_and_close_every_handle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            playback = root / "playback"
+            playback.mkdir()
+            exact = playback / "exact.cpp"
+            with exact.open("wb") as stream:
+                stream.truncate(8 << 20)
+            deadline = time.monotonic() + 30.0
+            with mock.patch.object(
+                capability_model,
+                "_scan_production_utf8_lines",
+                return_value=1,
+            ) as scan:
+                table = capability_model.enumerate_production_identities(
+                    root, AuditLimits(), deadline
+                )
+            self.assertIn(PurePosixPath("playback/exact.cpp"), table)
+            scan.assert_called_once()
+            table.close()
+
+            with exact.open("ab") as stream:
+                stream.write(b"x")
+            with mock.patch.object(
+                capability_model, "_scan_production_utf8_lines"
+            ) as scan, self.assertRaisesRegex(
+                AuditInfrastructureError, "per-file limit"
+            ):
+                capability_model.enumerate_production_identities(
+                    root, AuditLimits(), time.monotonic() + 30.0
+                )
+            scan.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            playback = root / "playback"
+            playback.mkdir()
+            for index in range(8):
+                with (playback / f"aggregate-{index}.cpp").open("wb") as stream:
+                    stream.truncate(8 << 20)
+            opened = []
+            original_open = capability_model._open_enumerated_production_file
+
+            def tracking_open(path):
+                stream, metadata = original_open(path)
+                opened.append(stream)
+                return stream, metadata
+
+            with mock.patch.object(
+                capability_model,
+                "_open_enumerated_production_file",
+                side_effect=tracking_open,
+            ), mock.patch.object(
+                capability_model,
+                "_scan_production_utf8_lines",
+                return_value=1,
+            ):
+                table = capability_model.enumerate_production_identities(
+                    root, AuditLimits(), time.monotonic() + 30.0
+                )
+            self.assertEqual(len(table), 8)
+            self.assertTrue(all(stream.closed for stream in opened))
+            table.close()
+
+            (playback / "aggregate-plus-one.cpp").write_bytes(b"x")
+            opened.clear()
+            with mock.patch.object(
+                capability_model,
+                "_open_enumerated_production_file",
+                side_effect=tracking_open,
+            ), mock.patch.object(
+                capability_model,
+                "_scan_production_utf8_lines",
+                return_value=1,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "aggregate limit"
+            ):
+                capability_model.enumerate_production_identities(
+                    root, AuditLimits(), time.monotonic() + 30.0
+                )
+            self.assertTrue(opened)
+            self.assertTrue(all(stream.closed for stream in opened))
+
+    def test_task8_enumeration_open_is_no_follow_on_each_platform(self):
+        if os.name == "nt":
+            import ctypes
+
+            create_file = mock.Mock(
+                return_value=ctypes.c_void_p(-1)
+            )
+            kernel32 = SimpleNamespace(
+                CreateFileW=create_file,
+                CloseHandle=mock.Mock(),
+            )
+            with mock.patch.object(
+                ctypes, "WinDLL", return_value=kernel32
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "descriptor open failed"
+            ):
+                capability_model._open_enumerated_production_file(self.source)
+            flags = create_file.call_args.args[5]
+            self.assertTrue(flags & 0x00200000)
+        else:
+            original_open = os.open
+            observed = []
+
+            def tracked_open(path, flags):
+                observed.append(flags)
+                return original_open(path, flags)
+
+            with mock.patch.object(
+                capability_model.os, "open", side_effect=tracked_open
+            ):
+                stream, _metadata = (
+                    capability_model._open_enumerated_production_file(
+                        self.source
+                    )
+                )
+                stream.close()
+            self.assertEqual(len(observed), 1)
+            self.assertTrue(observed[0] & os.O_NOFOLLOW)
+
+    def test_task8_enumeration_table_faults_clear_before_release(self):
+        for target in (
+            "insert-enumeration-table",
+            "freeze-enumeration-table",
+        ):
+            with self.subTest(target=target):
+                table = capability_model._EnumeratedProductionTable(
+                    AuditLimits()
+                )
+
+                def fail_at(event):
+                    if event == target:
+                        raise RuntimeError(target)
+
+                with mock.patch.object(
+                    capability_model,
+                    "_production_enumeration_allocation_event",
+                    side_effect=fail_at,
+                ), self.assertRaisesRegex(RuntimeError, target):
+                    table.insert(self.identity.relative, self.identity)
+                    table.freeze()
+                table.close()
+                self.assertEqual(table._backing, {})
+                self.assertEqual(table._casefolded, {})
+                self.assertEqual(table._filesystem_ids, {})
+                self.assertEqual(table.budget.current_bytes, 0)
+                self.assertTrue(table.structure_ownership.released)
 
     def test_decision_collection_uses_explicit_production_and_immutable_sidecars(self):
         database = self.root / "compile_commands.json"
@@ -1532,6 +1790,13 @@ class OrchestrationTests(unittest.TestCase):
         self.compiler.write_bytes(b"compiler-a")
         self.environment = {"PATH": str(self.compiler.parent), "GPU_MODE": "on"}
         self.cache = PreprocessCache((self.root / "cache").resolve())
+        self.result_cache = ConfigurationAuditCache(
+            (self.root / "audit-cache").resolve()
+        )
+        self.result_cache.prepare(time.monotonic() + 10.0)
+        self.inspection_cache = CompilerInspectionCache(
+            (self.root / "audit-cache").resolve()
+        )
         self.dependency_roots = build_dependency_root_authority(
             self.root, {"toolchain": self.compiler.parent}
         )
@@ -1553,6 +1818,1694 @@ class OrchestrationTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
         return path.resolve()
+
+    @staticmethod
+    def phase_accountant():
+        memory = capability_model.WindowsRunMemoryMeasurements(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, True
+        )
+        return SimpleNamespace(
+            begin_phase=lambda _phase, _deadline: None,
+            memory_measurements=lambda: memory,
+        )
+
+    def test_task8_public_run_and_production_limits_are_exact(self):
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(CompilerAuditRun)),
+            ("summary", "measurements"),
+        )
+        summary = CanonicalAuditContentSummary(
+            "a" * 64, ("b" * 64,), 1, 2, 3
+        )
+        for forbidden in ("results", "findings", "coverage"):
+            self.assertNotIn(
+                forbidden,
+                tuple(field.name for field in dataclasses.fields(CompilerAuditRun)),
+            )
+        self.assertEqual(summary.finding_count, 1)
+        limits = AuditLimits()
+        self.assertEqual(limits.production_raw_per_file_bytes, 8 << 20)
+        self.assertEqual(limits.production_raw_aggregate_bytes, 64 << 20)
+        self.assertEqual(limits.production_decoded_transient_bytes, 256 << 20)
+        self.assertEqual(limits.production_decoded_retained_bytes, 128 << 20)
+
+    def test_task8_active_sources_and_source_only_use_complete_production(self):
+        generic_path = self.write_source("playback/generic.cpp")
+        inactive_path = self.write_source(
+            "playback/gpu/applegpusurface_apple.mm"
+        )
+        generic = self.identity(generic_path, "playback/generic.cpp")
+        inactive = self.identity(
+            inactive_path, "playback/gpu/applegpusurface_apple.mm"
+        )
+        configuration = self.configuration(generic, "a" * 64)
+        production = {
+            generic.relative: generic,
+            inactive.relative: inactive,
+        }
+        active, configured = compute_active_sources(
+            (configuration,), production
+        )
+        self.assertEqual(active, frozenset((generic.relative,)))
+        self.assertEqual(configured, frozenset((generic.relative,)))
+        authoritative = frozenset((generic.relative,))
+        self.assertEqual(
+            frozenset(production) - authoritative,
+            frozenset((inactive.relative,)),
+        )
+
+    def test_task8_snapshot_detects_mutate_restore_and_decode_is_strict(self):
+        path = self.write_source("playback/snapshot.cpp", "A")
+        identity = self.identity(path, "playback/snapshot.cpp")
+        production = {identity.relative: identity}
+        with snapshot_production_sources(
+            production, AuditLimits(), time.monotonic() + 10.0
+        ) as held:
+            self.assertEqual(
+                tuple(held.initial_digest_map), (identity.relative,)
+            )
+            if os.name == "nt":
+                with self.assertRaises(OSError):
+                    path.write_bytes(b"B")
+                held.finalize_policy_boundary(time.monotonic() + 10.0)
+            else:
+                path.write_bytes(b"B")
+                path.write_bytes(b"A")
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "production snapshot generation"
+                ):
+                    held.finalize_policy_boundary(time.monotonic() + 10.0)
+
+        invalid_path = self.write_source("playback/invalid.cpp", "ok")
+        invalid_identity = self.identity(invalid_path, "playback/invalid.cpp")
+        invalid_path.write_bytes(b"\xff")
+        invalid_identity = dataclasses.replace(
+            invalid_identity, line_count=0
+        )
+        with snapshot_production_sources(
+            {invalid_identity.relative: invalid_identity},
+            AuditLimits(), time.monotonic() + 10.0,
+        ) as held:
+            sources = held.finalize_policy_boundary(time.monotonic() + 10.0)
+            with self.assertRaisesRegex(AuditInfrastructureError, "UTF-8"):
+                decode_validated_production_sources(
+                    sources, AuditLimits(), time.monotonic() + 10.0
+                )
+
+    def test_task8_closed_decoded_mapping_drops_carrier_before_reservation(self):
+        path = self.write_source("playback/closed-decoded.cpp", "stable")
+        identity = self.identity(path, "playback/closed-decoded.cpp")
+        with snapshot_production_sources(
+            {identity.relative: identity}, AuditLimits(),
+            time.monotonic() + 10.0,
+        ) as held:
+            raw = held.finalize_policy_boundary(time.monotonic() + 10.0)
+            decoded = decode_validated_production_sources(
+                raw, AuditLimits(), time.monotonic() + 10.0
+            )
+            budget = decoded.allocation_budget
+            decoded.close()
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "production mapping is closed"
+            ):
+                decoded[identity.relative]
+            self.assertNotIn(identity.relative, decoded._values)
+            self.assertGreater(budget.current_bytes, 0)
+
+    def test_task8_held_snapshot_invalidates_raw_mapping_before_raw_release(self):
+        path = self.write_source("playback/borrowed-raw.cpp", "stable")
+        identity = self.identity(path, "playback/borrowed-raw.cpp")
+        with snapshot_production_sources(
+            {identity.relative: identity}, AuditLimits(),
+            time.monotonic() + 10.0,
+        ) as held:
+            raw = held.finalize_policy_boundary(time.monotonic() + 10.0)
+            self.assertEqual(raw[identity.relative].raw_bytes, b"stable")
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "production mapping is closed"
+        ):
+            raw[identity.relative]
+        self.assertNotIn(identity.relative, raw._values)
+        self.assertEqual(held._budget.current_bytes, 0)
+
+    def test_task8_compact_result_must_reach_its_own_main(self):
+        path = self.write_source("playback/own-main.cpp")
+        identity = self.identity(path, "playback/own-main.cpp")
+        configuration = self.configuration(identity, "a" * 64)
+        result = capability_model.ConfigurationAuditResult(
+            configuration.digest,
+            "e" * 64,
+            (),
+            (PurePosixPath("playback/other.cpp"),),
+            (),
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits(),
+            require_main_provenance=True,
+        )
+        ownership = budget.reserve(
+            capability_model.compact_result_retained_bytes(result)
+        ).commit()
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "main-source provenance"
+        ):
+            aggregator.accept_validated_result(
+                configuration, result, ownership
+            )
+        if not ownership.released:
+            ownership.release()
+
+    def test_task8_empty_main_proof_becomes_authoritative_outer_coverage(self):
+        path = self.write_source("playback/empty-main.cpp", "")
+        identity = self.identity(path, "playback/empty-main.cpp")
+        self.assertEqual(identity.line_count, 0)
+        configuration = self.configuration(identity, "a" * 64)
+        dependency = DependencyDigest(
+            "production", identity.relative, identity,
+            hashlib.sha256(b"").hexdigest(),
+        )
+        result = capability_model.ConfigurationAuditResult(
+            configuration.digest, "e" * 64, (dependency,), (), ()
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits(),
+            require_main_provenance=True,
+        )
+        ownership = budget.reserve(
+            capability_model.compact_result_retained_bytes(result)
+        ).commit()
+        aggregator.accept_validated_result(configuration, result, ownership)
+        summary = aggregator.finish()
+        self.assertEqual(summary.reached_production, (identity.relative,))
+        builder = capability_runner.BoundedCanonicalAuditContentSummaryBuilder(
+            AuditLimits(), budget
+        )
+        growth = builder.premeasure_policy_merge_working_state(
+            {identity.relative: ""}, summary, time.monotonic() + 10.0
+        )
+        budget.reserve_aggregate_growth(summary.budget_ownership, growth)
+        budget.commit_aggregate_growth(summary.budget_ownership)
+        builder.merge_findings_into_reserved_backing_state(
+            {identity.relative: ""}, summary,
+            {identity.relative: identity}, frozenset((identity.relative,)),
+            summary.budget_ownership, time.monotonic() + 10.0,
+        )
+        canonical = builder.build_bounded_digest_and_count_summary(summary)
+        self.assertEqual(canonical.authoritative_path_count, 1)
+        builder.release_backing_state()
+        summary.release()
+
+    def test_task8_exact_conditional_translation_unit_table(self):
+        expected = {
+            PurePosixPath("playback/gpu/gpusurface_apple.mm"): "apple",
+            PurePosixPath("playback/gpu/gpufence_apple.mm"): "apple",
+            PurePosixPath("playback/gpu/applegpusurface_apple.mm"): "apple",
+            PurePosixPath(
+                "recorder_engine/codec/nativevideoencoder_videotoolbox.mm"
+            ): "apple",
+            PurePosixPath("playback/gpu/gpufence_win.cpp"): "windows",
+            PurePosixPath("playback/output/win/wingpuimportedge.cpp"): "windows",
+            PurePosixPath("playback/output/win/d3d11gpusurface.cpp"): "windows",
+            PurePosixPath(
+                "recorder_engine/codec/nativevideoencoder_mediafoundation.cpp"
+            ): "windows",
+        }
+        self.assertEqual(
+            dict(capability_runner._CONDITIONALLY_SELECTED_TRANSLATION_UNITS),
+            expected,
+        )
+        identities = {}
+        for relative in (*expected, PurePosixPath("playback/ordinary.cpp")):
+            path = self.write_source(relative.as_posix())
+            identities[relative] = self.identity(path, relative.as_posix())
+        ordinary = self.configuration(
+            identities[PurePosixPath("playback/ordinary.cpp")], "1" * 64
+        )
+        active, _configured = compute_active_sources(
+            (ordinary,), identities
+        )
+        self.assertEqual(
+            active, frozenset((PurePosixPath("playback/ordinary.cpp"),))
+        )
+        apple = self.configuration(
+            identities[PurePosixPath("playback/gpu/gpusurface_apple.mm")],
+            "2" * 64,
+        )
+        active, _configured = compute_active_sources(
+            (ordinary, apple), identities
+        )
+        self.assertEqual(
+            {path for path in active if expected.get(path) == "apple"},
+            {path for path, platform in expected.items() if platform == "apple"},
+        )
+        windows = self.configuration(
+            identities[PurePosixPath("playback/gpu/gpufence_win.cpp")],
+            "3" * 64,
+        )
+        active, _configured = compute_active_sources(
+            (ordinary, windows), identities
+        )
+        self.assertEqual(
+            {path for path in active if expected.get(path) == "windows"},
+            {path for path, platform in expected.items() if platform == "windows"},
+        )
+
+    def test_task8_production_caps_are_exact_and_reserved_before_construction(self):
+        limits = dataclasses.replace(
+            AuditLimits(),
+            production_raw_per_file_bytes=8,
+            production_raw_aggregate_bytes=16,
+            production_decoded_transient_bytes=65536,
+            production_decoded_retained_bytes=65536,
+        )
+        first = self.write_source("playback/cap-a.cpp", "12345678")
+        second = self.write_source("playback/cap-b.cpp", "abcdefgh")
+        identities = {
+            PurePosixPath("playback/cap-a.cpp"): self.identity(
+                first, "playback/cap-a.cpp"
+            ),
+            PurePosixPath("playback/cap-b.cpp"): self.identity(
+                second, "playback/cap-b.cpp"
+            ),
+        }
+        events = []
+        with mock.patch.object(
+            capability_runner,
+            "_production_allocation_event",
+            side_effect=events.append,
+        ):
+            with snapshot_production_sources(
+                identities, limits, time.monotonic() + 10.0
+            ) as held:
+                snapshots = held.finalize_policy_boundary(
+                    time.monotonic() + 10.0
+                )
+                decoded = decode_validated_production_sources(
+                    snapshots, limits, time.monotonic() + 10.0
+                )
+        self.assertEqual(decoded[PurePosixPath("playback/cap-a.cpp")], "12345678")
+        budget = decoded.allocation_budget
+        decoded.close()
+        self.assertEqual(budget.current_bytes, 0)
+        self.assertEqual(
+            [event for event in events if event not in {"read-final", "open"}],
+            [
+                "reserve-snapshot-structure",
+                "construct-frozen-table",
+                "reserve-raw", "construct-initial-digest-map", "read", "read",
+                "construct-final-snapshot-map",
+                "reserve-decode", "reserve-retained-strings",
+                "transfer-retained-before-construction", "decode",
+                "construct-strings", "construct-decoded-map",
+            ],
+        )
+        for event in (
+            "construct-frozen-table",
+            "construct-initial-digest-map",
+            "construct-final-snapshot-map",
+            "construct-decoded-map",
+        ):
+            self.assertEqual(events.count(event), 1)
+        first.write_bytes(b"123456789")
+        too_large = self.identity(first, "playback/cap-a.cpp")
+        with self.assertRaisesRegex(AuditInfrastructureError, "per-file limit"):
+            snapshot_production_sources(
+                {too_large.relative: too_large}, limits,
+                time.monotonic() + 10.0,
+            )
+        first.write_bytes(b"12345678")
+        identities[PurePosixPath("playback/cap-a.cpp")] = self.identity(
+            first, "playback/cap-a.cpp"
+        )
+        third = self.write_source("playback/cap-c.cpp", "x")
+        third_identity = self.identity(third, "playback/cap-c.cpp")
+        with self.assertRaisesRegex(AuditInfrastructureError, "aggregate limit"):
+            snapshot_production_sources(
+                {**identities, third_identity.relative: third_identity}, limits,
+                time.monotonic() + 10.0,
+            )
+
+        invalid = self.write_source("playback/cap-invalid.cpp", "x")
+        invalid.write_bytes(b"\xff")
+        invalid_identity = self.identity(
+            self.write_source("playback/cap-invalid-identity.cpp", "x"),
+            "playback/cap-invalid.cpp",
+        )
+        invalid_identity = dataclasses.replace(
+            invalid_identity,
+            canonical=invalid.resolve(),
+            device=int(invalid.stat().st_dev),
+            inode=int(invalid.stat().st_ino) or None,
+        )
+        with snapshot_production_sources(
+            {invalid_identity.relative: invalid_identity}, limits,
+            time.monotonic() + 10.0,
+        ) as held:
+            snapshots = held.finalize_policy_boundary(time.monotonic() + 10.0)
+            raw_live = snapshots.allocation_budget.current_bytes
+            with self.assertRaisesRegex(AuditInfrastructureError, "UTF-8"):
+                decode_validated_production_sources(
+                    snapshots, limits, time.monotonic() + 10.0
+                )
+            self.assertEqual(snapshots.allocation_budget.current_bytes, raw_live)
+
+    def test_task8_snapshot_structure_is_reserved_before_any_descriptor_open(self):
+        identities = {}
+        for index in range(64):
+            relative = f"playback/empty-{index:03d}.cpp"
+            path = self.write_source(relative, "")
+            identity = self.identity(path, relative)
+            identities[identity.relative] = identity
+        events = []
+        original_open = capability_runner._open_production_descriptor
+
+        def tracked_open(path):
+            events.append("open")
+            return original_open(path)
+
+        with mock.patch.object(
+            capability_runner,
+            "_production_allocation_event",
+            side_effect=events.append,
+        ), mock.patch.object(
+            capability_runner,
+            "_open_production_descriptor",
+            side_effect=tracked_open,
+        ):
+            with snapshot_production_sources(
+                identities, AuditLimits(), time.monotonic() + 10.0
+            ) as held:
+                self.assertGreater(held._budget.current_bytes, 0)
+                held.finalize_policy_boundary(time.monotonic() + 10.0)
+        self.assertEqual(events[0], "reserve-snapshot-structure")
+        self.assertEqual(held._budget.current_bytes, 0)
+
+    def test_task8_snapshot_descriptor_ceiling_fails_before_table_or_open(self):
+        class OversizedProduction(Mapping):
+            def __len__(self):
+                return AuditLimits().unique_dependency_handles + 1
+
+            def __iter__(self):
+                raise AssertionError("oversized table was iterated")
+
+            def __getitem__(self, _key):
+                raise AssertionError("oversized table was indexed")
+
+        events = []
+        with mock.patch.object(
+            capability_runner,
+            "_production_allocation_event",
+            side_effect=events.append,
+        ), mock.patch.object(
+            capability_runner, "_open_production_descriptor"
+        ) as opened, self.assertRaisesRegex(
+            AuditInfrastructureError, "descriptor ceiling"
+        ):
+            snapshot_production_sources(
+                OversizedProduction(), AuditLimits(), time.monotonic() + 10.0
+            )
+        opened.assert_not_called()
+        self.assertEqual(events, [])
+
+    def test_task8_snapshot_bound_uses_allocation_free_path_lengths(self):
+        path = self.write_source("playback/allocation-free.cpp", "")
+        identity = self.identity(path, "playback/allocation-free.cpp")
+        with mock.patch.object(
+            PurePosixPath,
+            "as_posix",
+            side_effect=AssertionError("as_posix allocated before reservation"),
+        ), mock.patch.object(
+            PurePosixPath,
+            "parts",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("parts allocated before reservation"),
+        ), mock.patch.object(
+            Path,
+            "__str__",
+            side_effect=AssertionError("str(Path) allocated before reservation"),
+        ):
+            bound = capability_runner._production_snapshot_structure_bound(
+                {identity.relative: identity}
+            )
+        self.assertGreater(bound, 0)
+
+    def test_task8_snapshot_bound_charges_three_simultaneous_dicts(self):
+        self.assertEqual(
+            capability_runner._production_snapshot_structure_dict_count(), 3
+        )
+
+    def test_task8_decode_reuses_snapshot_order_without_path_sort_allocations(self):
+        path = self.write_source("playback/decode-order.cpp", "stable")
+        identity = self.identity(path, "playback/decode-order.cpp")
+        with snapshot_production_sources(
+            {identity.relative: identity}, AuditLimits(),
+            time.monotonic() + 10.0,
+        ) as held:
+            snapshots = held.finalize_policy_boundary(time.monotonic() + 10.0)
+            with mock.patch.object(
+                PurePosixPath,
+                "as_posix",
+                side_effect=AssertionError("decode allocated path sort text"),
+            ), mock.patch.object(
+                PurePosixPath,
+                "parts",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError("decode allocated path sort parts"),
+            ):
+                decoded = decode_validated_production_sources(
+                    snapshots, AuditLimits(), time.monotonic() + 10.0
+                )
+        try:
+            self.assertEqual(decoded[identity.relative], "stable")
+        finally:
+            decoded.close()
+
+    def test_task8_snapshot_uses_one_open_and_two_reads_on_same_descriptor(self):
+        path = self.write_source("playback/twice.cpp", "stable")
+        identity = self.identity(path, "playback/twice.cpp")
+        opened = []
+        original_open = capability_runner._open_production_descriptor
+
+        class TrackingStream:
+            def __init__(self, stream):
+                self.stream = stream
+                self.read_count = 0
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def read(self, *args, **kwargs):
+                self.read_count += 1
+                return self.stream.read(*args, **kwargs)
+
+            def seek(self, *args, **kwargs):
+                return self.stream.seek(*args, **kwargs)
+
+            def close(self):
+                return self.stream.close()
+
+        def tracked_open(selected):
+            stream = TrackingStream(original_open(selected))
+            opened.append(stream)
+            return stream
+
+        with mock.patch.object(
+            capability_runner, "_open_production_descriptor", tracked_open
+        ):
+            with snapshot_production_sources(
+                {identity.relative: identity}, AuditLimits(),
+                time.monotonic() + 10.0,
+            ) as held:
+                held.finalize_policy_boundary(time.monotonic() + 10.0)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0].read_count, 2)
+
+    def test_task8_decoded_caps_accept_exact_and_reject_plus_one(self):
+        path = self.write_source("playback/decode-cap.cpp", "ab")
+        identity = self.identity(path, "playback/decode-cap.cpp")
+        with snapshot_production_sources(
+            {identity.relative: identity}, AuditLimits(),
+            time.monotonic() + 10.0,
+        ) as held:
+            baseline = held.finalize_policy_boundary(time.monotonic() + 10.0)
+            bounds = capability_runner._production_decode_allocation_bounds(
+                baseline
+            )
+            structure_bytes = (
+                capability_runner._production_snapshot_structure_bound(
+                    {identity.relative: identity}
+                )
+            )
+        exact = dataclasses.replace(
+            AuditLimits(),
+            production_raw_per_file_bytes=2,
+            production_raw_aggregate_bytes=2,
+            production_decoded_transient_bytes=(
+                structure_bytes + bounds.transient_bytes
+            ),
+            production_decoded_retained_bytes=(
+                structure_bytes + bounds.retained_bytes
+            ),
+        )
+        with snapshot_production_sources(
+            {identity.relative: identity}, exact, time.monotonic() + 10.0
+        ) as held:
+            snapshots = held.finalize_policy_boundary(time.monotonic() + 10.0)
+            decoded = decode_validated_production_sources(
+                snapshots, exact, time.monotonic() + 10.0
+            )
+            decoded.close()
+        for field, value, message in (
+            ("production_decoded_transient_bytes",
+             structure_bytes + bounds.transient_bytes - 1,
+             "transient limit"),
+            ("production_decoded_retained_bytes",
+             structure_bytes + bounds.retained_bytes - 1,
+             "retained limit"),
+        ):
+            limits = dataclasses.replace(exact, **{field: value})
+            with snapshot_production_sources(
+                {identity.relative: identity}, limits,
+                time.monotonic() + 10.0,
+            ) as held:
+                snapshots = held.finalize_policy_boundary(
+                    time.monotonic() + 10.0
+                )
+                raw_live = snapshots.allocation_budget.current_bytes
+                with self.assertRaisesRegex(AuditInfrastructureError, message):
+                    decode_validated_production_sources(
+                        snapshots, limits, time.monotonic() + 10.0
+                    )
+                self.assertEqual(
+                    snapshots.allocation_budget.current_bytes, raw_live
+                )
+
+    def test_task8_decode_schema_precharges_scratch_objects_and_peak_overlap(self):
+        path = self.write_source("playback/decode-schema.cpp", "abc")
+        identity = self.identity(path, "playback/decode-schema.cpp")
+        with snapshot_production_sources(
+            {identity.relative: identity}, AuditLimits(),
+            time.monotonic() + 10.0,
+        ) as held:
+            snapshots = held.finalize_policy_boundary(time.monotonic() + 10.0)
+            bounds = capability_runner._production_decode_allocation_bounds(
+                snapshots
+            )
+            self.assertGreater(bounds.transient_bytes, 4 * 3)
+            self.assertGreater(bounds.retained_bytes, 4 * 3)
+            self.assertGreater(bounds.decoder_scratch_bytes, 0)
+            decoded = decode_validated_production_sources(
+                snapshots, AuditLimits(), time.monotonic() + 10.0
+            )
+            self.assertLessEqual(
+                decoded.allocation_budget.peak_bytes,
+                (64 + 256) << 20,
+            )
+            self.assertLessEqual(
+                decoded.allocation_budget.peak_bytes + (128 << 20),
+                448 << 20,
+            )
+            decoded.close()
+            self.assertEqual(
+                snapshots.allocation_budget.current_bytes,
+                (64 << 20) + capability_runner._production_snapshot_structure_bound(
+                    {identity.relative: identity}
+                ),
+            )
+
+    def test_task8_snapshot_reads_only_the_pre_reserved_fstat_extent(self):
+        path = self.write_source("playback/read-extent.cpp", "stable")
+        identity = self.identity(path, "playback/read-extent.cpp")
+        requested = []
+        original_open = capability_runner._open_production_descriptor
+
+        class TrackingStream:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def read(self, size):
+                requested.append(size)
+                return self.stream.read(size)
+
+            def seek(self, *args):
+                return self.stream.seek(*args)
+
+            def close(self):
+                return self.stream.close()
+
+        with mock.patch.object(
+            capability_runner,
+            "_open_production_descriptor",
+            side_effect=lambda selected: TrackingStream(original_open(selected)),
+        ):
+            with snapshot_production_sources(
+                {identity.relative: identity}, AuditLimits(),
+                time.monotonic() + 10.0,
+            ) as held:
+                held.finalize_policy_boundary(time.monotonic() + 10.0)
+        self.assertEqual(requested, [len(b"stable"), len(b"stable")])
+
+    def test_task8_same_content_path_replacement_cannot_pass_final_boundary(self):
+        path = self.write_source("playback/replaced.cpp", "same")
+        identity = self.identity(path, "playback/replaced.cpp")
+        with snapshot_production_sources(
+            {identity.relative: identity}, AuditLimits(),
+            time.monotonic() + 10.0,
+        ) as held:
+            replacement = path.with_suffix(".replacement")
+            replacement.write_bytes(b"same")
+            if os.name == "nt":
+                with self.assertRaises(OSError):
+                    os.replace(replacement, path)
+                held.finalize_policy_boundary(time.monotonic() + 10.0)
+            else:
+                os.replace(replacement, path)
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "generation differs"
+                ):
+                    held.finalize_policy_boundary(time.monotonic() + 10.0)
+
+    def test_task8_aggregate_release_is_atomic_and_results_are_not_retained(self):
+        path = self.write_source("playback/aggregate.cpp")
+        identity = self.identity(path, "playback/aggregate.cpp")
+        configuration = self.configuration(identity, "a" * 64)
+        class TrackedResult(capability_model.ConfigurationAuditResult):
+            __slots__ = ("__weakref__",)
+
+        result = TrackedResult(
+            configuration.digest, "e" * 64, (), (identity.relative,), ()
+        )
+        result_ref = weakref.ref(result)
+        observer = capability_model.CompactAccountingObserver()
+        budget = CompactResultMemoryBudget(observer=observer)
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        ownership = budget.reserve(
+            capability_model.compact_result_retained_bytes(result)
+        ).commit()
+        ownership.record_semantic(
+            "retain-hit", delta_bytes=ownership.byte_count
+        )
+        aggregator.accept_validated_result(configuration, result, ownership)
+        del result
+        gc.collect()
+        self.assertIsNone(result_ref())
+        summary = aggregator.finish()
+        before = budget.live_bytes
+        with mock.patch.object(
+            capability_model,
+            "_before_compact_atomic_release",
+            side_effect=RuntimeError("release fault"),
+        ), self.assertRaisesRegex(RuntimeError, "release fault"):
+            summary.release()
+        self.assertEqual(budget.live_bytes, before)
+        self.assertFalse(summary.budget_ownership.released)
+        summary.release()
+        self.assertEqual(budget.live_bytes, 0)
+
+    def test_task8_pending_policy_growth_release_is_atomic_and_retryable(self):
+        path = self.write_source("playback/pending-growth.cpp")
+        identity = self.identity(path, "playback/pending-growth.cpp")
+        configuration = self.configuration(identity, "a" * 64)
+        budget = CompactResultMemoryBudget(
+            observer=capability_model.CompactAccountingObserver()
+        )
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        result = capability_model.ConfigurationAuditResult(
+            configuration.digest, "e" * 64, (), (identity.relative,), ()
+        )
+        ownership = budget.reserve(
+            capability_model.compact_result_retained_bytes(result)
+        ).commit()
+        ownership.record_semantic(
+            "retain-hit", delta_bytes=ownership.byte_count
+        )
+        aggregator.accept_validated_result(configuration, result, ownership)
+        summary = aggregator.finish()
+        budget.reserve_aggregate_growth(summary.budget_ownership, 4096)
+        before = budget.live_bytes
+        with mock.patch.object(
+            capability_model,
+            "_before_compact_atomic_release",
+            side_effect=lambda index: (
+                (_ for _ in ()).throw(RuntimeError("pending release fault"))
+                if index == 1 else None
+            ),
+        ), self.assertRaisesRegex(RuntimeError, "pending release fault"):
+            summary.release()
+        self.assertEqual(budget.live_bytes, before)
+        self.assertFalse(summary.budget_ownership.released)
+        summary.release()
+        self.assertEqual(budget.live_bytes, 0)
+
+    def test_task8_session_refuses_consumption_with_nonempty_reorder_window(self):
+        session = capability_runner._ScheduledAuditSession(
+            aggregate=mock.sentinel.aggregate,
+            cache_hits=1,
+            cache_misses=0,
+            inspection_probe_invocations=0,
+            audit_compiler_invocations=2,
+            runtime_contract=capability_model.WorkerRuntimeContract(
+                1, 1, 0, time.monotonic() + 10.0
+            ),
+            cache_root=self.root,
+            result_budget=CompactResultMemoryBudget(),
+            compact_accounting_observer=capability_model.CompactAccountingObserver(),
+            run_accountant=object(),
+            capability_registry=object(),
+            reorder_pending_count=1,
+            cache_maximum_encoded_result_bytes=4096,
+            cache_maximum_conservative_decoded_bytes=16384,
+            cache_maximum_conservative_retained_bytes=2048,
+        )
+        self.assertEqual(session.worker_counts_started, ())
+        with self.assertRaisesRegex(AuditInfrastructureError, "reorder window"):
+            session.consume_aggregate()
+
+    def test_task8_session_combines_warm_and_cold_authenticated_measurements(self):
+        reactor = SimpleNamespace(
+            stdout_bytes=17,
+            maximum_encoded_result_bytes=3000,
+            maximum_conservative_decoded_bytes=50000,
+            maximum_conservative_retained_bytes=1500,
+            worker_pids=[101],
+            states=[None],
+        )
+        session = capability_runner._ScheduledAuditSession(
+            aggregate=mock.sentinel.aggregate,
+            cache_hits=1,
+            cache_misses=1,
+            inspection_probe_invocations=0,
+            audit_compiler_invocations=2,
+            runtime_contract=capability_model.WorkerRuntimeContract(
+                4, 1, 0, time.monotonic() + 10.0
+            ),
+            cache_root=self.root,
+            result_budget=CompactResultMemoryBudget(),
+            compact_accounting_observer=capability_model.CompactAccountingObserver(),
+            run_accountant=object(),
+            capability_registry=object(),
+            reactor=reactor,
+            cache_maximum_encoded_result_bytes=4096,
+            cache_maximum_conservative_decoded_bytes=40000,
+            cache_maximum_conservative_retained_bytes=2048,
+        )
+        self.assertEqual(session.stdout_bytes, 17)
+        self.assertEqual(session.maximum_encoded_result_bytes, 4096)
+        self.assertEqual(session.maximum_conservative_decoded_bytes, 50000)
+        self.assertEqual(session.maximum_conservative_retained_bytes, 2048)
+        self.assertEqual(session.worker_counts_started, (1,))
+
+    def test_task8_session_rejects_missing_cold_measurements(self):
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "cold-miss measurements"
+        ):
+            capability_runner._ScheduledAuditSession(
+                aggregate=mock.sentinel.aggregate,
+                cache_hits=0,
+                cache_misses=1,
+                inspection_probe_invocations=0,
+                audit_compiler_invocations=2,
+                runtime_contract=capability_model.WorkerRuntimeContract(
+                    1, 1, 0, time.monotonic() + 10.0
+                ),
+                cache_root=self.root,
+                result_budget=CompactResultMemoryBudget(),
+                compact_accounting_observer=(
+                    capability_model.CompactAccountingObserver()
+                ),
+                run_accountant=object(),
+                capability_registry=object(),
+                reactor=SimpleNamespace(worker_pids=[]),
+            )
+
+    def test_task8_session_accepts_authenticated_cold_zero_stdout(self):
+        reactor = SimpleNamespace(
+            stdout_bytes=0,
+            maximum_encoded_result_bytes=1024,
+            maximum_conservative_decoded_bytes=17408,
+            maximum_conservative_retained_bytes=512,
+            worker_pids=[202],
+            states=[None],
+        )
+        session = capability_runner._ScheduledAuditSession(
+            aggregate=mock.sentinel.aggregate,
+            cache_hits=0,
+            cache_misses=1,
+            inspection_probe_invocations=0,
+            audit_compiler_invocations=2,
+            runtime_contract=capability_model.WorkerRuntimeContract(
+                4, 1, 0, time.monotonic() + 10.0
+            ),
+            cache_root=self.root,
+            result_budget=CompactResultMemoryBudget(),
+            compact_accounting_observer=capability_model.CompactAccountingObserver(),
+            run_accountant=object(),
+            capability_registry=object(),
+            reactor=reactor,
+        )
+        self.assertEqual(session.stdout_bytes, 0)
+        self.assertEqual(session.maximum_encoded_result_bytes, 1024)
+        self.assertEqual(session.worker_counts_started, (1,))
+
+    def test_task8_251_disjoint_results_release_all_compact_ownership(self):
+        path = self.write_source("playback/maximal.cpp")
+        identity = self.identity(path, "playback/maximal.cpp")
+        base = self.configuration(identity, "0" * 64)
+        configurations = tuple(
+            dataclasses.replace(base, digest=f"{index:064x}")
+            for index in range(251)
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            configurations, budget, AuditLimits()
+        )
+        for index, configuration in enumerate(configurations):
+            result = capability_model.ConfigurationAuditResult(
+                configuration.digest,
+                "e" * 64,
+                (),
+                (identity.relative,),
+                (capability_model.AuditResultFinding(
+                    identity.relative, index + 1, f"expr-{index}", "reason"
+                ),),
+            )
+            ownership = budget.reserve(
+                capability_model.compact_result_retained_bytes(result)
+            ).commit()
+            aggregator.accept_validated_result(
+                configuration, result, ownership
+            )
+        summary = aggregator.finish()
+        self.assertEqual(len(summary.configurations), 251)
+        self.assertEqual(len(summary.findings), 251)
+        builder = capability_runner.BoundedCanonicalAuditContentSummaryBuilder(
+            AuditLimits(), budget
+        )
+        sources = {identity.relative: "int maximal;\n"}
+        growth = builder.premeasure_policy_merge_working_state(
+            sources, summary, time.monotonic() + 10.0
+        )
+        budget.reserve_aggregate_growth(summary.budget_ownership, growth)
+        budget.commit_aggregate_growth(summary.budget_ownership)
+        builder.merge_findings_into_reserved_backing_state(
+            sources,
+            summary,
+            {identity.relative: identity},
+            frozenset((identity.relative,)),
+            summary.budget_ownership,
+            time.monotonic() + 10.0,
+        )
+        canonical = builder.build_bounded_digest_and_count_summary(summary)
+        self.assertEqual(canonical.finding_count, 251)
+        builder.release_backing_state()
+        summary.release()
+        self.assertEqual(budget.live_bytes, 0)
+
+    def test_task8_source_only_scratch_preflight_precedes_raw_lane(self):
+        main_path = self.write_source("playback/main.cpp", "int main_value;\n")
+        inactive_path = self.write_source("playback/inactive.cpp", "")
+        main = self.identity(main_path, "playback/main.cpp")
+        inactive = self.identity(inactive_path, "playback/inactive.cpp")
+        configuration = self.configuration(main, "a" * 64)
+        result = capability_model.ConfigurationAuditResult(
+            configuration.digest, "e" * 64, (), (main.relative,), ()
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        ownership = budget.reserve(
+            capability_model.compact_result_retained_bytes(result)
+        ).commit()
+        aggregator.accept_validated_result(configuration, result, ownership)
+        summary = aggregator.finish()
+        builder = capability_runner.BoundedCanonicalAuditContentSummaryBuilder(
+            AuditLimits(), budget
+        )
+        sources = {
+            main.relative: "int main_value;\n",
+            inactive.relative: "x" * (8 << 20),
+        }
+        with mock.patch.object(
+            capability_audit,
+            "audit_raw_sources",
+            wraps=capability_audit.audit_raw_sources,
+        ) as raw, self.assertRaisesRegex(
+            AuditInfrastructureError, "policy premeasure"
+        ):
+            builder.premeasure_policy_merge_working_state(
+                sources, summary, time.monotonic() + 10.0
+            )
+        raw.assert_not_called()
+        builder.release_backing_state()
+        summary.release()
+
+    def test_task8_directive_fanout_premeasure_precedes_raw_lane(self):
+        main_path = self.write_source("playback/main-directive.cpp", "int main_value;\n")
+        inactive_path = self.write_source("playback/inactive-directive.cpp", "")
+        main = self.identity(main_path, "playback/main-directive.cpp")
+        inactive = self.identity(inactive_path, "playback/inactive-directive.cpp")
+        configuration = self.configuration(main, "b" * 64)
+        result = capability_model.ConfigurationAuditResult(
+            configuration.digest, "e" * 64, (), (main.relative,), ()
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        ownership = budget.reserve(
+            capability_model.compact_result_retained_bytes(result)
+        ).commit()
+        aggregator.accept_validated_result(configuration, result, ownership)
+        summary = aggregator.finish()
+        cases = {
+            inactive.relative: "#else\n" * 30000,
+            PurePosixPath("playback/gpu/gpuretireregistry.h"): (
+                "class GpuRetireRegistry { public:\n"
+                + "void registerRetire();\n" * 7750
+                + "};\n"
+            ),
+            PurePosixPath("playback/gpu/gpuopscope.h"): (
+                "class GpuOpScope { public:\n"
+                + "void track();\n" * 10000
+                + "};\n"
+            ),
+        }
+        for path, source in cases.items():
+            with self.subTest(path=path):
+                builder = (
+                    capability_runner.BoundedCanonicalAuditContentSummaryBuilder(
+                        AuditLimits(), budget
+                    )
+                )
+                sources = {main.relative: "int main_value;\n", path: source}
+                with mock.patch.object(
+                    capability_audit,
+                    "audit_raw_sources",
+                    wraps=capability_audit.audit_raw_sources,
+                ) as raw, self.assertRaisesRegex(
+                    AuditInfrastructureError, "policy premeasure"
+                ):
+                    builder.premeasure_policy_merge_working_state(
+                        sources, summary, time.monotonic() + 10.0
+                    )
+                raw.assert_not_called()
+                builder.release_backing_state()
+        summary.release()
+
+    def test_task8_structural_stale_decision_launches_nothing(self):
+        deadline = time.monotonic() + 10.0
+        with mock.patch(
+            "gpu_capability_source_audit._attest_loaded_audit_engine",
+            return_value="e" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.canonical_platform_kind",
+            return_value="windows",
+        ), mock.patch.object(
+            capability_runner,
+            "bounded_uninspected_configuration_digest",
+            return_value="u" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.prevalidate_platform_worker_decision",
+            side_effect=AuditInfrastructureError("structural stale"),
+        ), mock.patch.object(
+            capability_runner, "collect_configurations_with_decision_records"
+        ) as collect, mock.patch.object(
+            capability_runner, "schedule_configuration_audits"
+        ) as schedule, self.assertRaisesRegex(
+            AuditInfrastructureError, "structural stale"
+        ):
+            capability_runner.run_compiler_audit_pipeline(
+                self.root,
+                (self.root / "compile_commands.json",),
+                {},
+                self.dependency_roots,
+                object(),
+                self.result_cache,
+                self.inspection_cache,
+                AuditLimits(),
+                "audit",
+                self.root / "decision.json",
+                deadline,
+                self.phase_accountant(),
+                object(),
+            )
+        collect.assert_not_called()
+        schedule.assert_not_called()
+
+    def test_task8_outer_rejects_unproved_accountant_before_enumeration(self):
+        deadline = time.monotonic() + 10.0
+        invalid_accountants = (
+            object(),
+            SimpleNamespace(begin_phase=lambda _phase, _deadline: None),
+        )
+        for accountant in invalid_accountants:
+            with self.subTest(accountant=type(accountant).__name__), mock.patch(
+                "gpu_capability_source_audit._attest_loaded_audit_engine",
+                return_value="e" * 64,
+            ), mock.patch(
+                "gpu_capability_calibration.canonical_platform_kind",
+                return_value="windows",
+            ), mock.patch.object(
+                capability_runner,
+                "enumerate_production_identities",
+                side_effect=AssertionError("enumeration ran"),
+            ) as enumerate_sources, self.assertRaisesRegex(
+                AuditInfrastructureError, "run accountant"
+            ):
+                capability_runner.run_compiler_audit_pipeline(
+                    self.root,
+                    (self.root / "compile_commands.json",),
+                    {},
+                    self.dependency_roots,
+                    object(),
+                    self.result_cache,
+                    self.inspection_cache,
+                    AuditLimits(),
+                    "audit",
+                    self.root / "decision.json",
+                    deadline,
+                    accountant,
+                    object(),
+                )
+            enumerate_sources.assert_not_called()
+
+    def test_task8_outer_rejects_total_seconds_above_hard_ceiling(self):
+        deadline = time.monotonic() + 10.0
+        for seconds in (180.000001, 181.0, 600.0):
+            with self.subTest(seconds=seconds), mock.patch(
+                "gpu_capability_source_audit._attest_loaded_audit_engine",
+                return_value="e" * 64,
+            ), mock.patch.object(
+                capability_runner,
+                "enumerate_production_identities",
+                side_effect=AssertionError("enumeration ran"),
+            ) as enumerate_sources, self.assertRaisesRegex(
+                AuditInfrastructureError, "pipeline inputs"
+            ):
+                capability_runner.run_compiler_audit_pipeline(
+                    self.root,
+                    (self.root / "compile_commands.json",),
+                    {},
+                    self.dependency_roots,
+                    object(),
+                    self.result_cache,
+                    self.inspection_cache,
+                    dataclasses.replace(AuditLimits(), total_seconds=seconds),
+                    "audit",
+                    self.root / "decision.json",
+                    deadline,
+                    self.phase_accountant(),
+                    object(),
+                )
+            enumerate_sources.assert_not_called()
+
+    def test_task8_public_outer_rejects_unprepared_result_cache_before_collection(self):
+        deadline = time.monotonic() + 10.0
+        cache_root = (self.root / "prepared-authority").resolve()
+        result_cache = ConfigurationAuditCache(cache_root)
+        inspection_cache = CompilerInspectionCache(cache_root)
+        with mock.patch(
+            "gpu_capability_source_audit._attest_loaded_audit_engine",
+            return_value="e" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.canonical_platform_kind",
+            return_value="windows",
+        ), mock.patch.object(
+            capability_runner,
+            "bounded_uninspected_configuration_digest",
+            return_value="u" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.prevalidate_platform_worker_decision",
+            return_value=object(),
+        ), mock.patch.object(
+            capability_runner, "collect_configurations_with_decision_records"
+        ) as collect, self.assertRaisesRegex(
+            AuditInfrastructureError, "result cache is not prepared"
+        ):
+            capability_runner.run_compiler_audit_pipeline(
+                self.root,
+                (self.root / "compile_commands.json",),
+                {},
+                self.dependency_roots,
+                object(),
+                result_cache,
+                inspection_cache,
+                AuditLimits(),
+                "audit",
+                self.root / "decision.json",
+                deadline,
+                self.phase_accountant(),
+                object(),
+            )
+        collect.assert_not_called()
+
+    def test_task8_final_key_stale_allows_inspection_but_no_audit_launch(self):
+        path = self.write_source("playback/final-stale.cpp")
+        identity = self.identity(path, "playback/final-stale.cpp")
+        configuration = self.configuration(identity, "a" * 64)
+        deadline = time.monotonic() + 10.0
+        collection = SimpleNamespace(
+            configurations=(configuration,),
+            decision_records={configuration.digest: SimpleNamespace(
+                compiler_digest="c" * 64
+            )},
+            inspection_probe_invocations=2,
+            dependency_root_authority=self.dependency_roots,
+            capability_registry=None,
+        )
+        registry = object()
+        collection.capability_registry = registry
+        with mock.patch(
+            "gpu_capability_source_audit._attest_loaded_audit_engine",
+            return_value="e" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.canonical_platform_kind",
+            return_value="windows",
+        ), mock.patch.object(
+            capability_runner,
+            "bounded_uninspected_configuration_digest",
+            return_value="u" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.prevalidate_platform_worker_decision",
+            return_value=object(),
+        ), mock.patch.object(
+            capability_runner,
+            "collect_configurations_with_decision_records",
+            return_value=collection,
+        ) as collect, mock.patch.object(
+            capability_runner, "_seal_accountant_phase", return_value=object()
+        ), mock.patch.object(
+            capability_runner,
+            "_validated_orchestration_inputs",
+            return_value=(configuration,),
+        ), mock.patch.object(
+            capability_runner,
+            "compute_active_sources",
+            return_value=(frozenset((identity.relative,)),
+                          frozenset((identity.relative,))),
+        ), mock.patch(
+            "gpu_capability_calibration.configuration_set_digest",
+            return_value="s" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.windows_calibration_envelope",
+            return_value=object(),
+        ), mock.patch(
+            "gpu_capability_calibration.effective_worker_capacity",
+            return_value=1,
+        ), mock.patch(
+            "gpu_capability_calibration.platform_worker_decision_key",
+            return_value=object(),
+        ), mock.patch(
+            "gpu_capability_calibration.finalize_platform_worker_decision",
+            side_effect=AuditInfrastructureError("final key stale"),
+        ), mock.patch.object(
+            capability_runner, "schedule_configuration_audits"
+        ) as schedule, self.assertRaisesRegex(
+            AuditInfrastructureError, "final key stale"
+        ):
+            capability_runner.run_compiler_audit_pipeline(
+                self.root,
+                (self.root / "compile_commands.json",),
+                {},
+                self.dependency_roots,
+                registry,
+                self.result_cache,
+                self.inspection_cache,
+                AuditLimits(),
+                "audit",
+                self.root / "decision.json",
+                deadline,
+                self.phase_accountant(),
+                object(),
+            )
+        self.assertEqual(collect.call_count, 1)
+        schedule.assert_not_called()
+
+    def test_task8_outer_final_boundary_preserves_primary_cleanup(self):
+        path = self.write_source("playback/mutate-final.cpp", "A")
+        identity = self.identity(path, "playback/mutate-final.cpp")
+        configuration = self.configuration(identity, "a" * 64)
+        deadline = time.monotonic() + 10.0
+        registry = object()
+        collection = SimpleNamespace(
+            configurations=(configuration,),
+            decision_records={configuration.digest: SimpleNamespace(
+                compiler_digest="c" * 64
+            )},
+            inspection_probe_invocations=2,
+            dependency_root_authority=self.dependency_roots,
+            capability_registry=registry,
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, AuditLimits()
+        )
+        result = capability_model.ConfigurationAuditResult(
+            configuration.digest, "e" * 64, (), (identity.relative,), ()
+        )
+        ownership = budget.reserve(
+            capability_model.compact_result_retained_bytes(result)
+        ).commit()
+        aggregator.accept_validated_result(configuration, result, ownership)
+        aggregate = aggregator.finish()
+        compiler_bytes = []
+
+        class Session:
+            compact_result_budget = budget
+            pending_result_reference_count = 0
+            aborted = []
+
+            def consume_aggregate(self):
+                return aggregate
+
+            def abort_and_reap(self, cleanup_deadline):
+                self.aborted.append(cleanup_deadline)
+                raise RuntimeError("cleanup failure")
+
+        session = Session()
+
+        def schedule(*_args, **_kwargs):
+            path.write_bytes(b"B")
+            compiler_bytes.extend((path.read_bytes(), path.read_bytes()))
+            path.write_bytes(b"A")
+            return session
+
+        with mock.patch(
+            "gpu_capability_source_audit._attest_loaded_audit_engine",
+            return_value="e" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.canonical_platform_kind",
+            return_value="windows",
+        ), mock.patch.object(
+            capability_runner,
+            "bounded_uninspected_configuration_digest",
+            return_value="u" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.prevalidate_platform_worker_decision",
+            return_value=object(),
+        ), mock.patch.object(
+            capability_runner,
+            "collect_configurations_with_decision_records",
+            return_value=collection,
+        ), mock.patch.object(
+            capability_runner, "_seal_accountant_phase", return_value=object()
+        ), mock.patch.object(
+            capability_runner,
+            "_validated_orchestration_inputs",
+            return_value=(configuration,),
+        ), mock.patch.object(
+            capability_runner,
+            "compute_active_sources",
+            return_value=(frozenset((identity.relative,)),
+                          frozenset((identity.relative,))),
+        ), mock.patch(
+            "gpu_capability_calibration.configuration_set_digest",
+            return_value="s" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.windows_calibration_envelope",
+            return_value=object(),
+        ), mock.patch(
+            "gpu_capability_calibration.effective_worker_capacity",
+            return_value=1,
+        ), mock.patch(
+            "gpu_capability_calibration.platform_worker_decision_key",
+            return_value=object(),
+        ), mock.patch(
+            "gpu_capability_calibration.finalize_platform_worker_decision",
+            return_value=object(),
+        ), mock.patch(
+            "gpu_capability_calibration.runtime_contract_from_platform_decision",
+            return_value=capability_model.WorkerRuntimeContract(
+                1, 1, 0, deadline
+            ),
+        ), mock.patch.object(
+            capability_runner,
+            "schedule_configuration_audits",
+            side_effect=schedule,
+        ), mock.patch.object(
+            capability_runner,
+            "_open_production_descriptor",
+            side_effect=lambda selected: selected.open("rb"),
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "production snapshot generation"
+        ) as raised:
+            capability_runner.run_compiler_audit_pipeline(
+                self.root,
+                (self.root / "compile_commands.json",),
+                {},
+                self.dependency_roots,
+                registry,
+                self.result_cache,
+                self.inspection_cache,
+                AuditLimits(),
+                "audit",
+                self.root / "decision.json",
+                deadline,
+                self.phase_accountant(),
+                object(),
+            )
+        self.assertEqual(compiler_bytes, [b"B", b"B"])
+        self.assertEqual(path.read_bytes(), b"A")
+        self.assertEqual(len(session.aborted), 1)
+        self.assertEqual(budget.live_bytes, 0)
+        self.assertIn(
+            "emergency abort/reap",
+            " ".join(getattr(raised.exception, "__notes__", ())),
+        )
+
+    def test_task8_outer_pipeline_is_bounded_order_independent_and_one_deadline(self):
+        identities = []
+        configurations = []
+        for index, relative in enumerate(
+            ("playback/outer-a.cpp", "playback/outer-b.cpp")
+        ):
+            path = self.write_source(relative, f"int value_{index};\n")
+            identity = self.identity(path, relative)
+            identities.append(identity)
+            configurations.append(
+                self.configuration(identity, f"{index + 1:064x}")
+            )
+        configurations = tuple(configurations)
+        production = {identity.relative: identity for identity in identities}
+        registry = object()
+        collection_tables = []
+        snapshot_tables = []
+        collection = SimpleNamespace(
+            configurations=configurations,
+            decision_records={
+                configuration.digest: SimpleNamespace(compiler_digest="c" * 64)
+                for configuration in configurations
+            },
+            inspection_probe_invocations=3,
+            dependency_root_authority=self.dependency_roots,
+            capability_registry=registry,
+        )
+        memory = capability_model.WindowsRunMemoryMeasurements(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, True
+        )
+        summary_events = []
+        allocation_events = []
+        cancelled_summary_reservations = []
+        decoded_source_mappings = []
+        accounting_deadlines = []
+        enumeration_deadlines = []
+
+        class Accountant:
+            def begin_phase(self, phase, observed_deadline):
+                self_case.assertIn(phase, {"inspection", "tasks"})
+                if phase == "inspection":
+                    accounting_deadlines.append(observed_deadline)
+
+            def memory_measurements(self):
+                return memory
+
+        self_case = self
+
+        class Evidence:
+            maximum_bytes = 524288
+
+            def __init__(self):
+                self.summaries = []
+
+            def reserve_summary(self, count, deadline):
+                summary_events.append("reserve-summary")
+                self.reserved = (count, deadline)
+                return object()
+
+            def commit_summary(self, _reservation, summary):
+                summary_events.append("commit-summary")
+                self.summaries.append(summary)
+
+            def cancel_summary(self, reservation):
+                cancelled_summary_reservations.append(reservation)
+
+            def release_summary(self, summary):
+                self.summaries.remove(summary)
+
+        def session_for(order, deadline):
+            budget = CompactResultMemoryBudget()
+            aggregator = StreamingResultAggregator(
+                configurations, budget, AuditLimits()
+            )
+            for index in order:
+                configuration = configurations[index]
+                result = capability_model.ConfigurationAuditResult(
+                    configuration.digest,
+                    "e" * 64,
+                    (),
+                    (configuration.source.relative,),
+                    (),
+                )
+                ownership = budget.reserve(
+                    capability_model.compact_result_retained_bytes(result)
+                ).commit()
+                aggregator.accept_validated_result(
+                    configuration, result, ownership
+                )
+            aggregate = aggregator.finish()
+
+            class Session:
+                compact_result_budget = budget
+                result_budget = budget
+                pending_result_reference_count = 0
+                cache_hits = 2
+                cache_misses = 0
+                inspection_probe_invocations = 3
+                audit_compiler_invocations = 0
+                stdout_bytes = 0
+                maximum_encoded_result_bytes = 4096
+                maximum_conservative_decoded_bytes = 16384
+                maximum_conservative_retained_bytes = 2048
+                cache_root = self.root / "outer-cache"
+                reactor = None
+                worker_counts_started = ()
+
+                def consume_aggregate(self):
+                    return aggregate
+
+                def shutdown_reap(self, observed_deadline):
+                    self.shutdown_deadline = observed_deadline
+
+                def abort_and_reap(self, _cleanup_deadline):
+                    raise AssertionError("normal run aborted")
+
+            Session.cache_root.mkdir(exist_ok=True)
+            return Session()
+
+        original_snapshot = capability_runner.snapshot_production_sources
+        original_summary = capability_runner._canonical_streaming_summary
+        original_decode = capability_runner.decode_validated_production_sources
+        original_enumerate = capability_runner.enumerate_production_identities
+
+        def enumerate_sources(root, limits, observed_deadline):
+            self.assertEqual(
+                len(accounting_deadlines), len(enumeration_deadlines) + 1
+            )
+            enumeration_deadlines.append(observed_deadline)
+            return original_enumerate(root, limits, observed_deadline)
+
+        def snapshot(table, limits, deadline, **kwargs):
+            snapshot_tables.append(table)
+            return original_snapshot(table, limits, deadline, **kwargs)
+
+        def collect(*args):
+            collection_tables.append(args[3])
+            return collection
+
+        def build_summary(*args):
+            summary_events.append("build-summary")
+            return original_summary(*args)
+
+        def decode_sources(*args):
+            decoded = original_decode(*args)
+            decoded_source_mappings.append(decoded)
+            return decoded
+
+        deadline = time.monotonic() + 20.0
+        sessions = (
+            session_for((1, 0), deadline),
+            session_for((0, 1), deadline),
+            session_for((0, 1), deadline),
+            session_for((0, 1), deadline),
+        )
+        with mock.patch(
+            "gpu_capability_source_audit._attest_loaded_audit_engine",
+            return_value="e" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.canonical_platform_kind",
+            return_value="windows",
+        ), mock.patch.object(
+            capability_runner,
+            "enumerate_production_identities",
+            side_effect=enumerate_sources,
+        ), mock.patch.object(
+            capability_runner,
+            "bounded_uninspected_configuration_digest",
+            return_value="u" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.prevalidate_platform_worker_decision",
+            return_value=object(),
+        ) as prevalidate, mock.patch.object(
+            capability_runner,
+            "collect_configurations_with_decision_records",
+            side_effect=collect,
+        ) as collect_mock, mock.patch.object(
+            capability_runner,
+            "compute_active_sources",
+            return_value=(frozenset(production), frozenset(production)),
+        ), mock.patch(
+            "gpu_capability_calibration.configuration_set_digest",
+            return_value="s" * 64,
+        ), mock.patch(
+            "gpu_capability_calibration.windows_calibration_envelope",
+            return_value=object(),
+        ), mock.patch(
+            "gpu_capability_calibration.effective_worker_capacity",
+            return_value=1,
+        ), mock.patch(
+            "gpu_capability_calibration.platform_worker_decision_key",
+            return_value=object(),
+        ), mock.patch(
+            "gpu_capability_calibration.finalize_platform_worker_decision",
+            return_value=object(),
+        ) as finalize, mock.patch(
+            "gpu_capability_calibration.runtime_contract_from_platform_decision",
+            side_effect=lambda _decision, observed: (
+                capability_model.WorkerRuntimeContract(1, 1, 0, observed)
+            ),
+        ), mock.patch.object(
+            capability_runner,
+            "schedule_configuration_audits",
+            side_effect=sessions,
+        ) as schedule, mock.patch.object(
+            capability_runner,
+            "snapshot_production_sources",
+            side_effect=snapshot,
+        ), mock.patch.object(
+            capability_runner,
+            "_canonical_streaming_summary",
+            side_effect=build_summary,
+        ), mock.patch.object(
+            capability_runner,
+            "decode_validated_production_sources",
+            side_effect=decode_sources,
+        ), mock.patch.object(
+            capability_runner,
+            "_production_allocation_event",
+            side_effect=allocation_events.append,
+        ), mock.patch.object(
+            capability_runner,
+            "_seal_accountant_phase",
+            side_effect=lambda _accountant, phase, _deadline, _platform: (
+                capability_model.WindowsPhaseSnapshot(
+                    "windows", phase, memory, 0
+                )
+            ),
+        ):
+            runs = tuple(
+                capability_runner.run_compiler_audit_pipeline(
+                    self.root,
+                    (self.root / "compile_commands.json",),
+                    {},
+                    self.dependency_roots,
+                    registry,
+                    self.result_cache,
+                    self.inspection_cache,
+                    AuditLimits(),
+                    "audit",
+                    self.root / "decision.json",
+                    deadline,
+                    Accountant(),
+                    Evidence(),
+                )
+                for _ in range(2)
+            )
+            with mock.patch.object(
+                capability_runner.BoundedCanonicalAuditContentSummaryBuilder,
+                "premeasure_policy_merge_working_state",
+                side_effect=AuditInfrastructureError("post-decode failure"),
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "post-decode failure"
+            ):
+                capability_runner.run_compiler_audit_pipeline(
+                    self.root,
+                    (self.root / "compile_commands.json",),
+                    {},
+                    self.dependency_roots,
+                    registry,
+                    self.result_cache,
+                    self.inspection_cache,
+                    AuditLimits(),
+                    "audit",
+                    self.root / "decision.json",
+                    deadline,
+                    Accountant(),
+                    Evidence(),
+                )
+            failed_evidence = Evidence()
+            with mock.patch.object(
+                capability_runner,
+                "_canonical_streaming_summary",
+                side_effect=AuditInfrastructureError("summary build failure"),
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "summary build failure"
+            ):
+                capability_runner.run_compiler_audit_pipeline(
+                    self.root,
+                    (self.root / "compile_commands.json",),
+                    {},
+                    self.dependency_roots,
+                    registry,
+                    self.result_cache,
+                    self.inspection_cache,
+                    AuditLimits(),
+                    "audit",
+                    self.root / "decision.json",
+                    deadline,
+                    Accountant(),
+                    failed_evidence,
+                )
+        self.assertEqual(runs[0].summary, runs[1].summary)
+        self.assertTrue(
+            all(run.measurements.worker_counts_started == () for run in runs)
+        )
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(runs[0])),
+            ("summary", "measurements"),
+        )
+        self.assertTrue(all(isinstance(table, MappingProxyType)
+                            for table in collection_tables))
+        self.assertEqual(
+            [id(table) for table in collection_tables],
+            [id(table) for table in snapshot_tables],
+        )
+        for start in (
+            index for index, event in enumerate(allocation_events)
+            if event == "reserve-snapshot-structure"
+        ):
+            segment = allocation_events[start:]
+            self.assertLess(
+                segment.index("reserve-snapshot-structure"),
+                segment.index("construct-frozen-table"),
+            )
+            self.assertLess(segment.index("construct-frozen-table"), segment.index("collect"))
+            self.assertLess(segment.index("collect"), segment.index("snapshot"))
+            self.assertLess(segment.index("snapshot"), segment.index("open"))
+        self.assertTrue(all(call.args[-1] == deadline
+                            for call in prevalidate.call_args_list))
+        self.assertEqual(enumeration_deadlines, [deadline] * 4)
+        self.assertEqual(accounting_deadlines, enumeration_deadlines)
+        self.assertTrue(all(call.args[-1] == deadline
+                            for call in finalize.call_args_list))
+        self.assertTrue(all(call.args[-2] == deadline
+                            for call in collect_mock.call_args_list))
+        self.assertTrue(all(call.args[8].pipeline_deadline == deadline
+                            for call in schedule.call_args_list))
+        self.assertEqual(
+            summary_events,
+            [
+                "reserve-summary", "build-summary", "commit-summary",
+                "reserve-summary", "build-summary", "commit-summary",
+                "reserve-summary",
+            ],
+        )
+        self.assertEqual(
+            [mapping.allocation_budget.current_bytes
+             for mapping in decoded_source_mappings],
+            [0, 0, 0, 0],
+        )
+        self.assertEqual(len(cancelled_summary_reservations), 1)
+        self.assertEqual(failed_evidence.summaries, [])
 
     def test_compact_result_batch_contract_keeps_cold_slot_inside_128_mib(self):
         budget = CompactResultMemoryBudget()
@@ -3325,7 +5278,9 @@ class WorkerAuditTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.header.write_bytes(generation_a)
-        production = capability_model.enumerate_production_identities(self.root)
+        production = capability_model.enumerate_production_identities(
+            self.root, AuditLimits(), time.monotonic() + 30.0
+        )
         toolchain_root = compiler.parent.parent
         roots = {"toolchain": toolchain_root}
         runtime_candidates = []
@@ -3706,7 +5661,8 @@ class ProcessCoordinatorTests(unittest.TestCase):
                 self.assertEqual(loaded_engine, engine)
                 self.assertGreater(pipeline_deadline, time.monotonic())
                 result = capability_model.ConfigurationAuditResult(
-                    configuration.digest, engine, (), (), ()
+                    configuration.digest, engine, (),
+                    (configuration.source.relative,), ()
                 )
                 ownership = result_budget.reserve(
                     capability_model.compact_result_retained_bytes(result),
@@ -3718,7 +5674,9 @@ class ProcessCoordinatorTests(unittest.TestCase):
                 aggregator.accept_validated_result(
                     configuration, result, ownership
                 )
-                return ConfigurationAuditLoadBatch(1, (), 0)
+                return ConfigurationAuditLoadBatch(
+                    1, (), 0, 4096, 16384, 2048
+                )
 
         with mock.patch("multiprocessing.Process.start") as start:
             session = capability_runner.schedule_configuration_audits(
@@ -3742,6 +5700,10 @@ class ProcessCoordinatorTests(unittest.TestCase):
         self.assertEqual(session.cache_misses, 0)
         self.assertEqual(session.inspection_probe_invocations, 7)
         self.assertEqual(session.audit_compiler_invocations, 0)
+        self.assertEqual(session.stdout_bytes, 0)
+        self.assertGreater(session.maximum_encoded_result_bytes, 0)
+        self.assertGreater(session.maximum_conservative_decoded_bytes, 0)
+        self.assertGreater(session.maximum_conservative_retained_bytes, 0)
         session.shutdown_reap(self.runtime.pipeline_deadline)
         summary.release()
 
@@ -3761,7 +5723,8 @@ class ProcessCoordinatorTests(unittest.TestCase):
             ):
                 self.assertIs(result_budget.observer, observer)
                 result = capability_model.ConfigurationAuditResult(
-                    configuration.digest, self.engine, (), (), ()
+                    configuration.digest, self.engine, (),
+                    (configuration.source.relative,), ()
                 )
                 ownership = result_budget.reserve(
                     capability_model.compact_result_retained_bytes(result),
@@ -3773,7 +5736,9 @@ class ProcessCoordinatorTests(unittest.TestCase):
                 aggregator.accept_validated_result(
                     configuration, result, ownership
                 )
-                return ConfigurationAuditLoadBatch(1, (), 0)
+                return ConfigurationAuditLoadBatch(
+                    1, (), 0, 4096, 16384, 2048
+                )
 
         session = capability_runner.schedule_configuration_audits(
             self.root,
@@ -3872,7 +5837,8 @@ class ProcessCoordinatorTests(unittest.TestCase):
                 maximum_cold_slot, pipeline_deadline,
             ):
                 result = capability_model.ConfigurationAuditResult(
-                    self.configuration.digest, self.engine, (), (), ()
+                    self.configuration.digest, self.engine, (),
+                    (self.configuration.source.relative,), ()
                 )
                 ownership = result_budget.reserve(
                     capability_model.compact_result_retained_bytes(result),
@@ -3884,7 +5850,9 @@ class ProcessCoordinatorTests(unittest.TestCase):
                 aggregator.accept_validated_result(
                     self.configuration, result, ownership
                 )
-                return ConfigurationAuditLoadBatch(1, (), 0)
+                return ConfigurationAuditLoadBatch(
+                    1, (), 0, 4096, 16384, 2048
+                )
 
         fake_task6_decision = object()
         with mock.patch(
@@ -4011,6 +5979,138 @@ class ProcessCoordinatorTests(unittest.TestCase):
                 2,
             )
         schedule.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows native scheduler proof")
+    def test_task8_a_to_b_to_a_real_scheduler_worker_never_publishes(self):
+        compiler_text = shutil.which("g++")
+        if compiler_text is None:
+            self.skipTest("requires a production g++ compiler")
+        compiler = Path(compiler_text).resolve()
+        original = b"int coordinator_a;\n"
+        mutated = b"int coordinator_b;\n"
+        self.source.write_bytes(original)
+        metadata = self.source.stat()
+        source_identity = FileIdentity(
+            self.source,
+            PurePosixPath("playback/gpu/coordinator.cpp"),
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) else None,
+            1,
+            True,
+        )
+        production = {source_identity.relative: source_identity}
+        roots = {
+            "toolchain": (
+                compiler.parents[3]
+                if len(compiler.parents) > 3 else compiler.parent.parent
+            ),
+            "windows-system": Path(
+                os.environ.get("SystemRoot", "C:/Windows")
+            ).resolve(),
+        }
+        authority = build_dependency_root_authority(self.root, roots)
+        deadline = time.monotonic() + 180.0
+        capability = open_compiler_executable_capability(
+            compiler,
+            authority,
+            deadline,
+            compiler_family=CompilerFamily.GCC,
+            working_directory=self.root,
+            preprocess_arguments=(str(self.source),),
+        )
+        configuration = PreprocessConfiguration(
+            entry_id="task8-real-generation:0",
+            family=CompilerFamily.GCC,
+            compiler=compiler,
+            working_directory=self.root,
+            source=source_identity,
+            arguments=(str(self.source),),
+            environment_digest=_environment_digest(dict(os.environ)),
+            digest="8" * 64,
+            dependency_root_authority_digest=authority.portable_authority_digest,
+            compiler_capability_digest=capability.capability_digest,
+            compiler_capability=capability,
+        )
+        registry = capability_runner.CompilerCapabilityRegistry(authority)
+        registry.register(capability)
+        cache = ConfigurationAuditCache((self.root / "task8-real-cache").resolve())
+        cache.prepare(deadline)
+        from gpu_capability_process_tree import WindowsNativeRunAccountant
+
+        accountant = WindowsNativeRunAccountant(os.getpid())
+        launches = []
+        publications = []
+        observed_maps = []
+        try:
+            with mock.patch.object(
+                capability_runner,
+                "_open_production_descriptor",
+                side_effect=lambda selected: selected.open("rb"),
+            ):
+                with snapshot_production_sources(
+                    production, AuditLimits(), deadline
+                ) as held:
+                    initial_map = held.initial_digest_map
+                    initial_items = tuple(initial_map.items())
+                    self.source.write_bytes(mutated)
+                    with mock.patch.object(
+                        capability_runner,
+                        "_scheduler_compiler_launch_event",
+                        side_effect=launches.append,
+                    ), mock.patch.object(
+                        capability_runner,
+                        "_scheduler_cache_publication_event",
+                        side_effect=publications.append,
+                    ), mock.patch.object(
+                        capability_runner,
+                        "_scheduler_initial_digest_map_event",
+                        side_effect=observed_maps.append,
+                    ), mock.patch(
+                        "gpu_capability_source_audit._attest_loaded_audit_engine",
+                        return_value=self.engine,
+                    ), self.assertRaisesRegex(
+                        AuditInfrastructureError,
+                        "production snapshot generation",
+                    ):
+                        capability_runner.schedule_configuration_audits(
+                            self.root,
+                            (configuration,),
+                            authority,
+                            registry,
+                            initial_map,
+                            cache,
+                            AuditLimits(rss_bytes=2**63 - 1),
+                            self.engine,
+                            capability_model.WorkerRuntimeContract(
+                                1, 1, 1 << 30, deadline
+                            ),
+                            inspection_probe_invocations=0,
+                            run_accountant=accountant,
+                            compact_observer=(
+                                capability_model.CompactAccountingObserver()
+                            ),
+                        )
+                    self.source.write_bytes(original)
+                    self.assertEqual(tuple(initial_map.items()), initial_items)
+                    with self.assertRaisesRegex(
+                        AuditInfrastructureError,
+                        "production snapshot generation",
+                    ):
+                        held.finalize_policy_boundary(deadline)
+        finally:
+            self.source.write_bytes(original)
+            capability.native_owner.close()
+        self.assertEqual(observed_maps, [initial_map])
+        self.assertIs(observed_maps[0], initial_map)
+        self.assertEqual(
+            tuple(event.purpose for event in launches),
+            (
+                capability_model.CompilerLaunchPurpose.AUDIT_DISCOVERY,
+                capability_model.CompilerLaunchPurpose.AUDIT_ACCEPTED,
+            ),
+        )
+        self.assertEqual(publications, [])
+        self.assertEqual(list(cache._results_root.rglob("*")), [])
 
     def test_real_spawn_cold_miss_has_pid_separation_and_exact_launch_count(self):
         compiler_text = shutil.which("g++")
@@ -4211,6 +6311,11 @@ class ProcessCoordinatorTests(unittest.TestCase):
             self.assertEqual(session.cache_misses, 3)
             self.assertEqual(session.audit_compiler_invocations, 6)
             self.assertEqual(session.expected_audit_compiler_invocations, 6)
+            self.assertEqual(session.worker_counts_started, (2,))
+            self.assertGreater(session.stdout_bytes, 0)
+            self.assertGreater(session.maximum_encoded_result_bytes, 0)
+            self.assertGreater(session.maximum_conservative_decoded_bytes, 0)
+            self.assertGreater(session.maximum_conservative_retained_bytes, 0)
             self.assertGreaterEqual(len(session.worker_pids), 3)
             self.assertGreaterEqual(
                 len(session.reactor.archived_generation_telemetry), 3

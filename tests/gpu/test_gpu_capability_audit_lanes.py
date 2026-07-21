@@ -2,11 +2,14 @@ import ast
 import dataclasses
 import contextlib
 import io
+import inspect
 import os
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
+import time
 import tracemalloc
 import types
 import unittest
@@ -48,21 +51,61 @@ from gpu_capability_source_audit import (  # noqa: E402
     capability_candidate_spellings,
     conservative_allocation_schema,
     probe_cpython_allocation_layout,
+    premeasure_streaming_policy_growth,
     reserve_before_allocation,
     view_has_capability_spelling,
     _audit_preprocessed_view_unfiltered,
 )
 
 
+def _reference_audit_pipeline_streaming(sources, compact_results):
+    """Test-only retain-all oracle; production must use the bounded outer path."""
+
+    by_digest = {result.configuration_digest: result for result in compact_results}
+    authoritative = frozenset(
+        path for result in by_digest.values()
+        for path in result.reached_production
+    )
+    source_only = frozenset(sources) - authoritative
+    configurations = tuple(sorted(by_digest))
+    observations = [
+        (finding, "raw-source")
+        for finding in capability_audit.audit_raw_sources(sources)
+    ]
+    for digest in configurations:
+        result = by_digest[digest]
+        observations.extend(
+            (
+                Finding(
+                    finding.path, finding.line,
+                    finding.expression, finding.reason,
+                ),
+                digest,
+            )
+            for finding in result.findings
+        )
+    for path in sorted(source_only, key=PurePosixPath.as_posix):
+        observations.extend(
+            (finding, "source-only")
+            for finding in capability_audit.audit_source_only(
+                path, sources[path]
+            )
+        )
+    return (
+        aggregate_findings(observations),
+        CoverageReport(authoritative, source_only, configurations),
+    )
+
+
 class AuditEngineFingerprintTests(unittest.TestCase):
     def test_task7_stage_and_module_roots_are_exact(self):
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_GRAPH_SCHEMA_BYTES,
-            b"olr-gpu-capability-live-graph-v6",
+            b"olr-gpu-capability-live-graph-v7",
         )
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-7-spawn-process-coordinator",
+            b"task-8-stream-findings-coverage",
         )
         self.assertEqual(
             tuple(module.__name__ for module in capability_audit._AUDIT_ENGINE_TARGET_MODULES),
@@ -162,7 +205,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
                 "test_gpu_capability_command.py": 1,
                 "test_gpu_capability_model.py": 1,
                 "test_gpu_capability_provenance.py": 1,
-                "test_gpu_capability_runner.py": 7,
+                "test_gpu_capability_runner.py": 8,
             },
         )
         source_directory = Path(__file__).resolve().parent
@@ -484,10 +527,150 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             "gpu_capability_source_audit._header_operand_after_leading_comments",
         ):
             self.assertIn(expected, names)
+
+    def test_task8_semantic_graph_owns_streaming_boundary_and_policy_growth(self):
+        import gpu_capability_runner as capability_runner
+
+        names = {
+            name for name, _value in capability_audit._enumerate_live_semantic_graph()
+        }
+        for expected in (
+            "gpu_capability_model.CanonicalAuditContentSummary",
+            "gpu_capability_model.CompilerAuditRun",
+            "gpu_capability_model.CompactBudgetOwnership",
+            "gpu_capability_runner._CONDITIONALLY_SELECTED_TRANSLATION_UNITS",
+            "gpu_capability_runner.HeldProductionSnapshot",
+            "gpu_capability_runner.compute_active_sources",
+            "gpu_capability_runner.decode_validated_production_sources",
+            "gpu_capability_runner.run_compiler_audit_pipeline",
+            "gpu_capability_runner.snapshot_production_sources",
+            "gpu_capability_source_audit.premeasure_streaming_policy_growth",
+        ):
+            self.assertIn(expected, names)
+        self.assertNotIn(
+            "gpu_capability_source_audit.audit_pipeline_streaming", names
+        )
+        self.assertFalse(
+            hasattr(capability_audit, "audit_pipeline_streaming")
+        )
+        self.assertNotIn("gpu_capability_runner.preprocess_all", names)
+        self.assertFalse(hasattr(capability_runner, "preprocess_all"))
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-7-spawn-process-coordinator",
+            b"task-8-stream-findings-coverage",
         )
+
+    def test_task8_pipeline_measures_cache_before_memory_under_effective_deadline(self):
+        import gpu_capability_runner as capability_runner
+
+        runner_path = Path(__file__).resolve().with_name("gpu_capability_runner.py")
+        source = runner_path.read_text(encoding="utf-8")
+        function = source[source.index("def run_compiler_audit_pipeline("):]
+        self.assertLess(
+            function.index("cache.measure(effective_deadline)"),
+            function.index("_accountant_memory(run_accountant)"),
+        )
+        self.assertIn(
+            "effective_deadline = min(\n"
+            "        operation_deadline, pipeline_started_at + total_seconds\n"
+            "    )",
+            function,
+        )
+        after_effective_deadline = function[
+            function.index("if time.monotonic() >= effective_deadline:"):
+        ]
+        self.assertNotIn("operation_deadline", after_effective_deadline)
+        parameters = inspect.signature(
+            capability_runner.run_compiler_audit_pipeline
+        ).parameters
+        self.assertNotIn("production", parameters)
+        self.assertNotIn("pipeline_started_at", parameters)
+        self.assertLess(
+            function.index("pipeline_started_at = time.monotonic()"),
+            function.index("production = enumerate_production_identities("),
+        )
+
+    def test_task8_long_policy_scans_accept_and_poll_effective_deadline(self):
+        runner_source = inspect.getsource(
+            __import__("gpu_capability_runner")._strict_utf8_code_point_count
+        )
+        premeasure_source = inspect.getsource(
+            capability_audit.premeasure_streaming_policy_growth
+        )
+        raw_source = inspect.getsource(capability_audit.audit_raw_sources)
+        self.assertIn("pipeline_deadline", runner_source)
+        self.assertIn("_check_deadline", runner_source)
+        self.assertIn("pipeline_deadline", premeasure_source)
+        self.assertIn("_check_policy_deadline", premeasure_source)
+        self.assertIn("pipeline_deadline", raw_source)
+        self.assertIn("_check_policy_deadline", raw_source)
+
+    def test_task8_multibyte_utf8_scan_polls_deadline_by_byte_threshold(self):
+        import gpu_capability_runner as capability_runner
+
+        class TrackingBytes(bytes):
+            last_index = -1
+
+            def __getitem__(self, index):
+                if isinstance(index, int):
+                    self.last_index = index
+                return super().__getitem__(index)
+
+        raw = TrackingBytes("\u20ac".encode("utf-8") * (128 * 1024))
+        calls = []
+
+        def stop_on_second(deadline):
+            calls.append((deadline, raw.last_index))
+            if len(calls) == 2:
+                raise AuditInfrastructureError("deadline cadence")
+
+        with mock.patch.object(
+            capability_runner.HeldProductionSnapshot,
+            "_check_deadline",
+            side_effect=stop_on_second,
+        ), self.assertRaisesRegex(AuditInfrastructureError, "deadline cadence"):
+            capability_runner._strict_utf8_code_point_count(raw, 321.0)
+        self.assertEqual([deadline for deadline, _index in calls], [321.0, 321.0])
+        self.assertGreaterEqual(calls[1][1], (64 * 1024) - 4)
+
+    def test_task8_source_only_propagates_deadline_and_releases_scratch(self):
+        path = PurePosixPath("playback/gpu/deadline-source-only.cpp")
+        source = "int value;\n"
+        observed = []
+
+        class Workspace:
+            current = 0
+
+            def reserve_policy_scratch(self, _characters, *, source_only):
+                self_case.assertTrue(source_only)
+                self.current += 1
+                return 1
+
+            def release_policy_scratch(self, charge):
+                self.current -= charge
+
+        self_case = self
+        workspace = Workspace()
+        deadline = time.monotonic() + 1000.0
+
+        def raw_sources(*_args, **kwargs):
+            observed.append(kwargs.get("pipeline_deadline"))
+            raise AuditInfrastructureError("between source-only phases")
+
+        with mock.patch.object(
+            capability_audit, "audit_raw_sources", side_effect=raw_sources
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "between source-only phases"
+        ):
+            capability_audit.audit_source_only(
+                path,
+                source,
+                workspace=workspace,
+                sink=lambda *_args: None,
+                pipeline_deadline=deadline,
+            )
+        self.assertEqual(observed, [deadline])
+        self.assertEqual(workspace.current, 0)
 
     def test_decision_graph_is_exhaustive_and_rebinding_changes_fingerprint(self):
         baseline = capability_audit.decision_engine_fingerprint(
@@ -748,13 +931,13 @@ print(recomputed)
             self.assertEqual(fingerprint(first), fingerprint(second))
             mutated = (second / "gpu_capability_source_audit.py").read_text(encoding="utf-8")
             self.assertIn(
-                'AUDIT_ENGINE_STAGE_BYTES = b"task-7-spawn-process-coordinator"',
+                'AUDIT_ENGINE_STAGE_BYTES = b"task-8-stream-findings-coverage"',
                 mutated,
             )
             (second / "gpu_capability_source_audit.py").write_text(
                 mutated.replace(
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-7-spawn-process-coordinator"',
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-7-spawn-process-coordinator-mutated"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-8-stream-findings-coverage"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-8-stream-findings-coverage-mutated"',
                     1,
                 ),
                 encoding="utf-8",
@@ -1020,8 +1203,9 @@ class CompilerAuditLaneTests(unittest.TestCase):
                 mock.patch.object(
                     capability_audit,
                     "enumerate_production_identities",
+                    autospec=True,
                     return_value={relative: identity},
-                ),
+                ) as enumerate_sources,
                 mock.patch.object(
                     capability_audit._gpu_capability_runner,
                     "stabilize_and_parse_configuration",
@@ -1045,6 +1229,9 @@ class CompilerAuditLaneTests(unittest.TestCase):
         stabilize.assert_called_once()
         self.assertEqual(stabilize.call_args.args[3].invocation_seconds, 300.0)
         self.assertEqual(stabilize.call_args.args[3].total_seconds, 600.0)
+        enumerate_sources.assert_called_once_with(
+            root, stabilize.call_args.args[3], stabilize.call_args.args[4]
+        )
 
     def test_candidate_paths_exclude_production_paths_without_rule_trigger(self):
         view = self.view((
@@ -1213,16 +1400,16 @@ class CompilerAuditLaneTests(unittest.TestCase):
                 ))
             return original_capability(path, source, *args, **kwargs)
 
-        def record_source_only(path, source):
+        def record_source_only(path, source, *args, **kwargs):
             captured.append((
                 "mutation-source-only",
                 f"source-only-{sum(item[0] == 'mutation-source-only' for item in captured):03d}",
                 path,
                 source,
             ))
-            return original_source_only(path, source)
+            return original_source_only(path, source, *args, **kwargs)
 
-        def record_raw(sources):
+        def record_raw(sources, *args, **kwargs):
             for path, source in sources.items():
                 captured.append((
                     "mutation-raw",
@@ -1230,7 +1417,7 @@ class CompilerAuditLaneTests(unittest.TestCase):
                     path,
                     source,
                 ))
-            return original_raw(sources)
+            return original_raw(sources, *args, **kwargs)
 
         with (
             mock.patch.object(
@@ -2166,6 +2353,324 @@ class FindingAggregationTests(unittest.TestCase):
         early = self.finding(line=2)
         aggregated = aggregate_findings(((late, "cfg"), (early, "cfg")))
         self.assertEqual([item.finding.line for item in aggregated], [2, 30])
+
+    def test_task8_streaming_pipeline_is_order_independent_and_equivalent(self):
+        first = capability_model.ConfigurationAuditResult(
+            "b" * 64,
+            capability_audit.audit_engine_fingerprint(),
+            (),
+            (PurePosixPath("playback/gpu/b.cpp"),),
+            (capability_model.AuditResultFinding(
+                self.finding(line=30).path,
+                30,
+                self.finding().expression,
+                self.finding().reason,
+            ),),
+        )
+        second = dataclasses.replace(
+            first,
+            configuration_digest="a" * 64,
+            reached_production=(PurePosixPath("playback/gpu/a.cpp"),),
+            findings=(capability_model.AuditResultFinding(
+                self.finding(line=2).path,
+                2,
+                self.finding().expression,
+                self.finding().reason,
+            ),),
+        )
+        sources = {
+            PurePosixPath("playback/gpu/a.cpp"): "int a;\n",
+            PurePosixPath("playback/gpu/b.cpp"): "int b;\n",
+            self.finding().path: "int h;\n",
+        }
+        expected_coverage = CoverageReport(
+            authoritative=frozenset((
+                PurePosixPath("playback/gpu/a.cpp"),
+                PurePosixPath("playback/gpu/b.cpp"),
+            )),
+            source_only=frozenset((self.finding().path,)),
+            configurations=("a" * 64, "b" * 64),
+        )
+        ordered = _reference_audit_pipeline_streaming(sources, (first, second))
+        reversed_order = _reference_audit_pipeline_streaming(
+            sources, (second, first)
+        )
+        self.assertEqual(ordered, reversed_order)
+        self.assertEqual(ordered[1], expected_coverage)
+        self.assertEqual(
+            [item.finding.line for item in ordered[0]], [2, 30]
+        )
+
+    def test_task8_policy_premeasure_charges_full_provenance_fanout(self):
+        sources = {
+            PurePosixPath("playback/gpu/a.cpp"): "int value;\n"
+        }
+        base = premeasure_streaming_policy_growth(
+            sources, 1, configuration_provenance_count=1
+        )
+        fanned_out = premeasure_streaming_policy_growth(
+            sources, 1, configuration_provenance_count=251
+        )
+        self.assertGreater(fanned_out - base, 250 * 64)
+
+    def test_task8_policy_premeasure_counts_every_finding_lane(self):
+        path = PurePosixPath("playback/gpu/every-lane.cpp")
+        cases = {
+            "directive": "#else\n" * 100,
+            "phase-two": ("native\\\nHandle();\n" * 100),
+            "capability": "surface.nativeHandle();\n" * 100,
+            "macro-ambiguity": "GPU_SURFACE_ALIAS\n" * 100,
+            "retire-registry": "public: void registerRetire();\n" * 100,
+            "op-scope": "public: void track();\n" * 100,
+        }
+        for label, source in cases.items():
+            with self.subTest(label=label):
+                quiet = "x" * len(source)
+                self.assertGreater(
+                    premeasure_streaming_policy_growth({path: source}, 0),
+                    premeasure_streaming_policy_growth({path: quiet}, 0),
+                )
+
+    def test_task8_directive_fanout_premeasure_exceeds_compact_boundary(self):
+        path = PurePosixPath("playback/gpu/directive-boundary.cpp")
+        required = premeasure_streaming_policy_growth(
+            {path: "#else\n" * 30000}, 0
+        )
+        self.assertGreater(required, 128 << 20)
+        smaller = premeasure_streaming_policy_growth(
+            {path: "#else\n" * 100}, 0
+        )
+        exact = capability_model.CompactResultMemoryBudget(
+            maximum_bytes=smaller
+        )
+        ownership = exact.reserve(smaller, label="final policy aggregate growth")
+        ownership.release()
+        one_less = capability_model.CompactResultMemoryBudget(
+            maximum_bytes=smaller - 1
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "aggregate 128 MiB"):
+            one_less.reserve(smaller, label="final policy aggregate growth")
+
+    def test_task8_special_public_member_fanout_exceeds_compact_boundary(self):
+        cases = {
+            PurePosixPath("playback/gpu/gpuretireregistry.h"): (
+                "class GpuRetireRegistry { public:\n"
+                + "void registerRetire();\n" * 7750
+                + "};\n"
+            ),
+            PurePosixPath("playback/gpu/gpuopscope.h"): (
+                "class GpuOpScope { public:\n"
+                + "void track();\n" * 10000
+                + "};\n"
+            ),
+        }
+        for path, source in cases.items():
+            with self.subTest(path=path):
+                self.assertGreater(
+                    premeasure_streaming_policy_growth({path: source}, 0),
+                    128 << 20,
+                )
+
+    def test_task8_policy_premeasure_does_not_allocate_path_or_authority_copies(self):
+        path = PurePosixPath("playback/gpu/allocation-free-premeasure.cpp")
+        with mock.patch.object(
+            PurePosixPath,
+            "as_posix",
+            side_effect=AssertionError("premeasure rendered a path"),
+        ), mock.patch.object(
+            PurePosixPath,
+            "parts",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("premeasure allocated path parts"),
+        ), mock.patch.object(
+            capability_audit,
+            "frozenset",
+            create=True,
+            side_effect=AssertionError("premeasure copied authority"),
+        ):
+            required = premeasure_streaming_policy_growth(
+                {path: "int value;\n"},
+                0,
+                authoritative_paths=(path,),
+            )
+        self.assertGreater(required, 0)
+
+    def test_task8_policy_premeasure_owns_source_only_grammar_workspace(self):
+        path = PurePosixPath("playback/gpu/source-only.cpp")
+        sources = {path: "int value;\n" * 5000}
+        reserved = premeasure_streaming_policy_growth(sources, 0)
+        tracemalloc.start()
+        try:
+            capability_audit.audit_source_only(path, sources[path])
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLessEqual(peak, reserved)
+
+    def test_task8_exact_eight_mib_source_only_fails_compact_budget_preflight(self):
+        path = PurePosixPath("playback/gpu/eight-mib-source-only.cpp")
+        source = "x" * (8 << 20)
+        reserved = premeasure_streaming_policy_growth({path: source}, 0)
+        budget = capability_model.CompactResultMemoryBudget(
+            maximum_bytes=128 << 20
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "aggregate 128 MiB"
+        ):
+            budget.reserve(reserved, label="final policy aggregate growth")
+
+    def test_task8_bounded_policy_workspace_rejects_before_unowned_parse(self):
+        import gpu_capability_runner as capability_runner
+
+        path = PurePosixPath("playback/gpu/eight-mib-workspace.cpp")
+        source = "x" * (8 << 20)
+        workspace = capability_runner._BoundedPolicyWorkspace(128 << 20)
+        with mock.patch.object(
+            capability_audit, "translate_source", wraps=capability_audit.translate_source
+        ) as translate, self.assertRaisesRegex(
+            AuditInfrastructureError, "policy workspace"
+        ):
+            capability_audit.audit_source_only(
+                path,
+                source,
+                workspace=workspace,
+                sink=workspace.record,
+            )
+        translate.assert_not_called()
+        self.assertEqual(workspace.current, 0)
+
+    def test_task8_bounded_policy_workspace_exact_zero_finding_boundary(self):
+        import gpu_capability_runner as capability_runner
+
+        path = PurePosixPath("playback/gpu/zero-finding.cpp")
+        source = "int value;\n" * 100
+        schema = conservative_allocation_schema()
+        exact = (
+            2 * 65536
+            + len(source) * schema.object_bound(8)
+            + len(source) * schema.object_bound(0)
+        )
+        workspace = capability_runner._BoundedPolicyWorkspace(exact)
+        capability_audit.audit_source_only(
+            path, source, workspace=workspace, sink=workspace.record
+        )
+        self.assertEqual(workspace.finding_provenance, {})
+        self.assertLessEqual(workspace.peak, exact)
+        with self.assertRaisesRegex(AuditInfrastructureError, "policy workspace"):
+            capability_audit.audit_source_only(
+                path,
+                source,
+                workspace=capability_runner._BoundedPolicyWorkspace(exact - 1),
+                sink=lambda *_args: None,
+            )
+
+    def test_task8_raw_sink_emits_each_path_before_releasing_its_scratch(self):
+        class Workspace:
+            def __init__(self):
+                self.live = 0
+                self.emissions = 0
+
+            def reserve_policy_scratch(self, _characters, *, source_only):
+                self.assert_false = source_only
+                self.live += 1
+                return 1
+
+            def release_policy_scratch(self, charge):
+                self.assertEqual(charge, 1)
+                self.assertGreater(self.emissions, 0)
+                self.live -= charge
+
+            def assertEqual(self, left, right):
+                self_case.assertEqual(left, right)
+
+            def assertGreater(self, left, right):
+                self_case.assertGreater(left, right)
+
+        self_case = self
+        workspace = Workspace()
+
+        def sink(_finding, _provenance):
+            self.assertGreater(workspace.live, 0)
+            workspace.emissions += 1
+
+        result = capability_audit.audit_raw_sources(
+            {
+                PurePosixPath("playback/gpu/first.cpp"): "surface.nativeHandle();\n",
+                PurePosixPath("playback/gpu/second.cpp"): "surface.nativeHandle();\n",
+            },
+            workspace=workspace,
+            sink=sink,
+        )
+        self.assertEqual(result, [])
+        self.assertEqual(workspace.live, 0)
+        self.assertGreaterEqual(workspace.emissions, 2)
+
+    def test_task8_hash_encode_charge_fails_before_bytes_construction(self):
+        import gpu_capability_runner as capability_runner
+
+        schema = conservative_allocation_schema()
+        value = "x" * 4096
+        required = schema.bytes_bound(4 * len(value))
+        workspace = capability_runner._BoundedPolicyWorkspace(required - 1)
+        with self.assertRaisesRegex(AuditInfrastructureError, "policy workspace"):
+            workspace.encode_for_hash(value)
+        self.assertEqual(workspace.current, 0)
+
+    def test_task8_policy_key_and_sort_path_lengths_do_not_allocate_first(self):
+        import hashlib
+        import gpu_capability_runner as capability_runner
+
+        workspace = capability_runner._BoundedPolicyWorkspace(1 << 20)
+        finding = self.finding()
+        original_as_posix = PurePosixPath.as_posix
+        rendered = []
+
+        def charged_as_posix(path):
+            self.assertGreater(workspace.current, 0)
+            rendered.append(path)
+            return original_as_posix(path)
+
+        with mock.patch.object(
+            PurePosixPath,
+            "as_posix",
+            new=charged_as_posix,
+        ), mock.patch.object(
+            PurePosixPath,
+            "parts",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("path parts allocated outside the ledger"),
+        ):
+            workspace.record(finding, "source-only")
+            ordered, charge = workspace.sorted_findings()
+            canonical = hashlib.sha256()
+            workspace.update_hash_path(canonical, finding.path)
+        self.assertEqual(ordered, [finding])
+        self.assertEqual(rendered, [finding.path])
+        ordered.clear()
+        workspace.release_transient(charge)
+
+    def test_task8_policy_hash_frame_preflight_fails_before_struct_pack(self):
+        import gpu_capability_runner as capability_runner
+
+        workspace = capability_runner._BoundedPolicyWorkspace(1)
+        with mock.patch.object(struct, "pack") as packed, self.assertRaisesRegex(
+            AuditInfrastructureError, "policy workspace"
+        ):
+            workspace.pack_hash_frame(7)
+        packed.assert_not_called()
+
+    def test_task8_candidate_free_directive_fanout_is_sink_bounded(self):
+        import gpu_capability_runner as capability_runner
+
+        workspace = capability_runner._BoundedPolicyWorkspace(128 << 20)
+        capability_audit.audit_source_only(
+            PurePosixPath("playback/gpu/directive-fanout.cpp"),
+            "#else\n" * 5000,
+            workspace=workspace,
+            sink=workspace.record,
+        )
+        self.assertEqual(len(workspace.finding_provenance), 5000)
+        self.assertLessEqual(workspace.peak, workspace.capacity)
 
 
 class RawLaneTests(unittest.TestCase):

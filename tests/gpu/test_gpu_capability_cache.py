@@ -10,6 +10,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import shutil
 import stat
 import struct
 import sys
@@ -20,6 +21,7 @@ import traceback
 import tracemalloc
 import unittest
 import weakref
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from array import array
 from pathlib import Path, PurePosixPath
@@ -541,6 +543,47 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             ),
             inspection,
         )
+
+    def test_inspection_publish_rejects_aggregate_partition_overflow(self):
+        inspection = self.inspection()
+        deadline = time.monotonic() + 10.0
+        self.cache.publish(
+            self.compiler.resolve(),
+            CompilerFamily.GCC,
+            self.environment,
+            self.authority,
+            "e" * 64,
+            self.capability_digest,
+            self.closure_digest,
+            inspection,
+            deadline,
+        )
+        first_key = compiler_inspection_cache_key(
+            self.compiler.resolve(),
+            CompilerFamily.GCC,
+            self.environment,
+            self.authority,
+            "e" * 64,
+            executable_capability_digest=self.capability_digest,
+            resolved_runtime_closure_digest=self.closure_digest,
+        )
+        exact_bytes = self.cache._path(first_key).stat().st_size
+        with mock.patch.object(
+            capability_cache, "_INSPECTION_MAX_TOTAL_BYTES", exact_bytes
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "inspection cache partition"
+        ):
+            self.cache.publish(
+                self.compiler.resolve(),
+                CompilerFamily.GCC,
+                self.environment,
+                self.authority,
+                "e" * 64,
+                self.capability_digest,
+                "0" * 64,
+                inspection,
+                deadline,
+            )
 
     def test_inspection_cache_hit_uses_held_capability_without_rehashing(self):
         inspection = self.inspection()
@@ -2824,7 +2867,6 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
         winner = self.cache._path(key)
         winner_identity = winner.stat().st_ino
         winner_bytes = winner.read_bytes()
-        different = dataclasses.replace(inspection, driver_fingerprint="a" * 64)
         real_unlink = Path.unlink
 
         def reject_owned_temporary(path, *args, **kwargs):
@@ -2833,15 +2875,19 @@ class CompilerInspectionCacheTests(unittest.TestCase, _PreprocessCacheFixture):
             return real_unlink(path, *args, **kwargs)
 
         with mock.patch.object(
+            os,
+            "replace",
+            side_effect=OSError("deterministic inspection replace failure"),
+        ), mock.patch.object(
             Path, "unlink", autospec=True, side_effect=reject_owned_temporary
         ), self.assertRaisesRegex(
             AuditInfrastructureError,
-            "cannot remove compiler inspection publication temporary.*winner differs",
+            "cannot remove compiler inspection publication temporary.*replace failure",
         ):
             CompilerInspectionCache(self.cache.root).publish(
                 self.compiler.resolve(), CompilerFamily.GCC, self.environment,
                 self.authority, "e" * 64, self.capability_digest,
-                self.closure_digest, different, time.monotonic() + 10.0,
+                "0" * 64, inspection, time.monotonic() + 10.0,
             )
 
         temporaries = list(self.cache.root.glob(".tmp-inspection-*"))
@@ -4008,6 +4054,804 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
 
     def tearDown(self) -> None:
         _PreprocessCacheFixture.tearDown(self)
+
+    def test_task8_prepared_result_and_inspection_caches_expose_one_root_authority(self):
+        result_cache = ConfigurationAuditCache(self.cache_root)
+        inspection_cache = CompilerInspectionCache(self.cache_root)
+        self.assertFalse(result_cache.is_prepared)
+        result_cache.prepare(self.pipeline_deadline)
+        self.assertTrue(result_cache.is_prepared)
+        self.assertEqual(result_cache.root_identity, inspection_cache.root_identity)
+        self.assertEqual(result_cache.root_identity.resolved_root, self.cache_root)
+
+    def test_task8_result_prepare_accepts_61_valid_shared_inspection_records(self):
+        source = self.root / "shared-inspection-source"
+        toolchain = self.root / "shared-inspection-toolchain"
+        source.mkdir()
+        toolchain.mkdir()
+        compiler = toolchain / "g++.exe"
+        compiler.write_bytes(b"shared-compiler")
+        authority = build_dependency_root_authority(
+            source, {"toolchain": toolchain}
+        )
+        metadata = compiler.stat()
+        compiler_identity = FileIdentity(
+            compiler.resolve(),
+            None,
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) != 0 else None,
+            0,
+            False,
+        )
+        capability_digest = "d" * 64
+        inspection = CompilerInspection(
+            CompilerFamily.GCC,
+            compiler_identity,
+            hashlib.sha256(compiler.read_bytes()).hexdigest(),
+            "g++ (GCC) 14.1.0",
+            "b" * 64,
+            "c" * 64,
+            capability_digest,
+        )
+        inspection_cache = CompilerInspectionCache(self.cache_root)
+        deadline = time.monotonic() + 60.0
+        for ordinal in range(61):
+            inspection_cache.publish(
+                compiler.resolve(),
+                CompilerFamily.GCC,
+                {"PATH": str(toolchain)},
+                authority,
+                "e" * 64,
+                capability_digest,
+                f"{ordinal:064x}",
+                inspection,
+                deadline,
+            )
+        result_cache = ConfigurationAuditCache(self.cache_root)
+        self.assertEqual(result_cache.root_identity, inspection_cache.root_identity)
+        result_cache.prepare(deadline)
+        self.assertTrue(result_cache.is_prepared)
+
+    def test_task8_shared_root_keeps_noninspection_name_bound(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        with mock.patch.object(
+            capability_cache,
+            "_AUDIT_CACHE_ROOT_NON_INSPECTION_MAXIMUM_ENTRIES",
+            0,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "root namespace entry bound"
+        ):
+            cache.prepare(self.pipeline_deadline)
+
+    def test_task8_shared_inspection_records_keep_32_mib_partition_bound(self):
+        record = self.cache_root / (
+            ".compiler-inspection-" + "a" * 64 + ".json"
+        )
+        self.cache_root.mkdir(parents=True)
+        record.write_bytes(b"{}")
+        cache = ConfigurationAuditCache(self.cache_root)
+        with mock.patch.object(
+            capability_cache, "_INSPECTION_MAX_TOTAL_BYTES", 1
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "inspection cache partition"
+        ):
+            cache.prepare(self.pipeline_deadline)
+
+    def test_task8_shared_inspection_partition_accepts_exact_bound_and_rejects_plus_one(self):
+        root = self.root / "inspection-partition-bound"
+        root.mkdir()
+        for ordinal in range(64):
+            record = root / (
+                ".compiler-inspection-" + f"{ordinal:064x}" + ".json"
+            )
+            with record.open("wb") as stream:
+                stream.truncate(512 * 1024)
+        self.assertEqual(
+            capability_cache._shared_cache_root_namespace_usage(
+                root, self.pipeline_deadline
+            ),
+            (32 * 1024 * 1024, 0),
+        )
+        (root / (".compiler-inspection-" + "f" * 64 + ".json")).write_bytes(
+            b"x"
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "inspection cache partition"
+        ):
+            capability_cache._shared_cache_root_namespace_usage(
+                root, self.pipeline_deadline
+            )
+
+    def test_task8_shared_inspection_record_rejects_per_record_overflow(self):
+        root = self.root / "inspection-record-bound"
+        root.mkdir()
+        record = root / (".compiler-inspection-" + "a" * 64 + ".json")
+        with record.open("wb") as stream:
+            stream.truncate((512 * 1024) + 1)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "inspection record size"
+        ):
+            capability_cache._shared_cache_root_namespace_usage(
+                root, self.pipeline_deadline
+            )
+
+    def test_task8_malformed_inspection_name_uses_noninspection_bound(self):
+        root = self.root / "malformed-inspection-name"
+        root.mkdir()
+        (root / ".compiler-inspection-not-a-key.json").write_bytes(b"{}")
+        with mock.patch.object(
+            capability_cache,
+            "_AUDIT_CACHE_ROOT_NON_INSPECTION_MAXIMUM_ENTRIES",
+            0,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "root namespace entry bound"
+        ):
+            capability_cache._shared_cache_root_namespace_usage(
+                root, self.pipeline_deadline
+            )
+
+    def test_task8_shared_inspection_record_rejects_hardlink(self):
+        root = self.root / "inspection-hardlink"
+        root.mkdir()
+        seed = root / "seed"
+        seed.write_bytes(b"{}")
+        record = root / (".compiler-inspection-" + "a" * 64 + ".json")
+        try:
+            os.link(seed, record)
+        except OSError as error:
+            self.skipTest(f"hardlinks unavailable: {error}")
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "inspection record namespace"
+        ):
+            capability_cache._shared_cache_root_namespace_usage(
+                root, self.pipeline_deadline
+            )
+
+    def test_task8_shared_inspection_record_rejects_symlink(self):
+        root = self.root / "inspection-symlink"
+        root.mkdir()
+        seed = root / "seed"
+        seed.write_bytes(b"{}")
+        record = root / (".compiler-inspection-" + "a" * 64 + ".json")
+        try:
+            record.symlink_to(seed)
+        except OSError as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "inspection record namespace"
+        ):
+            capability_cache._shared_cache_root_namespace_usage(
+                root, self.pipeline_deadline
+            )
+
+    def test_task8_shared_root_deadline_closes_midscan_iterator(self):
+        class Entries:
+            def __init__(self):
+                self.closed = False
+                self.returned = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.closed = True
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.returned:
+                    raise StopIteration
+                self.returned = True
+                return type(
+                    "Entry",
+                    (),
+                    {"name": "ordinary", "path": "ordinary"},
+                )()
+
+        entries = Entries()
+        ticks = iter((0.0, 11.0))
+        with mock.patch.object(
+            capability_cache.os, "scandir", return_value=entries
+        ), mock.patch.object(
+            capability_cache.time,
+            "monotonic",
+            side_effect=lambda: next(ticks, 11.0),
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "deadline exceeded"
+        ):
+            capability_cache._shared_cache_root_namespace_usage(
+                self.cache_root, 10.0
+            )
+        self.assertTrue(entries.closed)
+
+    def test_task8_cache_prepare_polls_deadline_during_namespace_scan(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        with mock.patch.object(
+            capability_cache,
+            "_next_scandir_entry",
+            side_effect=AuditInfrastructureError("deadline exceeded"),
+        ) as next_entry, self.assertRaisesRegex(
+            AuditInfrastructureError, "deadline exceeded"
+        ):
+            cache.prepare(self.pipeline_deadline)
+        next_entry.assert_called()
+
+    def test_task8_cache_prepare_bounds_raw_namespace_entries(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        bucket = cache._results_root / "aa"
+        bucket.mkdir()
+        (bucket / "unexpected").write_bytes(b"")
+        with mock.patch.object(
+            capability_cache,
+            "_AUDIT_CACHE_PREPARE_MAXIMUM_NAMESPACE_ENTRIES",
+            0,
+            create=True,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "namespace entry bound"
+        ):
+            cache.prepare(self.pipeline_deadline)
+
+    def test_task8_cache_candidate_preparse_and_decode_receive_deadline(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        key = audit_cache_key(self.configuration.digest, self.engine)
+        budget = CompactResultMemoryBudget()
+        with mock.patch.object(
+            capability_cache,
+            "_preparse_audit_result_payload",
+            wraps=capability_cache._preparse_audit_result_payload,
+        ) as preparse:
+            candidate = cache._read_authenticated_candidate_metadata(
+                self.configuration,
+                key,
+                self.engine,
+                budget,
+                self.pipeline_deadline,
+            )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(
+            preparse.call_args.kwargs["deadline"], self.pipeline_deadline
+        )
+        candidate.metadata_ownership.release()
+        with mock.patch.object(
+            capability_cache,
+            "_decode_audit_result_payload",
+            wraps=capability_cache._decode_audit_result_payload,
+        ) as decode:
+            loaded = cache._read_authenticated_entry(
+                self.configuration,
+                key,
+                self.engine,
+                self.pipeline_deadline,
+            )
+        self.assertIsNotNone(loaded)
+        self.assertEqual(
+            decode.call_args.kwargs["deadline"], self.pipeline_deadline
+        )
+
+    def test_task8_cache_decode_deadline_is_not_downgraded_to_a_miss(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        with mock.patch.object(
+            capability_cache,
+            "_decode_audit_result_payload",
+            side_effect=capability_cache._AuditCacheMeasurementDeadline(
+                "deadline exceeded"
+            ),
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "deadline exceeded"
+        ):
+            cache.load(
+                self.configuration,
+                self.dependency_roots,
+                self.engine,
+                self.production_snapshot,
+                self.pipeline_deadline,
+            )
+
+    def test_task8_cache_measure_counts_only_authenticated_compact_entries(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        self.assertEqual(cache.measure(self.pipeline_deadline), (0, 0))
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        measured_bytes, entries = cache.measure(self.pipeline_deadline)
+        self.assertGreater(measured_bytes, 0)
+        self.assertEqual(entries, 1)
+        carrier_bytes = sum(
+            path.stat().st_size
+            for path in self.cache_root.rglob("*")
+            if path.name in {"manifest.json", "payload.json"}
+        )
+        self.assertEqual(measured_bytes, carrier_bytes)
+
+    def test_task8_cache_measure_reports_exact_251_result_entries(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        deadline = time.monotonic() + 120.0
+        for ordinal in range(251):
+            digest = f"{ordinal:064x}"
+            configuration = dataclasses.replace(
+                self.configuration, digest=digest
+            )
+            result = dataclasses.replace(
+                self.result, configuration_digest=digest
+            )
+            permit = ConfigurationAuditPublicationPermit(
+                digest,
+                result.audit_engine_fingerprint,
+                result.dependencies,
+            )
+            cache.publish(
+                configuration,
+                self.dependency_roots,
+                result,
+                permit,
+                deadline,
+            )
+        measured_bytes, entries = cache.measure(deadline)
+        self.assertEqual(entries, 251)
+        carrier_bytes = sum(
+            path.stat().st_size
+            for path in self.cache_root.rglob("*")
+            if path.name in {"manifest.json", "payload.json"}
+        )
+        self.assertEqual(measured_bytes, carrier_bytes)
+
+    def test_task8_cache_measure_streams_a_bounded_carrier_name_set(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        with mock.patch.object(
+            os,
+            "listdir",
+            side_effect=AssertionError("cache measurement retained directory names"),
+        ):
+            _measured_bytes, entries = cache.measure(self.pipeline_deadline)
+        self.assertEqual(entries, 1)
+
+    def test_task8_cache_measure_rejects_results_root_replacement_after_prepare(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        results = cache._results_root
+        attacker = self.cache_root / "attacker-results"
+        displaced = self.cache_root / "displaced-results"
+        shutil.copytree(results, attacker)
+        original_prepare = cache._prepare_locked
+        replaced = False
+
+        def prepare_then_replace(deadline):
+            nonlocal replaced
+            identity = original_prepare(deadline)
+            if not replaced:
+                os.rename(results, displaced)
+                os.rename(attacker, results)
+                replaced = True
+            return identity
+
+        with mock.patch.object(cache, "_prepare_locked", prepare_then_replace):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "replaced|unsafe|changed"
+            ):
+                cache.measure(self.pipeline_deadline)
+
+    def test_task8_cache_measure_excludes_inflight_publish_commit(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        entered_commit = threading.Event()
+        release_commit = threading.Event()
+        original_read = cache._read_authenticated_entry
+
+        def blocked_read(*args, **kwargs):
+            entered_commit.set()
+            if not release_commit.wait(10.0):
+                raise AssertionError("publish commit was not released")
+            return original_read(*args, **kwargs)
+
+        deadline = time.monotonic() + 30.0
+        with mock.patch.object(cache, "_read_authenticated_entry", blocked_read):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                publish = pool.submit(
+                    cache.publish,
+                    self.configuration,
+                    self.dependency_roots,
+                    self.result,
+                    self.publication_permit,
+                    deadline,
+                )
+                self.assertTrue(entered_commit.wait(10.0))
+                measurement = pool.submit(cache.measure, deadline)
+                time.sleep(0.1)
+                overlapped_commit = measurement.done()
+                release_commit.set()
+                publish.result(timeout=10.0)
+                measurement.result(timeout=10.0)
+        self.assertFalse(overlapped_commit)
+
+    def test_task8_cache_measure_rejects_authenticated_non_result_payload(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        key = audit_cache_key(self.configuration.digest, self.engine)
+        entry = cache._results_root / key[:2] / key
+        entry.mkdir(parents=True)
+        payload = b"{}"
+        (entry / "payload.json").write_bytes(payload)
+        (entry / "manifest.json").write_bytes(cache._manifest_bytes(key, payload))
+        self.assertEqual(cache.measure(self.pipeline_deadline), (0, 0))
+
+    def test_task8_cache_measure_closes_scandir_on_exception(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        (cache._results_root / "invalid-bucket").mkdir()
+        with warnings.catch_warnings(record=True) as observed:
+            warnings.simplefilter("always", ResourceWarning)
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "bucket name is invalid"
+            ):
+                cache.measure(self.pipeline_deadline)
+            gc.collect()
+        self.assertFalse(
+            any(item.category is ResourceWarning for item in observed)
+        )
+
+    def test_task8_cache_measure_excludes_valid_payload_under_forged_key(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        original_key = audit_cache_key(self.configuration.digest, self.engine)
+        original = cache._entry_path(original_key)
+        forged_key = "f" * 64
+        self.assertNotEqual(forged_key, original_key)
+        forged = cache._results_root / forged_key[:2] / forged_key
+        forged.mkdir(parents=True)
+        payload = (original / "payload.json").read_bytes()
+        (forged / "payload.json").write_bytes(payload)
+        (forged / "manifest.json").write_bytes(
+            cache._manifest_bytes(forged_key, payload)
+        )
+        _measured_bytes, entries = cache.measure(self.pipeline_deadline)
+        self.assertEqual(entries, 1)
+
+    def test_task8_cache_measure_rejects_bucket_replacement_before_hold(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        key = audit_cache_key(self.configuration.digest, self.engine)
+        bucket = cache._results_root / key[:2]
+        attacker = self.cache_root / "attacker-bucket"
+        displaced = self.cache_root / "displaced-bucket"
+        shutil.copytree(bucket, attacker)
+        replaced = False
+
+        def replace(path):
+            nonlocal replaced
+            if path == bucket and not replaced:
+                os.rename(bucket, displaced)
+                os.rename(attacker, bucket)
+                replaced = True
+
+        with mock.patch.object(
+            capability_cache, "_before_measure_bucket_hold", side_effect=replace
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "bucket was replaced"
+        ):
+            cache.measure(self.pipeline_deadline)
+
+    def test_task8_cache_measure_rejects_entry_replacement_before_hold(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        key = audit_cache_key(self.configuration.digest, self.engine)
+        entry = cache._entry_path(key)
+        attacker = self.cache_root / "attacker-entry"
+        displaced = self.cache_root / "displaced-entry"
+        shutil.copytree(entry, attacker)
+        replaced = False
+
+        def replace(path):
+            nonlocal replaced
+            if path == entry and not replaced:
+                os.rename(entry, displaced)
+                os.rename(attacker, entry)
+                replaced = True
+
+        with mock.patch.object(
+            capability_cache, "_before_measure_entry_hold", side_effect=replace
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "entry was replaced"
+        ):
+            cache.measure(self.pipeline_deadline)
+
+    def test_task8_cache_measure_waits_for_cleanup_and_observes_post_state(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        entered_remove = threading.Event()
+        release_remove = threading.Event()
+        original_remove = cache._remove_audit_entry
+
+        def blocked_remove(*args, **kwargs):
+            entered_remove.set()
+            if not release_remove.wait(10.0):
+                raise AssertionError("cleanup removal was not released")
+            return original_remove(*args, **kwargs)
+
+        deadline = time.monotonic() + 30.0
+        expired = time.time() + capability_cache._COMPLETE_SECONDS + 1.0
+        with mock.patch.object(
+            cache, "_remove_audit_entry", side_effect=blocked_remove
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                cleanup = pool.submit(cache.cleanup, expired, deadline)
+                self.assertTrue(entered_remove.wait(10.0))
+                measurement = pool.submit(cache.measure, deadline)
+                time.sleep(0.1)
+                overlapped_cleanup = measurement.done()
+                release_remove.set()
+                cleanup.result(timeout=10.0)
+                measured = measurement.result(timeout=10.0)
+        self.assertFalse(overlapped_cleanup)
+        self.assertEqual(measured, (0, 0))
+
+    def test_task8_cleanup_does_not_delete_replaced_fresh_generation(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        key = audit_cache_key(self.configuration.digest, self.engine)
+        entry = cache._entry_path(key)
+        replacement = self.cache_root / "replacement-entry"
+        displaced = self.cache_root / "stale-entry"
+        shutil.copytree(entry, replacement)
+        access = cache._access_path(key)
+        stale = time.time() - capability_cache._COMPLETE_SECONDS - 10.0
+        os.utime(access, (stale, stale))
+        observed_now = time.time()
+        original_key_lock = cache._key_lock
+        replaced = False
+
+        @contextlib.contextmanager
+        def replace_then_lock(lock_key, deadline):
+            nonlocal replaced
+            if lock_key == key and not replaced:
+                os.rename(entry, displaced)
+                os.rename(replacement, entry)
+                os.utime(access, (observed_now, observed_now))
+                replaced = True
+            with original_key_lock(lock_key, deadline):
+                yield
+
+        with mock.patch.object(cache, "_key_lock", replace_then_lock):
+            cache.cleanup(observed_now, self.pipeline_deadline)
+        self.assertTrue(entry.is_dir())
+        self.assertEqual(cache.measure(self.pipeline_deadline)[1], 1)
+
+    def test_task8_measurement_semantic_preparse_expires_mid_payload(self):
+        findings = tuple(
+            AuditResultFinding(
+                PurePosixPath(f"playback/finding-{index:03}.cpp"),
+                index + 1,
+                f"expression-{index:03}",
+                "reason",
+            )
+            for index in range(32)
+        )
+        result = dataclasses.replace(self.result, findings=findings)
+        payload = capability_cache._encode_audit_result_payload(result)
+        key = audit_cache_key(self.configuration.digest, self.engine)
+        ticks = iter((0.0, 0.0, 0.0, 0.0, 11.0))
+        with mock.patch.object(
+            capability_cache.time,
+            "monotonic",
+            side_effect=lambda: next(ticks, 11.0),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "deadline exceeded"):
+            capability_cache._measurement_payload_is_authentic(
+                payload, key, 10.0
+            )
+
+    def test_task8_cache_measure_checks_deadline_after_each_scandir_next(self):
+        directory = self.cache_root / "bounded-names"
+        directory.mkdir(parents=True)
+        (directory / "manifest.json").write_bytes(b"x")
+        ticks = iter((0.0, 11.0))
+        with capability_cache._HeldDirectory(directory) as held, mock.patch.object(
+            capability_cache.time,
+            "monotonic",
+            side_effect=lambda: next(ticks, 11.0),
+        ), self.assertRaisesRegex(AuditInfrastructureError, "deadline exceeded"):
+            held.bounded_names(10.0)
+        measure_source = inspect.getsource(ConfigurationAuditCache.measure)
+        self.assertGreaterEqual(
+            measure_source.count("_next_scandir_entry("), 2
+        )
+
+    def test_task8_cache_measure_releases_every_lane_after_unlock_error(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        original_unlock = capability_cache._PublicationGuard._unlock
+        unlock_calls = []
+
+        def fail_first_unlock(stream):
+            unlock_calls.append(stream)
+            if len(unlock_calls) == 1:
+                raise OSError("injected lane unlock failure")
+            return original_unlock(stream)
+
+        with mock.patch.object(
+            capability_cache._PublicationGuard,
+            "_unlock",
+            side_effect=fail_first_unlock,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "barrier release"
+        ):
+            cache.measure(self.pipeline_deadline)
+        self.assertGreaterEqual(len(unlock_calls), 9)
+        lane_zero_key = next(
+            f"{value:064x}"
+            for value in range(1024)
+            if hashlib.sha256(
+                f"preprocess:{value:064x}".encode("utf-8")
+            ).digest()[0]
+            % capability_cache._LOCK_NAMESPACE_LANE_COUNT
+            == 0
+        )
+        with cache._key_lock(lane_zero_key, time.monotonic() + 5.0):
+            pass
+
+    def test_task8_cleanup_ignores_wrong_key_payload_before_eviction(self):
+        cache = ConfigurationAuditCache(self.cache_root, maximum_entries=1)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        original_key = audit_cache_key(self.configuration.digest, self.engine)
+        original = cache._entry_path(original_key)
+        forged_key = "f" * 64
+        self.assertNotEqual(forged_key, original_key)
+        forged = cache._results_root / forged_key[:2] / forged_key
+        forged.mkdir(parents=True)
+        payload = (original / "payload.json").read_bytes()
+        (forged / "payload.json").write_bytes(payload)
+        (forged / "manifest.json").write_bytes(
+            cache._manifest_bytes(forged_key, payload)
+        )
+        cache.cleanup(time.time(), self.pipeline_deadline)
+        self.assertTrue(original.is_dir())
+
+    def test_task8_cleanup_streams_bounded_held_carriers(self):
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        with mock.patch.object(
+            os,
+            "listdir",
+            side_effect=AssertionError("cleanup retained directory names"),
+        ), mock.patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("cleanup used an unbounded path read"),
+        ):
+            cache.cleanup(time.time(), self.pipeline_deadline)
+        source = inspect.getsource(ConfigurationAuditCache.cleanup)
+        source += inspect.getsource(ConfigurationAuditCache._inspect_cleanup_entry)
+        self.assertGreaterEqual(source.count("_next_scandir_entry("), 2)
+        self.assertIn("bounded_names(deadline)", source)
+
+    def test_task8_cleanup_quota_rechecks_access_under_key_lock(self):
+        cache = ConfigurationAuditCache(self.cache_root, maximum_entries=0)
+        cache.prepare(self.pipeline_deadline)
+        cache.publish(
+            self.configuration,
+            self.dependency_roots,
+            self.result,
+            self.publication_permit,
+            self.pipeline_deadline,
+        )
+        key = audit_cache_key(self.configuration.digest, self.engine)
+        entry = cache._entry_path(key)
+        access = cache._access_path(key)
+        observed_now = time.time()
+        stale = observed_now - 10.0
+        os.utime(access, (stale, stale))
+        original_key_lock = cache._key_lock
+        refreshed = False
+
+        @contextlib.contextmanager
+        def refresh_then_lock(lock_key, deadline):
+            nonlocal refreshed
+            if lock_key == key and not refreshed:
+                os.utime(access, (observed_now, observed_now))
+                refreshed = True
+            with original_key_lock(lock_key, deadline):
+                yield
+
+        with mock.patch.object(cache, "_key_lock", refresh_then_lock):
+            cache.cleanup(observed_now, self.pipeline_deadline)
+        self.assertTrue(entry.is_dir())
+
+    def test_task8_measurement_generation_baseline_precedes_direntry_stat(self):
+        source = inspect.getsource(ConfigurationAuditCache.measure)
+        self.assertLess(
+            source.index("bucket_generation = _directory_identity("),
+            source.index("bucket_metadata = raw_bucket.stat("),
+        )
+        self.assertLess(
+            source.index("entry_generation = _directory_identity("),
+            source.index("entry_metadata = raw_entry.stat("),
+        )
 
     def _transport_outcome(
         self,
@@ -5460,6 +6304,18 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 CompactResultColdSlot(1 << 20), self.pipeline_deadline,
             )
         self.assertEqual((batch.hit_count, batch.misses), (1, ()))
+        payload_bytes = len(capability_cache._encode_audit_result_payload(self.result))
+        self.assertEqual(batch.maximum_encoded_result_bytes, payload_bytes)
+        self.assertEqual(
+            batch.maximum_conservative_decoded_bytes,
+            capability_cache.compact_result_conservative_decoded_bytes(
+                payload_bytes
+            ),
+        )
+        self.assertEqual(
+            batch.maximum_conservative_retained_bytes,
+            capability_cache.compact_result_retained_bytes(self.result),
+        )
         self.assertEqual(decoded.call_count, 1)
         self.assertEqual(
             tuple(
@@ -5477,6 +6333,61 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 ),
             ),
         )
+
+    def test_task8_warm_empty_main_proof_becomes_authoritative_coverage(self):
+        self.main_path.write_bytes(b"")
+        metadata = self.main_path.stat()
+        empty_identity = dataclasses.replace(
+            self.main,
+            device=int(metadata.st_dev),
+            inode=int(metadata.st_ino) or None,
+            line_count=0,
+        )
+        configuration = dataclasses.replace(
+            self.configuration,
+            source=empty_identity,
+            digest="d" * 64,
+        )
+        dependency = DependencyDigest(
+            "production",
+            empty_identity.relative,
+            empty_identity,
+            hashlib.sha256(b"").hexdigest(),
+        )
+        result = ConfigurationAuditResult(
+            configuration.digest, self.engine, (dependency,), (), ()
+        )
+        cache = ConfigurationAuditCache(self.cache_root)
+        cache.publish(
+            configuration,
+            self.dependency_roots,
+            result,
+            ConfigurationAuditPublicationPermit(
+                result.configuration_digest,
+                result.audit_engine_fingerprint,
+                result.dependencies,
+            ),
+            self.pipeline_deadline,
+        )
+        budget = CompactResultMemoryBudget()
+        aggregator = StreamingResultAggregator(
+            (configuration,), budget, capability_cache.AuditLimits(),
+            require_main_provenance=True,
+        )
+        batch = cache.load_many(
+            (configuration,),
+            self.dependency_roots,
+            self.engine,
+            {empty_identity.relative: dependency},
+            budget,
+            aggregator,
+            CompactResultColdSlot(1 << 20),
+            self.pipeline_deadline,
+        )
+        self.assertEqual((batch.hit_count, batch.misses), (1, ()))
+        summary = aggregator.finish()
+        self.assertEqual(summary.reached_production, (empty_identity.relative,))
+        summary.release()
 
     def test_decoded_result_charge_outlives_every_cache_reference(self):
         cache = ConfigurationAuditCache(self.cache_root)
@@ -6296,6 +7207,14 @@ class ConfigurationAuditCacheTests(unittest.TestCase, _PreprocessCacheFixture):
                 CompactResultColdSlot(1 << 20), self.pipeline_deadline,
             )
         self.assertEqual((batch.hit_count, batch.misses), (0, configurations[1:]))
+        self.assertEqual(
+            (
+                batch.maximum_encoded_result_bytes,
+                batch.maximum_conservative_decoded_bytes,
+                batch.maximum_conservative_retained_bytes,
+            ),
+            (0, 0, 0),
+        )
         self.assertEqual(aggregator.accepted_count, 1)
         recorded_access.assert_not_called()
         self.main_path.write_bytes(original_dependency)
