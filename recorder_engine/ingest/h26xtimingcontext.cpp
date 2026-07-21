@@ -1542,12 +1542,10 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         if (sawPresentTimestamp) {
             if (!previousTimestampComparable || !currentTimestampComparable) {
                 orderingUnavailable = true;
-            } else if (currentClockTimestamp < previousClockTimestamp) {
-                result.status = TimecodeParseStatus::Malformed;
-                return result;
-            } else if (picStruct >= 3 && picStruct <= 6 &&
-                       currentClockTimestamp == previousClockTimestamp &&
-                       i == previousTimestampIndex + 1 && (ctType == 1 || previousCtType == 1)) {
+            } else if (currentClockTimestamp < previousClockTimestamp ||
+                       (picStruct >= 3 && picStruct <= 6 &&
+                        currentClockTimestamp == previousClockTimestamp &&
+                        i == previousTimestampIndex + 1 && (ctType == 1 || previousCtType == 1))) {
                 result.status = TimecodeParseStatus::Malformed;
                 return result;
             }
@@ -1599,6 +1597,8 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         case 5:
         case 6:
             mappingRepresentable = false;
+            break;
+        default:
             break;
         }
         if (!mappingRepresentable) unsupportedMapping = true;
@@ -1885,6 +1885,8 @@ H26xTimingDetail::TimecodeParseResult H26xTimingDetail::parseHevcTimeCode(
         case 5:
         case 6:
             representable = false;
+            break;
+        default:
             break;
         }
         HevcTimeCodeOutput currentOutput;

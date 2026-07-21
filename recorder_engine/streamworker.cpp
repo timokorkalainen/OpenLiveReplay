@@ -110,8 +110,13 @@ StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, Re
 }
 
 StreamWorker::~StreamWorker() {
-    stop();
-    wait();
+    // Destructors are implicitly noexcept; never let a teardown failure escape.
+    try {
+        stop();
+        wait();
+    } catch (...) {
+        qWarning("StreamWorker: swallowed an exception during destruction");
+    }
 }
 
 void StreamWorker::setConnected(bool c) {
@@ -328,6 +333,8 @@ void StreamWorker::enqueueDecodedVideoFrame(DecodedVideoFrame decoded) {
         if (decoded.frame) av_frame_free(&decoded.frame);
         return;
     }
+    // std::move is a no-op here in CPU-only builds but moves the move-only gpuFrame
+    // in GPU builds, so it must stay. NOLINTNEXTLINE(performance-move-const-arg)
     enqueueDecodedVideoFrameForSession(std::move(decoded), active->sessionIdentity);
 }
 
@@ -348,7 +355,7 @@ void StreamWorker::enqueueDecodedVideoFrameForSession(DecodedVideoFrame decoded,
     qf.frame = decoded.frame;
     qf.sourcePts = decoded.sourcePtsMs;
     qf.sourceTimecode100ns = decoded.sourceTimecode100ns;
-    qf.timecodeEvidence = std::move(decoded.timecodeEvidence);
+    qf.timecodeEvidence = decoded.timecodeEvidence;
 #if defined(OLR_GPU_PIPELINE_BUILD)
     qf.gpuFrame = std::move(decoded.gpuFrame);
     qf.gpuFenceValue = decoded.gpuFenceValue;
@@ -388,7 +395,7 @@ std::optional<TimecodeEvidence>
 StreamWorker::takeFrameTimecodeEvidenceForMux(std::optional<TimecodeEvidence>& selected,
                                               int64_t sessionFrameIndex) const {
     if (!selected) return std::nullopt;
-    std::optional<TimecodeEvidence> evidence = std::move(selected);
+    std::optional<TimecodeEvidence> evidence = selected;
     selected.reset();
     evidence->arrivalSessionFrame = sessionFrameIndex;
     evidence->sessionRate = FrameRateQ{m_targetFps, 1};
@@ -429,7 +436,7 @@ std::optional<DecodedFrameEvidence> StreamWorker::takeMuxFrameEvidence(int64_t p
     auto evidence = m_muxFrameEvidence.takeForOutputPts(ptsTicks);
     if (!evidence) return std::nullopt;
     const SourceCarrierToken token{evidence->carrierSessionIdentity, evidence->carrierGeneration};
-    return carrierTokenIsCurrentLocked(token) ? std::move(evidence) : std::nullopt;
+    return carrierTokenIsCurrentLocked(token) ? evidence : std::nullopt;
 }
 
 std::optional<DecodedFrameEvidence>
@@ -918,7 +925,7 @@ bool StreamWorker::populateMuxCompletion(uint64_t completionId,
         ++group.pendingWrites;
     }
     slot.carrierToken = carrierToken;
-    slot.evidence = std::move(evidence);
+    slot.evidence = evidence;
     return true;
 }
 
@@ -991,7 +998,7 @@ void StreamWorker::completeMuxWrite(uint64_t completionId, bool written) {
         if (!decodePoolId(completionId, kMuxCompletionPoolCapacity, &index, &generation)) return;
         MuxCompletionSlot& slot = m_muxCompletionPool[index];
         if (!slot.active || slot.generation != generation) return;
-        evidence = std::move(slot.evidence);
+        evidence = slot.evidence;
         carrierToken = slot.carrierToken;
         const uint64_t encodeSubmissionId = slot.encodeSubmissionId;
         const uint32_t keepGeneration = slot.generation;
@@ -1208,8 +1215,10 @@ void StreamWorker::commitBufferedEncodeSubmission(uint64_t submissionId) {
                         for (size_t i = 0; i < uniqueCount; ++i)
                             frameEvidence[i] =
                                 m_muxFrameEvidence.takeBySubmissionId(evidenceIds[i]);
-                        sourceTimecode100ns =
-                            frameEvidence[packetEvidenceIndices[0]]->sourceTimecode100ns;
+                        // Each entry was just taken above under this lock and is present;
+                        // guard the access defensively so it is never dereferenced empty.
+                        if (const auto& firstEvidence = frameEvidence[packetEvidenceIndices[0]])
+                            sourceTimecode100ns = firstEvidence->sourceTimecode100ns;
                         for (size_t i = 0; i < packetCount; ++i) {
                             const size_t completionIndex = completionIndices[i];
                             MuxCompletionSlot& completion = m_muxCompletionPool[completionIndex];
@@ -1221,8 +1230,8 @@ void StreamWorker::commitBufferedEncodeSubmission(uint64_t submissionId) {
                             completion.encodeSubmissionId = submissionId;
                             const size_t evidenceIndex = packetEvidenceIndices[i];
                             if (firstPacketIndices[evidenceIndex] == i) {
-                                completion.evidence =
-                                    std::move(frameEvidence[evidenceIndex]->timecodeEvidence);
+                                const auto& evidence = frameEvidence[evidenceIndex];
+                                if (evidence) completion.evidence = evidence->timecodeEvidence;
                             }
                             completionIds[i] = poolId(completionIndex, generation);
                         }
@@ -1331,7 +1340,7 @@ void StreamWorker::handleEncodedPacket(uint64_t submissionId, const QByteArray& 
         return;
     }
     std::optional<TimecodeEvidence> muxEvidence;
-    if (frameEvidence) muxEvidence = std::move(frameEvidence->timecodeEvidence);
+    if (frameEvidence) muxEvidence = frameEvidence->timecodeEvidence;
     const SourceCarrierToken completionToken =
         frameEvidence ? SourceCarrierToken{frameEvidence->carrierSessionIdentity,
                                            frameEvidence->carrierGeneration}
@@ -1361,7 +1370,7 @@ void StreamWorker::handleEncodedPacket(uint64_t submissionId, const QByteArray& 
 #ifdef OLR_UNIT_TEST
     runBeforeMuxPacketWriteForTest();
 #endif
-    if (!populateMuxCompletion(completionId, completionToken, std::move(muxEvidence))) {
+    if (!populateMuxCompletion(completionId, completionToken, muxEvidence)) {
         av_packet_free(&pkt);
         releaseMuxCompletionReservation(completionId);
         if (gpu) failEncodeSubmission(submissionId);
@@ -1482,7 +1491,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             if (pulled) av_frame_free(&pulled);
             pulled = top.frame;
             pulledTimecode100ns = top.sourceTimecode100ns;
-            pulledTimecodeEvidence = std::move(top.timecodeEvidence);
+            pulledTimecodeEvidence = top.timecodeEvidence;
             pulledCarrierToken = std::move(top.carrierToken);
             pulledAnyFrame = true;
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -1669,7 +1678,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                     if (evidenceSubmission.id != 0) discardMuxFrameEvidence(evidenceSubmission.id);
                     finishEncodeSubmission(submissionId);
                     if (muxEvidence && !m_latestFrameTimecodeEvidence)
-                        m_latestFrameTimecodeEvidence = std::move(muxEvidence);
+                        m_latestFrameTimecodeEvidence = muxEvidence;
                 } else {
                     bool encoded = false;
                     {
@@ -1687,7 +1696,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                         if (encoded) qWarning() << "Native encoder exceeded bounded packet batch";
                         discardMuxFrameEvidence(evidenceSubmission.id);
                         if (muxEvidence && !m_latestFrameTimecodeEvidence)
-                            m_latestFrameTimecodeEvidence = std::move(muxEvidence);
+                            m_latestFrameTimecodeEvidence = muxEvidence;
                     }
                 }
             }
@@ -1714,7 +1723,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                                         submissionToken, hasSyntheticCpuLatest);
             if (evidenceSubmission.id == 0) {
                 if (selectedEvidence && !m_latestFrameTimecodeEvidence)
-                    m_latestFrameTimecodeEvidence = std::move(selectedEvidence);
+                    m_latestFrameTimecodeEvidence = selectedEvidence;
             } else {
                 bool encodeAccepted = false;
                 bool receivedPacket = false;
@@ -1778,7 +1787,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                 } else {
                     discardMuxFrameEvidence(evidenceSubmission.id);
                     if (selectedEvidence && !m_latestFrameTimecodeEvidence)
-                        m_latestFrameTimecodeEvidence = std::move(selectedEvidence);
+                        m_latestFrameTimecodeEvidence = selectedEvidence;
                 }
             }
         }
@@ -1789,8 +1798,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         // For H.264, packets were written inline in the callback above.
         if (m_videoCodec != VideoCodecChoice::H264Hardware && encCtx) {
             std::optional<TimecodeEvidence> muxEvidence;
-            if (softwareFrameEvidence)
-                muxEvidence = std::move(softwareFrameEvidence->timecodeEvidence);
+            if (softwareFrameEvidence) muxEvidence = softwareFrameEvidence->timecodeEvidence;
             const uint64_t evidenceEpoch =
                 softwareFrameEvidence ? softwareFrameEvidence->carrierGeneration : 0;
             const SourceCarrierToken evidenceToken =
@@ -1808,12 +1816,10 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 #ifdef OLR_UNIT_TEST
             runBeforeMuxPacketWriteForTest();
 #endif
-            if (evidenceEpoch > 0 && !carrierTokenIsCurrent(evidenceToken)) {
-                havePacket = false;
-                releaseMuxCompletionReservation(softwareCompletionId);
-                softwareCompletionId = 0;
-            } else if (!populateMuxCompletion(softwareCompletionId, evidenceToken,
-                                              std::move(muxEvidence))) {
+            // Reject the packet on either a stale carrier or a failed completion
+            // populate (short-circuit keeps populateMuxCompletion out of the stale path).
+            if ((evidenceEpoch > 0 && !carrierTokenIsCurrent(evidenceToken)) ||
+                !populateMuxCompletion(softwareCompletionId, evidenceToken, muxEvidence)) {
                 havePacket = false;
                 releaseMuxCompletionReservation(softwareCompletionId);
                 softwareCompletionId = 0;
@@ -1910,6 +1916,8 @@ void StreamWorker::captureLoop() {
         };
 #endif
         callbacks.onVideoFrame = [this, captureSessionIdentity](DecodedVideoFrame decoded) {
+            // Moves the move-only gpuFrame in GPU builds; no-op in CPU-only builds.
+            // NOLINTNEXTLINE(performance-move-const-arg)
             enqueueDecodedVideoFrameForSession(std::move(decoded), captureSessionIdentity);
         };
         callbacks.onAudioChunk = [this, captureSessionIdentity](DecodedAudioChunk chunk) {
@@ -2152,11 +2160,14 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
 
     // Paint blue frame
     // Y plane (Brightness) - set to medium
-    memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
+    memset(m_latestFrame->data[0], 128,
+           static_cast<size_t>(m_latestFrame->linesize[0]) * m_latestFrame->height);
     // U plane (Blue Chrominance) - set to max
-    memset(m_latestFrame->data[1], 255, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
+    memset(m_latestFrame->data[1], 255,
+           static_cast<size_t>(m_latestFrame->linesize[1]) * (m_latestFrame->height / 2));
     // V plane (Red Chrominance) - set to low
-    memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
+    memset(m_latestFrame->data[2], 107,
+           static_cast<size_t>(m_latestFrame->linesize[2]) * (m_latestFrame->height / 2));
 
     return avcodec_open2(*encCtx, encoder, nullptr) >= 0;
 }

@@ -109,16 +109,16 @@ bool TimecodeEvidence::valid() const {
         if (dropFrame) return false;
         using I128 = __int128;
         const I128 rounded =
-            (I128(labelRate.num) * (24 * 60 * 60) + labelRate.den / 2) / labelRate.den;
+            (I128(labelRate.num) * (I128{24} * 60 * 60) + labelRate.den / 2) / labelRate.den;
         if (rounded <= 0 || rounded > std::numeric_limits<int64_t>::max()) return false;
         framesPerDay = int64_t(rounded);
     } else if (nominalRate <= 0 ||
-               !checkedMultiplyAdd(nominalRate, 24 * 60 * 60, 0, &framesPerDay)) {
+               !checkedMultiplyAdd(nominalRate, int64_t{24} * 60 * 60, 0, &framesPerDay)) {
         return false;
     }
 
     if (droppedLabelsPerMinute > 0) {
-        constexpr int64_t kMinutesPerDay = 24 * 60;
+        constexpr int64_t kMinutesPerDay = int64_t{24} * 60;
         constexpr int64_t kDropMinutesPerDay = kMinutesPerDay - kMinutesPerDay / 10;
         int64_t droppedLabelsPerDay = 0;
         if (!checkedMultiplyAdd(droppedLabelsPerMinute, kDropMinutesPerDay, 0,
@@ -136,7 +136,7 @@ std::optional<FrameRateQ> canonicalFrameRate(double framesPerSecond) {
         return std::nullopt;
 
     struct CanonicalRate {
-        double fps;
+        double fps = 0.0;
         FrameRateQ rate;
     };
     constexpr CanonicalRate canonical[] = {

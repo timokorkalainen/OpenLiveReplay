@@ -18,7 +18,12 @@ Muxer::Muxer() {
 }
 
 Muxer::~Muxer() {
-    close();
+    // Destructors are implicitly noexcept; never let a teardown failure escape.
+    try {
+        close();
+    } catch (...) {
+        qWarning("Muxer: swallowed an exception while closing during destruction");
+    }
 }
 
 namespace {
@@ -620,7 +625,7 @@ void Muxer::writerLoop() {
                 continue;
             }
             if (!m_pktQueue.front().carrierGuard.accepts()) {
-                queued = std::move(m_pktQueue.front());
+                queued = m_pktQueue.front();
                 m_pktQueue.pop();
                 lk.unlock();
                 m_qCv.notify_one();
@@ -663,7 +668,7 @@ void Muxer::writerLoop() {
             // ordered after the header boundary and cannot retroactively seed it.
             lk.lock();
             if (!m_pktQueue.front().carrierGuard.accepts()) {
-                queued = std::move(m_pktQueue.front());
+                queued = m_pktQueue.front();
                 m_pktQueue.pop();
                 lk.unlock();
                 m_qCv.notify_one();
@@ -744,7 +749,7 @@ void Muxer::writerLoop() {
                 ++m_candidateWindowGeneration;
                 if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
                 if (samePacket && !packetCarrierCurrent) {
-                    queued = std::move(m_pktQueue.front());
+                    queued = m_pktQueue.front();
                     m_pktQueue.pop();
                 }
                 lk.unlock();
@@ -796,7 +801,7 @@ void Muxer::writerLoop() {
                 if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
                 if (!m_pktQueue.empty() && m_pktQueue.front().sequence == packetSequence &&
                     !m_pktQueue.front().carrierGuard.accepts()) {
-                    queued = std::move(m_pktQueue.front());
+                    queued = m_pktQueue.front();
                     m_pktQueue.pop();
                 }
             }
@@ -840,7 +845,7 @@ void Muxer::writerLoop() {
                     if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
                 }
                 if (samePacket && !packetCurrent) {
-                    queued = std::move(m_pktQueue.front());
+                    queued = m_pktQueue.front();
                     m_pktQueue.pop();
                 }
             }
@@ -855,7 +860,7 @@ void Muxer::writerLoop() {
         {
             std::lock_guard<std::mutex> queueLock(m_qMutex);
             if (m_pktQueue.empty() || m_pktQueue.front().sequence != packetSequence) continue;
-            queued = std::move(m_pktQueue.front());
+            queued = m_pktQueue.front();
             m_pktQueue.pop();
             if (headerStatus == HeaderCommitStatus::Written) {
                 m_candidateWindowState = CandidateWindowState::Committed;

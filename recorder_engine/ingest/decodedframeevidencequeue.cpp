@@ -17,7 +17,7 @@ uint64_t DecodedFrameEvidenceQueue::enqueue(DecodedFrameEvidence evidence) {
     }
     const uint64_t submissionId = m_nextSubmissionId;
     if (m_nextSubmissionId != std::numeric_limits<uint64_t>::max()) ++m_nextSubmissionId;
-    m_entries.push_back({submissionId, std::move(evidence)});
+    m_entries.push_back({submissionId, evidence});
     return submissionId;
 }
 
@@ -46,7 +46,7 @@ DecodedFrameEvidenceQueue::takeBySubmissionId(uint64_t submissionId) {
     while (found != m_entries.end() && found->submissionId != submissionId)
         ++found;
     if (found == m_entries.end()) return std::nullopt;
-    DecodedFrameEvidence evidence = std::move(found->evidence);
+    DecodedFrameEvidence evidence = found->evidence;
     m_entries.erase(found);
     return evidence;
 }

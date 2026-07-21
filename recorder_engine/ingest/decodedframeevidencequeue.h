@@ -20,15 +20,15 @@ struct DecodedFrameEvidence {
 
     DecodedFrameEvidence(qint64 codecPts, int64_t sourcePts, int64_t sourceTimecode,
                          std::optional<TimecodeEvidence> timingEvidence)
-        : DecodedFrameEvidence(codecPts, sourcePts, sourceTimecode, std::move(timingEvidence),
+        : DecodedFrameEvidence(codecPts, sourcePts, sourceTimecode, timingEvidence,
                                CarrierSessionIdentity{}, CarrierGeneration{}) {}
 
     DecodedFrameEvidence(qint64 codecPts, int64_t sourcePts, int64_t sourceTimecode,
                          std::optional<TimecodeEvidence> timingEvidence,
                          CarrierSessionIdentity sessionIdentity, CarrierGeneration generation)
         : codecPts90k(codecPts), sourcePtsMs(sourcePts), sourceTimecode100ns(sourceTimecode),
-          timecodeEvidence(std::move(timingEvidence)),
-          carrierSessionIdentity(sessionIdentity.value), carrierGeneration(generation.value) {}
+          timecodeEvidence(timingEvidence), carrierSessionIdentity(sessionIdentity.value),
+          carrierGeneration(generation.value) {}
 
     qint64 codecPts90k = 0;
     int64_t sourcePtsMs = -1;

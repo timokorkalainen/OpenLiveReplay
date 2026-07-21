@@ -295,6 +295,9 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(
             parsed = H26xTimingDetail::parseH264PicTiming(rbsp.mid(pos, int(payloadSize)),
                                                           *context->h264());
             handled = true;
+            // Distinct SEI payload cases legitimately share the "unsupported" outcome; they
+            // cannot merge because the specific handled cases must precede these fallbacks.
+            // NOLINTNEXTLINE(bugprone-branch-clone)
         } else if (codec == NativeVideoCodec::H264 && payloadType == 1) {
             sawUnsupported = true;
         } else if (payloadType == 4 &&
@@ -410,7 +413,8 @@ extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTiming
             continue;
         }
         if (codec == NativeVideoCodec::Hevc) {
-            const int layerId = ((uchar(nal[0]) & 0x01u) << 5) | (uchar(nal[1]) >> 3);
+            const int layerId =
+                static_cast<int>(((uchar(nal[0]) & 0x01u) << 5) | (uchar(nal[1]) >> 3));
             if (layerId != 0) {
                 sawUnsupported = true;
                 continue;
@@ -478,6 +482,9 @@ extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTiming
                 sawMalformed = true;
             }
         }
+        // The Malformed and the Hevc-mismatch cases share the sawMalformed outcome but are
+        // distinct, order-dependent status checks that cannot be merged.
+        // NOLINTNEXTLINE(bugprone-branch-clone)
         if (parsed.status == TimecodeParseStatus::Malformed) {
             sawMalformed = true;
         } else if (parsed.status == TimecodeParseStatus::Unsupported) {

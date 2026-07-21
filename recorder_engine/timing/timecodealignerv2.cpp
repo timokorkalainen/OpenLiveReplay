@@ -90,6 +90,7 @@ bool absoluteWithinUs(Rational value, int64_t boundUs, bool strict = false) {
 }
 
 bool roundToInt64(Rational value, int64_t* out) {
+    if (value.denominator == 0) return false;
     I128 roundedNumerator = 0;
     if (!checkedAdd(absolute(value.numerator), value.denominator / 2, &roundedNumerator))
         return false;
@@ -120,11 +121,12 @@ bool framesPerDay(const TimecodeEvidence& evidence, int64_t* out) {
 
     I128 frames = 0;
     if (evidence.provenance == TimecodeProvenance::Ndi) {
-        frames = (I128(evidence.labelRate.num) * (24 * 60 * 60) + evidence.labelRate.den / 2) /
-                 evidence.labelRate.den;
+        frames =
+            (I128(evidence.labelRate.num) * (I128{24} * 60 * 60) + evidence.labelRate.den / 2) /
+            evidence.labelRate.den;
         if (evidence.dropFrame) return false;
     } else {
-        frames = I128(nominalRate) * (24 * 60 * 60);
+        frames = I128(nominalRate) * (I128{24} * 60 * 60);
         if (evidence.dropFrame) {
             int droppedLabelsPerMinute = 0;
             if (evidence.labelRate == FrameRateQ{30000, 1001})
