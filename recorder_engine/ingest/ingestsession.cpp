@@ -1,6 +1,27 @@
 #include "ingestsession.h"
 
+#include "decodedframeevidencequeue.h"
+
 #include <QtGlobal>
+
+extern "C" {
+#include <libavutil/avutil.h>
+#include <libavutil/frame.h>
+}
+
+DecodedVideoFrame decodedCpuVideoFrameForOutput(AVFrame* frame,
+                                                const DecodedFrameEvidence* evidence) {
+    DecodedVideoFrame decodedFrame;
+    decodedFrame.frame = frame;
+    if (evidence) {
+        decodedFrame.sourcePtsMs = evidence->sourcePtsMs;
+        decodedFrame.sourceTimecode100ns = evidence->sourceTimecode100ns;
+        decodedFrame.timecodeEvidence = evidence->timecodeEvidence;
+    } else if (frame && frame->pts != AV_NOPTS_VALUE) {
+        decodedFrame.sourcePtsMs = frame->pts / 90;
+    }
+    return decodedFrame;
+}
 
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options) {
     const QString scheme = url.scheme().toLower();

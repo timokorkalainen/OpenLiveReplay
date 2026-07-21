@@ -25,10 +25,12 @@
 #endif
 #include <QDebug>
 #include <QDateTime>
+#include <QScopeGuard>
 #include <QUrl>
 #include <QtGlobal>
 
 #include <atomic>
+#include <array>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -38,6 +40,30 @@ extern "C" {
 }
 
 namespace {
+uint64_t nextStreamWorkerInstanceIdentity() {
+    static std::atomic<uint64_t> nextIdentity{1};
+    const uint64_t identity = nextIdentity.fetch_add(1, std::memory_order_relaxed);
+    if (identity == 0) qFatal("StreamWorker instance identity exhausted");
+    return identity;
+}
+
+bool sameTimecodeIdentity(const TimecodeEvidence& a, const TimecodeEvidence& b) {
+    return a.labelRate == b.labelRate && a.sourceGeneration == b.sourceGeneration &&
+           a.timingGeneration == b.timingGeneration && a.provenance == b.provenance &&
+           a.dropFrame == b.dropFrame && a.sessionRate == b.sessionRate;
+}
+
+#if defined(OLR_GPU_PIPELINE_BUILD)
+bool sameTimecodeEvidence(const TimecodeEvidence& a, const TimecodeEvidence& b) {
+    return a.frameOfDay == b.frameOfDay && a.labelRate == b.labelRate &&
+           a.sourceGeneration == b.sourceGeneration && a.timingGeneration == b.timingGeneration &&
+           a.provenance == b.provenance && a.dropFrame == b.dropFrame &&
+           a.discontinuity == b.discontinuity && a.arrivalSessionFrame == b.arrivalSessionFrame &&
+           a.sessionRate == b.sessionRate && a.quantizationBoundUs == b.quantizationBoundUs &&
+           a.driftBoundUs == b.driftBoundUs;
+}
+#endif
+
 QString ingestFailureKindForLog(IngestFailureKind failure) {
     switch (failure) {
     case IngestFailureKind::UnsupportedProfile:
@@ -58,12 +84,17 @@ QString ingestFailureKindForLog(IngestFailureKind failure) {
 StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
                            int targetWidth, int targetHeight, int targetFps, int targetFpsNum,
                            int targetFpsDen, VideoCodecChoice codec, QObject* parent)
-    : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer),
+    : QThread(parent), m_url(url), m_sourceIndex(sourceIndex),
+      m_workerInstanceIdentity(nextStreamWorkerInstanceIdentity()), m_viewTrack(-1), m_muxer(muxer),
       m_sharedClock(clock) {
     m_videoCodec = codec;
     qRegisterMetaType<IngestStats>("IngestStats");
+    qRegisterMetaType<TimecodeEvidence>("TimecodeEvidence");
     m_restartCapture = 0;
     m_internalFrameCount = 0;
+    m_submissionPool = std::make_unique<EncodeSubmissionSlot[]>(kSubmissionPoolCapacity);
+    m_muxCompletionPool = std::make_unique<MuxCompletionSlot[]>(kMuxCompletionPoolCapacity);
+    m_activeCarrierToken = std::make_shared<const SourceCarrierToken>(SourceCarrierToken{0, 1});
     m_monotonic.start();
     if (targetWidth > 0) m_targetWidth = targetWidth;
     if (targetHeight > 0) m_targetHeight = targetHeight;
@@ -79,17 +110,193 @@ StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, Re
 }
 
 StreamWorker::~StreamWorker() {
-    stop();
-    wait();
+    // Destructors are implicitly noexcept; never let a teardown failure escape.
+    try {
+        stop();
+        wait();
+    } catch (...) {
+        qWarning("StreamWorker: swallowed an exception during destruction");
+    }
 }
 
 void StreamWorker::setConnected(bool c) {
-    // exchange first so the emit fires exactly once per real transition,
-    // even if two capture-thread call sites race the same value.
-    const bool prev = m_connected.exchange(c, std::memory_order_relaxed);
-    if (prev != c) {
-        emit connectionChanged(m_sourceIndex, c);
+    setConnectedImpl(c, 0);
+}
+
+void StreamWorker::setConnectedForSession(uint64_t sessionIdentity, bool connected) {
+    setConnectedImpl(connected, sessionIdentity);
+}
+
+void StreamWorker::setConnectedImpl(bool c, uint64_t requiredSessionIdentity) {
+    bool scheduleDrain = false;
+    {
+        std::lock_guard<std::mutex> lock(m_connectionTransitionMutex);
+        std::unique_lock<std::mutex> epochLock(m_epochMutex);
+        if (requiredSessionIdentity != 0 &&
+            requiredSessionIdentity != m_activeCaptureSessionIdentity) {
+            return;
+        }
+        const bool prev = m_connected.load(std::memory_order_relaxed);
+        if (prev == c) return;
+        if (!c) rotateCarrierLocked(false);
+        m_connected.store(c, std::memory_order_release);
+        m_pendingConnectionEmissions.push_back(c);
+        if (!m_connectionDrainScheduled) {
+            m_connectionDrainScheduled = true;
+            scheduleDrain = true;
+        }
     }
+    if (scheduleDrain)
+        QMetaObject::invokeMethod(
+            this, [this] { drainConnectionEmissions(); }, Qt::QueuedConnection);
+}
+
+void StreamWorker::reportStatsForSession(uint64_t sessionIdentity, const IngestStats& stats) {
+    {
+        std::lock_guard<std::mutex> epochLock(m_epochMutex);
+        if (sessionIdentity == 0 || sessionIdentity != m_activeCaptureSessionIdentity) return;
+    }
+    emit statsUpdated(m_sourceIndex, stats);
+}
+
+void StreamWorker::drainConnectionEmissions() {
+    for (;;) {
+        bool connected = false;
+        {
+            std::lock_guard<std::mutex> lock(m_connectionTransitionMutex);
+            if (m_pendingConnectionEmissions.empty()) {
+                m_connectionDrainScheduled = false;
+                return;
+            }
+            connected = m_pendingConnectionEmissions.front();
+            m_pendingConnectionEmissions.pop_front();
+        }
+        emit connectionChanged(m_sourceIndex, connected);
+    }
+}
+
+uint64_t StreamWorker::beginCaptureSession() {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    uint64_t nextIdentity = m_nextCaptureSessionIdentity + 1;
+    if (nextIdentity == 0) nextIdentity = 1;
+    uint64_t epoch = m_carrierEpoch.load(std::memory_order_relaxed) + 1;
+    if (epoch == 0) epoch = 1;
+    auto token =
+        std::make_shared<const SourceCarrierToken>(SourceCarrierToken{nextIdentity, epoch});
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    resetMuxFrameEvidenceLocked();
+    m_nextCaptureSessionIdentity = nextIdentity;
+    m_activeCaptureSessionIdentity = nextIdentity;
+    m_carrierEpoch.store(epoch, std::memory_order_release);
+    m_activeCarrierToken = std::move(token);
+    return nextIdentity;
+}
+
+void StreamWorker::endCaptureSession(uint64_t sessionIdentity) {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    if (m_activeCaptureSessionIdentity != sessionIdentity) return;
+    uint64_t epoch = m_carrierEpoch.load(std::memory_order_relaxed) + 1;
+    if (epoch == 0) epoch = 1;
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    resetMuxFrameEvidenceLocked();
+    m_activeCaptureSessionIdentity = 0;
+    m_activeCarrierToken = std::make_shared<const SourceCarrierToken>(SourceCarrierToken{0, epoch});
+    m_carrierEpoch.store(epoch, std::memory_order_release);
+}
+
+std::shared_ptr<const StreamWorker::SourceCarrierToken>
+StreamWorker::snapshotActiveCarrierToken() const {
+    std::lock_guard<std::mutex> lock(m_epochMutex);
+    return m_activeCarrierToken;
+}
+
+std::shared_ptr<const StreamWorker::SourceCarrierToken>
+StreamWorker::snapshotCarrierTokenForSession(uint64_t sessionIdentity) const {
+    std::lock_guard<std::mutex> lock(m_epochMutex);
+    if (sessionIdentity == 0 || sessionIdentity != m_activeCaptureSessionIdentity) return {};
+    return m_activeCarrierToken;
+}
+
+void StreamWorker::rotateCarrier(bool retainActiveSession) {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    rotateCarrierLocked(retainActiveSession);
+}
+
+void StreamWorker::rotateCarrierLocked(bool retainActiveSession) {
+    uint64_t epoch = m_carrierEpoch.load(std::memory_order_relaxed) + 1;
+    if (epoch == 0) epoch = 1;
+    const uint64_t sessionIdentity = retainActiveSession ? m_activeCaptureSessionIdentity : 0;
+    auto token =
+        std::make_shared<const SourceCarrierToken>(SourceCarrierToken{sessionIdentity, epoch});
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    resetMuxFrameEvidenceLocked();
+    if (!retainActiveSession) m_activeCaptureSessionIdentity = 0;
+    m_carrierEpoch.store(epoch, std::memory_order_release);
+    m_activeCarrierToken = std::move(token);
+}
+
+std::shared_ptr<const StreamWorker::SourceCarrierToken>
+StreamWorker::prepareCarrierTokenForFrameIngress(uint64_t sessionIdentity,
+                                                 const std::optional<TimecodeEvidence>& evidence) {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    return prepareCarrierTokenForFrameIngressLocked(sessionIdentity, evidence);
+}
+
+std::shared_ptr<const StreamWorker::SourceCarrierToken>
+StreamWorker::prepareCarrierTokenForFrameIngressLocked(
+    uint64_t sessionIdentity, const std::optional<TimecodeEvidence>& evidence) {
+    if (sessionIdentity == 0 || sessionIdentity != m_activeCaptureSessionIdentity ||
+        !m_activeCarrierToken) {
+        return {};
+    }
+
+    const bool identityBoundary =
+        evidence && (evidence->discontinuity ||
+                     (m_muxFrameEvidenceIdentity &&
+                      !sameTimecodeIdentity(*m_muxFrameEvidenceIdentity, *evidence)));
+    if (identityBoundary) {
+        uint64_t epoch = m_carrierEpoch.load(std::memory_order_relaxed) + 1;
+        if (epoch == 0) epoch = 1;
+        auto token = std::make_shared<const SourceCarrierToken>(
+            SourceCarrierToken{m_activeCaptureSessionIdentity, epoch});
+        resetMuxFrameEvidenceLocked();
+        m_carrierEpoch.store(epoch, std::memory_order_release);
+        m_activeCarrierToken = std::move(token);
+    }
+    if (evidence) m_muxFrameEvidenceIdentity = *evidence;
+    return m_activeCarrierToken;
+}
+
+bool StreamWorker::carrierTokenIsCurrent(
+    const std::shared_ptr<const SourceCarrierToken>& token) const {
+    return token && carrierTokenIsCurrent(*token);
+}
+
+bool StreamWorker::carrierTokenIsCurrent(const SourceCarrierToken& token) const {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    return carrierTokenIsCurrentLocked(token);
+}
+
+bool StreamWorker::carrierTokenIsCurrentLocked(const SourceCarrierToken& token) const {
+    return m_activeCarrierToken && token.epoch != 0 &&
+           token.sessionIdentity == m_activeCaptureSessionIdentity &&
+           token.sessionIdentity == m_activeCarrierToken->sessionIdentity &&
+           token.epoch == m_activeCarrierToken->epoch &&
+           token.epoch == m_carrierEpoch.load(std::memory_order_relaxed);
+}
+
+bool StreamWorker::packetCarrierGuardThunk(void* context, uint64_t sessionIdentity,
+                                           uint64_t epoch) {
+    return static_cast<StreamWorker*>(context)->carrierTokenIsCurrent(
+        SourceCarrierToken{sessionIdentity, epoch});
+}
+
+Muxer::PacketCarrierGuard
+StreamWorker::packetCarrierGuard(const SourceCarrierToken& token) noexcept {
+    return Muxer::PacketCarrierGuard{this, token.sessionIdentity, token.epoch,
+                                     &StreamWorker::packetCarrierGuardThunk};
 }
 
 qint64 StreamWorker::queuedFrameBytes(const QueuedFrame& frame) {
@@ -118,6 +325,157 @@ qint64 StreamWorker::queuedFrameBytes(const QueuedFrame& frame) {
     }
 #endif
     return bytes;
+}
+
+void StreamWorker::enqueueDecodedVideoFrame(DecodedVideoFrame decoded) {
+    const auto active = snapshotActiveCarrierToken();
+    if (!active || active->sessionIdentity == 0) {
+        if (decoded.frame) av_frame_free(&decoded.frame);
+        return;
+    }
+    // std::move is a no-op here in CPU-only builds but moves the move-only gpuFrame
+    // in GPU builds, so it must stay. NOLINTNEXTLINE(performance-move-const-arg)
+    enqueueDecodedVideoFrameForSession(std::move(decoded), active->sessionIdentity);
+}
+
+void StreamWorker::enqueueDecodedVideoFrameForSession(DecodedVideoFrame decoded,
+                                                      uint64_t sessionIdentity) {
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    if (!decoded.frame && decoded.gpuFrame.isNull()) return;
+#else
+    if (!decoded.frame) return;
+#endif
+
+    if (m_suppressEnqueue.load(std::memory_order_relaxed)) {
+        if (decoded.frame) av_frame_free(&decoded.frame);
+        return;
+    }
+
+    QueuedFrame qf;
+    qf.frame = decoded.frame;
+    qf.sourcePts = decoded.sourcePtsMs;
+    qf.sourceTimecode100ns = decoded.sourceTimecode100ns;
+    qf.timecodeEvidence = decoded.timecodeEvidence;
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    qf.gpuFrame = std::move(decoded.gpuFrame);
+    qf.gpuFenceValue = decoded.gpuFenceValue;
+    const uint64_t gpuCarrierSessionIdentity = decoded.gpuCarrierSessionIdentity;
+    const uint64_t gpuCarrierEpoch = decoded.gpuCarrierEpoch;
+#endif
+
+    // Carrier identity rotation and frame admission are one ordered ingress
+    // transaction. Reset paths take the same epoch->evidence order, so an old
+    // callback can neither rotate identity nor insert pixels after replacement.
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    if (!qf.gpuFrame.isNull() &&
+        ((gpuCarrierSessionIdentity == 0) != (gpuCarrierEpoch == 0) ||
+         (gpuCarrierEpoch != 0 &&
+          (!m_activeCarrierToken ||
+           m_activeCarrierToken->sessionIdentity != gpuCarrierSessionIdentity ||
+           m_activeCarrierToken->epoch != gpuCarrierEpoch)))) {
+        if (qf.frame) av_frame_free(&qf.frame);
+        return;
+    }
+#endif
+    auto token = prepareCarrierTokenForFrameIngressLocked(sessionIdentity, qf.timecodeEvidence);
+    if (!token || m_suppressEnqueue.load(std::memory_order_relaxed)) {
+        if (qf.frame) av_frame_free(&qf.frame);
+        return;
+    }
+    qf.carrierToken = std::move(token);
+    QMutexLocker locker(&m_frameMutex);
+    m_frameQueue.enqueue(std::move(qf));
+    m_lastFrameEnqueueAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
+    trimFrameQueueBackstopLocked(m_lastTickTargetMs.load(std::memory_order_relaxed));
+}
+
+std::optional<TimecodeEvidence>
+StreamWorker::takeFrameTimecodeEvidenceForMux(std::optional<TimecodeEvidence>& selected,
+                                              int64_t sessionFrameIndex) const {
+    if (!selected) return std::nullopt;
+    std::optional<TimecodeEvidence> evidence = selected;
+    selected.reset();
+    evidence->arrivalSessionFrame = sessionFrameIndex;
+    evidence->sessionRate = FrameRateQ{m_targetFps, 1};
+    return evidence;
+}
+
+StreamWorker::MuxFrameEvidenceSubmission StreamWorker::enqueueMuxFrameEvidence(
+    int64_t ptsTicks, int64_t sourceTimecode100ns, const std::optional<TimecodeEvidence>& evidence,
+    const std::shared_ptr<const SourceCarrierToken>& frameToken, bool allowSyntheticFrame) {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    const uint64_t currentEpoch = m_carrierEpoch.load(std::memory_order_relaxed);
+    const bool exactActiveCarrier =
+        frameToken && m_activeCarrierToken &&
+        frameToken->sessionIdentity == m_activeCaptureSessionIdentity &&
+        frameToken->epoch == currentEpoch &&
+        m_activeCarrierToken->sessionIdentity == frameToken->sessionIdentity &&
+        m_activeCarrierToken->epoch == frameToken->epoch;
+    const bool authorizedSynthetic = allowSyntheticFrame && exactActiveCarrier &&
+                                     frameToken->sessionIdentity == 0 && !evidence &&
+                                     sourceTimecode100ns < 0;
+    const bool authorizedSource = exactActiveCarrier && frameToken->sessionIdentity != 0;
+    if (!authorizedSource && !authorizedSynthetic) return {};
+    // DecodedFrameEvidenceQueue treats its key as opaque. Both submission and native/GPU
+    // output use the encoder's unchanged ptsTicks domain. The generation token lets a
+    // completion already queued in Muxer revalidate after reset without taking this mutex.
+    const SourceCarrierToken carrierToken = *frameToken;
+    const uint64_t id = m_muxFrameEvidence.enqueue(DecodedFrameEvidence{
+        ptsTicks, -1, sourceTimecode100ns, evidence,
+        DecodedFrameEvidence::CarrierSessionIdentity{carrierToken.sessionIdentity},
+        DecodedFrameEvidence::CarrierGeneration{carrierToken.epoch}});
+    return MuxFrameEvidenceSubmission{id, carrierToken};
+}
+
+std::optional<DecodedFrameEvidence> StreamWorker::takeMuxFrameEvidence(int64_t ptsTicks) {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    auto evidence = m_muxFrameEvidence.takeForOutputPts(ptsTicks);
+    if (!evidence) return std::nullopt;
+    const SourceCarrierToken token{evidence->carrierSessionIdentity, evidence->carrierGeneration};
+    return carrierTokenIsCurrentLocked(token) ? evidence : std::nullopt;
+}
+
+std::optional<DecodedFrameEvidence>
+StreamWorker::takeMuxFrameEvidence(int64_t ptsTicks, const SourceCarrierToken& expectedToken) {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    if (!carrierTokenIsCurrentLocked(expectedToken)) return std::nullopt;
+    auto evidence = m_muxFrameEvidence.takeForOutputPts(ptsTicks);
+    if (!evidence || evidence->carrierSessionIdentity != expectedToken.sessionIdentity ||
+        evidence->carrierGeneration != expectedToken.epoch) {
+        return std::nullopt;
+    }
+    return evidence;
+}
+
+void StreamWorker::discardMuxFrameEvidence(uint64_t submissionId) {
+    std::lock_guard<std::mutex> lock(m_muxFrameEvidenceMutex);
+    m_muxFrameEvidence.discard(submissionId);
+}
+
+void StreamWorker::clearMuxFrameEvidence() {
+    rotateCarrier(true);
+}
+
+void StreamWorker::resetMuxFrameEvidenceLocked() {
+    m_muxFrameEvidence.clear();
+    m_muxFrameEvidenceIdentity.reset();
+}
+
+bool StreamWorker::muxFrameEvidenceIsCurrent(uint64_t epoch) const {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    return m_activeCarrierToken && epoch > 0 && m_activeCarrierToken->epoch == epoch &&
+           m_carrierEpoch.load(std::memory_order_relaxed) == epoch;
+}
+
+void StreamWorker::emitFrameTimecodeEvidence(const TimecodeEvidence& evidence,
+                                             uint64_t carrierEpoch) {
+    emit frameTimecode(m_sourceIndex, m_workerInstanceIdentity, carrierEpoch, evidence);
 }
 
 qint64 StreamWorker::frameQueueBackstopBytes() const {
@@ -212,13 +570,36 @@ bool StreamWorker::preferGpuVideoFramesForIngest() const {
 #endif
 }
 
-void StreamWorker::latchGpuEncodeCpuFallback() {
-    if (m_gpuEncodeCpuFallback.exchange(true, std::memory_order_acq_rel)) return;
+bool StreamWorker::tryLatchGpuEncodeCpuFallback(const SourceCarrierToken& failureCarrier) {
+    {
+        std::lock_guard<std::mutex> epochLock(m_epochMutex);
+        if (!carrierTokenIsCurrentLocked(failureCarrier) ||
+            m_gpuEncodeCpuFallback.exchange(true, std::memory_order_acq_rel)) {
+            return false;
+        }
+        // Authorize, latch, and invalidate the failing carrier as one epoch
+        // transaction. rotateCarrierLocked preserves epoch -> evidence order.
+        rotateCarrierLocked(true);
+    }
+    // Cancellation can invoke failure callbacks. Keep it outside carrier locks;
+    // their old immutable tokens now fail the token-scoped latch above.
     if (m_gpuEncodePump) m_gpuEncodePump->cancelPending();
+    return true;
 }
 
-ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForEncode(void* nativeDecodedImage,
-                                                                 const FrameMetadata& metadata) {
+void StreamWorker::latchGpuEncodeCpuFallback() {
+    SourceCarrierToken activeCarrier;
+    {
+        std::lock_guard<std::mutex> epochLock(m_epochMutex);
+        if (!m_activeCarrierToken) return;
+        activeCarrier = *m_activeCarrierToken;
+    }
+    tryLatchGpuEncodeCpuFallback(activeCarrier);
+}
+
+ImportedGpuVideoFrame
+StreamWorker::importGpuVideoFrameForEncode(void* nativeDecodedImage, const FrameMetadata& metadata,
+                                           [[maybe_unused]] bool latchFallbackOnFailure) {
     ImportedGpuVideoFrame imported;
 #if defined(__APPLE__)
     auto surface = wrapAppleImageBuffer(nativeDecodedImage);
@@ -237,7 +618,7 @@ ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForEncode(void* nativeDec
                 qWarning() << "Source" << m_sourceIndex
                            << "Windows GPU video import unavailable:" << error;
             }
-            latchGpuEncodeCpuFallback();
+            if (latchFallbackOnFailure) latchGpuEncodeCpuFallback();
             return imported;
         }
     }
@@ -245,13 +626,13 @@ ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForEncode(void* nativeDec
     auto surface = m_gpuEncodeImportEdge->tryImportSurface(nativeDecodedImage, metadata.key.width,
                                                            metadata.key.height);
     if (!surface) {
-        latchGpuEncodeCpuFallback();
+        if (latchFallbackOnFailure) latchGpuEncodeCpuFallback();
         return imported;
     }
 
     std::shared_ptr<GpuFence> fence = makeD3D11GpuFence(surface->device());
     if (!fence) {
-        latchGpuEncodeCpuFallback();
+        if (latchFallbackOnFailure) latchGpuEncodeCpuFallback();
         return imported;
     }
     const uint64_t fenceValue = fence ? fence->signal() : 0;
@@ -265,6 +646,48 @@ ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForEncode(void* nativeDec
 #endif
     return imported;
 }
+
+ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForSession(uint64_t sessionIdentity,
+                                                                  void* nativeDecodedImage,
+                                                                  const FrameMetadata& metadata) {
+    SourceCarrierToken failureCarrier;
+    {
+        std::lock_guard<std::mutex> epochLock(m_epochMutex);
+        if (sessionIdentity == 0 || sessionIdentity != m_activeCaptureSessionIdentity ||
+            !m_activeCarrierToken) {
+            return {};
+        }
+        failureCarrier = *m_activeCarrierToken;
+    }
+    // Import can enter platform GPU APIs, so carrier locks are not held across
+    // the device operation. Revalidate before publishing the result or latching
+    // fallback; the matching onVideoFrame callback revalidates again before its
+    // queue mutation.
+    ImportedGpuVideoFrame imported;
+#ifdef OLR_UNIT_TEST
+    if (m_gpuImportForTest)
+        imported = m_gpuImportForTest(nativeDecodedImage, metadata);
+    else
+#endif
+        imported = importGpuVideoFrameForEncode(nativeDecodedImage, metadata, false);
+#ifdef OLR_UNIT_TEST
+    auto afterImport = std::exchange(m_afterGpuImportForTest, nullptr);
+    if (afterImport) afterImport();
+#endif
+    {
+        std::lock_guard<std::mutex> epochLock(m_epochMutex);
+        if (sessionIdentity == 0 || sessionIdentity != m_activeCaptureSessionIdentity ||
+            !carrierTokenIsCurrentLocked(failureCarrier)) {
+            return {};
+        }
+    }
+    if (imported.frame.isNull()) tryLatchGpuEncodeCpuFallback(failureCarrier);
+    if (!imported.frame.isNull()) {
+        imported.carrierSessionIdentity = failureCarrier.sessionIdentity;
+        imported.carrierEpoch = failureCarrier.epoch;
+    }
+    return imported;
+}
 #endif
 
 void debugTimestamp(const QString& prefix, int trackIndex) {
@@ -273,6 +696,7 @@ void debugTimestamp(const QString& prefix, int trackIndex) {
 }
 
 void StreamWorker::stop() {
+    rotateCarrier(false);
     m_restartCapture = 1;
     m_captureRunning = false;
     {
@@ -364,63 +788,667 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     processEncoderTick(m_persistentEncCtx, streamTimeMs, trimMs, jitterMs);
 }
 
-NativeVideoEncoder::PacketCallback
-StreamWorker::makeMuxerWriteCallback(int track, AVStream* st, bool* havePacket,
-                                     std::function<void()> beforePacketWrite,
-                                     std::function<void(bool)> afterPacketWritten) {
-    // Own the caller hooks behind one ref-counted handle. The returned callback
-    // then captures a single shared_ptr rather than move-capturing two type-erased
-    // std::functions: the static analyzer models shared_ptr lifetime precisely, so
-    // this avoids a false "leaked std::function storage" report on the capture.
-    struct MuxerWriteHooks {
-        std::function<void()> before;
-        std::function<void(bool)> after;
+uint64_t StreamWorker::poolId(size_t index, uint32_t generation) noexcept {
+    return (uint64_t(generation) << 32) | uint64_t(index + 1);
+}
+
+bool StreamWorker::decodePoolId(uint64_t id, size_t capacity, size_t* index,
+                                uint32_t* generation) noexcept {
+    if (id == 0) return false;
+    const uint64_t encodedIndex = id & 0xffffffffULL;
+    if (encodedIndex == 0 || encodedIndex > capacity) return false;
+    *index = size_t(encodedIndex - 1);
+    *generation = uint32_t(id >> 32);
+    return *generation != 0;
+}
+
+uint64_t StreamWorker::acquireEncodeSubmission(bool gpu, int track, AVStream* stream,
+                                               bool* havePacket,
+                                               const SourceCarrierToken& carrierToken,
+                                               uint64_t evidenceSubmissionId, int64_t streamTimeMs,
+                                               const QByteArray& metadata) {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    if (!carrierTokenIsCurrentLocked(carrierToken)) return 0;
+    std::lock_guard<std::mutex> poolLock(m_submissionPoolMutex);
+    for (size_t offset = 0; offset < kSubmissionPoolCapacity; ++offset) {
+        const size_t index = (m_nextSubmissionSlot + offset) % kSubmissionPoolCapacity;
+        EncodeSubmissionSlot& slot = m_submissionPool[index];
+        // A wrapped generation would make an ancient asynchronous ID valid
+        // again. Permanently retire the fixed slot once its ID space is spent.
+        if (slot.active || slot.generation == std::numeric_limits<uint32_t>::max()) continue;
+        const uint32_t generation = slot.generation + 1;
+        slot = EncodeSubmissionSlot{};
+        slot.active = true;
+        slot.generation = generation;
+        slot.gpu = gpu;
+        slot.track = track;
+        slot.stream = stream;
+        slot.havePacket = havePacket;
+        slot.carrierToken = carrierToken;
+        slot.evidenceSubmissionId = evidenceSubmissionId;
+        slot.streamTimeMs = streamTimeMs;
+        slot.metadata = metadata;
+        m_nextSubmissionSlot = (index + 1) % kSubmissionPoolCapacity;
+        return poolId(index, generation);
+    }
+    return 0;
+}
+
+bool StreamWorker::setEncodeSubmissionEvidenceId(uint64_t submissionId,
+                                                 uint64_t evidenceSubmissionId) {
+    if (evidenceSubmissionId == 0) return false;
+    std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) return false;
+    EncodeSubmissionSlot& slot = m_submissionPool[index];
+    if (!slot.active || slot.generation != generation || slot.evidenceSubmissionId != 0)
+        return false;
+    slot.evidenceSubmissionId = evidenceSubmissionId;
+    return true;
+}
+
+uint64_t StreamWorker::reserveMuxCompletion(uint64_t encodeSubmissionId) {
+    return reserveMuxCompletion(encodeSubmissionId, SourceCarrierToken{});
+}
+
+uint64_t StreamWorker::reserveMuxCompletion(uint64_t encodeSubmissionId,
+                                            const SourceCarrierToken& carrierToken) {
+    std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+    SourceCarrierToken immutableCarrier = carrierToken;
+    if (encodeSubmissionId != 0) {
+        size_t groupIndex = 0;
+        uint32_t groupGeneration = 0;
+        if (!decodePoolId(encodeSubmissionId, kSubmissionPoolCapacity, &groupIndex,
+                          &groupGeneration) ||
+            !m_submissionPool[groupIndex].active ||
+            m_submissionPool[groupIndex].generation != groupGeneration) {
+            return 0;
+        }
+        immutableCarrier = m_submissionPool[groupIndex].carrierToken;
+    }
+    for (size_t offset = 0; offset < kMuxCompletionPoolCapacity; ++offset) {
+        const size_t index = (m_nextMuxCompletionSlot + offset) % kMuxCompletionPoolCapacity;
+        MuxCompletionSlot& slot = m_muxCompletionPool[index];
+        // Fail closed rather than wrap and revalidate an ancient completion.
+        if (slot.active || slot.generation == std::numeric_limits<uint32_t>::max()) continue;
+        const uint32_t generation = slot.generation + 1;
+        slot = MuxCompletionSlot{};
+        slot.active = true;
+        slot.generation = generation;
+        slot.encodeSubmissionId = encodeSubmissionId;
+        slot.carrierToken = immutableCarrier;
+        m_nextMuxCompletionSlot = (index + 1) % kMuxCompletionPoolCapacity;
+        return poolId(index, generation);
+    }
+    return 0;
+}
+
+void StreamWorker::releaseMuxCompletionReservation(uint64_t completionId) {
+    std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!decodePoolId(completionId, kMuxCompletionPoolCapacity, &index, &generation)) return;
+    MuxCompletionSlot& slot = m_muxCompletionPool[index];
+    if (!slot.active || slot.generation != generation) return;
+    const uint32_t keepGeneration = slot.generation;
+    slot = MuxCompletionSlot{};
+    slot.generation = keepGeneration;
+}
+
+bool StreamWorker::populateMuxCompletion(uint64_t completionId,
+                                         const SourceCarrierToken& carrierToken,
+                                         std::optional<TimecodeEvidence> evidence) {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+    if (!carrierTokenIsCurrentLocked(carrierToken)) return false;
+    std::lock_guard<std::mutex> poolLock(m_submissionPoolMutex);
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!decodePoolId(completionId, kMuxCompletionPoolCapacity, &index, &generation)) return false;
+    MuxCompletionSlot& slot = m_muxCompletionPool[index];
+    if (!slot.active || slot.generation != generation) return false;
+    if (slot.carrierToken.epoch != 0 &&
+        (slot.carrierToken.sessionIdentity != carrierToken.sessionIdentity ||
+         slot.carrierToken.epoch != carrierToken.epoch)) {
+        return false;
+    }
+    if (slot.encodeSubmissionId != 0) {
+        size_t groupIndex = 0;
+        uint32_t groupGeneration = 0;
+        if (!decodePoolId(slot.encodeSubmissionId, kSubmissionPoolCapacity, &groupIndex,
+                          &groupGeneration))
+            return false;
+        EncodeSubmissionSlot& group = m_submissionPool[groupIndex];
+        if (!group.active || group.generation != groupGeneration) return false;
+        ++group.pendingWrites;
+    }
+    slot.carrierToken = carrierToken;
+    slot.evidence = evidence;
+    return true;
+}
+
+void StreamWorker::releaseEncodeSubmissionLocked(size_t index) {
+    EncodeSubmissionSlot& slot = m_submissionPool[index];
+    const uint32_t keepGeneration = slot.generation;
+    slot = EncodeSubmissionSlot{};
+    slot.generation = keepGeneration;
+}
+
+void StreamWorker::finishEncodeSubmission(uint64_t submissionId) {
+    std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) return;
+    EncodeSubmissionSlot& slot = m_submissionPool[index];
+    if (!slot.active || slot.generation != generation) return;
+    slot.encoderFinished = true;
+    if (slot.pendingWrites == 0) releaseEncodeSubmissionLocked(index);
+}
+
+void StreamWorker::failEncodeSubmission(uint64_t submissionId) {
+    uint64_t evidenceSubmissionId = 0;
+    bool triggerFallback = false;
+    SourceCarrierToken failureCarrier;
+    {
+        std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+        size_t index = 0;
+        uint32_t generation = 0;
+        if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) return;
+        EncodeSubmissionSlot& slot = m_submissionPool[index];
+        if (!slot.active || slot.generation != generation) return;
+        slot.encoderFinished = true;
+        evidenceSubmissionId = slot.evidenceSubmissionId;
+        failureCarrier = slot.carrierToken;
+        if (slot.gpu && !slot.fallbackTriggered) {
+            slot.fallbackTriggered = true;
+            triggerFallback = true;
+        }
+        if (slot.pendingWrites == 0) releaseEncodeSubmissionLocked(index);
+    }
+    if (evidenceSubmissionId != 0) discardMuxFrameEvidence(evidenceSubmissionId);
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    // A delayed failure from an invalidated carrier is cleanup, not evidence
+    // that the replacement session's GPU path failed. Authorize the exact
+    // immutable submission carrier before cancelling current work or rotating.
+    if (triggerFallback) {
+#ifdef OLR_UNIT_TEST
+        runBeforeGpuFallbackTryForTest();
+#endif
+        tryLatchGpuEncodeCpuFallback(failureCarrier);
+    }
+#else
+    Q_UNUSED(triggerFallback);
+#endif
+}
+
+void StreamWorker::completeMuxWrite(uint64_t completionId, bool written) {
+    std::optional<TimecodeEvidence> evidence;
+    SourceCarrierToken carrierToken;
+    bool emitSidecars = false;
+    bool triggerFallback = false;
+    int track = -1;
+    int64_t streamTimeMs = 0;
+    QByteArray metadata;
+    {
+        std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+        size_t index = 0;
+        uint32_t generation = 0;
+        if (!decodePoolId(completionId, kMuxCompletionPoolCapacity, &index, &generation)) return;
+        MuxCompletionSlot& slot = m_muxCompletionPool[index];
+        if (!slot.active || slot.generation != generation) return;
+        evidence = slot.evidence;
+        carrierToken = slot.carrierToken;
+        const uint64_t encodeSubmissionId = slot.encodeSubmissionId;
+        const uint32_t keepGeneration = slot.generation;
+        slot = MuxCompletionSlot{};
+        slot.generation = keepGeneration;
+
+        if (encodeSubmissionId != 0) {
+            size_t groupIndex = 0;
+            uint32_t groupGeneration = 0;
+            if (decodePoolId(encodeSubmissionId, kSubmissionPoolCapacity, &groupIndex,
+                             &groupGeneration)) {
+                EncodeSubmissionSlot& group = m_submissionPool[groupIndex];
+                if (group.active && group.generation == groupGeneration) {
+                    if (group.pendingWrites > 0) --group.pendingWrites;
+                    if (written && !group.sidecarsEmitted) {
+                        group.sidecarsEmitted = true;
+                        emitSidecars = true;
+                        track = group.track;
+                        streamTimeMs = group.streamTimeMs;
+                        metadata = std::move(group.metadata);
+                    }
+                    if (!written && group.gpu && !group.fallbackTriggered) {
+                        group.fallbackTriggered = true;
+                        triggerFallback = true;
+                    }
+                    if (group.encoderFinished && group.pendingWrites == 0)
+                        releaseEncodeSubmissionLocked(groupIndex);
+                }
+            }
+        }
+    }
+
+    const bool carrierAuthorized = carrierTokenIsCurrent(carrierToken);
+    if (written && evidence && carrierAuthorized)
+        emitFrameTimecodeEvidence(*evidence, carrierToken.epoch);
+    if (emitSidecars && carrierAuthorized && !metadata.isEmpty() && m_muxer)
+        m_muxer->writeMetadataPacket(track, streamTimeMs, metadata);
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    if (triggerFallback) tryLatchGpuEncodeCpuFallback(carrierToken);
+#else
+    Q_UNUSED(triggerFallback);
+#endif
+}
+
+void StreamWorker::bufferEncodedPacket(uint64_t submissionId, const QByteArray& data,
+                                       int64_t ptsTicks, bool keyframe) {
+    std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) return;
+    EncodeSubmissionSlot& slot = m_submissionPool[index];
+    if (!slot.active || slot.generation != generation || slot.encoderFinished) return;
+    if (slot.bufferedPacketCount >= slot.bufferedPackets.size()) {
+        slot.packetOverflow = true;
+        return;
+    }
+    BufferedEncodedPacket& packet = slot.bufferedPackets[slot.bufferedPacketCount++];
+    packet.data = data;
+    packet.ptsTicks = ptsTicks;
+    packet.keyframe = keyframe;
+}
+
+bool StreamWorker::bufferedSubmissionReady(uint64_t submissionId) const {
+    std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) return false;
+    const EncodeSubmissionSlot& slot = m_submissionPool[index];
+    return slot.active && slot.generation == generation && !slot.packetOverflow;
+}
+
+bool StreamWorker::takeBufferedSubmissionPacket(uint64_t submissionId,
+                                                BufferedEncodedPacket* packet) {
+    if (!packet) return false;
+    std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) return false;
+    EncodeSubmissionSlot& slot = m_submissionPool[index];
+    if (!slot.active || slot.generation != generation || slot.packetOverflow ||
+        slot.nextBufferedPacket >= slot.bufferedPacketCount) {
+        return false;
+    }
+    *packet = std::move(slot.bufferedPackets[slot.nextBufferedPacket++]);
+    return true;
+}
+
+void StreamWorker::commitBufferedEncodeSubmission(uint64_t submissionId) {
+    std::array<BufferedEncodedPacket, kMaxPacketsPerSubmission> bufferedPackets;
+    size_t packetCount = 0;
+    int track = -1;
+    AVStream* stream = nullptr;
+    bool* havePacket = nullptr;
+    bool gpu = false;
+    SourceCarrierToken expectedCarrierToken;
+    {
+        std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+        size_t index = 0;
+        uint32_t generation = 0;
+        if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) return;
+        EncodeSubmissionSlot& slot = m_submissionPool[index];
+        if (!slot.active || slot.generation != generation || slot.encoderFinished ||
+            slot.packetOverflow) {
+            return;
+        }
+        packetCount = slot.bufferedPacketCount;
+        track = slot.track;
+        stream = slot.stream;
+        havePacket = slot.havePacket;
+        gpu = slot.gpu;
+        expectedCarrierToken = slot.carrierToken;
+        for (size_t i = 0; i < packetCount; ++i)
+            bufferedPackets[i] = std::move(slot.bufferedPackets[i]);
+        slot.nextBufferedPacket = packetCount;
+    }
+
+    if (packetCount == 0) {
+        finishEncodeSubmission(submissionId);
+        return;
+    }
+
+    std::array<AVPacket*, kMaxPacketsPerSubmission> avPackets{};
+    auto freePackets = [&avPackets] {
+        for (AVPacket*& packet : avPackets)
+            av_packet_free(&packet);
     };
-    auto hooks = std::make_shared<MuxerWriteHooks>(
-        MuxerWriteHooks{std::move(beforePacketWrite), std::move(afterPacketWritten)});
-    return [this, track, st, havePacket, hooks](const QByteArray& data, int64_t ptsTicks,
-                                                bool keyframe) mutable {
-        AVPacket* pkt = av_packet_alloc();
-        if (!pkt) {
-            if (hooks->after) hooks->after(false);
+    for (size_t i = 0; i < packetCount; ++i) {
+        const BufferedEncodedPacket& buffered = bufferedPackets[i];
+        AVPacket*& packet = avPackets[i];
+        packet = av_packet_alloc();
+        if (!packet || buffered.data.size() > std::numeric_limits<int>::max() ||
+            av_new_packet(packet, static_cast<int>(buffered.data.size())) < 0 || !stream ||
+            !m_muxer) {
+            freePackets();
+            failEncodeSubmission(submissionId);
             return;
         }
-        if (data.size() > std::numeric_limits<int>::max()) {
-            av_packet_free(&pkt);
-            if (hooks->after) hooks->after(false);
-            return;
+        memcpy(packet->data, buffered.data.constData(), buffered.data.size());
+        packet->stream_index = track;
+        packet->pts = packet->dts =
+            av_rescale_q(buffered.ptsTicks, AVRational{1, m_targetFps}, stream->time_base);
+        packet->duration = av_rescale_q(1, AVRational{1, m_targetFps}, stream->time_base);
+        if (buffered.keyframe) packet->flags |= AV_PKT_FLAG_KEY;
+    }
+
+    enum class Preparation { Ready, StaleCarrier, Failed };
+    Preparation preparation = Preparation::Failed;
+    std::array<uint64_t, kMaxPacketsPerSubmission> completionIds{};
+    int64_t sourceTimecode100ns = -1;
+    {
+        // Batch authority and completion admission use the established
+        // epoch->evidence->pool lock order. Evidence is consumed only after
+        // every fixed completion slot is known to be available.
+        std::lock_guard<std::mutex> epochLock(m_epochMutex);
+        std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+        std::lock_guard<std::mutex> poolLock(m_submissionPoolMutex);
+        size_t submissionIndex = 0;
+        uint32_t submissionGeneration = 0;
+        if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &submissionIndex,
+                          &submissionGeneration)) {
+            preparation = Preparation::StaleCarrier;
+        } else {
+            EncodeSubmissionSlot& submission = m_submissionPool[submissionIndex];
+            if (!submission.active || submission.generation != submissionGeneration ||
+                !carrierTokenIsCurrentLocked(expectedCarrierToken)) {
+                preparation = Preparation::StaleCarrier;
+            } else {
+                std::array<size_t, kMaxPacketsPerSubmission> completionIndices{};
+                size_t available = 0;
+                for (size_t offset = 0;
+                     offset < kMuxCompletionPoolCapacity && available < packetCount; ++offset) {
+                    const size_t index =
+                        (m_nextMuxCompletionSlot + offset) % kMuxCompletionPoolCapacity;
+                    const MuxCompletionSlot& candidate = m_muxCompletionPool[index];
+                    if (candidate.active ||
+                        candidate.generation == std::numeric_limits<uint32_t>::max()) {
+                        continue;
+                    }
+                    completionIndices[available++] = index;
+                }
+                if (available == packetCount) {
+                    std::array<int64_t, kMaxPacketsPerSubmission> uniquePts{};
+                    std::array<uint64_t, kMaxPacketsPerSubmission> evidenceIds{};
+                    std::array<size_t, kMaxPacketsPerSubmission> packetEvidenceIndices{};
+                    std::array<size_t, kMaxPacketsPerSubmission> firstPacketIndices{};
+                    size_t uniqueCount = 0;
+                    bool allEvidencePresent = true;
+                    for (size_t i = 0; i < packetCount && allEvidencePresent; ++i) {
+                        size_t evidenceIndex = 0;
+                        while (evidenceIndex < uniqueCount &&
+                               uniquePts[evidenceIndex] != bufferedPackets[i].ptsTicks) {
+                            ++evidenceIndex;
+                        }
+                        if (evidenceIndex == uniqueCount) {
+                            const auto match =
+                                m_muxFrameEvidence.findForOutputPts(bufferedPackets[i].ptsTicks);
+                            if (!match ||
+                                match->carrierSessionIdentity !=
+                                    expectedCarrierToken.sessionIdentity ||
+                                match->carrierGeneration != expectedCarrierToken.epoch) {
+                                allEvidencePresent = false;
+                                break;
+                            }
+                            uniquePts[uniqueCount] = bufferedPackets[i].ptsTicks;
+                            evidenceIds[uniqueCount] = match->submissionId;
+                            firstPacketIndices[uniqueCount] = i;
+                            evidenceIndex = uniqueCount++;
+                        }
+                        packetEvidenceIndices[i] = evidenceIndex;
+                    }
+                    if (allEvidencePresent) {
+                        std::array<std::optional<DecodedFrameEvidence>, kMaxPacketsPerSubmission>
+                            frameEvidence;
+                        for (size_t i = 0; i < uniqueCount; ++i)
+                            frameEvidence[i] =
+                                m_muxFrameEvidence.takeBySubmissionId(evidenceIds[i]);
+                        // Each entry was just taken above under this lock and is present;
+                        // guard the access defensively so it is never dereferenced empty.
+                        if (const auto& firstEvidence = frameEvidence[packetEvidenceIndices[0]])
+                            sourceTimecode100ns = firstEvidence->sourceTimecode100ns;
+                        for (size_t i = 0; i < packetCount; ++i) {
+                            const size_t completionIndex = completionIndices[i];
+                            MuxCompletionSlot& completion = m_muxCompletionPool[completionIndex];
+                            const uint32_t generation = completion.generation + 1;
+                            completion = MuxCompletionSlot{};
+                            completion.active = true;
+                            completion.generation = generation;
+                            completion.carrierToken = expectedCarrierToken;
+                            completion.encodeSubmissionId = submissionId;
+                            const size_t evidenceIndex = packetEvidenceIndices[i];
+                            if (firstPacketIndices[evidenceIndex] == i) {
+                                const auto& evidence = frameEvidence[evidenceIndex];
+                                if (evidence) completion.evidence = evidence->timecodeEvidence;
+                            }
+                            completionIds[i] = poolId(completionIndex, generation);
+                        }
+                        submission.evidenceResolved = true;
+                        submission.pendingWrites += static_cast<uint32_t>(packetCount);
+                        m_nextMuxCompletionSlot =
+                            (completionIndices[packetCount - 1] + 1) % kMuxCompletionPoolCapacity;
+                        preparation = Preparation::Ready;
+                    } else {
+                        // Delayed output can belong to a carrier invalidated before
+                        // this newer submission. Consume only that old mapping;
+                        // preserve the current submission's mapping for its later
+                        // packet and never convert stale output into GPU fallback.
+                        preparation = Preparation::StaleCarrier;
+                    }
+                }
+            }
         }
-        if (av_new_packet(pkt, static_cast<int>(data.size())) < 0) {
-            av_packet_free(&pkt);
-            if (hooks->after) hooks->after(false);
-            return;
+    }
+
+    if (preparation != Preparation::Ready) {
+        freePackets();
+        if (preparation == Preparation::StaleCarrier)
+            finishEncodeSubmission(submissionId);
+        else
+            failEncodeSubmission(submissionId);
+        return;
+    }
+
+    QString startTimecodeCandidate;
+    if (sourceTimecode100ns >= 0) {
+        const Smpte12mTimecode startTc =
+            Smpte12m::from100ns(sourceTimecode100ns, Smpte12m::kTimecodeNominalFps);
+        char buf[12];
+        startTimecodeCandidate = QString::fromLatin1(Smpte12m::format(startTc, buf));
+    }
+    std::array<Muxer::PacketWriteRequest, kMaxPacketsPerSubmission> requests;
+    const Muxer::PacketCarrierGuard guard = packetCarrierGuard(expectedCarrierToken);
+    for (size_t i = 0; i < packetCount; ++i) {
+        requests[i].packet = avPackets[i];
+        requests[i].onWritten = muxCompletionCallback(completionIds[i]);
+        requests[i].carrierGuard = guard;
+        if (i == 0) requests[i].startTimecodeCandidate = startTimecodeCandidate;
+    }
+#ifdef OLR_UNIT_TEST
+    runBeforeMuxPacketWriteForTest();
+#endif
+    const bool accepted = m_muxer->writePacketBatch(requests.data(), packetCount);
+    freePackets();
+    if (accepted && havePacket && !gpu) *havePacket = true;
+    finishEncodeSubmission(submissionId);
+}
+
+void StreamWorker::handleEncodedPacket(uint64_t submissionId, const QByteArray& data,
+                                       int64_t ptsTicks, bool keyframe) {
+    int track = -1;
+    AVStream* stream = nullptr;
+    bool* havePacket = nullptr;
+    SourceCarrierToken expectedCarrierToken;
+    bool gpu = false;
+    {
+        std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+        size_t index = 0;
+        uint32_t generation = 0;
+        if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) return;
+        const EncodeSubmissionSlot& slot = m_submissionPool[index];
+        if (!slot.active || slot.generation != generation) return;
+        track = slot.track;
+        stream = slot.stream;
+        havePacket = slot.havePacket;
+        expectedCarrierToken = slot.carrierToken;
+        gpu = slot.gpu;
+    }
+
+    const uint64_t completionId = reserveMuxCompletion(submissionId);
+    if (completionId == 0) {
+        if (gpu) failEncodeSubmission(submissionId);
+        return;
+    }
+    auto frameEvidence = takeMuxFrameEvidence(ptsTicks, expectedCarrierToken);
+    bool evidenceWasAlreadyResolved = false;
+    bool submissionStillActive = false;
+    {
+        std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+        size_t index = 0;
+        uint32_t generation = 0;
+        if (decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) {
+            EncodeSubmissionSlot& slot = m_submissionPool[index];
+            if (slot.active && slot.generation == generation) {
+                submissionStillActive = true;
+                evidenceWasAlreadyResolved = slot.evidenceResolved;
+                if (frameEvidence) slot.evidenceResolved = true;
+            }
         }
-        memcpy(pkt->data, data.constData(), data.size());
-        pkt->stream_index = track;
-        if (st && m_muxer) {
-            pkt->pts = pkt->dts = av_rescale_q(ptsTicks, AVRational{1, m_targetFps}, st->time_base);
-            pkt->duration = av_rescale_q(1, AVRational{1, m_targetFps}, st->time_base);
-            if (keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
-            if (hooks->before) hooks->before();
-            const bool accepted = m_muxer->writePacket(pkt, std::move(hooks->after));
-            if (accepted && havePacket) *havePacket = true;
-        }
+    }
+    if (!submissionStillActive) {
+        releaseMuxCompletionReservation(completionId);
+        return;
+    }
+    // The first packet must resolve the exact input mapping. Later packets from
+    // the same encoder submission share that authorization but carry no second
+    // timecode observation.
+    if (expectedCarrierToken.epoch > 0 && !frameEvidence && !evidenceWasAlreadyResolved) {
+        releaseMuxCompletionReservation(completionId);
+        if (gpu) failEncodeSubmission(submissionId);
+        return;
+    }
+    std::optional<TimecodeEvidence> muxEvidence;
+    if (frameEvidence) muxEvidence = frameEvidence->timecodeEvidence;
+    const SourceCarrierToken completionToken =
+        frameEvidence ? SourceCarrierToken{frameEvidence->carrierSessionIdentity,
+                                           frameEvidence->carrierGeneration}
+                      : expectedCarrierToken;
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt || data.size() > std::numeric_limits<int>::max() ||
+        av_new_packet(pkt, static_cast<int>(data.size())) < 0 || !stream || !m_muxer) {
         av_packet_free(&pkt);
-    };
+        releaseMuxCompletionReservation(completionId);
+        if (gpu) failEncodeSubmission(submissionId);
+        return;
+    }
+    memcpy(pkt->data, data.constData(), data.size());
+    pkt->stream_index = track;
+    pkt->pts = pkt->dts = av_rescale_q(ptsTicks, AVRational{1, m_targetFps}, stream->time_base);
+    pkt->duration = av_rescale_q(1, AVRational{1, m_targetFps}, stream->time_base);
+    if (keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
+
+    QString startTimecodeCandidate;
+    if (frameEvidence && frameEvidence->sourceTimecode100ns >= 0) {
+        const Smpte12mTimecode startTc =
+            Smpte12m::from100ns(frameEvidence->sourceTimecode100ns, Smpte12m::kTimecodeNominalFps);
+        char buf[12];
+        startTimecodeCandidate = QString::fromLatin1(Smpte12m::format(startTc, buf));
+    }
+#ifdef OLR_UNIT_TEST
+    runBeforeMuxPacketWriteForTest();
+#endif
+    if (!populateMuxCompletion(completionId, completionToken, muxEvidence)) {
+        av_packet_free(&pkt);
+        releaseMuxCompletionReservation(completionId);
+        if (gpu) failEncodeSubmission(submissionId);
+        return;
+    }
+    const bool accepted =
+        m_muxer->writePacket(pkt, muxCompletionCallback(completionId), startTimecodeCandidate,
+                             packetCarrierGuard(completionToken));
+    if (accepted && havePacket) *havePacket = true;
+    av_packet_free(&pkt);
+}
+
+void StreamWorker::encodedPacketThunk(void* context, uint64_t submissionId, const QByteArray& data,
+                                      int64_t ptsTicks, bool keyframe) {
+    static_cast<StreamWorker*>(context)->handleEncodedPacket(submissionId, data, ptsTicks,
+                                                             keyframe);
+}
+
+void StreamWorker::bufferedPacketThunk(void* context, uint64_t submissionId, const QByteArray& data,
+                                       int64_t ptsTicks, bool keyframe) {
+    static_cast<StreamWorker*>(context)->bufferEncodedPacket(submissionId, data, ptsTicks,
+                                                             keyframe);
+}
+
+void StreamWorker::encodeFailureThunk(void* context, uint64_t submissionId) {
+    static_cast<StreamWorker*>(context)->failEncodeSubmission(submissionId);
+}
+
+void StreamWorker::encodeFinishedThunk(void* context, uint64_t submissionId) {
+    static_cast<StreamWorker*>(context)->finishEncodeSubmission(submissionId);
+}
+
+void StreamWorker::bufferedEncodeFinishedThunk(void* context, uint64_t submissionId) {
+    static_cast<StreamWorker*>(context)->commitBufferedEncodeSubmission(submissionId);
+}
+
+void StreamWorker::muxWriteCompletionThunk(void* context, uint64_t completionId, bool written) {
+    static_cast<StreamWorker*>(context)->completeMuxWrite(completionId, written);
+}
+
+NativeVideoEncoder::PacketCallback
+StreamWorker::packetCallbackForSubmission(uint64_t submissionId) noexcept {
+    return NativeVideoEncoder::PacketCallback{this, submissionId,
+                                              &StreamWorker::encodedPacketThunk};
+}
+
+NativeVideoEncoder::PacketCallback
+StreamWorker::bufferedPacketCallbackForSubmission(uint64_t submissionId) noexcept {
+    return NativeVideoEncoder::PacketCallback{this, submissionId,
+                                              &StreamWorker::bufferedPacketThunk};
+}
+
+#if defined(OLR_GPU_PIPELINE_BUILD)
+GpuEncodePump::JobCallbacks
+StreamWorker::gpuCallbacksForSubmission(uint64_t submissionId) noexcept {
+    return GpuEncodePump::JobCallbacks{this, submissionId, &StreamWorker::bufferedPacketThunk,
+                                       &StreamWorker::encodeFailureThunk,
+                                       &StreamWorker::bufferedEncodeFinishedThunk};
+}
+#endif
+
+Muxer::PacketWriteCallback StreamWorker::muxCompletionCallback(uint64_t completionId) noexcept {
+    return Muxer::PacketWriteCallback{this, completionId, &StreamWorker::muxWriteCompletionThunk};
 }
 
 void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,
                                       int64_t jitterMs) {
     AVPacket* outPkt = av_packet_alloc();
     bool havePacket = false;
+    std::optional<DecodedFrameEvidence> softwareFrameEvidence;
+    uint64_t softwareCompletionId = 0;
     int track = -1;
     const int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / m_targetFps;
 
     AVFrame* pulled = nullptr;
     int64_t pulledTimecode100ns = -1;
-    int64_t pulledTcFrames = -1;
-    int32_t pulledRateNum = 0;
-    int32_t pulledRateDen = 0;
+    std::optional<TimecodeEvidence> pulledTimecodeEvidence;
+    std::shared_ptr<const SourceCarrierToken> pulledCarrierToken;
     bool pulledAnyFrame = false;
 #ifdef OLR_GPU_PIPELINE_BUILD
     FrameHandle pulledGpuFrame;
@@ -449,6 +1477,11 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
         while (!m_frameQueue.isEmpty() && m_frameQueue.head().sourcePts <= targetTimeMs) {
             QueuedFrame top = m_frameQueue.dequeue();
+            if (top.carrierToken &&
+                top.carrierToken->epoch != m_carrierEpoch.load(std::memory_order_acquire)) {
+                av_frame_free(&top.frame);
+                continue;
+            }
 #ifdef OLR_GPU_PIPELINE_BUILD
             if (!top.frame && !top.gpuFrame.isNull() &&
                 m_gpuEncodeCpuFallback.load(std::memory_order_acquire)) {
@@ -458,9 +1491,8 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             if (pulled) av_frame_free(&pulled);
             pulled = top.frame;
             pulledTimecode100ns = top.sourceTimecode100ns;
-            pulledTcFrames = top.sourceTcFrames;
-            pulledRateNum = top.sourceFrameRateNum;
-            pulledRateDen = top.sourceFrameRateDen;
+            pulledTimecodeEvidence = top.timecodeEvidence;
+            pulledCarrierToken = std::move(top.carrierToken);
             pulledAnyFrame = true;
 #ifdef OLR_GPU_PIPELINE_BUILD
             pulledGpuFrame = top.gpuFrame;
@@ -483,16 +1515,16 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         }
         // A blue-painted frame carries no source timecode.
         m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
-        m_latestFrameTcFrames.store(-1, std::memory_order_release);
-        m_latestFrameRateNum.store(0, std::memory_order_release);
-        m_latestFrameRateDen.store(0, std::memory_order_release);
+        m_latestFrameTimecodeEvidence.reset();
+        m_latestFrameCarrierToken.reset();
 #ifdef OLR_GPU_PIPELINE_BUILD
         m_latestGpuFrame = FrameHandle{};
         m_latestGpuFenceValue = 0;
         m_latestGpuFrameTimecode100ns.store(-1, std::memory_order_release);
-        m_latestGpuFrameTcFrames.store(-1, std::memory_order_release);
-        m_latestGpuFrameRateNum.store(0, std::memory_order_release);
-        m_latestGpuFrameRateDen.store(0, std::memory_order_release);
+        std::atomic_store_explicit(&m_latestGpuFrameTimecodeEvidence,
+                                   std::shared_ptr<const TimecodeEvidence>{},
+                                   std::memory_order_release);
+        m_latestGpuFrameCarrierToken.reset();
 #endif
     }
     if (pulledAnyFrame) {
@@ -501,9 +1533,8 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             av_frame_move_ref(m_latestFrame, pulled);
             // The TC travels with the frame now held in m_latestFrame.
             m_latestFrameTimecode100ns.store(pulledTimecode100ns, std::memory_order_release);
-            m_latestFrameTcFrames.store(pulledTcFrames, std::memory_order_release);
-            m_latestFrameRateNum.store(pulledRateNum, std::memory_order_release);
-            m_latestFrameRateDen.store(pulledRateDen, std::memory_order_release);
+            m_latestFrameTimecodeEvidence = pulledTimecodeEvidence;
+            m_latestFrameCarrierToken = pulledCarrierToken;
         }
         if (pulled) av_frame_free(&pulled);
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -511,12 +1542,15 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         m_latestGpuFenceValue = pulledGpuFenceValue;
         m_latestGpuFrameTimecode100ns.store(m_latestGpuFrame.isNull() ? -1 : pulledTimecode100ns,
                                             std::memory_order_release);
-        m_latestGpuFrameTcFrames.store(m_latestGpuFrame.isNull() ? -1 : pulledTcFrames,
-                                       std::memory_order_release);
-        m_latestGpuFrameRateNum.store(m_latestGpuFrame.isNull() ? 0 : pulledRateNum,
-                                      std::memory_order_release);
-        m_latestGpuFrameRateDen.store(m_latestGpuFrame.isNull() ? 0 : pulledRateDen,
-                                      std::memory_order_release);
+        m_latestGpuFrameCarrierToken = m_latestGpuFrame.isNull()
+                                           ? std::shared_ptr<const SourceCarrierToken>{}
+                                           : pulledCarrierToken;
+        std::atomic_store_explicit(
+            &m_latestGpuFrameTimecodeEvidence,
+            m_latestGpuFrame.isNull() || !pulledTimecodeEvidence
+                ? std::shared_ptr<const TimecodeEvidence>{}
+                : std::make_shared<const TimecodeEvidence>(*pulledTimecodeEvidence),
+            std::memory_order_release);
 #endif
     }
 
@@ -524,41 +1558,26 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     // -1 = this source is not assigned to any view, skip encoding.
     track = m_viewTrack.load(std::memory_order_relaxed);
 
-    const bool hasCpuLatest = m_latestFrame && m_latestFrame->data[0];
+    const bool hasSyntheticCpuLatest =
+        !m_latestFrameCarrierToken && !m_latestFrameTimecodeEvidence &&
+        m_latestFrameTimecode100ns.load(std::memory_order_acquire) < 0;
+    const bool hasCpuLatest =
+        m_latestFrame && m_latestFrame->data[0] &&
+        (carrierTokenIsCurrent(m_latestFrameCarrierToken) || hasSyntheticCpuLatest);
 #ifdef OLR_GPU_PIPELINE_BUILD
-    const bool hasGpuLatest = !m_latestGpuFrame.isNull() && m_latestGpuFrame.isGpuBacked();
+    const auto gpuEvidenceForCarrierCheck =
+        std::atomic_load_explicit(&m_latestGpuFrameTimecodeEvidence, std::memory_order_acquire);
+    const bool hasSyntheticGpuLatest =
+        !m_latestGpuFrameCarrierToken && !gpuEvidenceForCarrierCheck &&
+        m_latestGpuFrameTimecode100ns.load(std::memory_order_acquire) < 0;
+    const bool hasGpuLatest =
+        !m_latestGpuFrame.isNull() && m_latestGpuFrame.isGpuBacked() &&
+        (carrierTokenIsCurrent(m_latestGpuFrameCarrierToken) || hasSyntheticGpuLatest);
 #else
     const bool hasGpuLatest = false;
 #endif
 
     if (track >= 0 && (hasCpuLatest || hasGpuLatest)) {
-        // Supply the session-start timecode candidate IN THE SAME THREAD that is
-        // about to write the first muxed packet — so the muxer's deferred header
-        // (written on that first packet) captures a real TC. Registered BEFORE the
-        // encode/write below because the H.264 path writes its packets inline in
-        // the encode callback, which would otherwise materialise the header before
-        // the candidate was offered. The muxer once-guards and first-wins, so doing
-        // this every tick is cheap and race-free: no cross-thread hand-off with the
-        // aligner. Only when this frame carried a valid source TC; recovered with
-        // kTimecodeNominalFps (NOT m_targetFps), because the 100 ns was produced
-        // with that same nominal fps and must round-trip to the original H:M:S:F.
-        // Absent TC -> no candidate -> no tag.
-        const bool asyncGpuEncodePath =
-#if defined(OLR_GPU_PIPELINE_BUILD)
-            m_videoCodec == VideoCodecChoice::H264Hardware && m_gpuEncodePump && hasGpuLatest &&
-            m_muxer && !m_gpuEncodeCpuFallback.load(std::memory_order_acquire);
-#else
-            false;
-#endif
-        const int64_t latestFrameTimecode100ns =
-            m_latestFrameTimecode100ns.load(std::memory_order_acquire);
-        if (!asyncGpuEncodePath && m_muxer && latestFrameTimecode100ns >= 0) {
-            const Smpte12mTimecode startTc =
-                Smpte12m::from100ns(latestFrameTimecode100ns, Smpte12m::kTimecodeNominalFps);
-            char buf[12];
-            m_muxer->setStartTimecodeCandidate(QString::fromLatin1(Smpte12m::format(startTc, buf)));
-        }
-
         bool submittedGpuEncode = false;
 #if defined(OLR_GPU_PIPELINE_BUILD)
         if (m_videoCodec == VideoCodecChoice::H264Hardware && m_gpuEncodePump && hasGpuLatest &&
@@ -566,62 +1585,66 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             AVStream* st = m_muxer->getStream(track);
             const int64_t sourceTimecode100ns =
                 m_latestGpuFrameTimecode100ns.load(std::memory_order_acquire);
-            const int64_t sourceTcFrames = m_latestGpuFrameTcFrames.load(std::memory_order_acquire);
-            const int sourceRateNum = m_latestGpuFrameRateNum.load(std::memory_order_acquire);
-            const int sourceRateDen = m_latestGpuFrameRateDen.load(std::memory_order_acquire);
-            const int64_t sessionFrameIndex = m_internalFrameCount;
-            const QString startTimecodeCandidate = [sourceTimecode100ns] {
-                if (sourceTimecode100ns < 0) return QString();
-                const Smpte12mTimecode startTc =
-                    Smpte12m::from100ns(sourceTimecode100ns, Smpte12m::kTimecodeNominalFps);
-                char buf[12];
-                return QString::fromLatin1(Smpte12m::format(startTc, buf));
-            }();
+            const auto selectedGpuEvidence = std::atomic_load_explicit(
+                &m_latestGpuFrameTimecodeEvidence, std::memory_order_acquire);
             QByteArray metaJson;
             {
                 QMutexLocker locker(&m_metadataMutex);
                 metaJson = m_sourceMetadataJson;
             }
-            auto emittedSidecars = std::make_shared<std::atomic_bool>(false);
             if (!m_gpuEncodeCpuFallback.load(std::memory_order_acquire)) {
-                submittedGpuEncode = m_gpuEncodePump->submit(
-                    m_latestGpuFrame, m_latestGpuFenceValue, m_internalFrameCount,
-                    m_latestGpuFrame.metadata().color,
-                    makeMuxerWriteCallback(
-                        track, st, nullptr,
-                        [this, startTimecodeCandidate] {
-                            if (!startTimecodeCandidate.isEmpty())
-                                m_muxer->setStartTimecodeCandidate(startTimecodeCandidate);
-                        },
-                        [this, track, streamTimeMs, sourceTimecode100ns, sourceTcFrames,
-                         sourceRateNum, sourceRateDen, sessionFrameIndex, metaJson,
-                         emittedSidecars](bool written) {
-                            if (!written) {
-                                latchGpuEncodeCpuFallback();
-                                return;
+                const auto submissionToken = m_latestGpuFrameCarrierToken
+                                                 ? m_latestGpuFrameCarrierToken
+                                                 : snapshotActiveCarrierToken();
+                const uint64_t submissionId = acquireEncodeSubmission(
+                    true, track, st, nullptr,
+                    submissionToken ? *submissionToken : SourceCarrierToken{}, 0, streamTimeMs,
+                    metaJson);
+                if (submissionId == 0) {
+                    qWarning() << "GPU encode callback pool exhausted; switching to CPU fallback";
+                    if (submissionToken) tryLatchGpuEncodeCpuFallback(*submissionToken);
+                } else {
+                    std::optional<TimecodeEvidence> selectedEvidence =
+                        selectedGpuEvidence ? std::optional<TimecodeEvidence>(*selectedGpuEvidence)
+                                            : std::nullopt;
+                    const auto muxEvidence =
+                        takeFrameTimecodeEvidenceForMux(selectedEvidence, m_internalFrameCount);
+#ifdef OLR_UNIT_TEST
+                    runBeforeMuxEvidenceSubmissionForTest();
+#endif
+                    const MuxFrameEvidenceSubmission evidenceSubmission = enqueueMuxFrameEvidence(
+                        m_internalFrameCount, sourceTimecode100ns, muxEvidence, submissionToken,
+                        hasSyntheticGpuLatest);
+                    if (evidenceSubmission.id == 0 ||
+                        !setEncodeSubmissionEvidenceId(submissionId, evidenceSubmission.id)) {
+                        if (evidenceSubmission.id != 0)
+                            discardMuxFrameEvidence(evidenceSubmission.id);
+                        finishEncodeSubmission(submissionId);
+                        // A reset can invalidate the carrier between latest-frame
+                        // validation and evidence insertion. That stale rejection
+                        // must not disable GPU encode for the replacement carrier.
+                        if (submissionToken) tryLatchGpuEncodeCpuFallback(*submissionToken);
+                    } else {
+                        submittedGpuEncode = m_gpuEncodePump->submit(
+                            m_latestGpuFrame, m_latestGpuFenceValue, m_internalFrameCount,
+                            m_latestGpuFrame.metadata().color,
+                            gpuCallbacksForSubmission(submissionId));
+                        if (submittedGpuEncode && selectedGpuEvidence) {
+                            if (m_latestFrameTimecodeEvidence &&
+                                sameTimecodeEvidence(*m_latestFrameTimecodeEvidence,
+                                                     *selectedGpuEvidence)) {
+                                m_latestFrameTimecodeEvidence.reset();
                             }
-                            if (emittedSidecars->exchange(true, std::memory_order_acq_rel)) return;
-                            if (sourceTcFrames >= 0) {
-                                emit frameTimecode(m_sourceIndex, sourceTcFrames, sourceRateNum,
-                                                   sourceRateDen, sessionFrameIndex);
-                                // One-shot clear, but ONLY if this callback's frame is
-                                // still the latest: a newer tick may have already
-                                // published its own TC/rate. Gate the rate/tcFrames
-                                // clears on the SAME CAS that guards the timecode so a
-                                // late callback cannot zero a newer frame's observation.
-                                int64_t expected = sourceTimecode100ns;
-                                if (m_latestGpuFrameTimecode100ns.compare_exchange_strong(
-                                        expected, -1, std::memory_order_acq_rel)) {
-                                    m_latestGpuFrameTcFrames.store(-1, std::memory_order_release);
-                                    m_latestGpuFrameRateNum.store(0, std::memory_order_release);
-                                    m_latestGpuFrameRateDen.store(0, std::memory_order_release);
-                                }
-                            }
-                            if (!metaJson.isEmpty())
-                                m_muxer->writeMetadataPacket(track, streamTimeMs, metaJson);
-                        }),
-                    [this] { latchGpuEncodeCpuFallback(); });
-                if (!submittedGpuEncode) latchGpuEncodeCpuFallback();
+                            auto expected = selectedGpuEvidence;
+                            std::atomic_compare_exchange_strong_explicit(
+                                &m_latestGpuFrameTimecodeEvidence, &expected,
+                                std::shared_ptr<const TimecodeEvidence>{},
+                                std::memory_order_acq_rel, std::memory_order_acquire);
+                        }
+                        if (submittedGpuEncode)
+                            m_latestGpuFrameTimecode100ns.store(-1, std::memory_order_release);
+                    }
+                }
             }
         }
 #endif
@@ -632,24 +1655,139 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             // each output packet directly.
             AVStream* st = m_muxer->getStream(track);
             QString encErr;
-            std::lock_guard<std::mutex> encoderLock(m_nativeEncodeMutex);
-            m_nativeEncoder->encode(m_latestFrame, m_internalFrameCount,
-                                    makeMuxerWriteCallback(track, st, &havePacket), &encErr);
+            const auto submissionToken = m_latestFrameCarrierToken ? m_latestFrameCarrierToken
+                                                                   : snapshotActiveCarrierToken();
+            const uint64_t submissionId = acquireEncodeSubmission(
+                false, track, st, &havePacket,
+                submissionToken ? *submissionToken : SourceCarrierToken{}, 0);
+            if (submissionId == 0) {
+                qWarning() << "Native encode callback pool exhausted; retaining frame evidence";
+            } else {
+                auto muxEvidence = takeFrameTimecodeEvidenceForMux(m_latestFrameTimecodeEvidence,
+                                                                   m_internalFrameCount);
+                const int64_t sourceTimecode100ns =
+                    m_latestFrameTimecode100ns.load(std::memory_order_acquire);
+#ifdef OLR_UNIT_TEST
+                runBeforeMuxEvidenceSubmissionForTest();
+#endif
+                const MuxFrameEvidenceSubmission evidenceSubmission =
+                    enqueueMuxFrameEvidence(m_internalFrameCount, sourceTimecode100ns, muxEvidence,
+                                            submissionToken, hasSyntheticCpuLatest);
+                if (evidenceSubmission.id == 0 ||
+                    !setEncodeSubmissionEvidenceId(submissionId, evidenceSubmission.id)) {
+                    if (evidenceSubmission.id != 0) discardMuxFrameEvidence(evidenceSubmission.id);
+                    finishEncodeSubmission(submissionId);
+                    if (muxEvidence && !m_latestFrameTimecodeEvidence)
+                        m_latestFrameTimecodeEvidence = muxEvidence;
+                } else {
+                    bool encoded = false;
+                    {
+                        std::lock_guard<std::mutex> encoderLock(m_nativeEncodeMutex);
+                        encoded = m_nativeEncoder->encode(
+                            m_latestFrame, m_internalFrameCount,
+                            bufferedPacketCallbackForSubmission(submissionId), &encErr);
+                    }
+                    const bool packetBatchValid = encoded && bufferedSubmissionReady(submissionId);
+                    if (packetBatchValid) {
+                        commitBufferedEncodeSubmission(submissionId);
+                        m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
+                    } else {
+                        finishEncodeSubmission(submissionId);
+                        if (encoded) qWarning() << "Native encoder exceeded bounded packet batch";
+                        discardMuxFrameEvidence(evidenceSubmission.id);
+                        if (muxEvidence && !m_latestFrameTimecodeEvidence)
+                            m_latestFrameTimecodeEvidence = muxEvidence;
+                    }
+                }
+            }
         } else if (!submittedGpuEncode && hasCpuLatest && encCtx) {
-            // MPEG-2 software-encode path (unchanged).
+            // MPEG-2 software-encode path. Evidence is registered against the
+            // input frame PTS and recovered by the encoder's actual output packet
+            // PTS before rescaling; delayed/B-frame output cannot consume a newer
+            // tick's evidence.
             // Set PTS on the FRAME, not the packet (avcodec_receive_packet
             // overwrites the packet entirely).
             m_latestFrame->pts = m_internalFrameCount;
 
-            if (avcodec_send_frame(encCtx, m_latestFrame) == 0) {
-                if (avcodec_receive_packet(encCtx, outPkt) == 0) {
-                    outPkt->stream_index = track;
-                    outPkt->duration = 1;
-                    AVStream* st = m_muxer->getStream(track);
-                    if (st) {
-                        av_packet_rescale_ts(outPkt, encCtx->time_base, st->time_base);
-                        havePacket = true;
+            auto selectedEvidence = takeFrameTimecodeEvidenceForMux(m_latestFrameTimecodeEvidence,
+                                                                    m_internalFrameCount);
+            const int64_t sourceTimecode100ns =
+                m_latestFrameTimecode100ns.load(std::memory_order_acquire);
+#ifdef OLR_UNIT_TEST
+            runBeforeMuxEvidenceSubmissionForTest();
+#endif
+            const auto submissionToken = m_latestFrameCarrierToken ? m_latestFrameCarrierToken
+                                                                   : snapshotActiveCarrierToken();
+            const MuxFrameEvidenceSubmission evidenceSubmission =
+                enqueueMuxFrameEvidence(m_internalFrameCount, sourceTimecode100ns, selectedEvidence,
+                                        submissionToken, hasSyntheticCpuLatest);
+            if (evidenceSubmission.id == 0) {
+                if (selectedEvidence && !m_latestFrameTimecodeEvidence)
+                    m_latestFrameTimecodeEvidence = selectedEvidence;
+            } else {
+                bool encodeAccepted = false;
+                bool receivedPacket = false;
+#ifdef OLR_UNIT_TEST
+                if (m_softwareEncodeOutputPtsForTest) {
+                    // Deterministic test encoder: script the reordered/delayed output
+                    // PTS instead of driving a real (reordering) codec, whose B-frame
+                    // output timing is platform-dependent. Production is all-intra.
+                    encodeAccepted = true;
+                    m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
+                    const std::optional<int64_t> scriptedPts =
+                        m_softwareEncodeOutputPtsForTest(m_latestFrame->pts);
+                    if (scriptedPts.has_value()) {
+                        av_packet_unref(outPkt);
+                        if (av_new_packet(outPkt, 1) == 0) {
+                            outPkt->data[0] = 0;
+                            outPkt->pts = *scriptedPts;
+                            outPkt->dts = *scriptedPts;
+                            // All-intra: every output is a keyframe. Without this the
+                            // muxer drops a leading non-keyframe on some platforms.
+                            outPkt->flags |= AV_PKT_FLAG_KEY;
+                            receivedPacket = true;
+                        }
                     }
+                } else
+#endif
+                {
+                    const int sendResult = avcodec_send_frame(encCtx, m_latestFrame);
+                    encodeAccepted = (sendResult == 0);
+                    if (encodeAccepted) {
+                        m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
+                        receivedPacket = (avcodec_receive_packet(encCtx, outPkt) == 0);
+                    }
+                }
+                if (encodeAccepted) {
+                    if (receivedPacket) {
+                        softwareCompletionId = reserveMuxCompletion(0);
+                        if (softwareCompletionId == 0) {
+                            qWarning()
+                                << "Mux completion pool exhausted; retaining packet evidence";
+                        } else {
+                            softwareFrameEvidence = takeMuxFrameEvidence(outPkt->pts);
+                        }
+                        // As with native/GPU output, an evidence-free frame still has
+                        // a mapping. If reset removed it, this delayed packet belongs
+                        // to an obsolete carrier and must not reach the muxer.
+                        if (softwareFrameEvidence) {
+                            outPkt->stream_index = track;
+                            outPkt->duration = 1;
+                            AVStream* st = m_muxer->getStream(track);
+                            if (st) {
+                                av_packet_rescale_ts(outPkt, encCtx->time_base, st->time_base);
+                                havePacket = true;
+                            }
+                        }
+                        if (!havePacket && softwareCompletionId != 0) {
+                            releaseMuxCompletionReservation(softwareCompletionId);
+                            softwareCompletionId = 0;
+                        }
+                    }
+                } else {
+                    discardMuxFrameEvidence(evidenceSubmission.id);
+                    if (selectedEvidence && !m_latestFrameTimecodeEvidence)
+                        m_latestFrameTimecodeEvidence = selectedEvidence;
                 }
             }
         }
@@ -659,26 +1797,43 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         // For MPEG-2, the packet is in outPkt and has not been written yet.
         // For H.264, packets were written inline in the callback above.
         if (m_videoCodec != VideoCodecChoice::H264Hardware && encCtx) {
-            m_muxer->writePacket(outPkt);
-        }
-
-        // Forward this frame's source timecode to ReplayManager's TimecodeAligner,
-        // keyed by the session frame index it was muxed on. Purely additive: only
-        // when the frame actually carried a valid TC (>= 0), so sources without TC
-        // never emit and behavior is unchanged when TC is absent.
-        const int64_t emittedTcFrames = m_latestFrameTcFrames.load(std::memory_order_acquire);
-        if (emittedTcFrames >= 0) {
-            emit frameTimecode(m_sourceIndex, emittedTcFrames,
-                               m_latestFrameRateNum.load(std::memory_order_acquire),
-                               m_latestFrameRateDen.load(std::memory_order_acquire),
-                               m_internalFrameCount);
-            // One-shot: a TC belongs to a single fresh frame. Clear it so a held /
-            // repeat CFR tick (which re-muxes m_latestFrame without a new pull) does
-            // not re-emit the same TC paired with a different session frame index.
-            m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
-            m_latestFrameTcFrames.store(-1, std::memory_order_release);
-            m_latestFrameRateNum.store(0, std::memory_order_release);
-            m_latestFrameRateDen.store(0, std::memory_order_release);
+            std::optional<TimecodeEvidence> muxEvidence;
+            if (softwareFrameEvidence) muxEvidence = softwareFrameEvidence->timecodeEvidence;
+            const uint64_t evidenceEpoch =
+                softwareFrameEvidence ? softwareFrameEvidence->carrierGeneration : 0;
+            const SourceCarrierToken evidenceToken =
+                softwareFrameEvidence
+                    ? SourceCarrierToken{softwareFrameEvidence->carrierSessionIdentity,
+                                         softwareFrameEvidence->carrierGeneration}
+                    : SourceCarrierToken{};
+            QString startTimecodeCandidate;
+            if (softwareFrameEvidence && softwareFrameEvidence->sourceTimecode100ns >= 0) {
+                const Smpte12mTimecode startTc = Smpte12m::from100ns(
+                    softwareFrameEvidence->sourceTimecode100ns, Smpte12m::kTimecodeNominalFps);
+                char buf[12];
+                startTimecodeCandidate = QString::fromLatin1(Smpte12m::format(startTc, buf));
+            }
+#ifdef OLR_UNIT_TEST
+            runBeforeMuxPacketWriteForTest();
+#endif
+            // Reject the packet on either a stale carrier or a failed completion
+            // populate (short-circuit keeps populateMuxCompletion out of the stale path).
+            if ((evidenceEpoch > 0 && !carrierTokenIsCurrent(evidenceToken)) ||
+                !populateMuxCompletion(softwareCompletionId, evidenceToken, muxEvidence)) {
+                havePacket = false;
+                releaseMuxCompletionReservation(softwareCompletionId);
+                softwareCompletionId = 0;
+            } else {
+                const bool accepted =
+                    m_muxer->writePacket(outPkt, muxCompletionCallback(softwareCompletionId),
+                                         startTimecodeCandidate, packetCarrierGuard(evidenceToken));
+                softwareCompletionId = 0; // The callback owns the populated slot, even on reject.
+                if (accepted) {
+                    m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
+                } else {
+                    havePacket = false;
+                }
+            }
         }
 
         // Write the per-frame source metadata to the paired subtitle track
@@ -687,10 +1842,11 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             QMutexLocker locker(&m_metadataMutex);
             metaJson = m_sourceMetadataJson;
         }
-        if (!metaJson.isEmpty()) {
+        if (havePacket && !metaJson.isEmpty()) {
             m_muxer->writeMetadataPacket(track, streamTimeMs, metaJson);
         }
     }
+    if (softwareCompletionId != 0) releaseMuxCompletionReservation(softwareCompletionId);
     av_packet_free(&outPkt);
 
     // Write this tick's worth of audio for the assigned view track
@@ -734,6 +1890,9 @@ void StreamWorker::captureLoop() {
         qDebug() << "Source" << m_sourceIndex
                  << "Attempting connection to:" << RtmpUrlParts::redactedForLog(QUrl(currentUrl));
         setConnected(false);
+        const uint64_t captureSessionIdentity = beginCaptureSession();
+        const auto endSession = qScopeGuard(
+            [this, captureSessionIdentity] { endCaptureSession(captureSessionIdentity); });
 
         IngestCallbacks callbacks;
         callbacks.shouldStop = [this]() {
@@ -749,58 +1908,32 @@ void StreamWorker::captureLoop() {
 #if defined(OLR_GPU_PIPELINE_BUILD)
         callbacks.preferGpuVideoFrames = preferGpuVideoFramesForIngest();
         callbacks.shouldPreferGpuVideoFrames = [this]() { return preferGpuVideoFramesForIngest(); };
-        callbacks.importGpuVideoFrame = [this](void* nativeDecodedImage,
-                                               const FrameMetadata& metadata) {
-            return importGpuVideoFrameForEncode(nativeDecodedImage, metadata);
+        callbacks.importGpuVideoFrame = [this,
+                                         captureSessionIdentity](void* nativeDecodedImage,
+                                                                 const FrameMetadata& metadata) {
+            return importGpuVideoFrameForSession(captureSessionIdentity, nativeDecodedImage,
+                                                 metadata);
         };
 #endif
-        callbacks.onVideoFrame = [this](DecodedVideoFrame decoded) {
-#if defined(OLR_GPU_PIPELINE_BUILD)
-            if (!decoded.frame && decoded.gpuFrame.isNull()) return;
-#else
-            if (!decoded.frame) return;
-#endif
-
-            // Bug 4: a restart/blue-paint is pending (source was cleared to an
-            // empty URL). Drop frames from the old source so a late straggler
-            // can't overwrite the painted blue frame.
-            if (m_suppressEnqueue.load(std::memory_order_relaxed)) {
-                if (decoded.frame) av_frame_free(&decoded.frame);
-                return;
-            }
-
-            QueuedFrame qf;
-            qf.frame = decoded.frame;
-            qf.sourcePts = decoded.sourcePtsMs;
-            qf.sourceTimecode100ns = decoded.sourceTimecode100ns;
-            qf.sourceTcFrames = decoded.sourceTcFrames;
-            qf.sourceFrameRateNum = decoded.sourceFrameRateNum;
-            qf.sourceFrameRateDen = decoded.sourceFrameRateDen;
-#if defined(OLR_GPU_PIPELINE_BUILD)
-            qf.gpuFrame = decoded.gpuFrame;
-            qf.gpuFenceValue = decoded.gpuFenceValue;
-#endif
-
-            QMutexLocker locker(&m_frameMutex);
-            m_frameQueue.enqueue(qf);
-
-            m_lastFrameEnqueueAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
-
-            const int64_t tickGateMs = m_lastTickTargetMs.load(std::memory_order_relaxed);
-            trimFrameQueueBackstopLocked(tickGateMs);
+        callbacks.onVideoFrame = [this, captureSessionIdentity](DecodedVideoFrame decoded) {
+            // Moves the move-only gpuFrame in GPU builds; no-op in CPU-only builds.
+            // NOLINTNEXTLINE(performance-move-const-arg)
+            enqueueDecodedVideoFrameForSession(std::move(decoded), captureSessionIdentity);
         };
-        callbacks.onAudioChunk = [this](DecodedAudioChunk chunk) {
+        callbacks.onAudioChunk = [this, captureSessionIdentity](DecodedAudioChunk chunk) {
             const qsizetype sampleCount = chunk.pcmS16Stereo.size() / kAudioBytesPerSample;
             if (sampleCount > std::numeric_limits<int>::max()) {
                 return;
             }
-            enqueueAudio(chunk.startSample,
-                         reinterpret_cast<const uint8_t*>(chunk.pcmS16Stereo.constData()),
-                         static_cast<int>(sampleCount));
+            enqueueAudioForSession(captureSessionIdentity, chunk.startSample,
+                                   reinterpret_cast<const uint8_t*>(chunk.pcmS16Stereo.constData()),
+                                   static_cast<int>(sampleCount));
         };
-        callbacks.setConnected = [this](bool connected) { setConnected(connected); };
-        callbacks.reportStats = [this](const IngestStats& stats) {
-            emit statsUpdated(m_sourceIndex, stats);
+        callbacks.setConnected = [this, captureSessionIdentity](bool connected) {
+            setConnectedForSession(captureSessionIdentity, connected);
+        };
+        callbacks.reportStats = [this, captureSessionIdentity](const IngestStats& stats) {
+            reportStatsForSession(captureSessionIdentity, stats);
         };
 
         const QUrl sourceUrl(currentUrl);
@@ -857,7 +1990,7 @@ void StreamWorker::captureLoop() {
                 qWarning() << "Source" << m_sourceIndex << "unsupported ingest scheme" << scheme
                            << "- OpenLiveReplay ingests only srt://, rtmp://, rtmps://, ndi:";
             }
-            setConnected(false);
+            setConnectedForSession(captureSessionIdentity, false);
             m_captureRunning = false;
             break;
         }
@@ -894,7 +2027,7 @@ void StreamWorker::captureLoop() {
             }
             continue;
         }
-        setConnected(true);
+        setConnectedForSession(captureSessionIdentity, true);
         m_connectBackoffMs = 1000;
         m_lastFrameEnqueueAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
         // A real source connected: stragglers from any previously-cleared
@@ -905,7 +2038,7 @@ void StreamWorker::captureLoop() {
             qDebug() << "Source" << m_sourceIndex << "No shared clock. Restarting...";
             m_restartCapture = 1;
             m_captureRunning = false;
-            setConnected(false);
+            setConnectedForSession(captureSessionIdentity, false);
             break;
         }
 
@@ -917,7 +2050,7 @@ void StreamWorker::captureLoop() {
             }
         }
 
-        setConnected(false);
+        setConnectedForSession(captureSessionIdentity, false);
         const IngestFailureKind failureKind = session->lastFailureKind();
         if (nativeRtmpAttempt && shouldStopNativeRtmpAfterFailure(failureKind)) {
             qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
@@ -1027,11 +2160,14 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
 
     // Paint blue frame
     // Y plane (Brightness) - set to medium
-    memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
+    memset(m_latestFrame->data[0], 128,
+           static_cast<size_t>(m_latestFrame->linesize[0]) * m_latestFrame->height);
     // U plane (Blue Chrominance) - set to max
-    memset(m_latestFrame->data[1], 255, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
+    memset(m_latestFrame->data[1], 255,
+           static_cast<size_t>(m_latestFrame->linesize[1]) * (m_latestFrame->height / 2));
     // V plane (Red Chrominance) - set to low
-    memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
+    memset(m_latestFrame->data[2], 107,
+           static_cast<size_t>(m_latestFrame->linesize[2]) * (m_latestFrame->height / 2));
 
     return avcodec_open2(*encCtx, encoder, nullptr) >= 0;
 }
@@ -1042,6 +2178,7 @@ void StreamWorker::changeSource(const QString& newUrl) {
         if (m_url == newUrl) return; // No change
         m_url = newUrl;
     }
+    rotateCarrier(false);
 
     if (newUrl.trimmed().isEmpty()) {
         m_paintBlue = 1;
@@ -1104,6 +2241,13 @@ void StreamWorker::enqueueAudio(int64_t startSample, const uint8_t* data, int nu
         m_audioFifo.remove(0, excess);
         m_audioFifoStartSample += excess / kAudioBytesPerSample;
     }
+}
+
+void StreamWorker::enqueueAudioForSession(uint64_t sessionIdentity, int64_t startSample,
+                                          const uint8_t* data, int numSamples) {
+    std::lock_guard<std::mutex> epochLock(m_epochMutex);
+    if (sessionIdentity == 0 || sessionIdentity != m_activeCaptureSessionIdentity) return;
+    enqueueAudio(startSample, data, numSamples);
 }
 
 void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs,

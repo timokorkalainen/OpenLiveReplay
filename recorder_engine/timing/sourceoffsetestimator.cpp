@@ -1,5 +1,7 @@
 #include "sourceoffsetestimator.h"
 
+#include <limits>
+
 SourceOffsetEstimator::SourceOffsetEstimator(int boundedBaseMs, int boundedPpmMsPerSec)
     : m_boundedBaseMs(boundedBaseMs > 0 ? boundedBaseMs : 0),
       m_boundedPpmMsPerSec(boundedPpmMsPerSec > 0 ? boundedPpmMsPerSec : 0) {}
@@ -15,7 +17,25 @@ void SourceOffsetEstimator::update(int sourceIndex, const SourcePhaseEvidence& e
     // makes equal frames coincide -> FrameAccurate; any recovered clock lock
     // (Pcr/Ndi/FlvPll) gives a numerically bounded estimate -> Bounded; otherwise
     // arrival timing only -> Approximate.
-    if (ev.timecodeAlignedToReference || ev.externalReference) {
+    if (ev.externalReference) {
+        entry.tier = ConfidenceTier::FrameAccurate;
+        entry.boundMs = 0;
+        return;
+    }
+
+    if (ev.timecodeKind != AlignmentOffset::Kind::Incomparable && ev.timecodeBoundUs >= 0) {
+        entry.offsetMs = ev.timecodeOffsetUs / 1000;
+        const int64_t roundedBoundMs =
+            ev.timecodeBoundUs / 1000 + (ev.timecodeBoundUs % 1000 != 0 ? 1 : 0);
+        entry.boundMs = roundedBoundMs > int64_t(std::numeric_limits<int>::max())
+                            ? std::numeric_limits<int>::max()
+                            : int(roundedBoundMs);
+        entry.tier =
+            ev.timecodeAlignedToReference ? ConfidenceTier::FrameAccurate : ConfidenceTier::Bounded;
+        return;
+    }
+
+    if (ev.timecodeAlignedToReference) {
         entry.tier = ConfidenceTier::FrameAccurate;
         entry.boundMs = 0;
         return;

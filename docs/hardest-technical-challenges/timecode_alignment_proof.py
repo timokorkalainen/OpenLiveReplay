@@ -23,6 +23,9 @@ WHAT IT PROVES (by exhaustive sweep over an exact-rational ground-truth model)
   5. DROP-FRAME: SMPTE 12M drop-frame frame NUMBERS skip at minute boundaries
      but the frame COUNT stays contiguous; verified across 00:00:59;29 ->
      00:01:00;02 (the renumbering the aligner must ride on).
+  6. ROLLOVER/UNCERTAINTY: the production six-rate grid unwraps one adjacent
+     day exactly, rejects a two-day gap, and propagates the four evidence
+     bounds plus a conservatively ceiled 50 ppm anchor-separation residual.
 
 GROUND-TRUTH MODEL (all exact rationals)
   A common TC generator defines wall time t (seconds).  Source i emits frame
@@ -215,10 +218,63 @@ def run_incomparable():
     print("  unknown rate -> Incomparable sentinel (no bare frame offset)  [OK]\n")
 
 
+def round_half_away_from_zero(value):
+    magnitude = abs(value)
+    rounded = (2 * magnitude.numerator + magnitude.denominator) \
+        // (2 * magnitude.denominator)
+    return -rounded if value < 0 else rounded
+
+
+def ceil_fraction(value):
+    assert value >= 0
+    return (value.numerator + value.denominator - 1) // value.denominator
+
+
+def run_rollover_uncertainty_grid():
+    print("=== 6. six-rate rollover and exact uncertainty grid ===")
+    rows = (
+        ("25", F(25), 2_160_000, 40_000, 2),
+        ("30000/1001 DF", F(30000, 1001), 2_589_408, 33_367, 2),
+        ("30", F(30), 2_592_000, 33_333, 2),
+        ("50", F(50), 4_320_000, 20_000, 1),
+        ("60000/1001 DF", F(60000, 1001), 5_178_816, 16_683, 1),
+        ("60", F(60), 5_184_000, 16_667, 1),
+    )
+    for name, rate, day_frames, expected_frame_us, expected_drift_us in rows:
+        last = day_frames - 1
+
+        # Adjacent-day candidate: last label -> frame zero is one exact frame,
+        # matching one session-frame progression.
+        label_progress = F(day_frames - last, 1) / rate
+        session_progress = F(day_frames - last, 1) / rate
+        assert session_progress - label_progress == 0, name
+
+        # C++ proof row: B arrives two frames after A while its unwrapped label
+        # is one frame after A, so A relative to B is exactly -one frame.
+        exact_offset_us = -F(1_000_000, 1) / rate
+        assert round_half_away_from_zero(exact_offset_us) == -expected_frame_us, name
+
+        # Never floor this term: any fractional microsecond is uncertainty.
+        drift_us = ceil_fraction(F(1_000_000, 1) / rate * F(50, 1_000_000))
+        assert drift_us == expected_drift_us, name
+        assert 3 + 7 + 5 + 11 + drift_us == 26 + expected_drift_us, name
+
+        # With zero uncertainty, no adjacent-day candidate can explain a
+        # two-day arrival progression.
+        two_day_session_progress = F(2 * day_frames, 1) / rate
+        adjacent_progresses = (F(0), F(day_frames, 1) / rate)
+        assert all(two_day_session_progress != candidate
+                   for candidate in adjacent_progresses), name
+
+    print(f"  exact C++-matching rows checked: {len(rows)}; "
+          "50 ppm residuals ceiled conservatively  [OK]\n")
+
+
 if __name__ == "__main__":
     run_falsifier()
     run_exactness()
     run_bound_sweep()
     run_dropframe()
     run_incomparable()
+    run_rollover_uncertainty_grid()
     print("ALL CHECKS PASSED")

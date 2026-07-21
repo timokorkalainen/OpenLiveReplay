@@ -209,6 +209,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/timing/driftestimator.h recorder_engine/timing/driftestimator.cpp
         recorder_engine/timing/timecode.h recorder_engine/timing/timecode.cpp
         recorder_engine/timing/smpte12m.h recorder_engine/timing/smpte12m.cpp
+        recorder_engine/timing/timecodeevidence.h recorder_engine/timing/timecodeevidence.cpp
         recorder_engine/timing/timecodealignerv2.h recorder_engine/timing/timecodealignerv2.cpp
         recorder_engine/timing/sourceoffsetestimator.h recorder_engine/timing/sourceoffsetestimator.cpp
         recorder_engine/timing/sourceclock.h recorder_engine/timing/sourceclock.cpp
@@ -238,7 +239,10 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/benchmark/benchmarkcache.h recorder_engine/benchmark/benchmarkcache.cpp
         recorder_engine/benchmark/runcodecbenchmark.h recorder_engine/benchmark/runcodecbenchmark.cpp
         recorder_engine/benchmark/recordgate.h recorder_engine/benchmark/recordgate.cpp
+        recorder_engine/ingest/h26xtimingcontext.h recorder_engine/ingest/h26xtimingcontext.cpp
         recorder_engine/ingest/h26xseitimecode.h recorder_engine/ingest/h26xseitimecode.cpp
+        recorder_engine/ingest/decodedframeevidencequeue.h
+        recorder_engine/ingest/decodedframeevidencequeue.cpp
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp

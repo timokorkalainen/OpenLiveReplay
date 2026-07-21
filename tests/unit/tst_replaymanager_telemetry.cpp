@@ -15,6 +15,21 @@ extern "C" {
 #include <libavcodec/packet.h>
 }
 
+namespace {
+struct WorkerLifetimeCompletion {
+    std::atomic<bool>* workerDestroyed = nullptr;
+    std::atomic<bool>* completionRan = nullptr;
+    std::atomic<bool>* completionSawWorkerAlive = nullptr;
+
+    static void complete(void* context, uint64_t, bool) {
+        auto& state = *static_cast<WorkerLifetimeCompletion*>(context);
+        state.completionSawWorkerAlive->store(
+            !state.workerDestroyed->load(std::memory_order_acquire), std::memory_order_release);
+        state.completionRan->store(true, std::memory_order_release);
+    }
+};
+} // namespace
+
 class TestReplayManagerTelemetry : public QObject {
     Q_OBJECT
 
@@ -327,11 +342,10 @@ void TestReplayManagerTelemetry::stopRecordingDrainsMuxerBeforeDeletingWorkers()
     pkt->dts = 0;
     pkt->duration = 1;
 
-    manager.m_muxer->writePacket(pkt, [&](bool) {
-        completionSawWorkerAlive.store(!workerDestroyed.load(std::memory_order_acquire),
-                                       std::memory_order_release);
-        completionRan.store(true, std::memory_order_release);
-    });
+    WorkerLifetimeCompletion completion{&workerDestroyed, &completionRan,
+                                        &completionSawWorkerAlive};
+    manager.m_muxer->writePacket(
+        pkt, Muxer::PacketWriteCallback{&completion, 0, &WorkerLifetimeCompletion::complete});
     av_packet_free(&pkt);
 
     manager.stopRecording();

@@ -1,5 +1,7 @@
 #include <QtTest>
 
+#include <QTemporaryDir>
+
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
 #include "playback/gpu/appleiosurface.h"
 #endif
@@ -12,6 +14,7 @@
 #include "recorder_engine/streamworker.h"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -69,8 +72,8 @@ class BlockingSurfaceEncoder final : public NativeVideoEncoder {
 public:
     bool encode(const AVFrame*, int64_t, const PacketCallback&, QString*) override { return false; }
 
-    bool encodeSurface(GpuSurface*, int64_t ptsTicks, const ColorMetadata&,
-                       const PacketCallback& onPacket, QString*) override {
+    bool encodeSurface(GpuSurface*, int64_t, const ColorMetadata&, const PacketCallback&,
+                       QString*) override {
         surfaceCalls.fetch_add(1, std::memory_order_acq_rel);
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -80,8 +83,9 @@ public:
 
         std::unique_lock<std::mutex> lock(m_mutex);
         m_cv.wait(lock, [&] { return m_released; });
-        lock.unlock();
-        onPacket(QByteArrayLiteral("pkt"), ptsTicks, true);
+        // This fake only exercises pump queueing. A successful submission that
+        // produces no immediate packet also models a hardware encoder buffering
+        // output for a later call, without involving an uninitialized test Muxer.
         return true;
     }
 
@@ -109,6 +113,134 @@ private:
     bool m_entered = false;
     bool m_released = false;
 };
+
+class BlockingFailureSurfaceEncoder final : public NativeVideoEncoder {
+public:
+    bool encode(const AVFrame*, int64_t, const PacketCallback&, QString*) override { return false; }
+
+    bool encodeSurface(GpuSurface*, int64_t, const ColorMetadata&, const PacketCallback&,
+                       QString*) override {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_entered = true;
+        }
+        m_cv.notify_all();
+
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [&] { return m_released; });
+        return false;
+    }
+
+    bool flush(const PacketCallback&, QString*) override { return true; }
+    QByteArray avccExtradata() const override { return QByteArrayLiteral("avcc"); }
+
+    bool waitForCall(int timeoutMs) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] { return m_entered; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_released = true;
+        }
+        m_cv.notify_all();
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    bool m_entered = false;
+    bool m_released = false;
+};
+
+class DelayedSurfaceEncoder final : public NativeVideoEncoder {
+public:
+    explicit DelayedSurfaceEncoder(bool blockSecondCall = false)
+        : m_blockSecondCall(blockSecondCall) {}
+
+    bool encode(const AVFrame*, int64_t, const PacketCallback&, QString*) override { return false; }
+
+    bool encodeSurface(GpuSurface*, int64_t ptsTicks, const ColorMetadata&,
+                       const PacketCallback& onPacket, QString*) override {
+        std::optional<int64_t> outputPts;
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            ++m_surfaceCalls;
+            m_cv.notify_all();
+            if (m_blockSecondCall && m_surfaceCalls == 2)
+                m_cv.wait(lock, [&] { return m_secondCallReleased; });
+            outputPts = m_pendingPts;
+            m_pendingPts = ptsTicks;
+        }
+
+        if (outputPts) onPacket(QByteArray::fromHex("000001b300100113"), *outputPts, true);
+        return true;
+    }
+
+    bool flush(const PacketCallback&, QString*) override { return true; }
+    QByteArray avccExtradata() const override { return QByteArrayLiteral("avcc"); }
+
+    bool waitForCalls(int count, int timeoutMs) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                             [&] { return m_surfaceCalls >= count; });
+    }
+
+    void releaseSecondCall() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_secondCallReleased = true;
+        }
+        m_cv.notify_all();
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::optional<int64_t> m_pendingPts;
+    int m_surfaceCalls = 0;
+    bool m_blockSecondCall = false;
+    bool m_secondCallReleased = false;
+};
+
+class CountingSurfaceEncoder final : public NativeVideoEncoder {
+public:
+    bool encode(const AVFrame*, int64_t, const PacketCallback&, QString*) override { return false; }
+    bool encodeSurface(GpuSurface*, int64_t, const ColorMetadata&, const PacketCallback&,
+                       QString*) override {
+        surfaceCalls.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    }
+    bool flush(const PacketCallback&, QString*) override { return true; }
+    QByteArray avccExtradata() const override { return QByteArrayLiteral("avcc"); }
+
+    std::atomic<int> surfaceCalls{0};
+};
+
+class TwoPacketSurfaceEncoder final : public NativeVideoEncoder {
+public:
+    bool encode(const AVFrame*, int64_t, const PacketCallback&, QString*) override { return false; }
+    bool encodeSurface(GpuSurface*, int64_t ptsTicks, const ColorMetadata&,
+                       const PacketCallback& onPacket, QString*) override {
+        onPacket(QByteArray::fromHex("000001b300100113"), ptsTicks, true);
+        onPacket(QByteArray::fromHex("000001b300100114"), ptsTicks, false);
+        return true;
+    }
+    bool flush(const PacketCallback&, QString*) override { return true; }
+    QByteArray avccExtradata() const override { return QByteArrayLiteral("avcc"); }
+};
+
+TimecodeEvidence gpuEvidence(int64_t frameOfDay, int64_t arrivalSessionFrame) {
+    TimecodeEvidence value;
+    value.frameOfDay = frameOfDay;
+    value.labelRate = {30, 1};
+    value.sourceGeneration = 7;
+    value.timingGeneration = 11;
+    value.arrivalSessionFrame = arrivalSessionFrame;
+    value.sessionRate = {30, 1};
+    return value;
+}
 #endif
 
 } // namespace
@@ -126,7 +258,17 @@ private slots:
     void gpuEncodeImportChargesRecorderWrap();
     void gpuEncodePumpStartsWhenGpuPipelineEnabled();
     void queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFlight();
+    void delayedGpuOutputUsesEvidenceForPacketPts();
+    void delayedGpuOutputAfterFallbackDropsOldEvidence();
+    void resetBetweenLatestValidationAndGpuSubmissionRejectsFrame();
+    void delayedOldSessionGpuFailureDoesNotLatchFallback();
+    void successfulGpuImportRotatedBeforeReturnIsRejected();
+    void importedGpuFrameCannotCrossLaterSameSessionRotation();
+    void resetBetweenFallbackCheckAndLatchCannotDisableReplacementCarrier();
+    void concurrentFallbackRacersLatchAndRotateExactlyOnce();
+    void gpuTwoPacketBatchRejectsBeforePartialCommit();
     void gpuEncodeFallbackDisablesGpuFrameIngestPreference();
+    void gpuFallbackRotatesTokenButRetainsLiveSession();
     void appleDefaultsToCpuIngestWhenGpuPipelineEnabled();
     void gpuRecordSurfaceEncodeOptInPrefersGpuFramesWhereSupported();
     void gpuOnlyQueuedFrameBeforeEncodeFallbackDoesNotClearCpuLatest();
@@ -353,6 +495,342 @@ void TestStreamWorkerGpuEncode::queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFli
     worker.m_gpuEncodePump->stop();
 }
 
+void TestStreamWorkerGpuEncode::delayedGpuOutputUsesEvidenceForPacketPts() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
+
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-delayed-gpu"), 1, 16, 16, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.setViewTrack(0);
+    auto encoder = std::make_unique<DelayedSurfaceEncoder>();
+    auto* encoderPtr = encoder.get();
+    worker.m_nativeEncoder = std::move(encoder);
+    worker.m_gpuEncodePump =
+        std::make_unique<GpuEncodePump>(worker.m_nativeEncoder.get(), nullptr, 4);
+    worker.m_gpuEncodePump->start();
+    worker.m_latestGpuFrame = makeGpuHandle();
+    worker.beginCaptureSession();
+    worker.m_latestGpuFrameCarrierToken = worker.snapshotActiveCarrierToken();
+
+    QList<TimecodeEvidence> delivered;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::frameTimecode, this,
+        [&delivered](int sourceIndex, uint64_t, uint64_t, TimecodeEvidence value) {
+            QCOMPARE(sourceIndex, 0);
+            delivered.append(value);
+        },
+        Qt::QueuedConnection));
+
+    const TimecodeEvidence first = gpuEvidence(100, 80);
+    std::atomic_store_explicit(&worker.m_latestGpuFrameTimecodeEvidence,
+                               std::make_shared<const TimecodeEvidence>(first),
+                               std::memory_order_release);
+    worker.m_latestGpuFrameTimecode100ns.store(100, std::memory_order_release);
+    worker.m_internalFrameCount = 80;
+    worker.processEncoderTick(nullptr, 2666, 0, 0);
+    QVERIFY2(encoderPtr->waitForCalls(1, 1000), "first GPU encode did not start");
+    QCOMPARE(delivered.size(), 0);
+
+    const TimecodeEvidence second = gpuEvidence(101, 81);
+    std::atomic_store_explicit(&worker.m_latestGpuFrameTimecodeEvidence,
+                               std::make_shared<const TimecodeEvidence>(second),
+                               std::memory_order_release);
+    worker.m_latestGpuFrameTimecode100ns.store(200, std::memory_order_release);
+    worker.m_internalFrameCount = 81;
+    worker.processEncoderTick(nullptr, 2700, 0, 0);
+
+    QVERIFY2(encoderPtr->waitForCalls(2, 1000), "second GPU encode did not start");
+    QTRY_COMPARE_WITH_TIMEOUT(delivered.size(), 1, 5000);
+    QCOMPARE(delivered.front().frameOfDay, first.frameOfDay);
+    QCOMPARE(delivered.front().arrivalSessionFrame, int64_t(80));
+
+    worker.m_gpuEncodePump->stop();
+    muxer.close();
+}
+
+void TestStreamWorkerGpuEncode::delayedGpuOutputAfterFallbackDropsOldEvidence() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
+
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-delayed-gpu-reset"), 1, 16, 16, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.setViewTrack(0);
+    auto encoder = std::make_unique<DelayedSurfaceEncoder>(true);
+    auto* encoderPtr = encoder.get();
+    worker.m_nativeEncoder = std::move(encoder);
+    worker.m_gpuEncodePump =
+        std::make_unique<GpuEncodePump>(worker.m_nativeEncoder.get(), nullptr, 4);
+    worker.m_gpuEncodePump->start();
+    worker.m_latestGpuFrame = makeGpuHandle();
+    worker.beginCaptureSession();
+    worker.m_latestGpuFrameCarrierToken = worker.snapshotActiveCarrierToken();
+
+    QList<TimecodeEvidence> delivered;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::frameTimecode, this,
+        [&delivered](int, uint64_t, uint64_t, TimecodeEvidence value) { delivered.append(value); },
+        Qt::QueuedConnection));
+
+    const TimecodeEvidence first = gpuEvidence(200, 90);
+    std::atomic_store_explicit(&worker.m_latestGpuFrameTimecodeEvidence,
+                               std::make_shared<const TimecodeEvidence>(first),
+                               std::memory_order_release);
+    worker.m_latestGpuFrameTimecode100ns.store(100, std::memory_order_release);
+    worker.m_internalFrameCount = 90;
+    worker.processEncoderTick(nullptr, 3000, 0, 0);
+    QVERIFY2(encoderPtr->waitForCalls(1, 1000), "first GPU encode did not start");
+
+    const TimecodeEvidence second = gpuEvidence(201, 91);
+    std::atomic_store_explicit(&worker.m_latestGpuFrameTimecodeEvidence,
+                               std::make_shared<const TimecodeEvidence>(second),
+                               std::memory_order_release);
+    worker.m_latestGpuFrameTimecode100ns.store(200, std::memory_order_release);
+    worker.m_internalFrameCount = 91;
+    worker.processEncoderTick(nullptr, 3033, 0, 0);
+    QVERIFY2(encoderPtr->waitForCalls(2, 1000), "second GPU encode did not start");
+
+    worker.latchGpuEncodeCpuFallback();
+    encoderPtr->releaseSecondCall();
+    QTRY_VERIFY_WITH_TIMEOUT(worker.m_gpuEncodePump->framesEncoded() >= 2, 2000);
+    QTest::qWait(100);
+    QCOMPARE(delivered.size(), 0);
+    QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(-1));
+
+    worker.m_gpuEncodePump->stop();
+    muxer.close();
+}
+
+void TestStreamWorkerGpuEncode::resetBetweenLatestValidationAndGpuSubmissionRejectsFrame() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("gpu-validation-reset"), 1, 16, 16, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.setViewTrack(0);
+    worker.beginCaptureSession();
+    auto encoder = std::make_unique<CountingSurfaceEncoder>();
+    auto* encoderPtr = encoder.get();
+    worker.m_nativeEncoder = std::move(encoder);
+    worker.m_gpuEncodePump =
+        std::make_unique<GpuEncodePump>(worker.m_nativeEncoder.get(), nullptr, 4);
+    worker.m_gpuEncodePump->start();
+    worker.m_latestGpuFrame = makeGpuHandle();
+    worker.m_latestGpuFrameCarrierToken = worker.snapshotActiveCarrierToken();
+    std::atomic_store_explicit(&worker.m_latestGpuFrameTimecodeEvidence,
+                               std::make_shared<const TimecodeEvidence>(gpuEvidence(100, 1)),
+                               std::memory_order_release);
+    worker.m_beforeMuxEvidenceSubmissionForTest = [&worker] { worker.clearMuxFrameEvidence(); };
+    const uint64_t epochBeforeReset = worker.currentCarrierEpoch();
+
+    worker.m_internalFrameCount = 1;
+    worker.processEncoderTick(nullptr, 33, 0, 0);
+    QTest::qWait(100);
+
+    QCOMPARE(encoderPtr->surfaceCalls.load(std::memory_order_acquire), 0);
+    QCOMPARE(worker.m_muxFrameEvidence.size(), 0);
+    QVERIFY(!worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
+    QCOMPARE(worker.currentCarrierEpoch(), epochBeforeReset + 1);
+    worker.m_gpuEncodePump->stop();
+    muxer.close();
+}
+
+void TestStreamWorkerGpuEncode::delayedOldSessionGpuFailureDoesNotLatchFallback() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
+
+    Muxer muxer;
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.setViewTrack(0);
+    auto encoder = std::make_unique<BlockingFailureSurfaceEncoder>();
+    auto* encoderPtr = encoder.get();
+    worker.m_nativeEncoder = std::move(encoder);
+    worker.m_gpuEncodePump =
+        std::make_unique<GpuEncodePump>(worker.m_nativeEncoder.get(), nullptr, 4);
+    worker.m_gpuEncodePump->start();
+    worker.m_latestGpuFrame = makeGpuHandle();
+    const uint64_t oldSession = worker.beginCaptureSession();
+    worker.m_latestGpuFrameCarrierToken = worker.snapshotCarrierTokenForSession(oldSession);
+    QVERIFY(worker.m_latestGpuFrameCarrierToken);
+
+    worker.m_internalFrameCount = 1;
+    worker.processEncoderTick(nullptr, 33, 0, 0);
+    QVERIFY2(encoderPtr->waitForCall(1000), "GPU encode did not enter old-session failure");
+
+    worker.endCaptureSession(oldSession);
+    const uint64_t newSession = worker.beginCaptureSession();
+    QVERIFY(newSession != oldSession);
+    const uint64_t replacementEpoch = worker.currentCarrierEpoch();
+    encoderPtr->release();
+    QTRY_VERIFY_WITH_TIMEOUT(worker.m_gpuEncodePump->queueDrops() >= 1, 2000);
+
+    QVERIFY(!worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
+    QCOMPARE(worker.currentCarrierEpoch(), replacementEpoch);
+    worker.m_gpuEncodePump->stop();
+}
+
+void TestStreamWorkerGpuEncode::successfulGpuImportRotatedBeforeReturnIsRejected() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    const uint64_t session = worker.beginCaptureSession();
+    FrameMetadata metadata;
+    metadata.key.format = FramePixelFormat::Nv12;
+    metadata.key.width = 16;
+    metadata.key.height = 16;
+
+    worker.m_gpuImportForTest = [](void*, const FrameMetadata&) {
+        return ImportedGpuVideoFrame{makeGpuHandle(), 17};
+    };
+    worker.m_afterGpuImportForTest = [&worker] { worker.rotateCarrier(true); };
+
+    const ImportedGpuVideoFrame imported =
+        worker.importGpuVideoFrameForSession(session, reinterpret_cast<void*>(1), metadata);
+    QVERIFY(imported.frame.isNull());
+    QVERIFY(!worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
+}
+
+void TestStreamWorkerGpuEncode::importedGpuFrameCannotCrossLaterSameSessionRotation() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    const uint64_t session = worker.beginCaptureSession();
+    const auto importedCarrier = worker.snapshotCarrierTokenForSession(session);
+    QVERIFY(importedCarrier);
+
+    DecodedVideoFrame decoded;
+    decoded.gpuFrame = makeGpuHandle();
+    decoded.gpuCarrierSessionIdentity = importedCarrier->sessionIdentity;
+    decoded.gpuCarrierEpoch = importedCarrier->epoch;
+    worker.rotateCarrier(true);
+
+    worker.enqueueDecodedVideoFrameForSession(std::move(decoded), session);
+    QMutexLocker frameLock(&worker.m_frameMutex);
+    QVERIFY(worker.m_frameQueue.isEmpty());
+}
+
+void TestStreamWorkerGpuEncode::resetBetweenFallbackCheckAndLatchCannotDisableReplacementCarrier() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.beginCaptureSession();
+    const auto failureCarrier = worker.snapshotActiveCarrierToken();
+    QVERIFY(failureCarrier);
+    const uint64_t submissionId =
+        worker.acquireEncodeSubmission(true, 0, nullptr, nullptr, *failureCarrier, 0);
+    QVERIFY(submissionId != 0);
+    const uint64_t epochBeforeReset = worker.currentCarrierEpoch();
+
+    worker.m_beforeGpuFallbackTryForTest = [&worker] { worker.rotateCarrier(true); };
+    worker.failEncodeSubmission(submissionId);
+
+    QVERIFY(!worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
+    QCOMPARE(worker.currentCarrierEpoch(), epochBeforeReset + 1);
+}
+
+void TestStreamWorkerGpuEncode::concurrentFallbackRacersLatchAndRotateExactlyOnce() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.beginCaptureSession();
+    const auto failureCarrier = worker.snapshotActiveCarrierToken();
+    QVERIFY(failureCarrier);
+    const uint64_t epochBeforeFallback = worker.currentCarrierEpoch();
+
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    int ready = 0;
+    bool race = false;
+    std::atomic<int> winners{0};
+    auto racer = [&] {
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            ++ready;
+            gateCv.notify_all();
+            gateCv.wait(lock, [&] { return race; });
+        }
+        if (worker.tryLatchGpuEncodeCpuFallback(*failureCarrier))
+            winners.fetch_add(1, std::memory_order_acq_rel);
+    };
+    std::thread first(racer);
+    std::thread second(racer);
+    {
+        std::unique_lock<std::mutex> lock(gateMutex);
+        QVERIFY(gateCv.wait_for(lock, std::chrono::seconds(1), [&] { return ready == 2; }));
+        race = true;
+    }
+    gateCv.notify_all();
+    first.join();
+    second.join();
+
+    QCOMPARE(winners.load(std::memory_order_acquire), 1);
+    QVERIFY(worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
+    QCOMPARE(worker.currentCarrierEpoch(), epochBeforeFallback + 1);
+}
+
+void TestStreamWorkerGpuEncode::gpuTwoPacketBatchRejectsBeforePartialCommit() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
+
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-gpu-two-packet-capacity"), 1, 16, 16, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.setViewTrack(0);
+    worker.m_nativeEncoder = std::make_unique<TwoPacketSurfaceEncoder>();
+    worker.m_gpuEncodePump =
+        std::make_unique<GpuEncodePump>(worker.m_nativeEncoder.get(), nullptr, 4);
+    worker.m_gpuEncodePump->start();
+    worker.m_latestGpuFrame = makeGpuHandle();
+    worker.beginCaptureSession();
+    worker.m_latestGpuFrameCarrierToken = worker.snapshotActiveCarrierToken();
+    QVERIFY(worker.m_latestGpuFrameCarrierToken);
+    std::atomic_store_explicit(&worker.m_latestGpuFrameTimecodeEvidence,
+                               std::make_shared<const TimecodeEvidence>(gpuEvidence(100, 1)),
+                               std::memory_order_release);
+
+    std::array<uint64_t, StreamWorker::kMuxCompletionPoolCapacity - 1> heldCompletions{};
+    for (uint64_t& id : heldCompletions) {
+        id = worker.reserveMuxCompletion(0);
+        QVERIFY(id != 0);
+    }
+
+    worker.m_internalFrameCount = 1;
+    worker.processEncoderTick(nullptr, 33, 0, 0);
+    QTRY_VERIFY_WITH_TIMEOUT(worker.m_gpuEncodePump->framesEncoded() >= 1, 2000);
+    QTest::qWait(100);
+    // processEncoderTick still admits its one silence audio packet; the rejected
+    // two-packet video access unit must not consume any additional sequences.
+    QCOMPARE(muxer.m_nextQueuedPacketSequence, uint64_t(2));
+    QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(-1));
+
+    for (uint64_t id : heldCompletions)
+        worker.releaseMuxCompletionReservation(id);
+    worker.m_gpuEncodePump->stop();
+    muxer.close();
+}
+
 void TestStreamWorkerGpuEncode::gpuEncodeFallbackDisablesGpuFrameIngestPreference() {
     qputenv("OLR_GPU_PIPELINE", "1");
     qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
@@ -364,6 +842,25 @@ void TestStreamWorkerGpuEncode::gpuEncodeFallbackDisablesGpuFrameIngestPreferenc
     worker.latchGpuEncodeCpuFallback();
 
     QVERIFY(!worker.preferGpuVideoFramesForIngestForTest());
+}
+
+void TestStreamWorkerGpuEncode::gpuFallbackRotatesTokenButRetainsLiveSession() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    const uint64_t sessionIdentity = worker.beginCaptureSession();
+    const auto oldToken = worker.snapshotCarrierTokenForSession(sessionIdentity);
+    QVERIFY(oldToken != nullptr);
+
+    worker.latchGpuEncodeCpuFallback();
+
+    const auto newToken = worker.snapshotCarrierTokenForSession(sessionIdentity);
+    QVERIFY(newToken != nullptr);
+    QVERIFY(!worker.carrierTokenIsCurrent(oldToken));
+    QVERIFY(worker.carrierTokenIsCurrent(newToken));
+    QVERIFY(newToken->epoch > oldToken->epoch);
 }
 
 void TestStreamWorkerGpuEncode::appleDefaultsToCpuIngestWhenGpuPipelineEnabled() {

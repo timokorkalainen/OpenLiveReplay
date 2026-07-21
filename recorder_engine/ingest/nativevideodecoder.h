@@ -48,6 +48,11 @@ public:
     bool lastDecodedWasIOSurfaceBacked() const;
 
 private:
+#if defined(OLR_UNIT_TEST) && defined(_WIN32)
+    friend bool nativeVideoDecoderMediaFoundationDeliverOutputForTest(
+        qint64 samplePts90k, qint64 fallbackPts90k, NativeVideoDecoder::FrameCallback onFrame,
+        NativeVideoDecoder::KeepSurfaceCallback onSurface, QString* error);
+#endif
     class Impl;
     Impl* m_impl = nullptr;
 };
@@ -57,6 +62,11 @@ NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities();
 #ifdef OLR_UNIT_TEST
 bool nativeVideoDecoderKeepSurfaceNullImageRejectedForTest();
 bool nativeVideoDecoderNoFrameRejectedForTest(QString* error = nullptr);
+#if defined(_WIN32)
+bool nativeVideoDecoderMediaFoundationDeliverOutputForTest(
+    qint64 samplePts90k, qint64 fallbackPts90k, NativeVideoDecoder::FrameCallback onFrame,
+    NativeVideoDecoder::KeepSurfaceCallback onSurface, QString* error = nullptr);
+#endif
 #endif
 
 #endif // NATIVEVIDEODECODER_H

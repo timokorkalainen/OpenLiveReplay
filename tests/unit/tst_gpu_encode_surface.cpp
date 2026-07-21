@@ -27,12 +27,11 @@ void TestGpuEncodeSurface::encodesSurfaceToKeyframeWithoutCpuUpload() {
     if (!enc) QSKIP("no hardware H.264 encoder on this platform");
 
     bool gotKeyframe = false;
-    const bool ok = enc->encodeSurface(
-        surface.get(), 0, ColorMetadata{},
-        [&](const QByteArray& data, int64_t, bool keyframe) {
-            if (!data.isEmpty() && keyframe) gotKeyframe = true;
-        },
-        &err);
+    auto onPacket = [&](const QByteArray& data, int64_t, bool keyframe) {
+        if (!data.isEmpty() && keyframe) gotKeyframe = true;
+    };
+    const bool ok = enc->encodeSurface(surface.get(), 0, ColorMetadata{},
+                                       NativeVideoEncoder::PacketCallback::bind(onPacket), &err);
     QVERIFY2(ok, qPrintable(err));
     QVERIFY(gotKeyframe);
     QVERIFY(!enc->avccExtradata().isEmpty());

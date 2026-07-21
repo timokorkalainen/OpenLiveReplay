@@ -2,6 +2,7 @@
 #define NATIVERTMPINGESTSESSION_H
 
 #include "nativeaacdecoder.h"
+#include "decodedframeevidencequeue.h"
 #include "h26xaccessunit.h"
 #include "h26xseitimecode.h"
 #include "ingestsession.h"
@@ -23,6 +24,7 @@ class QTcpSocket;
 class NativeRtmpIngestSession final : public IngestSession {
 #if defined(QT_TESTLIB_LIB)
     friend class TestIngestBackendSelector;
+    friend class TestIngestTimecodeEvidence;
 #endif
 public:
     NativeRtmpIngestSession(int sourceIndex, int outputWidth, int outputHeight,
@@ -62,26 +64,30 @@ private:
     RtmpHevcConfig m_hevcConfig;
     RtmpAacConfig m_aacConfig;
     NativeVideoCodec m_videoCodec = NativeVideoCodec::Unknown;
+    QByteArray m_activeVideoConfiguration;
     bool m_keepSurfaceDecodeActive = false;
     int m_outputChunkSize = 128;
     int m_streamId = 1;
     AnchoredSourceClock m_ownedClock{ClockQuality::FlvPll};
     AnchoredSourceClock* m_clock = &m_ownedClock;
     bool m_externalClock = false;
-    // SMPTE 12M timecode (100 ns since midnight) stamped onto the emitted
-    // DecodedVideoFrame. -1 = the current frame carries no timecode (the common
-    // case). Reset per access unit (to the AMF fallback, or -1) so an SEI TC never
-    // bleeds across frames; an SEI TC overrides the AMF fallback for its frame.
+    uint64_t m_sourceGeneration = 0;
+    H26xTimingContext m_timingContext;
+    H26xSeiTimecodeState m_timecodeState;
     int64_t m_pendingVideoTimecode100ns = -1;
-    int64_t m_pendingVideoTcFrames = -1;
-    int32_t m_pendingVideoRateNum = 0;
-    int32_t m_pendingVideoRateDen = 0;
-    // AMF onMetaData timecode (100 ns since midnight), -1 = none. A sticky fallback
-    // used for frames whose access unit carries no SEI timecode, until the next SEI
-    // TC appears. Set best-effort from a malformed-tolerant string parse.
+    std::optional<TimecodeEvidence> m_pendingTimecodeEvidence;
+    DecodedFrameEvidenceQueue m_decodedFrameEvidence;
     int64_t m_amfTimecode100ns = -1;
-    int32_t m_amfFrameRateNum = 0;
-    int32_t m_amfFrameRateDen = 0;
+    int64_t m_amfFrameOfDay = -1;
+    FrameRateQ m_amfFrameRate;
+    uint64_t m_amfTimingGeneration = 0;
+    int64_t m_amfAnchorPtsMs = -1;
+    int64_t m_amfLastPtsMs = -1;
+    int64_t m_amfLastFrameOfDay = -1;
+    QByteArray m_lastAmfMetadataPayload;
+    bool m_hasAppliedAmfMetadata = false;
+    uint64_t m_amfMetadataParseCount = 0;
+    uint64_t m_amfMetadataApplyCount = 0;
     int64_t m_prevAudioPtsMs = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastKeyframeAtMs = -1;
@@ -126,14 +132,13 @@ private:
     bool parseAacSequenceHeader(const QByteArray& payload, QString* error);
     int64_t sourcePtsMsForVideo(qint64 dtsMs, qint64 ptsMs);
     int64_t sourcePtsMsForAudio(qint64 ptsMs);
-    // Reset m_pendingVideoTimecode100ns to the AMF fallback (m_amfTimecode100ns, or
-    // -1), then (if the access unit carries a SMPTE 12M SEI) overwrite it with that
-    // TC. Called once per access unit so an SEI TC never bleeds across frames and an
-    // SEI TC always wins over the AMF fallback for its own frame.
-    void updatePendingVideoTimecode(const QByteArray& annexB, NativeVideoCodec codec);
-    // Parse an AMF onMetaData timecode string (best-effort, malformed -> ignored)
-    // and remember it as the sticky AMF fallback (m_amfTimecode100ns).
+    // Build one frame-local observation from standard SEI or, when no stronger
+    // codec rate exists, the validated advancing metadata anchor.
+    void updatePendingVideoTimecode(const QByteArray& annexB, NativeVideoCodec codec,
+                                    int64_t sourcePtsMs = 0, int64_t presentationPtsMs = -1);
+    // Legacy recording-tag seam; alignment evidence requires applyAmfMetadata().
     void applyAmfTimecodeString(const QString& text);
+    void applyAmfMetadata(const QString& timecode, double frameRate);
 };
 
 #endif // NATIVERTMPINGESTSESSION_H

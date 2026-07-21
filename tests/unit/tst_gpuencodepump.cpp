@@ -20,6 +20,8 @@ public:
     std::atomic<int> calls{0};
     std::atomic<int> cpuCalls{0};
     std::atomic<bool> failSurfaceEncode{false};
+    std::atomic<int> packetsPerSurfaceEncode{1};
+    std::atomic<int> packetsBeforeFailure{-1};
     std::atomic<bool> cpuEncodeSucceeds{false};
     std::mutex* expectedEncoderMutex = nullptr;
     std::atomic<bool> sawEncoderMutexHeld{false};
@@ -57,8 +59,16 @@ public:
             std::unique_lock<std::mutex> lock(blockMutex);
             blockCv.wait(lock, [&] { return releaseBlockedSurfaceEncode; });
         }
+        const int failingPacketCount = packetsBeforeFailure.load(std::memory_order_acquire);
+        if (failingPacketCount >= 0) {
+            for (int i = 0; i < failingPacketCount; ++i)
+                onPacket(QByteArray("failed-pkt-" + QByteArray::number(i)), ptsTicks, i == 0);
+            return false;
+        }
         if (failSurfaceEncode.load(std::memory_order_acquire)) return false;
-        onPacket(QByteArray("pkt"), ptsTicks, true);
+        const int packetCount = packetsPerSurfaceEncode.load(std::memory_order_acquire);
+        for (int i = 0; i < packetCount; ++i)
+            onPacket(QByteArray("pkt-" + QByteArray::number(i)), ptsTicks, i == 0);
         return true;
     }
 
@@ -140,6 +150,44 @@ private:
     uint64_t m_completedValue = 0;
 };
 
+struct PumpProbe {
+    std::atomic<int> packets{0};
+    std::atomic<int> failures{0};
+    std::atomic<int> finished{0};
+    std::atomic<bool> callbackCouldLockEncoderMutex{false};
+    std::mutex* encoderMutex = nullptr;
+
+    static void packet(void* context, uint64_t, const QByteArray&, int64_t, bool) {
+        auto& probe = *static_cast<PumpProbe*>(context);
+        if (probe.encoderMutex) {
+            std::atomic<bool> locked{false};
+            std::thread lockProbe([&] {
+                if (probe.encoderMutex->try_lock()) {
+                    locked.store(true, std::memory_order_release);
+                    probe.encoderMutex->unlock();
+                }
+            });
+            lockProbe.join();
+            probe.callbackCouldLockEncoderMutex.store(locked.load(std::memory_order_acquire),
+                                                      std::memory_order_release);
+        }
+        probe.packets.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    static void failure(void* context, uint64_t) {
+        static_cast<PumpProbe*>(context)->failures.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    static void finish(void* context, uint64_t) {
+        static_cast<PumpProbe*>(context)->finished.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    GpuEncodePump::JobCallbacks callbacks(uint64_t id = 1) {
+        return GpuEncodePump::JobCallbacks{this, id, &PumpProbe::packet, &PumpProbe::failure,
+                                           &PumpProbe::finish};
+    }
+};
+
 FrameHandle makeGpuHandle() {
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
@@ -167,8 +215,11 @@ private slots:
     void encodeSurfaceFailureDropsJobWithoutCpuFallback();
     void unreadableGpuHandleDropsWithoutCpuReadback();
     void packetCallbackRunsAfterEncoderMutexReleased();
+    void multiplePacketsForwardedAndFinishedOnce();
+    void failureAfterPacketDiscardsBufferedPackets();
+    void packetOverflowFailsWithoutPartialPackets();
     void submitBackpressuresOnOverflowUntilQueueSpace();
-    void cancelPendingDropsQueuedJobsWithoutInvokingCallbacks();
+    void cancelPendingReleasesQueuedJobCallbacks();
 };
 
 void TestGpuEncodePump::encodeWaitsForFenceThenForwardsPacket() {
@@ -178,18 +229,16 @@ void TestGpuEncodePump::encodeWaitsForFenceThenForwardsPacket() {
     GpuEncodePump pump(&enc, fence, 4);
     pump.start();
 
-    std::atomic<int> packets{0};
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{},
-                        [&](const QByteArray&, int64_t, bool) {
-                            packets.fetch_add(1, std::memory_order_acq_rel);
-                        }));
+    PumpProbe probe;
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
 
     QTest::qWait(60);
     QCOMPARE(enc.calls.load(std::memory_order_acquire), 0);
 
     fence->signal();
     QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 1, 2000);
-    QTRY_COMPARE_WITH_TIMEOUT(packets.load(std::memory_order_acquire), 1, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.packets.load(std::memory_order_acquire), 1, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.finished.load(std::memory_order_acquire), 1, 2000);
 
     pump.stop();
     QCOMPARE(pump.framesEncoded(), uint64_t(1));
@@ -204,13 +253,12 @@ void TestGpuEncodePump::encodeSurfaceFailureReportsDroppedJob() {
     GpuEncodePump pump(&enc, fence, 4);
     pump.start();
 
-    std::atomic<int> failures{0};
-    QVERIFY(pump.submit(
-        makeGpuHandle(), 1, 100, ColorMetadata{}, [](const QByteArray&, int64_t, bool) {},
-        [&] { failures.fetch_add(1, std::memory_order_acq_rel); }));
+    PumpProbe probe;
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
 
     QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 1, 2000);
-    QTRY_COMPARE_WITH_TIMEOUT(failures.load(std::memory_order_acquire), 1, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.finished.load(std::memory_order_acquire), 1, 2000);
 
     pump.stop();
     QCOMPARE(enc.cpuCalls.load(std::memory_order_acquire), 0);
@@ -229,19 +277,15 @@ void TestGpuEncodePump::encodeSurfaceFailureDropsJobWithoutCpuFallback() {
     GpuEncodePump pump(&enc, fence, 4);
     pump.start();
 
-    std::atomic<int> packets{0};
-    std::atomic<int> failures{0};
-    QVERIFY(pump.submit(
-        makeGpuHandle(), 1, 100, ColorMetadata{},
-        [&](const QByteArray&, int64_t, bool) { packets.fetch_add(1, std::memory_order_acq_rel); },
-        [&] { failures.fetch_add(1, std::memory_order_acq_rel); }));
+    PumpProbe probe;
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
 
     QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 1, 2000);
-    QTRY_COMPARE_WITH_TIMEOUT(failures.load(std::memory_order_acquire), 1, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
 
     pump.stop();
     QCOMPARE(enc.cpuCalls.load(std::memory_order_acquire), 0);
-    QCOMPARE(packets.load(std::memory_order_acquire), 0);
+    QCOMPARE(probe.packets.load(std::memory_order_acquire), 0);
     QCOMPARE(pump.framesEncoded(), uint64_t(0));
     QCOMPARE(pump.queueDrops(), uint64_t(1));
 }
@@ -257,20 +301,16 @@ void TestGpuEncodePump::unreadableGpuHandleDropsWithoutCpuReadback() {
     GpuEncodePump pump(&enc, fence, 4);
     pump.start();
 
-    std::atomic<int> packets{0};
-    std::atomic<int> failures{0};
-    QVERIFY(pump.submit(
-        makeUnreadableGpuHandle(data), 1, 100, ColorMetadata{},
-        [&](const QByteArray&, int64_t, bool) { packets.fetch_add(1, std::memory_order_acq_rel); },
-        [&] { failures.fetch_add(1, std::memory_order_acq_rel); }));
+    PumpProbe probe;
+    QVERIFY(pump.submit(makeUnreadableGpuHandle(data), 1, 100, ColorMetadata{}, probe.callbacks()));
 
     QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 1, 2000);
-    QTRY_COMPARE_WITH_TIMEOUT(failures.load(std::memory_order_acquire), 1, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
 
     pump.stop();
     QCOMPARE(data->readCount(), 0);
     QCOMPARE(enc.cpuCalls.load(std::memory_order_acquire), 0);
-    QCOMPARE(packets.load(std::memory_order_acquire), 0);
+    QCOMPARE(probe.packets.load(std::memory_order_acquire), 0);
     QCOMPARE(pump.framesEncoded(), uint64_t(0));
     QCOMPARE(pump.queueDrops(), uint64_t(1));
 }
@@ -285,26 +325,65 @@ void TestGpuEncodePump::packetCallbackRunsAfterEncoderMutexReleased() {
     GpuEncodePump pump(&enc, fence, 4, &encoderMutex);
     pump.start();
 
-    std::atomic<int> packets{0};
-    std::atomic<bool> callbackCouldLockEncoderMutex{false};
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{},
-                        [&](const QByteArray&, int64_t, bool) {
-                            std::atomic<bool> locked{false};
-                            std::thread probe([&] {
-                                if (encoderMutex.try_lock()) {
-                                    locked.store(true, std::memory_order_release);
-                                    encoderMutex.unlock();
-                                }
-                            });
-                            probe.join();
-                            callbackCouldLockEncoderMutex.store(
-                                locked.load(std::memory_order_acquire), std::memory_order_release);
-                            packets.fetch_add(1, std::memory_order_acq_rel);
-                        }));
+    PumpProbe probe;
+    probe.encoderMutex = &encoderMutex;
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
 
-    QTRY_COMPARE_WITH_TIMEOUT(packets.load(std::memory_order_acquire), 1, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.packets.load(std::memory_order_acquire), 1, 2000);
     QVERIFY(enc.sawEncoderMutexHeld.load(std::memory_order_acquire));
-    QVERIFY(callbackCouldLockEncoderMutex.load(std::memory_order_acquire));
+    QVERIFY(probe.callbackCouldLockEncoderMutex.load(std::memory_order_acquire));
+
+    pump.stop();
+}
+
+void TestGpuEncodePump::multiplePacketsForwardedAndFinishedOnce() {
+    FakeEncoder enc;
+    enc.packetsPerSurfaceEncode.store(2, std::memory_order_release);
+    auto fence = std::make_shared<FakeFence>();
+    fence->signal();
+    GpuEncodePump pump(&enc, fence, 4);
+    pump.start();
+
+    PumpProbe probe;
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QTRY_COMPARE_WITH_TIMEOUT(probe.packets.load(std::memory_order_acquire), 2, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.finished.load(std::memory_order_acquire), 1, 2000);
+    QCOMPARE(probe.failures.load(std::memory_order_acquire), 0);
+
+    pump.stop();
+}
+
+void TestGpuEncodePump::failureAfterPacketDiscardsBufferedPackets() {
+    FakeEncoder enc;
+    enc.packetsBeforeFailure.store(1, std::memory_order_release);
+    auto fence = std::make_shared<FakeFence>();
+    fence->signal();
+    GpuEncodePump pump(&enc, fence, 4);
+    pump.start();
+
+    PumpProbe probe;
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.finished.load(std::memory_order_acquire), 1, 2000);
+    QCOMPARE(probe.packets.load(std::memory_order_acquire), 0);
+
+    pump.stop();
+}
+
+void TestGpuEncodePump::packetOverflowFailsWithoutPartialPackets() {
+    FakeEncoder enc;
+    enc.packetsPerSurfaceEncode.store(GpuEncodePump::kMaxPacketsPerJob + 1,
+                                      std::memory_order_release);
+    auto fence = std::make_shared<FakeFence>();
+    fence->signal();
+    GpuEncodePump pump(&enc, fence, 4);
+    pump.start();
+
+    PumpProbe probe;
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.finished.load(std::memory_order_acquire), 1, 2000);
+    QCOMPARE(probe.packets.load(std::memory_order_acquire), 0);
 
     pump.stop();
 }
@@ -318,22 +397,17 @@ void TestGpuEncodePump::submitBackpressuresOnOverflowUntilQueueSpace() {
     GpuEncodePump pump(&enc, fence, 1);
     pump.start();
 
-    std::atomic<int> packets{0};
-    std::atomic<int> failures{0};
-    auto onPacket = [&](const QByteArray&, int64_t, bool) {
-        packets.fetch_add(1, std::memory_order_acq_rel);
-    };
-    auto onFailure = [&] { failures.fetch_add(1, std::memory_order_acq_rel); };
+    PumpProbe probe;
 
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 1, ColorMetadata{}, onPacket, onFailure));
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 1, ColorMetadata{}, probe.callbacks(1)));
     QTRY_COMPARE_WITH_TIMEOUT(enc.blockedSurfaceEncodeEntries.load(std::memory_order_acquire), 1,
                               2000);
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 2, ColorMetadata{}, onPacket, onFailure));
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 2, ColorMetadata{}, probe.callbacks(2)));
 
     std::atomic<bool> returned{false};
     bool thirdSubmit = false;
     std::thread submitter([&] {
-        thirdSubmit = pump.submit(makeGpuHandle(), 1, 3, ColorMetadata{}, onPacket, onFailure);
+        thirdSubmit = pump.submit(makeGpuHandle(), 1, 3, ColorMetadata{}, probe.callbacks(3));
         returned.store(true, std::memory_order_release);
     });
 
@@ -352,32 +426,28 @@ void TestGpuEncodePump::submitBackpressuresOnOverflowUntilQueueSpace() {
     QVERIFY2(returnedAfterRelease, "submit must resume once the encode worker opens queue space");
     QVERIFY(thirdSubmit);
     QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 3, 2000);
-    QTRY_COMPARE_WITH_TIMEOUT(packets.load(std::memory_order_acquire), 3, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(probe.packets.load(std::memory_order_acquire), 3, 2000);
 
     QCOMPARE(pump.queueDrops(), uint64_t(0));
-    QCOMPARE(failures.load(std::memory_order_acquire), 0);
+    QCOMPARE(probe.failures.load(std::memory_order_acquire), 0);
 }
 
-void TestGpuEncodePump::cancelPendingDropsQueuedJobsWithoutInvokingCallbacks() {
+void TestGpuEncodePump::cancelPendingReleasesQueuedJobCallbacks() {
     FakeEncoder enc;
     auto fence = std::make_shared<FakeFence>();
     GpuEncodePump pump(&enc, fence, 4);
 
-    std::atomic<int> packets{0};
-    std::atomic<int> failures{0};
-    auto onPacket = [&](const QByteArray&, int64_t, bool) {
-        packets.fetch_add(1, std::memory_order_acq_rel);
-    };
-    auto onFailure = [&] { failures.fetch_add(1, std::memory_order_acq_rel); };
+    PumpProbe probe;
 
-    QVERIFY(pump.submit(makeGpuHandle(), 9, 1, ColorMetadata{}, onPacket, onFailure));
-    QVERIFY(pump.submit(makeGpuHandle(), 9, 2, ColorMetadata{}, onPacket, onFailure));
+    QVERIFY(pump.submit(makeGpuHandle(), 9, 1, ColorMetadata{}, probe.callbacks(1)));
+    QVERIFY(pump.submit(makeGpuHandle(), 9, 2, ColorMetadata{}, probe.callbacks(2)));
 
     pump.cancelPending();
 
     QCOMPARE(pump.queueDrops(), uint64_t(2));
-    QCOMPARE(packets.load(std::memory_order_acquire), 0);
-    QCOMPARE(failures.load(std::memory_order_acquire), 0);
+    QCOMPARE(probe.packets.load(std::memory_order_acquire), 0);
+    QCOMPARE(probe.failures.load(std::memory_order_acquire), 2);
+    QCOMPARE(probe.finished.load(std::memory_order_acquire), 2);
 }
 
 QTEST_GUILESS_MAIN(TestGpuEncodePump)

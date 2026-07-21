@@ -333,12 +333,11 @@ RampStepResult H264CodecRunner::runStep(int concurrency, const BenchmarkConfig& 
                     res.startupFailed = true;
                     return;
                 } // C3
+                auto onPrimePacket = [&](const QByteArray& data, int64_t, bool) {
+                    gotPrimePacket = gotPrimePacket || !data.isEmpty();
+                };
                 const bool primeOk = enc->encode(
-                    prime, p,
-                    [&](const QByteArray& data, int64_t, bool) {
-                        gotPrimePacket = gotPrimePacket || !data.isEmpty();
-                    },
-                    &err);
+                    prime, p, NativeVideoEncoder::PacketCallback::bind(onPrimePacket), &err);
                 av_frame_free(&prime);
                 if (!primeOk) {
                     res.startupFailed = true;
@@ -371,8 +370,9 @@ RampStepResult H264CodecRunner::runStep(int concurrency, const BenchmarkConfig& 
                 AVFrame* wf = makeSyntheticFrame(cfg.width, cfg.height, w);
                 if (!wf) break;
                 QByteArray wData;
-                enc->encode(
-                    wf, w + 1, [&](const QByteArray& d, int64_t, bool) { wData = d; }, &err);
+                auto onWarmupPacket = [&](const QByteArray& d, int64_t, bool) { wData = d; };
+                enc->encode(wf, w + 1, NativeVideoEncoder::PacketCallback::bind(onWarmupPacket),
+                            &err);
                 av_frame_free(&wf);
                 if (wData.isEmpty()) continue;
                 const QByteArray wAnnex = avccToAnnexB(wData);
@@ -400,12 +400,11 @@ RampStepResult H264CodecRunner::runStep(int concurrency, const BenchmarkConfig& 
                 encTimer.start();
 
                 QByteArray encodedData;
+                auto onEncodedPacket = [&](const QByteArray& data, int64_t, bool) {
+                    encodedData = data; // avcC length-prefixed
+                };
                 bool encOk = enc->encode(
-                    f, res.pairs,
-                    [&](const QByteArray& data, int64_t, bool) {
-                        encodedData = data; // avcC length-prefixed
-                    },
-                    &err);
+                    f, res.pairs, NativeVideoEncoder::PacketCallback::bind(onEncodedPacket), &err);
                 av_frame_free(&f);
                 const double encMs = encTimer.nsecsElapsed() / 1e6;
 

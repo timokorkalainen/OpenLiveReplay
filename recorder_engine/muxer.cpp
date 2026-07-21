@@ -8,10 +8,22 @@
 #include <algorithm>
 #include <limits>
 
-Muxer::Muxer() {}
+Muxer::Muxer() {
+    static_assert(std::is_nothrow_default_constructible_v<QueuedPacket>);
+    static_assert(std::is_nothrow_move_constructible_v<QueuedPacket>);
+    static_assert(std::is_nothrow_move_assignable_v<QueuedPacket>);
+    static_assert(std::is_nothrow_default_constructible_v<AcceptedCandidate>);
+    static_assert(std::is_nothrow_move_constructible_v<AcceptedCandidate>);
+    static_assert(std::is_nothrow_move_assignable_v<AcceptedCandidate>);
+}
 
 Muxer::~Muxer() {
-    close();
+    // Destructors are implicitly noexcept; never let a teardown failure escape.
+    try {
+        close();
+    } catch (...) {
+        qWarning("Muxer: swallowed an exception while closing during destruction");
+    }
 }
 
 namespace {
@@ -82,6 +94,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         QMutexLocker headerLock(&m_headerMutex);
         m_headerWritten = false;
         m_startTimecodeCandidate = isWellFormedTimecode(startTimecode) ? startTimecode : QString();
+        m_startTimecodeCandidatePublicationId = 0;
         // Open the bounded grace window for the first source TC (see muxer.h). An
         // up-front candidate (e.g. from a unit test) means TC is already known, so
         // there is nothing to wait for — leave the grace at 0 and commit on the
@@ -279,15 +292,21 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     m_fatalWriteError.store(false, std::memory_order_relaxed);
     m_consecutiveWriteErrors = 0;
 
+    {
+        std::lock_guard<std::mutex> queueLock(m_qMutex);
+        m_acceptedStartTimecodeCandidate.clear();
+        m_acceptedStartTimecodeCandidates.clear();
+        m_candidateWindowGeneration = 1;
+        m_candidateWindowState = CandidateWindowState::Open;
+    }
+
     m_initialized = true;
 
-    // Start the dedicated writer thread. The header has NOT been written yet, but
-    // every write path calls ensureHeaderWritten() before enqueuing a packet, so
-    // by the time the writer thread pops anything the header is in place. From here
-    // until close() joins it, the writer thread is the ONLY thread that calls
-    // av_write_frame/avio_flush on m_outCtx; the header write itself happens on the
-    // ENQUEUEING (caller) thread, before the packet is handed off, so it never
-    // races the writer thread.
+    // Start the dedicated writer thread. The header remains deferred until that
+    // thread is ready to write the first accepted packet, allowing a bounded grace
+    // period for a source timecode candidate. From here until close() joins it, the
+    // writer thread is the ONLY thread that writes the header or calls
+    // av_write_frame/avio_flush on m_outCtx.
     m_blockingWritesAllowed.store(true, std::memory_order_release);
     m_writerRunning = true;
     m_writerThread = std::thread(&Muxer::writerLoop, this);
@@ -306,9 +325,26 @@ bool Muxer::headerWriteDeferred() {
 }
 
 bool Muxer::ensureHeaderWritten() {
+    return ensureHeaderWrittenForPacket(PacketCarrierGuard{}, PacketCarrierGuard{}) ==
+           HeaderCommitStatus::Written;
+}
+
+Muxer::HeaderCommitStatus
+Muxer::ensureHeaderWrittenForPacket(const PacketCarrierGuard& packetGuard,
+                                    const PacketCarrierGuard& candidateGuard) {
     QMutexLocker headerLock(&m_headerMutex);
-    if (m_headerWritten) return true;
-    if (!m_outCtx) return false;
+    if (m_headerWritten) return HeaderCommitStatus::Written;
+    if (!m_outCtx) return HeaderCommitStatus::Failed;
+#ifdef OLR_UNIT_TEST
+    auto beforeCommit = std::exchange(m_beforeHeaderCommitForTest, nullptr);
+    if (beforeCommit) beforeCommit();
+#endif
+    // The final candidate read is the header-commit linearization point. The
+    // candidate/packet/candidate double collect rejects a reset observed on either side
+    // without retaining producer or carrier locks across FFmpeg.
+    if (!candidateGuard.accepts() || !packetGuard.accepts() || !candidateGuard.accepts()) {
+        return HeaderCommitStatus::StaleAuthority;
+    }
 
     // Materialise the winning start-timecode candidate into the "timecode" tag,
     // format-level + each video track, IMMEDIATELY before the header is written
@@ -332,11 +368,11 @@ bool Muxer::ensureHeaderWritten() {
         char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(headerRet, errbuf, sizeof(errbuf));
         qDebug() << "Muxer: avformat_write_header failed:" << errbuf;
-        return false;
+        return HeaderCommitStatus::Failed;
     }
     avio_flush(m_outCtx->pb); // Forces the EBML header to be visible to the reader
     m_headerWritten = true;
-    return true;
+    return HeaderCommitStatus::Written;
 }
 
 void Muxer::setStartTimecodeCandidate(const QString& tc) {
@@ -345,17 +381,56 @@ void Muxer::setStartTimecodeCandidate(const QString& tc) {
     // that writes the first packet supplies the start TC — no cross-thread race).
     if (!m_headerWritten && m_startTimecodeCandidate.isEmpty() && isWellFormedTimecode(tc)) {
         m_startTimecodeCandidate = tc;
+        m_startTimecodeCandidatePublicationId = 0;
     }
 }
 
-bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten) {
+bool Muxer::publishStartTimecodeCandidate(const QString& tc, uint64_t publicationId) {
+    QMutexLocker headerLock(&m_headerMutex);
+    if (m_headerWritten || !m_startTimecodeCandidate.isEmpty() || !isWellFormedTimecode(tc))
+        return false;
+    m_startTimecodeCandidate = tc;
+    m_startTimecodeCandidatePublicationId = publicationId;
+    return true;
+}
+
+void Muxer::undoStartTimecodeCandidatePublication(const QString& tc, uint64_t publicationId) {
+    QMutexLocker headerLock(&m_headerMutex);
+    if (m_headerWritten || publicationId == 0 ||
+        m_startTimecodeCandidatePublicationId != publicationId || m_startTimecodeCandidate != tc)
+        return;
+    m_startTimecodeCandidate.clear();
+    m_startTimecodeCandidatePublicationId = 0;
+}
+
+bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten,
+                        const QString& startTimecodeCandidate, PacketCarrierGuard carrierGuard) {
+    PacketWriteRequest request{pkt, onWritten, startTimecodeCandidate, carrierGuard};
+    return writePacketBatch(&request, 1);
+}
+
+bool Muxer::writePacketBatch(const PacketWriteRequest* packets, size_t packetCount) {
     // ENQUEUE-ONLY. Clone the caller's packet (the caller still owns theirs,
     // exactly as before) and hand the clone to the writer thread, then return
     // immediately. The DTS-bump, av_write_frame and avio_flush all happen on
     // the writer thread — so a stalled disk no longer blocks the caller.
     const bool writerThreadDrain = (t_writerMuxer == this);
+    auto rejectAll = [packets, packetCount](std::array<AVPacket*, kMaxPacketBatch>& clones) {
+        for (AVPacket*& clone : clones)
+            av_packet_free(&clone);
+        if (!packets) return;
+        for (size_t i = 0; i < packetCount; ++i) {
+            if (packets[i].onWritten) packets[i].onWritten(false);
+        }
+    };
+    std::array<AVPacket*, kMaxPacketBatch> clones{};
+    if (!packets || packetCount == 0 || packetCount > kMaxPacketBatch ||
+        packetCount > kMaxQueuedPackets) {
+        rejectAll(clones);
+        return false;
+    }
     if (!m_writerRunning.load(std::memory_order_acquire) && !writerThreadDrain) {
-        if (onWritten) onWritten(false);
+        rejectAll(clones);
         return false;
     }
 
@@ -365,15 +440,16 @@ bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten) {
     // TC can win the tmcd tag. Enqueue-only here keeps the producer non-blocking
     // and lets the writer hold early no-TC packets without dropping or reordering.
 
-    if (!pkt) {
-        if (onWritten) onWritten(false);
-        return false;
-    }
-
-    AVPacket* localPkt = av_packet_clone(pkt);
-    if (!localPkt) {
-        if (onWritten) onWritten(false);
-        return false;
+    for (size_t i = 0; i < packetCount; ++i) {
+        if (!packets[i].packet) {
+            rejectAll(clones);
+            return false;
+        }
+        clones[i] = av_packet_clone(packets[i].packet);
+        if (!clones[i]) {
+            rejectAll(clones);
+            return false;
+        }
     }
 
     std::unique_lock<std::mutex> lk(m_qMutex);
@@ -383,25 +459,76 @@ bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten) {
     // literally cannot keep up — but it is still strictly better than blocking
     // on every single packet. During shutdown drain, blocked producers wake and
     // reject if still full; in-flight packets may still enqueue when space exists.
-    m_qCv.wait(lk, [this, writerThreadDrain] {
-        return writerThreadDrain || m_pktQueue.size() < kMaxQueued ||
+    m_qCv.wait(lk, [this, writerThreadDrain, packetCount] {
+        return writerThreadDrain || m_pktQueue.size() <= kMaxQueuedPackets - packetCount ||
                !m_writerRunning.load(std::memory_order_acquire) ||
                !m_blockingWritesAllowed.load(std::memory_order_acquire);
     });
     if (!m_writerRunning.load(std::memory_order_acquire) && !writerThreadDrain) {
         // Shutting down; do not enqueue (close() is draining/finishing).
         lk.unlock();
-        av_packet_free(&localPkt);
-        if (onWritten) onWritten(false);
+        rejectAll(clones);
         return false;
     }
-    if (!writerThreadDrain && m_pktQueue.size() >= kMaxQueued) {
+    if (!writerThreadDrain && m_pktQueue.size() > kMaxQueuedPackets - packetCount) {
         lk.unlock();
-        av_packet_free(&localPkt);
-        if (onWritten) onWritten(false);
+        rejectAll(clones);
         return false;
     }
-    m_pktQueue.push(QueuedPacket{localPkt, std::move(onWritten)});
+    if (m_pktQueue.size() > m_pktQueue.capacity() - packetCount) {
+        lk.unlock();
+        rejectAll(clones);
+        return false;
+    }
+    // The caller may have validated an immutable carrier before blocking on
+    // backpressure. Recheck immediately before candidate/queue commit so a reset
+    // during that wait cannot admit stale packet metadata.
+    for (size_t i = 0; i < packetCount; ++i) {
+        if (!packets[i].carrierGuard.accepts()) {
+            lk.unlock();
+            rejectAll(clones);
+            return false;
+        }
+    }
+    // Commit only after every rejection point above. This critical section is
+    // also the queue append, so the first accepted valid candidate wins in the
+    // same order that concurrent producers enter the writer queue.
+    size_t candidateCount = 0;
+    // A candidate arriving after an empty boundary is ordered after that
+    // tentative selection: it cannot affect a successful header commit, but it
+    // must remain queued in case the boundary packet becomes stale and the
+    // header attempt is retried.
+    const bool candidateAdmissionOpen = m_candidateWindowState != CandidateWindowState::Committed;
+    if (candidateAdmissionOpen) {
+        for (size_t i = 0; i < packetCount; ++i) {
+            if (isWellFormedTimecode(packets[i].startTimecodeCandidate)) ++candidateCount;
+        }
+    }
+    if (candidateCount >
+        m_acceptedStartTimecodeCandidates.capacity() - m_acceptedStartTimecodeCandidates.size()) {
+        lk.unlock();
+        rejectAll(clones);
+        return false;
+    }
+    if (m_nextQueuedPacketSequence == 0 ||
+        packetCount - 1 > std::numeric_limits<uint64_t>::max() - m_nextQueuedPacketSequence) {
+        lk.unlock();
+        rejectAll(clones);
+        return false;
+    }
+    for (size_t i = 0; i < packetCount; ++i) {
+        const uint64_t packetSequence = m_nextQueuedPacketSequence++;
+        const PacketWriteRequest& request = packets[i];
+        if (candidateAdmissionOpen && isWellFormedTimecode(request.startTimecodeCandidate)) {
+            m_acceptedStartTimecodeCandidates.push_back(AcceptedCandidate{
+                request.startTimecodeCandidate, request.carrierGuard, packetSequence});
+            if (m_acceptedStartTimecodeCandidate.isEmpty())
+                m_acceptedStartTimecodeCandidate = request.startTimecodeCandidate;
+        }
+        m_pktQueue.push(
+            QueuedPacket{clones[i], request.onWritten, request.carrierGuard, packetSequence});
+        clones[i] = nullptr;
+    }
     lk.unlock();
     m_qCv.notify_one();
     return true;
@@ -478,6 +605,12 @@ void Muxer::writerLoop() {
 
     for (;;) {
         QueuedPacket queued;
+        uint64_t packetSequence = 0;
+        QString boundaryCandidate;
+        PacketCarrierGuard boundaryPacketGuard;
+        PacketCarrierGuard boundaryCandidateGuard;
+        uint64_t boundaryCandidateSequence = 0;
+        uint64_t boundaryCandidateGeneration = 0;
         {
             std::unique_lock<std::mutex> lk(m_qMutex);
             // Wait for work, or for shutdown. Keep draining while the queue is
@@ -491,32 +624,264 @@ void Muxer::writerLoop() {
                 if (!m_writerRunning.load(std::memory_order_acquire)) return;
                 continue;
             }
+            if (!m_pktQueue.front().carrierGuard.accepts()) {
+                queued = m_pktQueue.front();
+                m_pktQueue.pop();
+                lk.unlock();
+                m_qCv.notify_one();
+                if (queued.onWritten) queued.onWritten(false);
+                av_packet_free(&queued.pkt);
+                continue;
+            }
             // Hold the first packet(s) while the header write is deferred for the
             // first source TC (bounded grace). Leave them queued — no pop, no
             // reorder, no drop — and re-loop after a short sleep until the grace
             // resolves (a candidate arrives or the window expires). Only honour the
             // deferral while still running; on shutdown drain immediately so close()
-            // never wedges. Released the q lock first so setStartTimecodeCandidate /
-            // ensureHeaderWritten (both take m_headerMutex) never block the producer.
-            if (m_writerRunning.load(std::memory_order_acquire) && headerWriteDeferred()) {
-                lk.unlock();
+            // never wedges. Release qMutex before publishing the candidate or
+            // inspecting header state, since both operations take m_headerMutex.
+            while (!m_acceptedStartTimecodeCandidates.empty() &&
+                   !m_acceptedStartTimecodeCandidates.front().carrierGuard.accepts()) {
+                m_acceptedStartTimecodeCandidates.pop_front();
+                ++m_candidateWindowGeneration;
+                if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
+            }
+            m_acceptedStartTimecodeCandidate =
+                m_acceptedStartTimecodeCandidates.empty()
+                    ? QString()
+                    : m_acceptedStartTimecodeCandidates.front().value;
+            const QString acceptedCandidate = m_acceptedStartTimecodeCandidate;
+            lk.unlock();
+#ifdef OLR_UNIT_TEST
+            auto snapshotHook = std::exchange(m_afterCandidateSnapshotForTest, nullptr);
+            if (snapshotHook) snapshotHook();
+#endif
+            if (m_writerRunning.load(std::memory_order_acquire) && acceptedCandidate.isEmpty() &&
+                headerWriteDeferred()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
             }
-            queued = std::move(m_pktQueue.front());
-            m_pktQueue.pop();
+
+            // Grace has resolved. Reacquire qMutex once to include a candidate
+            // accepted after the first snapshot but before this decision, then
+            // close the candidate window. Producers accepted after this point are
+            // ordered after the header boundary and cannot retroactively seed it.
+            lk.lock();
+            if (!m_pktQueue.front().carrierGuard.accepts()) {
+                queued = m_pktQueue.front();
+                m_pktQueue.pop();
+                lk.unlock();
+                m_qCv.notify_one();
+                if (queued.onWritten) queued.onWritten(false);
+                av_packet_free(&queued.pkt);
+                continue;
+            }
+            while (!m_acceptedStartTimecodeCandidates.empty() &&
+                   !m_acceptedStartTimecodeCandidates.front().carrierGuard.accepts()) {
+                m_acceptedStartTimecodeCandidates.pop_front();
+                ++m_candidateWindowGeneration;
+                if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
+            }
+            m_acceptedStartTimecodeCandidate =
+                m_acceptedStartTimecodeCandidates.empty()
+                    ? QString()
+                    : m_acceptedStartTimecodeCandidates.front().value;
+            const QString finalAcceptedCandidate = m_acceptedStartTimecodeCandidate;
+            const PacketCarrierGuard finalCandidateGuard =
+                m_acceptedStartTimecodeCandidates.empty()
+                    ? PacketCarrierGuard{}
+                    : m_acceptedStartTimecodeCandidates.front().carrierGuard;
+            const uint64_t finalCandidateSequence =
+                m_acceptedStartTimecodeCandidates.empty()
+                    ? 0
+                    : m_acceptedStartTimecodeCandidates.front().sequence;
+            const uint64_t candidateWindowGeneration = m_candidateWindowGeneration;
+            packetSequence = m_pktQueue.front().sequence;
+            boundaryPacketGuard = m_pktQueue.front().carrierGuard;
+            // This is the empty-boundary admission linearization point. Once an
+            // empty final snapshot is selected, later packet candidates are
+            // ordered after the header boundary and cannot seed this header. A
+            // non-empty tentative selection deliberately remains replaceable if
+            // its carrier becomes stale before the irreversible write.
+            m_candidateWindowState = finalAcceptedCandidate.isEmpty()
+                                         ? CandidateWindowState::TentativeEmptyClosed
+                                         : CandidateWindowState::TentativeCandidate;
+            lk.unlock();
+#ifdef OLR_UNIT_TEST
+            auto publicationHook = std::exchange(m_beforeCandidatePublicationForTest, nullptr);
+            if (publicationHook) publicationHook();
+#endif
+            const bool publishedCandidate =
+                !finalAcceptedCandidate.isEmpty() &&
+                publishStartTimecodeCandidate(finalAcceptedCandidate, finalCandidateSequence);
+
+            // Candidate publication may block on m_headerMutex. Keep qMutex
+            // released across that boundary, then consume only the exact packet
+            // whose accepted candidate/order was snapshotted above.
+            lk.lock();
+            const bool samePacket =
+                !m_pktQueue.empty() && m_pktQueue.front().sequence == packetSequence;
+            const bool packetCarrierCurrent =
+                samePacket && m_pktQueue.front().carrierGuard.accepts();
+            const bool candidateSelectionCurrent =
+                (finalAcceptedCandidate.isEmpty() &&
+                 m_candidateWindowState == CandidateWindowState::TentativeEmptyClosed) ||
+                (!finalAcceptedCandidate.isEmpty() &&
+                 m_candidateWindowState == CandidateWindowState::TentativeCandidate &&
+                 m_candidateWindowGeneration == candidateWindowGeneration &&
+                 !m_acceptedStartTimecodeCandidates.empty() &&
+                 m_acceptedStartTimecodeCandidates.front().sequence == finalCandidateSequence &&
+                 finalCandidateGuard.accepts());
+            if (!samePacket || !packetCarrierCurrent || !candidateSelectionCurrent) {
+                if (!candidateSelectionCurrent) {
+                    while (!m_acceptedStartTimecodeCandidates.empty() &&
+                           (!m_acceptedStartTimecodeCandidates.front().carrierGuard.accepts() ||
+                            m_acceptedStartTimecodeCandidates.front().sequence ==
+                                finalCandidateSequence)) {
+                        m_acceptedStartTimecodeCandidates.pop_front();
+                    }
+                }
+                m_acceptedStartTimecodeCandidate =
+                    m_acceptedStartTimecodeCandidates.empty()
+                        ? QString()
+                        : m_acceptedStartTimecodeCandidates.front().value;
+                m_candidateWindowState = CandidateWindowState::Open;
+                ++m_candidateWindowGeneration;
+                if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
+                if (samePacket && !packetCarrierCurrent) {
+                    queued = m_pktQueue.front();
+                    m_pktQueue.pop();
+                }
+                lk.unlock();
+                if (publishedCandidate && !candidateSelectionCurrent)
+                    undoStartTimecodeCandidatePublication(finalAcceptedCandidate,
+                                                          finalCandidateSequence);
+                if (queued.pkt) {
+                    m_qCv.notify_one();
+                    if (queued.onWritten) queued.onWritten(false);
+                    av_packet_free(&queued.pkt);
+                }
+                continue;
+            }
+            boundaryCandidate = finalAcceptedCandidate;
+            boundaryCandidateGuard = finalCandidateGuard;
+            boundaryCandidateSequence = finalCandidateSequence;
+            boundaryCandidateGeneration = candidateWindowGeneration;
+            lk.unlock();
         }
-        // Notify a possibly back-pressured producer that there is now room.
+#ifdef OLR_UNIT_TEST
+        auto afterPublicationHook = std::exchange(m_afterCandidatePublicationForTest, nullptr);
+        if (afterPublicationHook) afterPublicationHook();
+#endif
+
+        // Publication and the queue pop are not the commit boundary. A reset can
+        // independently stale the packet carrier or the accepted candidate while
+        // the header mutex is released. Revalidate both here, immediately before
+        // ensureHeaderWritten() can make either irreversible.
+        const bool candidateCarrierCurrent =
+            boundaryCandidate.isEmpty() || boundaryCandidateGuard.accepts();
+        if (!candidateCarrierCurrent) {
+            // Undo only the exact publication selected above. A configured or
+            // replacement candidate has a different publication id and survives.
+            undoStartTimecodeCandidatePublication(boundaryCandidate, boundaryCandidateSequence);
+            {
+                std::lock_guard<std::mutex> queueLock(m_qMutex);
+                if (m_candidateWindowGeneration == boundaryCandidateGeneration &&
+                    !m_acceptedStartTimecodeCandidates.empty() &&
+                    m_acceptedStartTimecodeCandidates.front().sequence ==
+                        boundaryCandidateSequence) {
+                    m_acceptedStartTimecodeCandidates.pop_front();
+                }
+                m_acceptedStartTimecodeCandidate =
+                    m_acceptedStartTimecodeCandidates.empty()
+                        ? QString()
+                        : m_acceptedStartTimecodeCandidates.front().value;
+                m_candidateWindowState = CandidateWindowState::Open;
+                ++m_candidateWindowGeneration;
+                if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
+                if (!m_pktQueue.empty() && m_pktQueue.front().sequence == packetSequence &&
+                    !m_pktQueue.front().carrierGuard.accepts()) {
+                    queued = m_pktQueue.front();
+                    m_pktQueue.pop();
+                }
+            }
+            if (queued.pkt) {
+                m_qCv.notify_one();
+                if (queued.onWritten) queued.onWritten(false);
+                av_packet_free(&queued.pkt);
+            }
+            continue;
+        }
+
+        // Keep the exact packet reserved at queue front until the header mutex
+        // validates packet/candidate/packet authority and commits the header.
+        // Producers may append, but cannot consume this reserved slot or change
+        // the linearized front packet.
+        const HeaderCommitStatus headerStatus =
+            ensureHeaderWrittenForPacket(boundaryPacketGuard, boundaryCandidateGuard);
+        if (headerStatus == HeaderCommitStatus::StaleAuthority) {
+            const bool candidateCurrent =
+                boundaryCandidate.isEmpty() || boundaryCandidateGuard.accepts();
+            if (!candidateCurrent)
+                undoStartTimecodeCandidatePublication(boundaryCandidate, boundaryCandidateSequence);
+            {
+                std::lock_guard<std::mutex> queueLock(m_qMutex);
+                m_candidateWindowState = CandidateWindowState::Open;
+                const bool samePacket =
+                    !m_pktQueue.empty() && m_pktQueue.front().sequence == packetSequence;
+                const bool packetCurrent = samePacket && m_pktQueue.front().carrierGuard.accepts();
+                if (!candidateCurrent) {
+                    if (m_candidateWindowGeneration == boundaryCandidateGeneration &&
+                        !m_acceptedStartTimecodeCandidates.empty() &&
+                        m_acceptedStartTimecodeCandidates.front().sequence ==
+                            boundaryCandidateSequence) {
+                        m_acceptedStartTimecodeCandidates.pop_front();
+                    }
+                    m_acceptedStartTimecodeCandidate =
+                        m_acceptedStartTimecodeCandidates.empty()
+                            ? QString()
+                            : m_acceptedStartTimecodeCandidates.front().value;
+                    ++m_candidateWindowGeneration;
+                    if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
+                }
+                if (samePacket && !packetCurrent) {
+                    queued = m_pktQueue.front();
+                    m_pktQueue.pop();
+                }
+            }
+            if (queued.pkt) {
+                m_qCv.notify_one();
+                if (queued.onWritten) queued.onWritten(false);
+                av_packet_free(&queued.pkt);
+            }
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> queueLock(m_qMutex);
+            if (m_pktQueue.empty() || m_pktQueue.front().sequence != packetSequence) continue;
+            queued = m_pktQueue.front();
+            m_pktQueue.pop();
+            if (headerStatus == HeaderCommitStatus::Written) {
+                m_candidateWindowState = CandidateWindowState::Committed;
+                m_acceptedStartTimecodeCandidates.clear();
+                m_acceptedStartTimecodeCandidate.clear();
+            }
+        }
         m_qCv.notify_one();
 
-        // Commit the deferred header (once) just before the first real write, now
-        // that the grace has resolved and any first-frame TC candidate has been
-        // registered. On a fatal header failure record the outcome and drop the
-        // packet (file is unusable if the header never landed).
-        if (!ensureHeaderWritten()) {
+        if (headerStatus == HeaderCommitStatus::Failed) {
             if (queued.onWritten) queued.onWritten(false);
             av_packet_free(&queued.pkt);
             recordWriteOutcome(true, "avformat_write_header failed");
+            continue;
+        }
+
+        // A reset after the header linearization is ordered after that commit,
+        // but its pixels must still be rejected before av_write_frame().
+        if (!queued.carrierGuard.accepts()) {
+            if (queued.onWritten) queued.onWritten(false);
+            av_packet_free(&queued.pkt);
             continue;
         }
 
