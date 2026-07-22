@@ -776,6 +776,7 @@ class LinuxSupervisorContractTests(unittest.TestCase):
             working_directory=Path("/workspace"))
         self.assertEqual(prefix, (
             "sudo", "systemd-run", "--unit=olr-gpu-audit-7", "--wait", "--collect",
+            "--pipe",
             "--property=Type=exec", "--property=Delegate=yes",
             "--property=MemoryAccounting=yes", "--property=MemoryMax=536870912",
             "--property=MemoryHigh=469762048", "--uid=1000", "--gid=1001",

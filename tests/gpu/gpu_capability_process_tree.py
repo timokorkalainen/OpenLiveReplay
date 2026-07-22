@@ -1280,7 +1280,7 @@ def linux_systemd_run_prefix(*, unit: str, uid: int, gid: int,
                            or working_directory.as_posix().startswith("/")),
                       "systemd working directory is invalid")
     return (
-        "sudo", "systemd-run", f"--unit={unit}", "--wait", "--collect",
+        "sudo", "systemd-run", f"--unit={unit}", "--wait", "--collect", "--pipe",
         "--property=Type=exec", "--property=Delegate=yes",
         "--property=MemoryAccounting=yes",
         f"--property=MemoryMax={LINUX_MEMORY_MAX_BYTES}",
