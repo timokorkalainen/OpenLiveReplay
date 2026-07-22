@@ -432,18 +432,15 @@ std::shared_ptr<GpuFence> WinGpuImportEdge::createFence() const {
                : nullptr;
 }
 
+FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
+                                                        FrameMetadata meta,
+                                                        std::shared_ptr<GpuFence> renderFence,
 #ifdef OLR_GPU_PIPELINE_BUILD
-FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
-                                                        FrameMetadata meta,
-                                                        std::shared_ptr<GpuFence> renderFence,
                                                         GpuBudgetCharge charge,
-                                                        uint64_t* submittedFenceValue) {
 #else
-FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
-                                                        FrameMetadata meta,
-                                                        std::shared_ptr<GpuFence> renderFence,
-                                                        uint64_t* submittedFenceValue) {
+                                                        std::nullptr_t charge,
 #endif
+                                                        uint64_t* submittedFenceValue) {
     if (!surface) return FrameHandle();
     if (renderFence && !renderFence->sharesDeviceAuthorityWith(surface)) return FrameHandle();
     if (meta.key.width <= 0) meta.key.width = surface->desc().width;
@@ -455,7 +452,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
         auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
-        const auto result = operation.submit(
+        const auto result = operation.submitRetained(
             adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
         if (!result.succeeded()) return FrameHandle{};
         exactFence = result.producerFence;
@@ -466,6 +463,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
     auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(exactFence),
                                                      exactFenceValue, std::move(charge));
 #else
+    (void) charge;
     auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(exactFence),
                                                      exactFenceValue);
 #endif
@@ -605,7 +603,7 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
             GpuRetireRegistry registry;
             GpuOpScope operation(m_renderFence, registry);
             auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
-            (void) operation.submit(
+            (void) operation.submitRetained(
                 adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{m_surface}));
         }
         m_cpuCache.insert(int(target), out);

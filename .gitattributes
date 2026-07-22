@@ -10,3 +10,8 @@
 tests/perf/saved912gpuopscope.h text eol=lf
 tests/perf/saved912preparedregistry.h text eol=lf
 tests/perf/saved912preparedregistry.cpp text eol=lf
+
+# Task-9 validates these compiler-capture fixtures byte-for-byte against a
+# Windows MinGW manifest: the source is LF, while the captured `.ii` is CRLF.
+tests/gpu/fixtures/task9_mingw_capture.cpp text eol=lf
+tests/gpu/fixtures/task9_mingw_preprocessed.ii text eol=crlf

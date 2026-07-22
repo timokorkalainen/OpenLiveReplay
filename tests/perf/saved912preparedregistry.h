@@ -2,7 +2,7 @@
 #define OLR_TESTS_PERF_SAVED912_PREPARED_REGISTRY_H
 
 // Frozen production-path control copied from exact commit
-// 912663be1458a0bdba36fca10c0421ab79d5cbd4. Keep this type isolated from the
+// 912663bed2eaf4016e0dc29ab44253c030d8eab3. Keep this type isolated from the
 // current registry: the relative benchmark must compile both with identical flags.
 
 #include "playback/gpu/gpusubmission.h"

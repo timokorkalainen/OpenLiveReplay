@@ -316,7 +316,7 @@ int probeFence() {
     GpuRetireRegistry registry;
     GpuOpScope operation(fence, registry);
     auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
-    const auto submission = operation.submit(
+    const auto submission = operation.submitRetained(
         adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
     if (!submission.succeeded()) return 5;
     const uint64_t signalValue = operation.fenceValue();

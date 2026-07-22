@@ -13,7 +13,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <exception>
 #include <limits>
+#include <new>
 #include <type_traits>
 #include <utility>
 
@@ -387,25 +389,44 @@ std::shared_ptr<GpuFence> detachNodeFromFenceGroup(RetireShard& shard, size_t sh
 }
 
 struct DeferredReleases {
-    std::array<std::shared_ptr<GpuSurface>, kNodesPerShard * kOwnersPerNode> owners;
-    std::array<std::shared_ptr<GpuFence>, kNodesPerShard> fences;
+    using Owner = std::shared_ptr<GpuSurface>;
+    using Fence = std::shared_ptr<GpuFence>;
+    using OwnerSlot = std::aligned_storage_t<sizeof(Owner), alignof(Owner)>;
+    using FenceSlot = std::aligned_storage_t<sizeof(Fence), alignof(Fence)>;
+
+    std::array<OwnerSlot, kNodesPerShard * kOwnersPerNode> owners;
+    std::array<FenceSlot, kNodesPerShard> fences;
     size_t ownerCount = 0;
     size_t fenceCount = 0;
 
+    DeferredReleases() noexcept = default;
+    DeferredReleases(const DeferredReleases&) = delete;
+    DeferredReleases& operator=(const DeferredReleases&) = delete;
+    ~DeferredReleases() { clear(); }
+
+    void appendOwner(Owner&& owner) noexcept {
+        Q_ASSERT(ownerCount < owners.size());
+        if (Q_UNLIKELY(ownerCount >= owners.size())) std::terminate();
+        ::new (static_cast<void*>(&owners[ownerCount])) Owner(std::move(owner));
+        ++ownerCount;
+    }
+
+    void appendFence(Fence&& fence) noexcept {
+        Q_ASSERT(fenceCount < fences.size());
+        if (Q_UNLIKELY(fenceCount >= fences.size())) std::terminate();
+        ::new (static_cast<void*>(&fences[fenceCount])) Fence(std::move(fence));
+        ++fenceCount;
+    }
+
     void clear() noexcept {
         for (size_t i = 0; i < ownerCount; ++i)
-            owners[i].reset();
+            std::launder(reinterpret_cast<Owner*>(&owners[i]))->~Owner();
         for (size_t i = 0; i < fenceCount; ++i)
-            fences[i].reset();
+            std::launder(reinterpret_cast<Fence*>(&fences[i]))->~Fence();
         ownerCount = 0;
         fenceCount = 0;
     }
 };
-
-DeferredReleases& deferredReleases() {
-    thread_local DeferredReleases releases;
-    return releases;
-}
 
 void recycleNode(RetireShard& shard, size_t shardIndex, uint16_t index, DeferredReleases& releases,
                  bool detachFenceGroup = true, bool detachActiveNode = true) noexcept {
@@ -414,7 +435,7 @@ void recycleNode(RetireShard& shard, size_t shardIndex, uint16_t index, Deferred
     if (detachFenceGroup) {
         std::shared_ptr<GpuFence> releasedFence =
             detachNodeFromFenceGroup(shard, shardIndex, index);
-        if (releasedFence) releases.fences[releases.fenceCount++] = std::move(releasedFence);
+        if (releasedFence) releases.appendFence(std::move(releasedFence));
     } else {
         node.groupNext = kNoNode;
         node.groupPrevious = kNoNode;
@@ -422,7 +443,7 @@ void recycleNode(RetireShard& shard, size_t shardIndex, uint16_t index, Deferred
     }
     if (detachActiveNode) unlinkActive(shard, index);
     for (uint16_t owner = 0; owner < oldOwnerCount; ++owner)
-        releases.owners[releases.ownerCount++] = std::move(node.owners[owner]);
+        releases.appendOwner(std::move(node.owners[owner]));
     node.ownerCount = 0;
     node.fenceValue = 0;
     node.reservation = 0;
@@ -444,7 +465,7 @@ void recycleWholeShardNode(RetireShard& shard, uint16_t index,
                            DeferredReleases& releases) noexcept {
     RetireNode& node = shard.nodes[index];
     for (uint16_t owner = 0; owner < node.ownerCount; ++owner)
-        releases.owners[releases.ownerCount++] = std::move(node.owners[owner]);
+        releases.appendOwner(std::move(node.owners[owner]));
     node.ownerCount = 0;
     node.fenceValue = 0;
     node.state = RetireNodeState::Free;
@@ -479,31 +500,52 @@ struct FenceProbe {
 };
 
 struct FenceProbeWorkspace {
-    std::array<FenceProbe, kFenceGroupsPerShard> values;
+    using Slot = std::aligned_storage_t<sizeof(FenceProbe), alignof(FenceProbe)>;
+
+    std::array<Slot, kFenceGroupsPerShard> values;
     size_t used = 0;
+
+    FenceProbeWorkspace() noexcept = default;
+    FenceProbeWorkspace(const FenceProbeWorkspace&) = delete;
+    FenceProbeWorkspace& operator=(const FenceProbeWorkspace&) = delete;
+    ~FenceProbeWorkspace() { clear(); }
+
+    FenceProbe& at(size_t index) noexcept {
+        Q_ASSERT(index < used);
+        if (Q_UNLIKELY(index >= used)) std::terminate();
+        return *std::launder(reinterpret_cast<FenceProbe*>(&values[index]));
+    }
+
+    const FenceProbe& at(size_t index) const noexcept {
+        Q_ASSERT(index < used);
+        if (Q_UNLIKELY(index >= used)) std::terminate();
+        return *std::launder(reinterpret_cast<const FenceProbe*>(&values[index]));
+    }
+
+    void append(FenceProbe&& probe) noexcept {
+        Q_ASSERT(used < values.size());
+        if (Q_UNLIKELY(used >= values.size())) std::terminate();
+        ::new (static_cast<void*>(&values[used])) FenceProbe(std::move(probe));
+        ++used;
+    }
 
     void clear() noexcept {
         for (size_t i = 0; i < used; ++i)
-            values[i].fence.reset();
+            at(i).~FenceProbe();
         used = 0;
     }
 };
 
-FenceProbeWorkspace& fenceProbeWorkspace() {
-    thread_local FenceProbeWorkspace workspace;
-    return workspace;
-}
-
-size_t collectFenceGroups(RetireShard& shard, size_t shardIndex,
-                          std::array<FenceProbe, kFenceGroupsPerShard>& probes) {
+size_t collectFenceGroups(RetireShard& shard, size_t shardIndex, FenceProbeWorkspace& probes) {
     size_t probeCount = 0;
     RetireMutexLocker locker(&shard.mutex);
     uint16_t index = shard.activeFenceGroupHead;
     while (index != kNoFenceGroup) {
         const FenceGroup& group = shard.fenceGroups[index];
         noteFenceGroupVisit();
-        probes[probeCount++] =
-            FenceProbe{index, group.serial, group.identity, group.fence, group.maximumValue, 0};
+        probes.append(
+            FenceProbe{index, group.serial, group.identity, group.fence, group.maximumValue, 0});
+        ++probeCount;
         index = group.activeNext;
     }
     if (probeCount == 0)
@@ -527,9 +569,9 @@ uint64_t pollCompleted(const std::shared_ptr<GpuFence>& fence) noexcept {
     }
 }
 
-void queryCompleted(std::array<FenceProbe, kFenceGroupsPerShard>& probes, size_t probeCount) {
+void queryCompleted(FenceProbeWorkspace& probes, size_t probeCount) {
     for (size_t i = 0; i < probeCount; ++i)
-        probes[i].completedValue = pollCompleted(probes[i].fence);
+        probes.at(i).completedValue = pollCompleted(probes.at(i).fence);
 }
 
 struct ReleaseCompletedResult {
@@ -537,14 +579,13 @@ struct ReleaseCompletedResult {
     uint64_t timedOut = 0;
 };
 
-ReleaseCompletedResult
-releaseCompletedGroups(RetireShard& shard, size_t shardIndex,
-                       const std::array<FenceProbe, kFenceGroupsPerShard>& probes,
-                       size_t probeCount, DeferredReleases& releases) {
+ReleaseCompletedResult releaseCompletedGroups(RetireShard& shard, size_t shardIndex,
+                                              const FenceProbeWorkspace& probes, size_t probeCount,
+                                              DeferredReleases& releases) {
     ReleaseCompletedResult result;
     RetireMutexLocker locker(&shard.mutex);
     for (size_t probeIndex = 0; probeIndex < probeCount; ++probeIndex) {
-        const FenceProbe& probe = probes[probeIndex];
+        const FenceProbe& probe = probes.at(probeIndex);
         if (probe.groupIndex >= kFenceGroupsPerShard) continue;
         FenceGroup& group = shard.fenceGroups[probe.groupIndex];
         if (!group.inUse || group.serial != probe.groupSerial || group.identity != probe.identity)
@@ -576,7 +617,7 @@ releaseCompletedGroups(RetireShard& shard, size_t shardIndex,
             group.nodeCount = 0;
             deactivateFenceGroup(shard, shardIndex, probe.groupIndex);
             std::shared_ptr<GpuFence> releasedFence = releaseFenceGroup(shard, probe.groupIndex);
-            if (releasedFence) releases.fences[releases.fenceCount++] = std::move(releasedFence);
+            if (releasedFence) releases.appendFence(std::move(releasedFence));
         }
         if (releaseWholeShard) {
             shard.activeHead = kNoNode;
@@ -590,8 +631,7 @@ releaseCompletedGroups(RetireShard& shard, size_t shardIndex,
 
 qsizetype abandonShardDomains(RetireShard& shard, size_t shardIndex,
                               const GpuValidatedDeadDomains& deadDomains) {
-    DeferredReleases& releases = deferredReleases();
-    releases.clear();
+    DeferredReleases releases;
     qsizetype released = 0;
     qsizetype pendingReleased = 0;
     qsizetype quarantineReleased = 0;
@@ -775,8 +815,7 @@ void GpuReadbackRetainer::quarantine(const GpuRetirePreparedHandle& prepared) no
 
 void GpuReadbackRetainer::release(const GpuRetirePreparedHandle& prepared) noexcept {
     if (!prepared || prepared.shard >= kShardCount) return;
-    DeferredReleases& releases = deferredReleases();
-    releases.clear();
+    DeferredReleases releases;
     RetireShard& shard = storage().shards[prepared.shard];
     {
         RetireMutexLocker locker(&shard.mutex);
@@ -793,6 +832,7 @@ void GpuReadbackRetainer::release(const GpuRetirePreparedHandle& prepared) noexc
 
 void GpuReadbackRetainer::drainCompleted() {
     const uint32_t activeShards = storage().activeShardMask.load(std::memory_order_acquire);
+    FenceProbeWorkspace workspace;
     for (size_t shardIndex = 0; shardIndex < kShardCount; ++shardIndex) {
         if ((activeShards & uint32_t(1u << shardIndex)) == 0) continue;
 #ifdef OLR_UNIT_TEST
@@ -800,15 +840,12 @@ void GpuReadbackRetainer::drainCompleted() {
             storage().probe.drainShardVisits.fetch_add(1, std::memory_order_relaxed);
 #endif
         RetireShard& shard = storage().shards[shardIndex];
-        FenceProbeWorkspace& workspace = fenceProbeWorkspace();
         workspace.clear();
-        const size_t probeCount = collectFenceGroups(shard, shardIndex, workspace.values);
-        workspace.used = probeCount;
+        const size_t probeCount = collectFenceGroups(shard, shardIndex, workspace);
         if (probeCount == 0) continue;
-        queryCompleted(workspace.values, probeCount);
-        DeferredReleases& releases = deferredReleases();
-        releases.clear();
-        (void) releaseCompletedGroups(shard, shardIndex, workspace.values, probeCount, releases);
+        queryCompleted(workspace, probeCount);
+        DeferredReleases releases;
+        (void) releaseCompletedGroups(shard, shardIndex, workspace, probeCount, releases);
         releases.clear();
         workspace.clear();
     }
@@ -839,6 +876,7 @@ int GpuReadbackRetainer::drainWithBoundedWait(int totalTimeoutMs) {
     int released = 0;
     uint64_t timedOut = 0;
     const uint32_t activeShards = storage().activeShardMask.load(std::memory_order_acquire);
+    FenceProbeWorkspace workspace;
     for (size_t shardIndex = 0; shardIndex < kShardCount; ++shardIndex) {
         if ((activeShards & uint32_t(1u << shardIndex)) == 0) continue;
 #ifdef OLR_UNIT_TEST
@@ -846,32 +884,29 @@ int GpuReadbackRetainer::drainWithBoundedWait(int totalTimeoutMs) {
             storage().probe.drainShardVisits.fetch_add(1, std::memory_order_relaxed);
 #endif
         RetireShard& shard = storage().shards[shardIndex];
-        FenceProbeWorkspace& workspace = fenceProbeWorkspace();
         workspace.clear();
-        const size_t probeCount = collectFenceGroups(shard, shardIndex, workspace.values);
-        workspace.used = probeCount;
+        const size_t probeCount = collectFenceGroups(shard, shardIndex, workspace);
         if (probeCount == 0) continue;
-        queryCompleted(workspace.values, probeCount);
+        queryCompleted(workspace, probeCount);
         for (size_t i = 0; i < probeCount; ++i) {
-            if (workspace.values[i].completedValue >= workspace.values[i].maximumValue) continue;
+            FenceProbe& probe = workspace.at(i);
+            if (probe.completedValue >= probe.maximumValue) continue;
             const int remainingMs = qMax(0, totalTimeoutMs - int(elapsed.elapsed()));
             if (remainingMs <= 0) continue;
             bool completedMaximum = false;
             try {
-                completedMaximum =
-                    workspace.values[i].fence->wait(workspace.values[i].maximumValue, remainingMs);
+                completedMaximum = probe.fence->wait(probe.maximumValue, remainingMs);
             } catch (...) {
             }
             if (completedMaximum)
-                workspace.values[i].completedValue = workspace.values[i].maximumValue;
+                probe.completedValue = probe.maximumValue;
             else
-                workspace.values[i].completedValue = pollCompleted(workspace.values[i].fence);
+                probe.completedValue = pollCompleted(probe.fence);
         }
 
-        DeferredReleases& releases = deferredReleases();
-        releases.clear();
+        DeferredReleases releases;
         const ReleaseCompletedResult result =
-            releaseCompletedGroups(shard, shardIndex, workspace.values, probeCount, releases);
+            releaseCompletedGroups(shard, shardIndex, workspace, probeCount, releases);
         releases.clear();
         workspace.clear();
         timedOut += result.timedOut;

@@ -13,13 +13,18 @@ from dataclasses import dataclass
 import enum
 import hashlib
 import hmac
+import json
 import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import statistics
 import struct
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 import types
 from types import MappingProxyType
@@ -46,8 +51,16 @@ from gpu_capability_model import (
 )
 
 
-SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".mm"})
-PRODUCTION_ROOTS = ("playback", "recorder_engine")
+SOURCE_SUFFIXES = frozenset({
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp",
+    ".m", ".mm",
+})
+COMPILE_SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".m", ".mm"})
+FIRST_PARTY_EXCLUDED_PARTS = frozenset({
+    "deps", "dependencies", "docs", "external", "handoff-notes", "node_modules",
+    "tests", "third_party", "third-party", "vendor", "vendors", "linux_build",
+    "windows_build", "_deps",
+})
 LEASE_HEADER = PurePosixPath("playback/gpu/gpusurfacelease.h")
 REGISTRY_HEADER = PurePosixPath("playback/gpu/gpuretireregistry.h")
 OP_SCOPE_HEADER = PurePosixPath("playback/gpu/gpuopscope.h")
@@ -111,6 +124,16 @@ _AUDIT_SPELLING_ALTERNATIVES = MappingProxyType({
     b"<%": b"{ ",
     b"%>": b"} ",
     b"%:": b"# ",
+})
+
+# Scoped native surfaces are non-copyable, function-bounded facades minted only
+# by GpuOpScope.  The capability may be synchronously delegated only through
+# these reviewed backend layers; arbitrary calls could retain its address.
+REVIEWED_SCOPED_SURFACE_SINKS = MappingProxyType({
+    PurePosixPath("playback/gpu/gpurhicontext_apple.mm"):
+        frozenset({"retainApplePixelBufferWrapper"}),
+    PurePosixPath("playback/gpu/gpucompositor_apple.mm"):
+        frozenset({"makePixelBufferWrapper", "retainApplePixelBufferWrapper"}),
 })
 _DEFAULT_CANDIDATE_PATHS = b"derived-capability-paths"
 
@@ -1615,17 +1638,22 @@ MEMBER_CALL = re.compile(
 def preprocessor_capability_findings(path: PurePosixPath,
                                      translated: TranslationText) -> list[Finding]:
     findings: list[Finding] = []
-    unique_capability = re.compile(r"\b(?:GpuSyncReadScope|withRead|nativeHandle)\b")
+    unique_capability = re.compile(
+        r"\b(?:GpuScopedNativeSurface|GpuScopedNativeView|GpuSyncReadScope|"
+        r"withRead|nativeHandle)\b")
     nonlocal_jump = re.compile(r"\b(?:_longjmp|longjmp|siglongjmp)\b")
-    approved_consumers = REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
+    approved_consumers = (
+        REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset()) |
+        REVIEWED_SCOPED_SURFACE_SINKS.get(path, frozenset())
+    )
     approved_methods = REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset())
     approved_types = REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset())
 
     def pasted_guarded_identifier(text: str) -> bool:
         tokens = re.findall(r"[A-Za-z_]\w*|##|\S", text)
         guarded = {
-            "GpuSyncReadScope", "_longjmp", "longjmp", "nativeHandle", "siglongjmp",
-            "withRead",
+            "GpuScopedNativeSurface", "GpuScopedNativeView", "GpuSyncReadScope",
+            "_longjmp", "longjmp", "nativeHandle", "siglongjmp", "withRead",
         }
         changed = True
         while changed:
@@ -1650,7 +1678,7 @@ def preprocessor_capability_findings(path: PurePosixPath,
         if not stripped.startswith("#"):
             return
         macro_mutation = re.match(r"#\s*(?:define|undef)\b", stripped) is not None
-        if "##" in stripped or "%:%:" in stripped:
+        if ("##" in stripped or "%:%:" in stripped) and pasted_guarded_identifier(stripped):
             findings.append(Finding(
                 path, logical_start, "preprocessor token concatenation",
                 "token concatenation can reconstruct guarded GPU operations or non-local "
@@ -1843,18 +1871,451 @@ def source_macro_environment_events(
     return events, directive_ranges
 
 
+def gpu_op_scope_type_names(source: str) -> set[str]:
+    if "GpuOpScope" not in source:
+        return {"GpuOpScope"}
+    qualified_type = r"(?:::)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*"
+    namespace_blocks = []
+    for match in re.finditer(
+            r"\bnamespace\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\{", source):
+        opening = source.find("{", match.start(), match.end())
+        depth = 1
+        closing = opening + 1
+        while closing < len(source) and depth:
+            depth += (source[closing] == "{") - (source[closing] == "}")
+            closing += 1
+        if depth == 0:
+            namespace_blocks.append((opening, closing - 1,
+                                     tuple(match.group(1).split("::"))))
+
+    def namespace_at(position: int) -> tuple[str, ...]:
+        result: tuple[str, ...] = ()
+        for opening, closing, components in sorted(namespace_blocks):
+            if opening < position < closing:
+                result += components
+        return result
+
+    def candidates(target: str, namespace: tuple[str, ...]):
+        global_name = target.startswith("::")
+        parts = tuple(target[2:].split("::") if global_name else target.split("::"))
+        if global_name:
+            return (parts,)
+        return tuple(namespace[:depth] + parts for depth in range(len(namespace), -1, -1))
+
+    aliases = []
+    for match in re.finditer(
+            rf"\busing\s+([A-Za-z_]\w*)\s*=\s*({qualified_type})\s*;", source):
+        aliases.append((namespace_at(match.start()), match.group(1), match.group(2)))
+    for match in re.finditer(
+            rf"\btypedef\s+({qualified_type})\s+([A-Za-z_]\w*)\s*;", source):
+        aliases.append((namespace_at(match.start()), match.group(2), match.group(1)))
+    declarations = {
+        namespace_at(match.start()) + (match.group(1),)
+        for match in re.finditer(
+            r"\b(?:class|struct|union|enum)\s+([A-Za-z_]\w*)\b", source)
+    }
+    symbols = {("GpuOpScope",)}
+    changed = True
+    while changed:
+        changed = False
+        for namespace, alias, target in aliases:
+            symbol = namespace + (alias,)
+            resolution = next(
+                (candidate in symbols for candidate in candidates(target, namespace)
+                 if candidate in symbols or candidate in declarations),
+                False)
+            if symbol not in symbols and resolution:
+                symbols.add(symbol)
+                changed = True
+    return {"::".join(symbol) for symbol in symbols}
+
+
+def gpu_op_scope_owner_is_protected(source: str, owner: str, position: int) -> bool:
+    symbols = {tuple(name.split("::")) for name in gpu_op_scope_type_names(source)}
+    global_name = owner.startswith("::")
+    parts = tuple(owner[2:].split("::") if global_name else owner.split("::"))
+    if global_name:
+        return parts in symbols
+    namespace_blocks = []
+    for match in re.finditer(
+            r"\bnamespace\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\{", source):
+        opening = source.find("{", match.start(), match.end())
+        depth = 1
+        closing = opening + 1
+        while closing < len(source) and depth:
+            depth += (source[closing] == "{") - (source[closing] == "}")
+            closing += 1
+        if depth == 0:
+            namespace_blocks.append((opening, closing - 1,
+                                     tuple(match.group(1).split("::"))))
+
+    def namespace_at(location: int) -> tuple[str, ...]:
+        result: tuple[str, ...] = ()
+        for opening, closing, components in sorted(namespace_blocks):
+            if opening < location < closing:
+                result += components
+        return result
+
+    declarations = {
+        namespace_at(match.start()) + (match.group(1),)
+        for match in re.finditer(
+            r"\b(?:class|struct|union|enum)\s+([A-Za-z_]\w*)\b", source)
+    }
+    namespace = namespace_at(position)
+    for depth in range(len(namespace), -1, -1):
+        candidate = namespace[:depth] + parts
+        if candidate in symbols:
+            return True
+        if candidate in declarations:
+            return False
+    return False
+
+
+def gpu_op_scope_owner_macros(source: str) -> set[tuple[str, bool]]:
+    protected: set[tuple[str, bool]] = set()
+    definitions = list(re.finditer(
+        r"(?m)^\s*#\s*define\s+([A-Za-z_]\w*)(\s*\(\s*\))?\s+([^\n]+)", source))
+    changed = True
+    while changed:
+        changed = False
+        for definition in definitions:
+            name, function, replacement = definition.groups()
+            target = replacement.strip()
+            if (gpu_op_scope_owner_is_protected(source, target, definition.start())
+                    or (target, False) in protected):
+                value = (name, function is not None)
+                if value not in protected:
+                    protected.add(value)
+                    changed = True
+    return protected
+
+
+def compiler_member_pointer_has_protected_owner(
+        source: str, items: list[CppToken], scope_operator: int) -> bool:
+    cursor = scope_operator - 1
+    macros = gpu_op_scope_owner_macros(source)
+    if cursor >= 2 and items[cursor].value == ")":
+        if (items[cursor - 1].value == "(" and
+                (items[cursor - 2].value, True) in macros):
+            return cursor >= 3 and items[cursor - 3].value == "&"
+        return False
+    if cursor < 0 or not re.fullmatch(r"[A-Za-z_]\w*", items[cursor].value):
+        return False
+    end = cursor
+    cursor -= 1
+    while (cursor >= 1 and items[cursor].value == "::" and
+           re.fullmatch(r"[A-Za-z_]\w*", items[cursor - 1].value)):
+        cursor -= 2
+    if cursor >= 0 and items[cursor].value == "::":
+        cursor -= 1
+    if cursor < 0 or items[cursor].value != "&":
+        return False
+    owner = "".join(token.value for token in items[cursor + 1:end + 1])
+    return ((owner, False) in macros or
+            gpu_op_scope_owner_is_protected(source, owner, items[scope_operator].start))
+
+
+def gpu_op_scope_reference_alias_pairs(source: str) -> list[tuple[
+        str, str | None, str | None, frozenset[str], int, str | None]]:
+    """Parse the finite identity-initializer grammar for protected references."""
+    tokens = _compiler_tokens(source)
+    values = [token.value for token in tokens]
+
+    def matching_paren(items: list[str], opening: int) -> int | None:
+        depth = 0
+        for index in range(opening, len(items)):
+            depth += (items[index] == "(") - (items[index] == ")")
+            if depth == 0:
+                return index
+        return None
+
+    def unwrap_parentheses(items: list[str]) -> list[str]:
+        result = list(items)
+        while result and result[0] == "(":
+            closing = matching_paren(result, 0)
+            if closing != len(result) - 1:
+                break
+            result = result[1:-1]
+        return result
+
+    def identity_target(initializer: list[str]) -> str | None:
+        expression = unwrap_parentheses(initializer)
+        if expression and expression[0] == "&":
+            expression = unwrap_parentheses(expression[1:])
+        if len(expression) == 1 and re.fullmatch(r"[A-Za-z_]\w*", expression[0]):
+            return expression[0]
+        if len(expression) < 6 or expression[:2] != ["std", "::"]:
+            return None
+        function = expression[2]
+        cursor = 3
+        if function == "forward":
+            if cursor >= len(expression) or expression[cursor] != "<":
+                return None
+            depth = 0
+            while cursor < len(expression):
+                value = expression[cursor]
+                if value == "<":
+                    depth += 1
+                elif value == ">":
+                    depth -= 1
+                elif value == ">>":
+                    depth -= 2
+                cursor += 1
+                if depth == 0:
+                    break
+            if depth != 0:
+                return None
+        elif function != "move":
+            return None
+        if cursor >= len(expression) or expression[cursor] != "(":
+            return None
+        closing = matching_paren(expression, cursor)
+        if closing != len(expression) - 1:
+            return None
+        argument = unwrap_parentheses(expression[cursor + 1:closing])
+        return (argument[0] if len(argument) == 1
+                and re.fullmatch(r"[A-Za-z_]\w*", argument[0]) else None)
+
+    def allowed_value_initializer(initializer: list[str]) -> str | None:
+        expression = unwrap_parentheses(initializer)
+        if not expression:
+            return None
+        if expression[0] == "submitCompactedOwners":
+            receiver = "*submitCompactedOwners*"
+            cursor = 1
+        elif (len(expression) >= 4
+              and re.fullmatch(r"[A-Za-z_]\w*", expression[0])
+              and expression[1] in {".", "->"}
+              and expression[2] in {"submit", "submitRetained"}):
+            receiver = expression[0]
+            cursor = 3
+        else:
+            return None
+        if cursor < len(expression) and expression[cursor] == "<":
+            depth = 0
+            while cursor < len(expression):
+                value = expression[cursor]
+                if value == "<":
+                    depth += 1
+                elif value == ">":
+                    depth -= 1
+                elif value == ">>":
+                    depth -= 2
+                cursor += 1
+                if depth == 0:
+                    break
+        if (cursor >= len(expression) or expression[cursor] != "("
+                or matching_paren(expression, cursor) != len(expression) - 1):
+            return None
+        if receiver == "*submitCompactedOwners*":
+            arguments: list[list[str]] = []
+            current: list[str] = []
+            depth = 0
+            for token in expression[cursor + 1:-1]:
+                depth += (token in {"(", "[", "{"}) - (token in {")", "]", "}"})
+                if token == "," and depth == 0:
+                    arguments.append(current)
+                    current = []
+                else:
+                    current.append(token)
+            arguments.append(current)
+            exact = [["operation"], ["adapter"]]
+            owners = [["retirementOwners"], ["retirementOwnerCount"]]
+            compact = [["owners"], ["ownerCount"]]
+            if len(arguments) != 4 or arguments[:2] != exact \
+                    or arguments[2:] not in (owners, compact):
+                return None
+        return receiver
+
+    declarations = []
+    for index, value in enumerate(values):
+        if value != "auto":
+            continue
+        cursor = index + 1
+        if cursor < len(values) and values[cursor] == "const":
+            cursor += 1
+        reference_kind = None
+        if cursor < len(values) and values[cursor] in {"&", "&&", "*"}:
+            reference_kind = values[cursor]
+            cursor += 1
+        if cursor >= len(values) or not re.fullmatch(r"[A-Za-z_]\w*", values[cursor]):
+            continue
+        alias = values[cursor]
+        cursor += 1
+        if cursor >= len(values) or values[cursor] != "=":
+            continue
+        end = cursor + 1
+        paren = bracket = brace = 0
+        while end < len(values):
+            token = values[end]
+            if token == ";" and paren == bracket == brace == 0:
+                break
+            paren += (token == "(") - (token == ")")
+            bracket += (token == "[") - (token == "]")
+            brace += (token == "{") - (token == "}")
+            end += 1
+        if end >= len(values):
+            continue
+        initializer = values[cursor + 1:end]
+        identifiers = frozenset(
+            token for token in initializer if re.fullmatch(r"[A-Za-z_]\w*", token)
+        )
+        declarations.append((
+            alias, reference_kind, identity_target(initializer), identifiers,
+            tokens[index].start, allowed_value_initializer(initializer),
+        ))
+    return declarations
+
+
+def gpu_op_scope_binding_names(source: str) -> set[str]:
+    names: set[str] = set()
+    protected_types = gpu_op_scope_type_names(source)
+    candidate_types = protected_types | {
+        type_name.rsplit("::", 1)[-1] for type_name in protected_types
+    }
+    qualified_type = "|".join(
+        re.escape(type_name) for type_name in sorted(candidate_types, key=len, reverse=True)
+    )
+    for match in re.finditer(
+            rf"(?<![A-Za-z0-9_])((?:::)?(?:{qualified_type}))\s*"
+            r"(?:const\s*)?(?:[&*]\s*)?"
+            r"([A-Za-z_]\w*)\b", source):
+        if gpu_op_scope_owner_is_protected(source, match.group(1), match.start()):
+            names.add(match.group(2))
+    changed = True
+    reference_declarations = gpu_op_scope_reference_alias_pairs(source)
+    while changed:
+        changed = False
+        for alias, reference_kind, target, identifiers, _position, _value_allowed \
+                in reference_declarations:
+            touches_protected = target in names or not identifiers.isdisjoint(names)
+            if reference_kind is not None and touches_protected and alias not in names:
+                names.add(alias)
+                changed = True
+    return names
+
+
+def noncanonical_gpu_op_scope_initializers(
+        source: str, path: PurePosixPath | None = None) -> list[tuple[str, int]]:
+    names = gpu_op_scope_binding_names(source)
+    violations = []
+    for alias, reference_kind, target, identifiers, position, value_receiver in \
+            gpu_op_scope_reference_alias_pairs(source):
+        if identifiers.isdisjoint(names):
+            continue
+        if reference_kind == "*":
+            violations.append((alias, position))
+            continue
+        if reference_kind is not None and target in names:
+            continue
+        if reference_kind is None and value_receiver in names:
+            continue
+        if (reference_kind is None and value_receiver == "*submitCompactedOwners*"
+                and path == PurePosixPath("playback/gpu/gpucompositor.cpp")):
+            continue
+        violations.append((alias, position))
+    return violations
+
+
+def immediate_compiler_receiver_name(tokens: list[CppToken], operator: int) -> str | None:
+    cursor = operator - 1
+    if cursor < 0:
+        return None
+    if re.fullmatch(r"[A-Za-z_]\w*", tokens[cursor].value):
+        return tokens[cursor].value
+    if tokens[cursor].value != ")":
+        return None
+    depth = 1
+    opening = cursor - 1
+    while opening >= 0:
+        if tokens[opening].value == ")":
+            depth += 1
+        elif tokens[opening].value == "(":
+            depth -= 1
+            if depth == 0:
+                break
+        opening -= 1
+    if opening < 0:
+        return None
+    values = [token.value for token in tokens[opening + 1:cursor]]
+    while len(values) >= 2 and values[0] == "(" and values[-1] == ")":
+        values = values[1:-1]
+    return values[0] if len(values) == 1 and re.fullmatch(r"[A-Za-z_]\w*", values[0]) else None
+
+
+def gpu_op_scope_method_context(source: str, method: str) -> bool:
+    """Recognize a method/member-pointer use tied to a named GpuOpScope binding."""
+    names = gpu_op_scope_binding_names(source)
+    tokens = _compiler_tokens(source)
+    aliases = {
+        match.group(1) for match in re.finditer(
+            rf"(?m)^\s*#\s*define\s+([A-Za-z_]\w*)(?:\s*\(\s*\))?[^\n]*"
+            rf"\b{re.escape(method)}\b", source)
+    }
+    for index, token in enumerate(tokens):
+        if token.value not in ({method} | aliases):
+            continue
+        if (index >= 2 and tokens[index - 1].value == "::"
+                and compiler_member_pointer_has_protected_owner(source, tokens, index - 1)):
+            return True
+        operator = index - 1
+        if operator >= 0 and tokens[operator].value == "template":
+            operator -= 1
+        if operator < 1 or tokens[operator].value not in {".", "->"}:
+            continue
+        if immediate_compiler_receiver_name(tokens, operator) in names:
+            return True
+    return False
+
+
+def protected_submit_adapter_names(source: str) -> set[str]:
+    """Return exact identifier arguments passed to protected direct submit calls."""
+    bindings = gpu_op_scope_binding_names(source)
+    tokens = _compiler_tokens(source)
+    adapters: set[str] = set()
+    for index, token in enumerate(tokens):
+        if token.value not in {"submit", "submitRetained"}:
+            continue
+        operator = index - 1
+        if operator >= 0 and tokens[operator].value == "template":
+            operator -= 1
+        if (operator < 1 or tokens[operator].value not in {".", "->"}
+                or immediate_compiler_receiver_name(tokens, operator) not in bindings):
+            continue
+        cursor = index + 1
+        if cursor < len(tokens) and tokens[cursor].value == "<":
+            depth = 1
+            cursor += 1
+            while cursor < len(tokens) and depth:
+                if tokens[cursor].value == "<":
+                    depth += 1
+                elif tokens[cursor].value == ">":
+                    depth -= 1
+                cursor += 1
+        if cursor >= len(tokens) or tokens[cursor].value != "(":
+            continue
+        cursor += 1
+        while cursor < len(tokens) and tokens[cursor].value == "(":
+            cursor += 1
+        if cursor < len(tokens) and re.fullmatch(r"[A-Za-z_]\w*", tokens[cursor].value):
+            adapters.add(tokens[cursor].value)
+    return adapters
+
+
 def guarded_macro_composition_findings(
         path: PurePosixPath, translated: TranslationText,
         *, source_only: bool = False,
         ) -> list[Finding]:
     """Reject source-visible macro calls whose identifier pieces form guarded names."""
     guarded = {
-        "GpuSyncReadScope", "_longjmp", "complete", "longjmp", "nativeHandle", "read",
-        "siglongjmp", "withRead",
+        "GpuScopedNativeSurface", "GpuScopedNativeView", "GpuSyncReadScope", "_longjmp",
+        "complete", "longjmp", "nativeHandle", "read", "siglongjmp", "submit",
+        "submitRetained", "withRead",
     }
     guarded.update(REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset()))
     guarded.update(REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset()))
     guarded.update(REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset()))
+    guarded.update(REVIEWED_SCOPED_SURFACE_SINKS.get(path, frozenset()))
     tokens = _compiler_tokens(translated.masked)
     environment_events, directive_ranges = source_macro_environment_events(
         translated.masked
@@ -2311,6 +2772,9 @@ def guarded_macro_composition_findings(
                 REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
             )
             policy_spellings.update(
+                REVIEWED_SCOPED_SURFACE_SINKS.get(path, frozenset())
+            )
+            policy_spellings.update(
                 REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset())
             )
             policy_spellings.update(
@@ -2327,19 +2791,28 @@ def guarded_macro_composition_findings(
                 if not token_is_in_directive(item.start)
             ]
             rendered = " ".join(prefix + [item.value for item in candidate])
-            if audit_capability_uses(path, rendered, compiler_view=True):
+            if (source_only
+                    and audit_capability_uses(path, rendered, compiler_view=True)):
                 return "guarded identifier macro composition"
-            if re.search(
+            if source_only and re.search(
                 r"(?:&\s*[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*\s*::|\.|->)\s*"
                 r"nativeHandle\b",
                 rendered,
             ):
+                return "guarded identifier macro composition"
+            if (gpu_op_scope_method_context(rendered, "submit")
+                    or gpu_op_scope_method_context(rendered, "submitRetained")):
                 return "guarded identifier macro composition"
             if re.search(r"\b(?:_longjmp|longjmp|siglongjmp)\s*\(", rendered):
                 return "guarded identifier macro composition"
             if any(
                 re.search(rf"\b{re.escape(name)}\s*\(", rendered)
                 for name in REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
+            ):
+                return "guarded identifier macro composition"
+            if any(
+                re.search(rf"\b{re.escape(name)}\s*\(", rendered)
+                for name in REVIEWED_SCOPED_SURFACE_SINKS.get(path, frozenset())
             ):
                 return "guarded identifier macro composition"
             if any(
@@ -2483,8 +2956,8 @@ def phase_two_capability_findings(path: PurePosixPath, source: str,
     if "\\\n" not in source and "\\\r\n" not in source:
         return []
     guarded = {
-        "GpuSyncReadScope", "_longjmp", "complete", "longjmp", "nativeHandle", "read",
-        "siglongjmp", "withRead",
+        "GpuScopedNativeSurface", "GpuScopedNativeView", "GpuSyncReadScope", "_longjmp",
+        "complete", "longjmp", "nativeHandle", "read", "siglongjmp", "withRead",
     }
     translated = translate_source(source) if translated is None else translated
     masked = translated.masked
@@ -2722,6 +3195,62 @@ def is_direct_call_argument(tokens: list[CppToken], use_start: int, use_end: int
     return False
 
 
+def is_reviewed_scoped_surface_argument(tokens: list[CppToken], use_start: int,
+                                        use_end: int, allowed_calls: frozenset[str],
+                                        identity_tokens: list[CppToken], masked: str,
+                                        pairs: list[tuple[int, int]]) -> bool:
+    """Accept direct reviewed calls, including one canonical local wrapper definition."""
+    if is_direct_call_argument(
+            tokens, use_start, use_end, allowed_calls, frozenset(),
+            identity_tokens, masked, pairs):
+        return True
+    call = enclosing_call(tokens, use_start)
+    if call is None or call[0] not in allowed_calls:
+        return False
+    name, opening, closing = call
+    argument_start = opening + 1
+    paren_depth = bracket_depth = brace_depth = 0
+    direct = False
+    for index in range(opening + 1, closing + 1):
+        value = tokens[index].value
+        if index == closing or (value == "," and paren_depth == bracket_depth == brace_depth == 0):
+            if argument_start <= use_start < index:
+                direct_start, direct_end = strip_transparent_parentheses(
+                    tokens, argument_start, index)
+                direct = direct_start == use_start and direct_end == use_end
+                break
+            argument_start = index + 1
+            continue
+        if value == "(":
+            paren_depth += 1
+        elif value == ")":
+            paren_depth -= 1
+        elif value == "[":
+            bracket_depth += 1
+        elif value == "]":
+            bracket_depth -= 1
+        elif value == "{":
+            brace_depth += 1
+        elif value == "}":
+            brace_depth -= 1
+    if not direct:
+        return False
+    call_position = tokens[opening - 1].start
+    canonical = list(re.finditer(
+        rf"\b{re.escape(name)}\s*\(\s*const\s+GpuScopedNativeSurface\s*&\s*"
+        r"[A-Za-z_]\w*\s*\)\s*\{",
+        masked[:call_position],
+    ))
+    if len(canonical) != 1:
+        return False
+    definition_end = canonical[0].end()
+    intervening = _compiler_tokens(masked, definition_end, call_position)
+    known_types = declared_type_names(intervening)
+    return not any(token.value == name and
+                   token_is_declarator_name(intervening, index, known_types)
+                   for index, token in enumerate(intervening))
+
+
 def safe_boolean_expression(tokens: list[CppToken], start: int, end: int,
                             alias: str, allow_bare: bool = True) -> bool:
     start, end = strip_transparent_parentheses(tokens, start, end)
@@ -2865,6 +3394,11 @@ def local_native_alias(path: PurePosixPath, masked: str, pairs: list[tuple[int, 
         return None
     equals_index = equals[0]
     lhs = tokens[:equals_index]
+    while lhs and lhs[0].value == "#":
+        directive_end = masked.find("\n", lhs[0].start)
+        if directive_end < 0:
+            return None
+        lhs = [token for token in lhs if token.start > directive_end]
     if len(lhs) < 2:
         return None
     alias = lhs[-1]
@@ -2977,6 +3511,16 @@ def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
         if is_direct_call_argument(
                 tokens, index, index + 1, safe_calls, safe_member_calls,
                 identity_tokens, masked, pairs):
+            consumed = True
+            continue
+        statement_values = [
+            item.value for item in statement_tokens(masked, pairs, token.start)
+        ]
+        exact_test_observation = [
+            "m_lastReadbackHadNativeHandleForTest", ".", "store", "(", alias,
+            "!=", "nullptr", ",", "std", "::", "memory_order_release", ")", ";",
+        ]
+        if statement_values == exact_test_observation:
             consumed = True
             continue
         condition = enclosing_call(tokens, index)
@@ -3508,6 +4052,64 @@ def callback_lease_bindings(masked: str, pairs: list[tuple[int, int]],
     return bindings
 
 
+def scoped_native_surface_bindings(masked: str,
+                                   pairs: list[tuple[int, int]]) -> list[HandleBinding]:
+    """Find exact const-ref facade parameters whose function body owns their lifetime."""
+    parameter_pairs = delimiter_pairs(masked, "(", ")")
+    blocks_by_opening = {opening: (opening, closing) for opening, closing in pairs}
+    bindings: list[HandleBinding] = []
+    pattern = re.compile(
+        r"\bconst\s+GpuScopedNativeSurface\s*&\s*([A-Za-z_]\w*)\b")
+    for match in pattern.finditer(masked):
+        position = match.start(1)
+        if type_name_is_source_shadowed(masked, pairs, "GpuScopedNativeSurface", position):
+            continue
+        containing = [pair for pair in parameter_pairs
+                      if pair[0] < position < pair[1]]
+        if not containing:
+            continue
+        parameter_list = min(containing, key=lambda pair: pair[1] - pair[0])
+        tail = masked[parameter_list[1] + 1:]
+        boundary = re.search(r"[(){};=]", tail)
+        if boundary is None or boundary.group(0) != "{":
+            continue
+        body_opening = parameter_list[1] + 1 + boundary.start()
+        block = blocks_by_opening.get(body_opening)
+        if block is None:
+            continue
+        bindings.append(HandleBinding(match.group(1), position, block, None, None))
+    return bindings
+
+
+def scoped_native_view_bindings(masked: str,
+                                pairs: list[tuple[int, int]]) -> list[HandleBinding]:
+    """Find exact const-ref native-view parameters owned by a synchronous adapter."""
+    parameter_pairs = delimiter_pairs(masked, "(", ")")
+    blocks_by_opening = {opening: (opening, closing) for opening, closing in pairs}
+    bindings: list[HandleBinding] = []
+    pattern = re.compile(
+        r"\bconst\s+GpuScopedNativeView\s*<[^;{}()]+>\s*&\s*([A-Za-z_]\w*)\b")
+    for match in pattern.finditer(masked):
+        position = match.start(1)
+        if type_name_is_source_shadowed(masked, pairs, "GpuScopedNativeView", position):
+            continue
+        containing = [pair for pair in parameter_pairs
+                      if pair[0] < position < pair[1]]
+        if not containing:
+            continue
+        parameter_list = min(containing, key=lambda pair: pair[1] - pair[0])
+        tail = masked[parameter_list[1] + 1:]
+        boundary = re.search(r"[(){};=]", tail)
+        if boundary is None or boundary.group(0) != "{":
+            continue
+        body_opening = parameter_list[1] + 1 + boundary.start()
+        block = blocks_by_opening.get(body_opening)
+        if block is None:
+            continue
+        bindings.append(HandleBinding(match.group(1), position, block, None, None))
+    return bindings
+
+
 def resolve_handle_binding(bindings: list[HandleBinding], masked: str,
                            pairs: list[tuple[int, int]],
                            call: re.Match[str]) -> HandleBinding | None:
@@ -3807,6 +4409,250 @@ def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
     return True
 
 
+def scoped_surface_binding_stays_local(path: PurePosixPath, masked: str,
+                                       pairs: list[tuple[int, int]],
+                                       binding: HandleBinding,
+                                       shadow_index=None) -> bool:
+    """Allow only direct facade methods and reviewed synchronous delegation."""
+    allowed_methods = {"desc", "nativeHandle", "nativeSubresource", "valid"}
+    safe_calls = REVIEWED_SCOPED_SURFACE_SINKS.get(path, frozenset())
+    tokens = _compiler_tokens(masked, binding.position, binding.block[1])
+    identity_tokens = _compiler_tokens(masked, 0, binding.block[1])
+    known_types = declared_type_names(tokens)
+    for index, token in enumerate(tokens):
+        if token.value != binding.name or token.start == binding.position:
+            continue
+        if token_is_declarator_name(tokens, index, known_types):
+            declaration_tokens = statement_tokens(masked, pairs, token.start)
+            if any(item.value == "GpuScopedNativeSurface" for item in declaration_tokens):
+                continue
+        if name_is_shadowed(binding.name, binding.position, binding.position,
+                            masked, pairs, token.start, shadow_index):
+            continue
+        if not stays_in_synchronous_blocks(masked, pairs, binding.block, token.start):
+            return False
+        if (index + 3 < len(tokens)
+                and tokens[index + 1].value == "."
+                and tokens[index + 2].value in allowed_methods
+                and tokens[index + 3].value == "("):
+            continue
+        if is_reviewed_scoped_surface_argument(
+                tokens, index, index + 1, safe_calls,
+                identity_tokens, masked, pairs):
+            continue
+        return False
+    return True
+
+
+def scoped_native_view_binding_stays_local(masked: str,
+                                           pairs: list[tuple[int, int]],
+                                           binding: HandleBinding,
+                                           shadow_index=None) -> bool:
+    """Permit only direct, synchronous typed-view access in a submit adapter."""
+    tokens = _compiler_tokens(masked, binding.position, binding.block[1])
+    known_types = declared_type_names(tokens)
+    for index, token in enumerate(tokens):
+        if token.value != binding.name or token.start == binding.position:
+            continue
+        if token_is_declarator_name(tokens, index, known_types):
+            declaration_tokens = statement_tokens(masked, pairs, token.start)
+            if any(item.value == "GpuScopedNativeView" for item in declaration_tokens):
+                continue
+        if name_is_shadowed(binding.name, binding.position, binding.position,
+                            masked, pairs, token.start, shadow_index):
+            continue
+        if not stays_in_synchronous_blocks(masked, pairs, binding.block, token.start):
+            return False
+        statement = statement_tokens(masked, pairs, token.start)
+        statement_values = [item.value for item in statement]
+        occurrence = next((position for position, item in enumerate(statement)
+                           if item.start == token.start), None)
+        if occurrence is None:
+            return False
+        prefix = statement_values[:occurrence]
+        if ("return" in prefix or "&" in prefix or "*" in prefix
+                or any(statement_values[index:index + 3] in
+                       (["std", "::", "ref"], ["std", "::", "cref"])
+                       for index in range(max(0, len(statement_values) - 2)))
+                or "reference_wrapper" in statement_values):
+            return False
+        # Typed adapters may consume an exact slot only through get<I>(), or
+        # inspect the fixed view size. Bracket access is intentionally denied:
+        # it is the only production pattern that takes a slot address, and its
+        # generic-lambda compositor exception is checked by the whole-tree
+        # native-submit audit rather than this type-binding lane.
+        if index + 3 < len(tokens) and tokens[index + 1].value == ".":
+            if (tokens[index + 2].value == "size"
+                    and tokens[index + 3].value == "("):
+                continue
+            if tokens[index + 2].value == "get" and tokens[index + 3].value == "<":
+                depth = 0
+                cursor = index + 3
+                while cursor < len(tokens):
+                    if tokens[cursor].value == "<":
+                        depth += 1
+                    elif tokens[cursor].value == ">":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    cursor += 1
+                if (depth == 0 and cursor + 1 < len(tokens)
+                        and tokens[cursor + 1].value == "("):
+                    continue
+        return False
+    return True
+
+
+def gpu_op_scope_directness_findings(path: PurePosixPath,
+                                     translated: TranslationText) -> list[Finding]:
+    findings: list[Finding] = []
+    source = translated.masked
+    if "submit" not in source:
+        return findings
+    items = _compiler_tokens(source)
+    aliases = {
+        match.group(1): method
+        for method in ("submit", "submitRetained")
+        for match in re.finditer(
+            rf"(?m)^\s*#\s*define\s+([A-Za-z_]\w*)(?:\s*\(\s*\))?[^\n]*"
+            rf"\b{method}\b", source)
+    }
+    for index, token in enumerate(items):
+        method = token.value if token.value in {"submit", "submitRetained"} else aliases.get(
+            token.value)
+        if method is None or index < 2 or items[index - 1].value != "::":
+            continue
+        if not compiler_member_pointer_has_protected_owner(source, items, index - 1):
+            continue
+        findings.append(Finding(
+            path, translated.line_at(token.start), f"GpuOpScope::{method}",
+            "native submission must be a direct auditable member call; member pointers and "
+            "aliases are forbidden"))
+    return findings
+
+
+def native_submit_adapter_escape_findings(path: PurePosixPath,
+                                           translated: TranslationText) -> list[Finding]:
+    """Constrain scoped native views/accessors in both source and compiler views."""
+    masked = translated.masked
+    if not (gpu_op_scope_method_context(masked, "submit")
+            or gpu_op_scope_method_context(masked, "submitRetained")):
+        return []
+    pairs = brace_pairs(masked)
+    findings: list[Finding] = []
+    pattern = re.compile(
+        r"\bauto\s+[A-Za-z_]\w*\s*=\s*\[[^\]]*\]\s*\(\s*const\s+"
+        r"(?:GpuScopedNativeView\s*<[^>]+>|auto)\s*&\s*([A-Za-z_]\w*)\s*\)\s*"
+        r"noexcept\s*\{")
+    adapter_blocks: list[tuple[re.Match[str], tuple[int, int]]] = []
+    for match in pattern.finditer(masked):
+        opening = masked.find("{", match.start(), match.end())
+        block = next((pair for pair in pairs if pair[0] == opening), None)
+        if block is None:
+            continue
+        adapter_blocks.append((match, block))
+
+    adapter_types: set[str] = set()
+    for adapter in protected_submit_adapter_names(masked):
+        declarations = re.finditer(
+            rf"(?<![A-Za-z0-9_])([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
+            rf"(?:const\s*)?(?:[&*]\s*)?{re.escape(adapter)}\b", masked)
+        adapter_types.update(match.group(1).rsplit("::", 1)[-1]
+                             for match in declarations)
+    operator_pattern = re.compile(
+        r"\boperator\s*\(\s*\)\s*\(\s*const\s+"
+        r"(?:GpuScopedNativeView\s*<[^>]+>|auto)\s*&\s*([A-Za-z_]\w*)\s*\)\s*"
+        r"(?:const\s*)?noexcept(?:\s*\([^)]*\))?\s*\{")
+    for adapter_type in adapter_types:
+        for declaration in re.finditer(
+                rf"\b(?:class|struct)\s+{re.escape(adapter_type)}\b[^;{{]*\{{", masked):
+            opening = masked.find("{", declaration.start(), declaration.end())
+            class_block = next((pair for pair in pairs if pair[0] == opening), None)
+            if class_block is None:
+                continue
+            for match in operator_pattern.finditer(
+                    masked, class_block[0] + 1, class_block[1]):
+                body_opening = masked.find("{", match.start(), match.end())
+                body_block = next((pair for pair in pairs if pair[0] == body_opening), None)
+                if body_block is not None and body_block[1] <= class_block[1]:
+                    adapter_blocks.append((match, body_block))
+
+    for match, block in adapter_blocks:
+        body_tokens = _compiler_tokens(masked, block[0], block[1] + 1)
+        values = [token.value for token in body_tokens]
+        view = match.group(1)
+        body = masked[block[0]:block[1] + 1]
+        slot = rf"{re.escape(view)}\s*(?:\[[^\]]+\]|\.\s*get\s*<[^>]+>\s*\(\s*\))"
+        if "nativeAt" not in values and re.search(rf"&\s*{slot}", body, re.DOTALL):
+            findings.append(Finding(
+                path, translated.line_at(match.start()), view,
+                "scoped native view must remain inside its synchronous submit adapter"))
+            continue
+        if "nativeAt" in values:
+            valid = (
+                path == PurePosixPath("playback/gpu/gpucompositor.cpp")
+                and values.count(view) == 2
+                and values.count("nativeAt") == 2
+                and re.search(
+                    r"\brenderGridWithRhi\s*\([^;{}]*\bnativeAt\b[^;{}]*\)",
+                    body, re.DOTALL) is not None
+            )
+        else:
+            valid = values.count(view) == 1
+        if not valid:
+            findings.append(Finding(
+                path, translated.line_at(match.start()), view,
+                "native submit adapter capability must remain confined to its single "
+                "synchronous backend argument"))
+    return findings
+
+
+def native_submit_macro_escape_findings(path: PurePosixPath,
+                                         translated: TranslationText) -> list[Finding]:
+    """Reject source macros that can materialize a scoped-view/accessor escape."""
+    masked = translated.masked
+    if "GpuOpScope" not in masked:
+        return []
+    definitions: dict[str, list[MacroDefinition]] = {}
+    for _position, name, definition in source_macro_events(masked)[0]:
+        if definition is not None:
+            definitions.setdefault(name, []).append(definition)
+    if not definitions:
+        return []
+    pairs = brace_pairs(masked)
+    findings: list[Finding] = []
+    adapter = re.compile(
+        r"\bauto\s+[A-Za-z_]\w*\s*=\s*\[[^\]]*\]\s*\(\s*const\s+"
+        r"(?:GpuScopedNativeView\s*<[^>]+>|auto)\s*&\s*([A-Za-z_]\w*)\s*\)\s*"
+        r"noexcept\s*\{")
+    for match in adapter.finditer(masked):
+        opening = masked.find("{", match.start(), match.end())
+        block = next((pair for pair in pairs if pair[0] == opening), None)
+        if block is None:
+            continue
+        protected = {"nativeAt", match.group(1)}
+        unsafe: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for name, variants in definitions.items():
+                if name in unsafe:
+                    continue
+                replacement = {
+                    token for definition in variants for token in definition.replacement
+                }
+                if replacement.intersection(protected | unsafe):
+                    unsafe.add(name)
+                    changed = True
+        for token in _compiler_tokens(masked, block[0] + 1, block[1]):
+            if token.value in unsafe:
+                findings.append(Finding(
+                    path, translated.line_at(token.start), token.value,
+                    "macro expansion cannot copy, store, return, capture, or defer a native "
+                    "submit adapter capability"))
+    return findings
+
+
 def audit_capability_uses(path: PurePosixPath, source: str,
                           *, compiler_view: bool = False,
                           compiler_translation_text: TranslationText | None = None,
@@ -3822,6 +4668,14 @@ def audit_capability_uses(path: PurePosixPath, source: str,
         if compiler_analysis is not None else brace_pairs(masked)
     )
     findings: list[Finding] = []
+    for alias, position in noncanonical_gpu_op_scope_initializers(masked, path):
+        findings.append(Finding(
+            path, translated.line_at(position), alias,
+            "non-canonical protected receiver initializer is forbidden"))
+    findings.extend(gpu_op_scope_directness_findings(path, translated))
+    findings.extend(native_submit_adapter_escape_findings(path, translated))
+    if not compiler_view:
+        findings.extend(native_submit_macro_escape_findings(path, translated))
     if not compiler_view:
         findings.extend(preprocessor_capability_findings(path, translated))
         findings.extend(phase_two_capability_findings(path, source, translated))
@@ -3872,6 +4726,10 @@ def audit_capability_uses(path: PurePosixPath, source: str,
     acquisitions_by_scope: dict[int, list[re.Match[str]]] = {}
     completes_by_scope: dict[int, list[re.Match[str]]] = {}
     handle_bindings: list[HandleBinding] = []
+    scoped_surface_bindings = scoped_native_surface_bindings(masked, pairs)
+    handle_bindings.extend(scoped_surface_bindings)
+    scoped_surface_positions = {binding.position for binding in scoped_surface_bindings}
+    scoped_view_bindings = scoped_native_view_bindings(masked, pairs)
     claimed_reads: set[int] = set()
     canonical_scope_cache: dict[int, bool] = {}
 
@@ -4009,10 +4867,28 @@ def audit_capability_uses(path: PurePosixPath, source: str,
             native_bindings[call.start()] = None
 
     for binding in handle_bindings:
-        if not lease_binding_stays_local(masked, pairs, binding, shadow_index):
+        stays_local = (
+            scoped_surface_binding_stays_local(
+                path, masked, pairs, binding, shadow_index)
+            if binding.position in scoped_surface_positions
+            else lease_binding_stays_local(masked, pairs, binding, shadow_index)
+        )
+        if not stays_local:
+            reason = (
+                "scoped native surface must remain inside its synchronous function body"
+                if binding.position in scoped_surface_positions
+                else "lease reference must remain inside the immediate callback body"
+            )
             findings.append(Finding(
                 path, translated.line_at(binding.position), binding.name,
-                "lease reference must remain inside the immediate callback body"))
+                reason))
+
+    for binding in scoped_view_bindings:
+        if not scoped_native_view_binding_stays_local(
+                masked, pairs, binding, shadow_index):
+            findings.append(Finding(
+                path, translated.line_at(binding.position), binding.name,
+                "scoped native view must remain inside its synchronous submit adapter"))
 
     all_tokens = list(
         compiler_analysis.tokens
@@ -4204,7 +5080,7 @@ def _validate_capability_expression_provenance(
     scopes = list(analysis.scope_bindings)
     scopes_by_name = analysis.scopes_by_name
     shadow_index = analysis.shadow_index
-    handle_bindings: list[HandleBinding] = []
+    handle_bindings: list[HandleBinding] = scoped_native_surface_bindings(masked, pairs)
 
     def require_tokens(tokens: list[CppToken]) -> None:
         if tokens:
@@ -4353,6 +5229,9 @@ class CapabilityRule:
 _CAPABILITY_RULES = (
     CapabilityRule(
         (
+            b"GpuScopedNativeSurface",
+            b"GpuScopedNativeView",
+            b"GpuOpScope",
             b"GpuSyncReadScope",
             b"_longjmp",
             b"complete",
@@ -4413,6 +5292,7 @@ def _capability_policy_key(path: PurePosixPath) -> tuple[object, ...]:
         tuple(sorted(REVIEWED_NATIVE_HANDLE_METHODS.get(path, ()))),
         tuple(sorted(REVIEWED_NATIVE_HANDLE_MEMBER_SINKS.get(path, ()))),
         tuple(sorted(REVIEWED_NATIVE_HANDLE_TYPES.get(path, ()))),
+        tuple(sorted(REVIEWED_SCOPED_SURFACE_SINKS.get(path, ()))),
     )
 
 
@@ -5043,6 +5923,11 @@ def audit_raw_sources(
         try:
             path_findings: list[Finding] = []
             _check_policy_deadline(pipeline_deadline)
+            source_translation = translate_source(source)
+            path_findings.extend(guarded_macro_composition_findings(
+                path, source_translation, source_only=False
+            ))
+            _check_policy_deadline(pipeline_deadline)
             translated, directive_findings = _raw_lane_translation(path, source)
             _check_policy_deadline(pipeline_deadline)
             path_findings.extend(directive_findings)
@@ -5064,6 +5949,7 @@ def audit_raw_sources(
                     sink(finding, provenance)
                 path_findings.clear()
                 directive_findings = None
+                source_translation = None
                 translated = None
         finally:
             if scratch is not None:
@@ -6330,6 +7216,8 @@ def premeasure_streaming_policy_growth(
             )
     spellings = (
         "nativeHandle",
+        "GpuScopedNativeSurface",
+        "GpuScopedNativeView",
         "GpuSyncReadScope",
         "GpuReadLease",
         "GpuSurface",
@@ -6478,12 +7366,238 @@ def audit_sources(sources: Mapping[PurePosixPath, str]) -> list[Finding]:
 
 
 def is_production_path(path: PurePosixPath) -> bool:
-    return (bool(path.parts) and path.parts[0] in PRODUCTION_ROOTS
-            and path.suffix.lower() in SOURCE_SUFFIXES)
+    if not path.parts or path.suffix.lower() not in SOURCE_SUFFIXES:
+        return False
+    for part in path.parts[:-1]:
+        lowered = part.lower()
+        if (lowered in FIRST_PARTY_EXCLUDED_PARTS or lowered == "build"
+                or lowered.startswith("build-")
+                or lowered.startswith("cmake-build") or lowered.startswith(".")):
+            return False
+    return True
 
 
 def mutation_self_tests() -> None:
     cases = (
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuScopedNativeView<1>& view) { "
+         "const auto* escaped = &view[0]; storeForLater(escaped); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuScopedNativeView<1>& view) { "
+         "auto wrapped = std::ref(view[0]); storeForLater(wrapped); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuScopedNativeView<1>& view) { "
+         "const auto& alias = view.get<0>(); storeForLater(&alias); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuScopedNativeView<1>& view) { "
+         "auto wrapped = std::cref(view.get<0>()); storeForLater(wrapped); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuScopedNativeView<1>& view) { "
+         "const auto& alias = view[0]; auto deferred = [&alias] { consume(alias); }; "
+         "queue(deferred); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "#define CAT_I(left, right) left ## right\n"
+         "#define CAT(left, right) CAT_I(left, right)\n"
+         "void bad() { GpuOpScope operation(fence, registry); "
+         "operation.CAT(submit, Retained)(unsafe, pack); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/bad.cpp"),
+         "#define CAT_I(left, right) left ## right\n"
+         "#define CAT(left, right) CAT_I(left, right)\n"
+         "void bad() { GpuOpScope operation(fence, registry); "
+         "operation.CAT(sub, mit)(unsafe, pack); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad() { auto member = &GpuOpScope::submit<Adapter, 1>; "
+         "consume(member); }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad() { auto member = &GpuOpScope::submitRetained<Adapter, 1>; "
+         "consume(member); }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "using FirstScope = GpuOpScope; typedef FirstScope ScopeAlias; "
+         "void bad() { auto member = &ScopeAlias::submit<Adapter, 1>; consume(member); }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "typedef GpuOpScope FirstScope; using ScopeAlias = FirstScope; "
+         "void bad() { auto member = &ScopeAlias::submitRetained<Adapter, 1>; "
+         "consume(member); }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "using ScopeAlias = ::GpuOpScope; "
+         "void bad() { auto member = &ScopeAlias::submit<Adapter, 1>; consume(member); }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "namespace gpu { using FirstScope = ::GpuOpScope; } "
+         "using ScopeAlias = gpu::FirstScope; "
+         "void bad() { auto member = &ScopeAlias::submitRetained<Adapter, 1>; "
+         "consume(member); }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad() { auto member = &::GpuOpScope::submit<Adapter, 1>; }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "namespace gpu { using ScopeAlias = ::GpuOpScope; } "
+         "void bad() { auto member = &gpu::ScopeAlias::submitRetained<Adapter, 1>; }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "#define SCOPE_OWNER ::GpuOpScope\n"
+         "void bad() { auto member = &SCOPE_OWNER::submit<Adapter, 1>; }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "#define SCOPE_OWNER() ::GpuOpScope\n"
+         "void bad() { auto member = &SCOPE_OWNER()::submitRetained<Adapter, 1>; }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "#define SUBMIT_MEMBER submit\n"
+         "void bad() { auto member = &::GpuOpScope::SUBMIT_MEMBER<Adapter, 1>; }",
+         "native submission must be a direct auditable member call"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad() { GpuOpScope operation(fence, registry); auto& hidden=(operation); "
+         "auto adapter=[&](const auto& view) noexcept { auto* escaped=&view[0]; "
+         "storeForLater(escaped); return GpuSubmitOutcome::Submitted; }; "
+         "hidden.submit(adapter, pack); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad() { GpuOpScope operation(fence, registry); "
+         "auto&& hidden=std::move(operation); "
+         "auto adapter=[&](const auto& view) noexcept { auto* escaped=&view[0]; "
+         "storeForLater(escaped); return GpuSubmitOutcome::Submitted; }; "
+         "hidden.submit(adapter, pack); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "struct EscapingAdapter { GpuSubmitOutcome operator()(const auto& view) noexcept { "
+         "auto* escaped=&view[0]; storeForLater(escaped); "
+         "return GpuSubmitOutcome::Submitted; } }; "
+         "void bad() { GpuOpScope operation(fence, registry); "
+         "auto&& hidden=std::move((operation)); EscapingAdapter adapter; "
+         "hidden.submit(adapter, pack); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "struct EscapingAdapter { GpuSubmitOutcome operator()(const auto& view) noexcept { "
+         "auto* escaped=&view[0]; storeForLater(escaped); "
+         "return GpuSubmitOutcome::Submitted; } }; "
+         "void bad() { GpuOpScope operation(fence, registry); "
+         "auto&& hidden=std::forward<std::type_identity_t<GpuOpScope>&>(operation); "
+         "EscapingAdapter adapter; hidden.submit(adapter, pack); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "GpuOpScope& identity(GpuOpScope& scope) { return scope; } "
+         "struct EscapingAdapter { GpuSubmitOutcome operator()(const auto& view) noexcept { "
+         "auto* escaped=&view[0]; storeForLater(escaped); "
+         "return GpuSubmitOutcome::Submitted; } }; "
+         "void bad() { GpuOpScope operation(fence, registry); "
+         "auto&& hidden=identity(operation); EscapingAdapter adapter; "
+         "hidden.submit(adapter, pack); }",
+         "non-canonical protected receiver initializer"),
+        (PurePosixPath("playback/bad.cpp"),
+         "struct EscapingAdapter { GpuSubmitOutcome operator()(const auto& view) noexcept { "
+         "auto* escaped=&view[0]; storeForLater(escaped); "
+         "return GpuSubmitOutcome::Submitted; } }; "
+         "void bad() { GpuOpScope operation(fence, registry); auto* hidden=&operation; "
+         "EscapingAdapter adapter; hidden->submit(adapter, pack); }",
+         "non-canonical protected receiver initializer"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad() { GpuOpScope operation(fence, registry); auto* pointer=&operation; "
+         "consume(pointer); }",
+         "non-canonical protected receiver initializer"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad() { GpuOpScope operation(fence, registry); "
+         "auto holder=std::ref(operation); consume(holder.get()); }",
+         "non-canonical protected receiver initializer"),
+        (PurePosixPath("playback/gpu/gpucompositor.cpp"),
+         "void bad() { GpuOpScope operation; auto adapter=[&](const auto& view) noexcept { "
+         "auto nativeAt=[&](size_t slot) { return &view[slot]; }; "
+         "escaped.push_back(nativeAt); return GpuSubmitOutcome::Submitted; }; "
+         "operation.submit(adapter, pack); }",
+         "native submit adapter capability must remain confined"),
+        (PurePosixPath("playback/gpu/gpucompositor.cpp"),
+         "struct Adapter { GpuSubmitOutcome operator()(const auto& view) noexcept { "
+         "auto nativeAt=[&](size_t slot) { return &view[slot]; }; "
+         "escaped.push_back(nativeAt); return GpuSubmitOutcome::Submitted; } }; "
+         "void bad() { GpuOpScope operation; Adapter adapter; operation.submit(adapter, pack); }",
+         "native submit adapter capability must remain confined"),
+        (PurePosixPath("playback/gpu/gpucompositor.cpp"),
+         "void bad() { GpuOpScope operation; auto result=submitCompactedOwners<1>("
+         "adapter, operation, owners, ownerCount); }",
+         "non-canonical protected receiver initializer"),
+        (PurePosixPath("playback/gpu/gpucompositor.cpp"),
+         "void bad() { GpuOpScope operation; auto result=submitCompactedOwners<1>("
+         "wrap(operation), adapter, owners, ownerCount); }",
+         "non-canonical protected receiver initializer"),
+        (PurePosixPath("playback/gpu/gpucompositor.cpp"),
+         "void bad() { GpuOpScope operation; auto result=submitCompactedOwners<1>("
+         "other(operation), adapter, owners, ownerCount); }",
+         "non-canonical protected receiver initializer"),
+        (PurePosixPath("project/unrelated_helper.cpp"),
+         "void bad() { GpuOpScope operation; auto result=submitCompactedOwners<1>("
+         "operation, adapter, owners, ownerCount); }",
+         "non-canonical protected receiver initializer"),
+        (PurePosixPath("playback/bad.cpp"),
+         "namespace gpu { using ScopeAlias=::GpuOpScope; void bad() { "
+         "ScopeAlias operation(fence, registry); auto adapter=[&](const auto& view) noexcept { "
+         "auto* escaped=&view[0]; storeForLater(escaped); "
+         "return GpuSubmitOutcome::Submitted; }; operation.submit(adapter, pack); } }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "struct EscapingAdapter { GpuSubmitOutcome operator()(const auto& view) noexcept { "
+         "auto* escaped=&view[0]; storeForLater(escaped); "
+         "return GpuSubmitOutcome::Submitted; } }; "
+         "void bad() { GpuOpScope operation(fence, registry); EscapingAdapter adapter; "
+         "operation.submit(adapter, pack); }",
+         "scoped native view must remain inside its synchronous submit adapter"),
+        (PurePosixPath("playback/bad.cpp"),
+         "#define NATIVE_SUBMIT submit\n"
+         "void bad() { GpuOpScope operation(fence, registry); "
+         "operation.NATIVE_SUBMIT(adapter, pack); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/bad.cpp"),
+         "#define RETAINED_CALL submitRetained\n"
+         "void bad() { GpuOpScope operation(fence, registry); "
+         "operation.RETAINED_CALL(adapter, pack); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuScopedNativeSurface& surface) { "
+         "g_handle = surface.nativeHandle(); }",
+         "native handle value must initialize a callback-local alias"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuScopedNativeSurface& surface) { "
+         "auto later = [&] { void* handle = surface.nativeHandle(); "
+         "if (handle) consume(); }; later(); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuScopedNativeSurface& surface, GpuSurface& decoy) { "
+         "(void) surface.valid(); (void) decoy.nativeHandle(); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuScopedNativeSurface& surface) { escaped = &surface; }",
+         "scoped native surface must remain inside its synchronous function body"),
+        (PurePosixPath("playback/bad.cpp"),
+         "struct GpuScopedNativeSurface { void* nativeHandle() const; }; "
+         "void bad(const GpuScopedNativeSurface& surface) { "
+         "void* handle = surface.nativeHandle(); if (handle) return; }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(void (*callback)(const GpuScopedNativeSurface& surface)) { "
+         "void* handle = surface.nativeHandle(); if (handle) return; }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpucompositor_apple.mm"),
+         "CVPixelBufferRef makePixelBufferWrapper(const GpuScopedNativeSurface& surface) { "
+         "return retainApplePixelBufferWrapper(surface); } "
+         "void bad(const GpuScopedNativeSurface& surface) { auto makePixelBufferWrapper = "
+         "[](const auto&) { return nullptr; }; (void) makePixelBufferWrapper(surface); }",
+         "scoped native surface must remain inside its synchronous function body"),
+        (PurePosixPath("playback/gpu/gpucompositor_apple.mm"),
+         "#define makePixelBufferWrapper(surface) persist(surface)\n"
+         "void bad(const GpuScopedNativeSurface& surface) { "
+         "(void) makePixelBufferWrapper(surface); }",
+         "approved native-handle consumer cannot be hidden or shadowed"),
         (PurePosixPath("playback/bad.cpp"),
          "void bad(GpuSurface* surface) { (void) surface->nativeHandle(); }",
          "GpuSurface::nativeHandle()"),
@@ -7047,7 +8161,7 @@ def mutation_self_tests() -> None:
          "scope.withRead(s, [](const GpuReadLease& lease) { "
          "void* handle = lease.CAT(native, Handle)(); "
          "(void) isCompatibleWithNativeHandle(handle); }); }",
-         "preprocessor token concatenation"),
+         "guarded identifier macro composition"),
         (PurePosixPath("playback/gpu/gpufence.h"),
          "#define CAT_IMPL(left, right) left %:%: right\n"
          "#define CAT(left, right) CAT_IMPL(left, right)\n"
@@ -7055,7 +8169,7 @@ def mutation_self_tests() -> None:
          "scope.withRead(s, [](const GpuReadLease& lease) { "
          "void* handle = lease.nativeHandle(); "
          "(void) isCompatibleWithNativeHandle(handle); CAT(long, jmp)(env, 1); }); }",
-         "preprocessor token concatenation"),
+         "guarded identifier macro composition"),
         (PurePosixPath("playback/gpu/gpufence.h"),
          "#define CAT(left, right) left ## right\n"
          "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
@@ -7376,6 +8490,410 @@ def mutation_self_tests() -> None:
         if expected not in rendered:
             raise AssertionError(
                 f"source-audit mutation survived ({expected}):\nsource: {source}\n{rendered}")
+
+    production_macro_source = (
+        "#define CAT(left, right) CAT_I(left, right)\n"
+        "#define CAT_I(left, right) left ## right\n"
+        "void bad() { GpuOpScope operation(fence, registry); "
+        "operation.CAT(sub, mit)(adapter, pack); }")
+    production_macro_findings = audit_raw_sources({
+        PurePosixPath("project/production_macro_escape.cpp"): production_macro_source,
+    })
+    if "guarded identifier macro composition" not in "\n".join(
+            finding.render() for finding in production_macro_findings):
+        raise AssertionError(
+            "the whole-production raw lane omitted guarded token-paste composition")
+    ordinary_macro_source = (
+        "#define CAT(left, right) CAT_I(left, right)\n"
+        "#define CAT_I(left, right) left ## right\n"
+        "struct Queue { void submit(int); }; "
+        "void safe(Queue& queue) { queue.CAT(sub, mit)(1); }")
+    ordinary_macro_findings = audit_raw_sources({
+        PurePosixPath("project/ordinary_macro.cpp"): ordinary_macro_source,
+    })
+    if ordinary_macro_findings:
+        raise AssertionError(
+            "whole-production macro composition rejected an ordinary receiver:\n" +
+            "\n".join(finding.render() for finding in ordinary_macro_findings))
+
+    scoped_native_safe = audit_capability_uses(
+        PurePosixPath("playback/gpu/backend.cpp"),
+        "void safe(const GpuScopedNativeSurface& surface) { "
+        "void* handle = surface.nativeHandle(); if (handle != nullptr) return; }")
+    if scoped_native_safe:
+        raise AssertionError(
+            "exact scoped native parameter was rejected:\n" +
+            "\n".join(finding.render() for finding in scoped_native_safe))
+    preprocessor_scoped_safe = audit_capability_uses(
+        PurePosixPath("playback/gpu/backend.cpp"),
+        "void safe(const GpuScopedNativeSurface& surface) {\n"
+        "#ifdef OLR_UNIT_TEST\n"
+        "void* testHandle = surface.nativeHandle(); "
+        "m_lastReadbackHadNativeHandleForTest.store(testHandle != nullptr, "
+        "std::memory_order_release);\n"
+        "#endif\n"
+        "void* handle = surface.nativeHandle(); if (handle != nullptr) return;\n}")
+    if preprocessor_scoped_safe:
+        raise AssertionError(
+            "preprocessor-adjacent callback-local native aliases were rejected:\n" +
+            "\n".join(finding.render() for finding in preprocessor_scoped_safe))
+
+    scoped_view_safe = audit_capability_uses(
+        PurePosixPath("playback/gpu/backend.cpp"),
+        "void safe(const GpuScopedNativeView<1>& view) { "
+        "consumeSynchronously(view.get<0>()); }")
+    if scoped_view_safe:
+        raise AssertionError(
+            "exact synchronous scoped view use was rejected:\n" +
+            "\n".join(finding.render() for finding in scoped_view_safe))
+
+    covered_paths = (
+        PurePosixPath("project/source.cpp"), PurePosixPath("telemetry/source.cc"),
+        PurePosixPath("websocket/source.cxx"), PurePosixPath("midi/source.mm"),
+        PurePosixPath("streamdeck/source.h"), PurePosixPath("builder/source.cpp"),
+        PurePosixPath("build_support/source.cpp"), PurePosixPath("root_source.cpp"),
+    )
+    if not all(is_production_path(path) for path in covered_paths):
+        raise AssertionError("whole-tree source audit omitted a first-party or root source")
+    excluded_paths = (
+        PurePosixPath("tests/source.cpp"), PurePosixPath("build/source.cpp"),
+        PurePosixPath("build-review/source.cpp"), PurePosixPath("docs/source.cpp"),
+        PurePosixPath("handoff-notes/source.cpp"), PurePosixPath("third_party/source.cpp"),
+        PurePosixPath("vendor/source.cpp"), PurePosixPath("dependencies/source.cpp"),
+        PurePosixPath("windows_build/source.cpp"),
+        PurePosixPath("windows_build/dist/dependency.cpp"),
+        PurePosixPath(".claude/worktrees/source.cpp"),
+    )
+    if any(is_production_path(path) for path in excluded_paths):
+        raise AssertionError("whole-tree source audit included generated/dependency metadata")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        for relative in covered_paths + excluded_paths:
+            path = root / Path(*relative.parts)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("// fixture\n", encoding="utf-8")
+        discovered = set(load_production_sources(root))
+        if discovered != set(covered_paths):
+            raise AssertionError(
+                "whole-tree source loader did not match first-party fixture: "
+                f"{sorted(discovered)}")
+        missing_database = root / "missing-compile-commands.json"
+        try:
+            validated_compile_database(missing_database)
+        except AuditInfrastructureError:
+            pass
+        else:
+            raise AssertionError("a nonexistent compile database was silently ignored")
+        invalid_database = root / "invalid-compile-commands.json"
+        invalid_database.write_text("{}", encoding="utf-8")
+        try:
+            validated_compile_database(invalid_database)
+        except AuditInfrastructureError:
+            pass
+        else:
+            raise AssertionError("an invalid compile database was silently accepted")
+        real_database = root / "compile_commands.json"
+        real_database.write_text(json.dumps([{
+            "directory": str(root),
+            "file": str(root / "project/source.cpp"),
+            "arguments": ["fixture-compiler", "-c", "project/source.cpp"],
+        }]), encoding="utf-8")
+        loaded_database = validated_compile_database(real_database)
+        if (len(loaded_database) != 1
+                or loaded_database[0]["arguments"][0] != "fixture-compiler"):
+            raise AssertionError("the supplied compile database was not actually consumed")
+        target_source = root / "project/source.cpp"
+        header_source = root / "project/macros.h"
+        streamed = retain_target_preprocessor_segments((
+            f'# 1 "{target_source}"\n',
+            f'# 1 "{header_source}" 1\n',
+            "\n",
+            f'# 7 "{target_source}" 2\n',
+            "escapedAccessors.push_back(nativeAt);\n",
+        ), target_source, root)
+        if "escapedAccessors.push_back(nativeAt)" not in streamed:
+            raise AssertionError(
+                "header-defined macro expansion was lost from the target compiler view")
+
+        compiler = root / "fixture_compiler.py"
+        compiler.write_text(
+            "import pathlib, sys\n"
+            "if any('OLR_UNIT_TEST' in value for value in sys.argv):\n"
+            "    raise SystemExit(9)\n"
+            "target = pathlib.Path(sys.argv[-1]).resolve()\n"
+            "print(f'# 1 \\\"{target}\\\"')\n"
+            "print(target.read_text(encoding='utf-8'))\n",
+            encoding="utf-8",
+        )
+        authority_paths = (
+            PurePosixPath("playback/gpu/gpucompositor.cpp"),
+            PurePosixPath("playback/gpu/gpuframedata.cpp"),
+        )
+        authority_sources = {}
+        for relative in authority_paths:
+            path = root / Path(*relative.parts)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("void safe() {}\n", encoding="utf-8")
+            authority_sources[relative] = path.read_text(encoding="utf-8")
+
+        def compile_entry(relative, *defines, command_source=None, directory=None):
+            target = root / Path(*(command_source or relative).parts)
+            return {
+                "directory": str(directory or root),
+                "file": str(root / Path(*relative.parts)),
+                "arguments": [sys.executable, str(compiler), *defines, "-c", str(target)],
+            }
+
+        partial_database = root / "partial-compile-commands.json"
+        partial_database.write_text(json.dumps([
+            compile_entry(authority_paths[0]),
+        ]), encoding="utf-8")
+        try:
+            audit_compile_database_views(root, partial_database, authority_sources)
+        except AuditInfrastructureError as error:
+            if "missing production authority source" not in str(error):
+                raise AssertionError(
+                    "partial compile database failed for the wrong reason") from error
+        else:
+            raise AssertionError("a partial production compile database was accepted")
+
+        unit_database = root / "unit-only-compile-commands.json"
+        unit_database.write_text(json.dumps([
+            compile_entry(relative, "-DOLR_UNIT_TEST=1") for relative in authority_paths
+        ]), encoding="utf-8")
+        try:
+            audit_compile_database_views(root, unit_database, authority_sources)
+        except AuditInfrastructureError as error:
+            if "unit-test-only" not in str(error):
+                raise AssertionError(
+                    "unit-only compile database failed for the wrong reason") from error
+        else:
+            raise AssertionError("a unit-only compile database was accepted")
+
+        for index, define in enumerate((
+            ("-D", "OLR_UNIT_TEST=1"), ("/D", "OLR_UNIT_TEST"),
+            ("-DOLR_UNIT_TEST",), ("/DOLR_UNIT_TEST=1",),
+        )):
+            split_unit_database = root / f"unit-only-{index}.json"
+            split_unit_database.write_text(json.dumps([
+                compile_entry(relative, *define) for relative in authority_paths
+            ]), encoding="utf-8")
+            try:
+                audit_compile_database_views(root, split_unit_database, authority_sources)
+            except AuditInfrastructureError as error:
+                if "unit-test-only" not in str(error):
+                    raise AssertionError(
+                        "split/joined unit define failed for the wrong reason") from error
+            else:
+                raise AssertionError("a split/joined unit-only database was accepted")
+
+        production_database = root / "production-compile-commands.json"
+        production_database.write_text(json.dumps([
+            entry
+            for relative in authority_paths
+            for entry in (
+                compile_entry(relative, "-DOLR_UNIT_TEST=1"),
+                compile_entry(relative, "-DOLR_GPU_PIPELINE_BUILD=1", "-DPRODUCTION_A=1"),
+                compile_entry(relative, "-DOLR_GPU_PIPELINE_BUILD=1", "-DPRODUCTION_B=1"),
+                compile_entry(relative, "-DOLR_GPU_PIPELINE_BUILD=1", "-DPRODUCTION_A=1"),
+            )
+        ]), encoding="utf-8")
+        _findings, production_views = audit_compile_database_views(
+            root, production_database, authority_sources)
+        if production_views != 2 * len(authority_paths):
+            raise AssertionError("all distinct production compiler configurations were not selected")
+
+        config_directories = (root / "config-a", root / "config-b")
+        for directory in config_directories:
+            directory.mkdir()
+        cwd_database = root / "cwd-compile-commands.json"
+        cwd_database.write_text(json.dumps([
+            compile_entry(relative, "-Irelative-config", directory=directory)
+            for relative in authority_paths
+            for directory in config_directories
+        ]), encoding="utf-8")
+        _findings, cwd_views = audit_compile_database_views(
+            root, cwd_database, authority_sources)
+        if cwd_views != len(authority_paths) * len(config_directories):
+            raise AssertionError(
+                "compile configurations with distinct working directories were collapsed")
+
+        mismatched_database = root / "mismatched-compile-commands.json"
+        mismatched_database.write_text(json.dumps([
+            compile_entry(relative, command_source=authority_paths[1 - index])
+            for index, relative in enumerate(authority_paths)
+        ]), encoding="utf-8")
+        try:
+            audit_compile_database_views(root, mismatched_database, authority_sources)
+        except AuditInfrastructureError as error:
+            if "does not compile its declared source" not in str(error):
+                raise AssertionError(
+                    "mismatched compile entry failed for the wrong reason") from error
+        else:
+            raise AssertionError("mismatched compiler source entries were accepted")
+
+        mixed_database = root / "mixed-source-compile-commands.json"
+        mixed_entries = [compile_entry(relative) for relative in authority_paths]
+        for index, entry in enumerate(mixed_entries):
+            entry["arguments"].append(str(root / Path(*authority_paths[1 - index].parts)))
+        mixed_database.write_text(json.dumps(mixed_entries), encoding="utf-8")
+        try:
+            audit_compile_database_views(root, mixed_database, authority_sources)
+        except AuditInfrastructureError as error:
+            if "single declared source" not in str(error):
+                raise AssertionError("mixed compiler inputs failed for the wrong reason") from error
+        else:
+            raise AssertionError("a mixed-authority compiler command was accepted")
+
+    submit_decoy = (
+        "#define CAT_I(left, right) left ## right\n"
+        "#define CAT(left, right) CAT_I(left, right)\n"
+        "#define RETAINED_CALL submitRetained\n"
+        "struct Queue { void submit(int); void submitRetained(int); };\n"
+        "void safe(GpuOpScope& operation, Queue& queue) { "
+        "consume(operation, queue.CAT(sub, mit)(1)); "
+        "consume(operation, queue.CAT(submit, Retained)(1)); "
+        "consume(operation, queue.RETAINED_CALL(1)); }")
+    submit_decoy_findings = audit_capability_uses(
+        PurePosixPath("project/queue.cpp"), submit_decoy)
+    submit_decoy_findings.extend(audit_source_only(
+        PurePosixPath("project/queue.cpp"), submit_decoy))
+    if submit_decoy_findings:
+        raise AssertionError(
+            "unrelated submit/submitRetained macro decoy was treated as GpuOpScope:\n" +
+            "\n".join(finding.render() for finding in submit_decoy_findings))
+    alias_direct = audit_capability_uses(
+        PurePosixPath("project/alias_direct.cpp"),
+        "using FirstScope = GpuOpScope; typedef FirstScope ScopeAlias; "
+        "void safe() { ScopeAlias operation(fence, registry); "
+        "operation.submit(adapter, pack); operation.submitRetained(retained, pack); }")
+    if alias_direct:
+        raise AssertionError(
+            "valid direct calls through an alias-typed GpuOpScope were rejected:\n" +
+            "\n".join(finding.render() for finding in alias_direct))
+    unrelated_alias = audit_capability_uses(
+        PurePosixPath("project/unrelated_alias.cpp"),
+        "namespace ordinary { struct GpuOpScope {}; } "
+        "using ScopeAlias = ordinary::GpuOpScope; "
+        "void decoy() { auto first = &ScopeAlias::submit<Adapter, 1>; "
+        "auto second = &ScopeAlias::submitRetained<Adapter, 1>; consume(first, second); }")
+    if unrelated_alias:
+        raise AssertionError(
+            "an unrelated qualified same-name type was treated as GpuOpScope:\n" +
+            "\n".join(finding.render() for finding in unrelated_alias))
+    namespace_collision = audit_capability_uses(
+        PurePosixPath("project/namespace_collision.cpp"),
+        "struct OtherScope {}; namespace gpu { using ScopeAlias = ::GpuOpScope; } "
+        "namespace ordinary { using ScopeAlias = ::OtherScope; } "
+        "void decoy() { auto member = &ordinary::ScopeAlias::submit<Adapter, 1>; }")
+    if namespace_collision:
+        raise AssertionError(
+            "an unrelated namespace alias collided with a protected alias:\n" +
+            "\n".join(finding.render() for finding in namespace_collision))
+    ordinary_namespace = audit_capability_uses(
+        PurePosixPath("project/ordinary_namespace.cpp"),
+        "namespace ordinary { struct GpuOpScope {}; void safe() { GpuOpScope operation; "
+        "auto adapter=[&](const auto& view) noexcept { auto* ordinaryUse=&view[0]; "
+        "consumeSynchronously(ordinaryUse); return GpuSubmitOutcome::Submitted; }; "
+        "operation.submit(adapter, pack); } }")
+    if ordinary_namespace:
+        raise AssertionError(
+            "a namespace-local ordinary GpuOpScope was treated as protected:\n" +
+            "\n".join(finding.render() for finding in ordinary_namespace))
+    unrelated_function_object = audit_capability_uses(
+        PurePosixPath("project/unrelated_function_object.cpp"),
+        "struct EscapingDecoy { GpuSubmitOutcome operator()(const auto& view) noexcept { "
+        "auto* pointer=&view[0]; consumeSynchronously(pointer); "
+        "return GpuSubmitOutcome::Submitted; } }; "
+        "struct SafeAdapter { GpuSubmitOutcome operator()(const auto& view) noexcept { "
+        "consumeSynchronously(view[0]); return GpuSubmitOutcome::Submitted; } }; "
+        "void safe() { GpuOpScope operation(fence, registry); SafeAdapter adapter; "
+        "operation.submit(adapter, pack); }")
+    if unrelated_function_object:
+        raise AssertionError(
+            "an unsubmitted generic function object was treated as the protected adapter:\n" +
+            "\n".join(finding.render() for finding in unrelated_function_object))
+    for initializer in ("other(decoy)", "std::move(decoy)"):
+        reference_decoy = audit_capability_uses(
+            PurePosixPath("project/reference_decoy.cpp"),
+            "struct EscapingAdapter { GpuSubmitOutcome operator()(const auto& view) "
+            "noexcept { auto* pointer=&view[0]; consumeSynchronously(pointer); "
+            "return GpuSubmitOutcome::Submitted; } }; "
+            "void safe() { GpuOpScope operation(fence, registry); OtherScope decoy; "
+            f"auto&& hidden={initializer}; EscapingAdapter adapter; "
+            "hidden.submit(adapter, pack); }")
+        if reference_decoy:
+            raise AssertionError(
+                "a non-identity or other-operand initializer became protected:\n" +
+                "\n".join(finding.render() for finding in reference_decoy))
+    explicit_value_decoy = audit_capability_uses(
+        PurePosixPath("project/explicit_value_decoy.cpp"),
+        "void safe() { GpuOpScope operation(fence, registry); "
+        "bool value=other(operation); consume(value); }")
+    if explicit_value_decoy:
+        raise AssertionError(
+            "a proven non-reference declaration was rejected:\n" +
+            "\n".join(finding.render() for finding in explicit_value_decoy))
+    native_at_function_object = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpucompositor.cpp"),
+        "struct CompositorAdapter { GpuSubmitOutcome operator()(const auto& nativeView) "
+        "noexcept { auto nativeAt=[&](size_t slot) "
+        "->const GpuScopedNativeSurface* { return slot<nativeView.size() "
+        "? &nativeView[slot] : nullptr; }; renderGridWithRhi(nativeAt); "
+        "return GpuSubmitOutcome::Submitted; } }; "
+        "void safe() { GpuOpScope operation(fence, registry); CompositorAdapter adapter; "
+        "operation.submit(adapter, pack); }")
+    if native_at_function_object:
+        raise AssertionError(
+            "the confined compositor nativeAt function object was rejected:\n" +
+            "\n".join(finding.render() for finding in native_at_function_object))
+
+    macro_adapter = """
+void compose() {
+    GpuOpScope operation(fence, registry);
+    auto adapter = [&](const auto& nativeView) noexcept {
+        auto nativeAt = [&](size_t slot) -> const GpuScopedNativeSurface* {
+            return slot < nativeView.size() ? &nativeView[slot] : nullptr;
+        };
+        ESCAPE_MACRO;
+        renderGridWithRhi(nativeAt);
+        return GpuSubmitOutcome::Submitted;
+    };
+    operation.submit(adapter, pack);
+}
+"""
+    for definition in (
+        "#define ESCAPE_MACRO escapedAccessors.push_back(nativeAt)\n",
+        "#define INNER_ESCAPE escapedSlots.push_back(&nativeView[slot])\n"
+        "#define ESCAPE_MACRO INNER_ESCAPE\n",
+        "#define ESCAPE_FN() auto later = [nativeAt] { return nativeAt; }; queue(later)\n"
+        "#define ESCAPE_MACRO ESCAPE_FN()\n",
+    ):
+        findings = audit_capability_uses(
+            PurePosixPath("playback/gpu/gpucompositor.cpp"),
+            definition + macro_adapter)
+        if not any("macro expansion cannot copy" in finding.reason for finding in findings):
+            raise AssertionError(
+                "native adapter macro escape mutation survived:\n" +
+                "\n".join(finding.render() for finding in findings))
+    safe_adapter_macro = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpucompositor.cpp"),
+        "#define ESCAPE_MACRO recordRenderMetric()\n" + macro_adapter)
+    if safe_adapter_macro:
+        raise AssertionError(
+            "safe unrelated adapter macro was rejected:\n" +
+            "\n".join(finding.render() for finding in safe_adapter_macro))
+    expanded_header_escape = macro_adapter.replace(
+        "ESCAPE_MACRO;", "escapedAccessors.push_back(nativeAt);")
+    expanded_findings = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpucompositor.cpp"), expanded_header_escape,
+        compiler_view=True,
+        compiler_translation_text=translate_source(expanded_header_escape))
+    if not any("single synchronous backend argument" in finding.reason
+               for finding in expanded_findings):
+        raise AssertionError(
+            "header-defined macro escape survived the compiler view:\n" +
+            "\n".join(finding.render() for finding in expanded_findings))
 
     ordinary_join = audit_capability_uses(
         PurePosixPath("playback/gpu/gpufence.h"),
@@ -7775,8 +9293,53 @@ def adjacent_sensitive_source(count: int) -> str:
     )
 
 
+def median_paired_scaling_ratios(
+        samples: Mapping[int, list[float]], counts: tuple[int, ...],
+        ) -> tuple[tuple[float, ...], float]:
+    sample_count = len(samples[counts[0]])
+    if sample_count != 5 or any(len(samples[count]) != sample_count for count in counts):
+        raise AssertionError("scaling oracle requires exactly five paired samples")
+    adjacent = tuple(
+        statistics.median([
+            samples[right][index] / samples[left][index]
+            for index in range(sample_count)
+        ])
+        for left, right in zip(counts, counts[1:])
+    )
+    aggregate = statistics.median([
+        samples[counts[-1]][index] / samples[counts[0]][index]
+        for index in range(sample_count)
+    ])
+    return adjacent, aggregate
+
+
 def performance_self_tests() -> str:
     """Run the noisy scaling check independently from functional mutations."""
+    regime_samples = {
+        100: [0.1267, 0.1013, 0.1173, 0.2398, 0.1209],
+        200: [0.3003, 0.3428, 0.2505, 0.2537, 0.2456],
+        400: [0.8404, 0.9587, 0.5087, 0.4937, 0.5132],
+        800: [1.7972, 2.0829, 1.0029, 2.1095, 0.9607],
+    }
+    regime_counts = (100, 200, 400, 800)
+    independent = tuple(
+        statistics.median(regime_samples[right]) /
+        statistics.median(regime_samples[left])
+        for left, right in zip(regime_counts, regime_counts[1:]))
+    paired, paired_aggregate = median_paired_scaling_ratios(
+        regime_samples, regime_counts)
+    if max(independent) <= 3.25 or max(paired) > 3.25 or paired_aggregate > 12.0:
+        raise AssertionError("paired scaling oracle did not isolate load-regime mixing")
+    regression_samples = {
+        1: [value for value in (1.0, 1.1, 0.9, 1.2, 0.8)],
+        2: [4.0 * value for value in (1.0, 1.1, 0.9, 1.2, 0.8)],
+        4: [16.0 * value for value in (1.0, 1.1, 0.9, 1.2, 0.8)],
+    }
+    regression_adjacent, regression_aggregate = median_paired_scaling_ratios(
+        regression_samples, (1, 2, 4))
+    if max(regression_adjacent) <= 3.25 or regression_aggregate <= 5.75:
+        raise AssertionError("paired scaling oracle missed a true scaling regression")
+
     path = PurePosixPath("playback/gpu/gpufence.h")
     counts = (4096, 8192, 16384)
     sources = {count: nested_phase_two_source(count) for count in counts}
@@ -7800,13 +9363,8 @@ def performance_self_tests() -> str:
                 raise AssertionError(
                     f"nested phase-two binding control lost findings at {count}")
 
-    # Score the middle of the fastest three samples. Two arbitrarily delayed
-    # samples therefore cannot fail an otherwise linear implementation.
-    scores = {
-        count: statistics.median(sorted(samples[count])[:3]) for count in counts
-    }
-    adjacent = (scores[8192] / scores[4096], scores[16384] / scores[8192])
-    aggregate = scores[16384] / scores[4096]
+    scores = {count: statistics.median(samples[count]) for count in counts}
+    adjacent, aggregate = median_paired_scaling_ratios(samples, counts)
     if max(adjacent) > 3.25 or aggregate > 5.75:
         raise AssertionError(
             "nested phase-two declaration assignment is not near-linear: "
@@ -7821,7 +9379,7 @@ def performance_self_tests() -> str:
         for count in counts
     }
     postfix_samples: dict[int, list[float]] = {count: [] for count in counts}
-    for order in (counts, tuple(reversed(counts)), (8192, 16384, 4096)):
+    for order in orders:
         for count in order:
             started = time.perf_counter()
             findings = guarded_macro_composition_findings(
@@ -7832,13 +9390,10 @@ def performance_self_tests() -> str:
                 raise AssertionError(
                     f"nested macro postfix control did not fail closed at {count}")
     postfix_scores = {
-        count: min(postfix_samples[count]) for count in counts
+        count: statistics.median(postfix_samples[count]) for count in counts
     }
-    postfix_adjacent = (
-        postfix_scores[8192] / postfix_scores[4096],
-        postfix_scores[16384] / postfix_scores[8192],
-    )
-    postfix_aggregate = postfix_scores[16384] / postfix_scores[4096]
+    postfix_adjacent, postfix_aggregate = median_paired_scaling_ratios(
+        postfix_samples, counts)
     if max(postfix_adjacent) > 3.25 or postfix_aggregate > 5.75:
         raise AssertionError(
             "nested macro postfix audit is not near-linear: "
@@ -7856,7 +9411,7 @@ def performance_self_tests() -> str:
         for count in counts
     }
     wide_samples: dict[int, list[float]] = {count: [] for count in counts}
-    for order in (counts, tuple(reversed(counts)), (8192, 16384, 4096)):
+    for order in orders:
         for count in order:
             started = time.perf_counter()
             findings = guarded_macro_composition_findings(
@@ -7866,12 +9421,8 @@ def performance_self_tests() -> str:
                        for finding in findings):
                 raise AssertionError(
                     f"wide macro replacement did not fail closed at {count}")
-    wide_scores = {count: min(wide_samples[count]) for count in counts}
-    wide_adjacent = (
-        wide_scores[8192] / wide_scores[4096],
-        wide_scores[16384] / wide_scores[8192],
-    )
-    wide_aggregate = wide_scores[16384] / wide_scores[4096]
+    wide_scores = {count: statistics.median(wide_samples[count]) for count in counts}
+    wide_adjacent, wide_aggregate = median_paired_scaling_ratios(wide_samples, counts)
     if max(wide_adjacent) > 3.25 or wide_aggregate > 5.75:
         raise AssertionError(
             "wide macro replacement audit is not near-linear: "
@@ -7893,21 +9444,21 @@ def performance_self_tests() -> str:
         ambiguity_counts,
         tuple(reversed(ambiguity_counts)),
         (200, 800, 100, 400),
+        (400, 100, 800, 200),
+        (800, 200, 400, 100),
     ):
         for count in order:
             started = time.perf_counter()
             _source_only_unknown_macro_findings(path, ambiguity_sources[count])
             ambiguity_samples[count].append(time.perf_counter() - started)
+    # Median scoring keeps the fixed ratio limits meaningful when the smallest
+    # fixture receives one unusually favorable scheduler slice.
     ambiguity_scores = {
-        count: min(ambiguity_samples[count]) for count in ambiguity_counts
+        count: statistics.median(ambiguity_samples[count])
+        for count in ambiguity_counts
     }
-    ambiguity_adjacent = tuple(
-        ambiguity_scores[right] / ambiguity_scores[left]
-        for left, right in zip(ambiguity_counts, ambiguity_counts[1:])
-    )
-    ambiguity_aggregate = (
-        ambiguity_scores[800] / ambiguity_scores[100]
-    )
+    ambiguity_adjacent, ambiguity_aggregate = median_paired_scaling_ratios(
+        ambiguity_samples, ambiguity_counts)
     if max(ambiguity_adjacent) > 3.25 or ambiguity_aggregate > 12.0:
         raise AssertionError(
             "nested withRead ambiguity audit is not near-linear: "
@@ -7928,7 +9479,13 @@ def performance_self_tests() -> str:
     nested_samples: dict[int, list[float]] = {
         count: [] for count in ambiguity_counts
     }
-    for order in (ambiguity_counts, tuple(reversed(ambiguity_counts))):
+    for order in (
+        ambiguity_counts,
+        tuple(reversed(ambiguity_counts)),
+        (200, 800, 100, 400),
+        (400, 100, 800, 200),
+        (800, 200, 400, 100),
+    ):
         for count in order:
             started = time.perf_counter()
             nested_findings = audit_source_only(path, nested_sources[count])
@@ -7938,13 +9495,11 @@ def performance_self_tests() -> str:
                     f"end-to-end nested withRead control lost findings at {count}"
                 )
     nested_scores = {
-        count: min(nested_samples[count]) for count in ambiguity_counts
+        count: statistics.median(nested_samples[count])
+        for count in ambiguity_counts
     }
-    nested_adjacent = tuple(
-        nested_scores[right] / nested_scores[left]
-        for left, right in zip(ambiguity_counts, ambiguity_counts[1:])
-    )
-    nested_aggregate = nested_scores[800] / nested_scores[100]
+    nested_adjacent, nested_aggregate = median_paired_scaling_ratios(
+        nested_samples, ambiguity_counts)
     if max(nested_adjacent) > 3.25 or nested_aggregate > 12.0:
         raise AssertionError(
             "end-to-end nested withRead audit is not near-linear: "
@@ -7965,7 +9520,13 @@ def performance_self_tests() -> str:
     ordinary_samples: dict[int, list[float]] = {
         count: [] for count in ambiguity_counts
     }
-    for order in (ambiguity_counts, tuple(reversed(ambiguity_counts))):
+    for order in (
+        ambiguity_counts,
+        tuple(reversed(ambiguity_counts)),
+        (200, 800, 100, 400),
+        (400, 100, 800, 200),
+        (800, 200, 400, 100),
+    ):
         for count in order:
             started = time.perf_counter()
             ordinary_findings = audit_source_only(path, ordinary_sources[count])
@@ -7976,13 +9537,11 @@ def performance_self_tests() -> str:
                     f"at {count}: {ordinary_findings[:3]}"
                 )
     ordinary_scores = {
-        count: min(ordinary_samples[count]) for count in ambiguity_counts
+        count: statistics.median(ordinary_samples[count])
+        for count in ambiguity_counts
     }
-    ordinary_adjacent = tuple(
-        ordinary_scores[right] / ordinary_scores[left]
-        for left, right in zip(ambiguity_counts, ambiguity_counts[1:])
-    )
-    ordinary_aggregate = ordinary_scores[800] / ordinary_scores[100]
+    ordinary_adjacent, ordinary_aggregate = median_paired_scaling_ratios(
+        ordinary_samples, ambiguity_counts)
     if max(ordinary_adjacent) > 3.25 or ordinary_aggregate > 12.0:
         raise AssertionError(
             "ordinary nested callback audit is not near-linear: "
@@ -8004,7 +9563,11 @@ def performance_self_tests() -> str:
     isolated_binding_samples: dict[int, list[float]] = {
         count: [] for count in isolated_counts
     }
-    for order in (isolated_counts, tuple(reversed(isolated_counts))):
+    for order in (
+        isolated_counts, tuple(reversed(isolated_counts)),
+        (1000, 4000, 500, 2000), (2000, 500, 4000, 1000),
+        (4000, 1000, 2000, 500),
+    ):
         for count in order:
             translated = isolated_translations[count]
             _events, ranges = source_macro_events(translated.masked)
@@ -8019,15 +9582,11 @@ def performance_self_tests() -> str:
                     f"isolated binding index lost declarations at {count}"
                 )
     isolated_binding_scores = {
-        count: min(isolated_binding_samples[count]) for count in isolated_counts
+        count: statistics.median(isolated_binding_samples[count])
+        for count in isolated_counts
     }
-    isolated_binding_adjacent = tuple(
-        isolated_binding_scores[right] / isolated_binding_scores[left]
-        for left, right in zip(isolated_counts, isolated_counts[1:])
-    )
-    isolated_binding_aggregate = (
-        isolated_binding_scores[4000] / isolated_binding_scores[500]
-    )
+    isolated_binding_adjacent, isolated_binding_aggregate = median_paired_scaling_ratios(
+        isolated_binding_samples, isolated_counts)
     if (max(isolated_binding_adjacent) > 3.25
             or isolated_binding_aggregate > 12.0):
         raise AssertionError(
@@ -8052,7 +9611,11 @@ def performance_self_tests() -> str:
     read_result_samples: dict[int, list[float]] = {
         count: [] for count in read_result_counts
     }
-    for order in (read_result_counts, tuple(reversed(read_result_counts))):
+    for order in (
+        read_result_counts, tuple(reversed(read_result_counts)),
+        (1000, 4000, 500, 2000), (2000, 500, 4000, 1000),
+        (4000, 1000, 2000, 500),
+    ):
         for count in order:
             translated = read_result_translations[count]
             _events, ranges = source_macro_events(translated.masked)
@@ -8068,15 +9631,11 @@ def performance_self_tests() -> str:
                     f"read-result binding inference lost leases at {count}"
                 )
     read_result_scores = {
-        count: min(read_result_samples[count]) for count in read_result_counts
+        count: statistics.median(read_result_samples[count])
+        for count in read_result_counts
     }
-    read_result_adjacent = tuple(
-        read_result_scores[right] / read_result_scores[left]
-        for left, right in zip(read_result_counts, read_result_counts[1:])
-    )
-    read_result_aggregate = (
-        read_result_scores[4000] / read_result_scores[500]
-    )
+    read_result_adjacent, read_result_aggregate = median_paired_scaling_ratios(
+        read_result_samples, read_result_counts)
     if (max(read_result_adjacent) > 3.25
             or read_result_aggregate > 12.0):
         raise AssertionError(
@@ -8098,24 +9657,24 @@ def performance_self_tests() -> str:
         count: isolated_use_before_declaration_source(count)
         for count in isolated_audit_counts
     }
-    isolated_audit_scores: dict[int, float] = {}
-    for count in isolated_audit_counts:
-        started = time.perf_counter()
-        isolated_findings = audit_source_only(
-            path, isolated_audit_sources[count]
-        )
-        isolated_audit_scores[count] = time.perf_counter() - started
-        if len(isolated_findings) < count:
-            raise AssertionError(
-                f"isolated full audit lost unresolved receivers at {count}"
-            )
-    isolated_audit_adjacent = (
-        isolated_audit_scores[4000] / isolated_audit_scores[2000],
-        isolated_audit_scores[8000] / isolated_audit_scores[4000],
-    )
-    isolated_audit_aggregate = (
-        isolated_audit_scores[8000] / isolated_audit_scores[2000]
-    )
+    isolated_audit_samples = {count: [] for count in isolated_audit_counts}
+    for order in (
+        isolated_audit_counts, tuple(reversed(isolated_audit_counts)),
+        (4000, 8000, 2000), (8000, 2000, 4000), (2000, 8000, 4000),
+    ):
+        for count in order:
+            started = time.perf_counter()
+            isolated_findings = audit_source_only(path, isolated_audit_sources[count])
+            isolated_audit_samples[count].append(time.perf_counter() - started)
+            if len(isolated_findings) < count:
+                raise AssertionError(
+                    f"isolated full audit lost unresolved receivers at {count}")
+    isolated_audit_scores = {
+        count: statistics.median(isolated_audit_samples[count])
+        for count in isolated_audit_counts
+    }
+    isolated_audit_adjacent, isolated_audit_aggregate = median_paired_scaling_ratios(
+        isolated_audit_samples, isolated_audit_counts)
     if (max(isolated_audit_adjacent) > 3.25
             or isolated_audit_aggregate > 5.75):
         raise AssertionError(
@@ -8131,20 +9690,20 @@ def performance_self_tests() -> str:
     adjacent_sources = {
         count: adjacent_sensitive_source(count) for count in counts
     }
-    adjacent_scores: dict[int, float] = {}
-    for count in counts:
-        started = time.perf_counter()
-        adjacent_findings = audit_source_only(path, adjacent_sources[count])
-        adjacent_scores[count] = time.perf_counter() - started
-        if len(adjacent_findings) < count:
-            raise AssertionError(
-                f"adjacent sensitive-call audit lost findings at {count}"
-            )
-    adjacent_call_ratios = (
-        adjacent_scores[8192] / adjacent_scores[4096],
-        adjacent_scores[16384] / adjacent_scores[8192],
-    )
-    adjacent_call_aggregate = adjacent_scores[16384] / adjacent_scores[4096]
+    adjacent_samples = {count: [] for count in counts}
+    for order in orders:
+        for count in order:
+            started = time.perf_counter()
+            adjacent_findings = audit_source_only(path, adjacent_sources[count])
+            adjacent_samples[count].append(time.perf_counter() - started)
+            if len(adjacent_findings) < count:
+                raise AssertionError(
+                    f"adjacent sensitive-call audit lost findings at {count}")
+    adjacent_scores = {
+        count: statistics.median(adjacent_samples[count]) for count in counts
+    }
+    adjacent_call_ratios, adjacent_call_aggregate = median_paired_scaling_ratios(
+        adjacent_samples, counts)
     if max(adjacent_call_ratios) > 3.25 or adjacent_call_aggregate > 5.75:
         raise AssertionError(
             "adjacent sensitive-call audit is not near-linear: "
@@ -8219,10 +9778,18 @@ def performance_self_tests() -> str:
 
 def load_production_sources(root: Path) -> dict[PurePosixPath, str]:
     sources: dict[PurePosixPath, str] = {}
-    for directory in PRODUCTION_ROOTS:
-        for path in (root / directory).rglob("*"):
-            if path.is_file() and path.suffix.lower() in SOURCE_SUFFIXES:
-                relative = PurePosixPath(path.relative_to(root).as_posix())
+    for current, directories, files in os.walk(root):
+        current_path = Path(current)
+        relative_current = current_path.relative_to(root)
+        directories[:] = [
+            directory for directory in directories
+            if is_production_path(PurePosixPath(
+                (relative_current / directory / "probe.cpp").as_posix()))
+        ]
+        for filename in files:
+            path = current_path / filename
+            relative = PurePosixPath(path.relative_to(root).as_posix())
+            if is_production_path(relative):
                 sources[relative] = path.read_text(encoding="utf-8")
     return sources
 
@@ -9366,20 +10933,28 @@ def decision_engine_fingerprint(
     return digest.hexdigest()
 
 
-def profile_compiler_view(
-    source_root: Path,
-    database: Path,
-    source: PurePosixPath,
-) -> str:
-    """Run one representative real compiler view as a developer diagnostic."""
+def validated_compile_database(database: Path) -> tuple[Mapping[str, object], ...]:
+    try:
+        resolved = database.resolve(strict=True)
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise AuditInfrastructureError(
+            f"compile database cannot be loaded: {database}: {error}") from error
+    if (not isinstance(payload, list) or not payload
+            or any(not isinstance(entry, dict)
+                   or not isinstance(entry.get("directory"), str)
+                   or not isinstance(entry.get("file"), str)
+                   or not (isinstance(entry.get("command"), str)
+                           or isinstance(entry.get("arguments"), list))
+                   for entry in payload)):
+        raise AuditInfrastructureError(
+            f"compile database is invalid or empty: {resolved}")
+    return tuple(payload)
 
-    root = source_root.resolve(strict=True)
-    database = database.resolve(strict=True)
+
+def dependency_authority_for_root(root: Path):
     external_roots: dict[str, Path] = {}
     if os.name == "nt":
-        # Keep the diagnostic authority as narrow as the real compiler view.
-        # Drive roots end in a separator and are intentionally rejected by the
-        # canonical dependency identity validator.
         for role, candidate in (
             ("qt-toolchain", Path("C:/Qt")),
             ("windows-system", Path(os.environ.get("SystemRoot", "C:/Windows"))),
@@ -9390,7 +10965,268 @@ def profile_compiler_view(
         sibling_dependencies = shared_checkout / "windows_build"
         if sibling_dependencies.is_dir():
             external_roots["workspace-dependencies"] = sibling_dependencies
-    authority = build_dependency_root_authority(root, external_roots)
+    return build_dependency_root_authority(root, external_roots)
+
+
+def retain_target_preprocessor_segments(lines: Iterable[str], target: Path,
+                                        directory: Path) -> str:
+    """Retain streamed compiler output only while #line attributes it to target."""
+    target = target.resolve()
+    active = False
+    retained: list[str] = []
+    retained_bytes = 0
+    marker = re.compile(r'^\s*#\s*(?:line\s+)?\d+\s+"([^"]+)"')
+    for line in lines:
+        match = marker.match(line)
+        if match is not None:
+            named = Path(match.group(1))
+            candidate = named if named.is_absolute() else directory / named
+            try:
+                active = candidate.resolve() == target
+            except OSError:
+                active = False
+            continue
+        if not active:
+            continue
+        retained_bytes += len(line.encode("utf-8", errors="replace"))
+        if retained_bytes > AuditLimits().production_raw_per_file_bytes:
+            raise AuditInfrastructureError(
+                f"target preprocessor view exceeds bounded size: {target}")
+        retained.append(line)
+        if _current_process_rss_bytes() > AuditLimits().rss_bytes:
+            raise AuditInfrastructureError(
+                "compiler-view streaming coordinator RSS limit exceeded")
+    if not retained:
+        raise AuditInfrastructureError(
+            f"compiler preprocessor produced no target-attributed output: {target}")
+    return "".join(retained)
+
+
+def streaming_preprocessor_command(arguments: list[str], target: Path) -> list[str]:
+    compiler = arguments[0].strip('"')
+    compiler_name = Path(compiler).name.lower()
+    if compiler_name in {"cl", "cl.exe"}:
+        kept = [compiler, "/nologo", "/E"]
+        skip_next = False
+        for argument in arguments[1:]:
+            if skip_next:
+                skip_next = False
+                continue
+            lowered = argument.lower().strip('"')
+            if ((Path(lowered).name.lower() == target.name.lower()
+                 and Path(lowered).suffix.lower() in SOURCE_SUFFIXES)
+                    or lowered == "/c"):
+                continue
+            if lowered == "/fo":
+                skip_next = True
+                continue
+            if lowered.startswith("/fo"):
+                continue
+            kept.append(argument)
+        kept.append(str(target))
+        return kept
+
+    kept = [compiler]
+    skip_next = False
+    for argument in arguments[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        normalized = argument.strip('"')
+        if ((Path(normalized).name == target.name
+             and Path(normalized).suffix.lower() in SOURCE_SUFFIXES)
+                or argument in {"-c", "-MD", "-MMD"}):
+            continue
+        if argument in {"-o", "-MF", "-MT", "-MQ"}:
+            skip_next = True
+            continue
+        kept.append(argument)
+    kept.extend(("-E", str(target)))
+    return kept
+
+
+def compile_entry_arguments(entry: Mapping[str, object]) -> list[str]:
+    arguments_value = entry.get("arguments")
+    if isinstance(arguments_value, list):
+        return [str(value) for value in arguments_value]
+    return shlex.split(str(entry["command"]), posix=os.name != "nt")
+
+
+def compile_entry_targets_source(arguments: list[str], directory: Path,
+                                 target: Path) -> bool:
+    expected = target.resolve()
+    source_inputs = []
+    for raw_argument in arguments[1:]:
+        argument = raw_argument.strip('"')
+        lowered = argument.lower()
+        if lowered.startswith(("/tp", "/tc")):
+            argument = argument[3:].strip('"')
+        elif argument.startswith("-"):
+            continue
+        candidate = Path(argument)
+        if candidate.suffix.lower() not in COMPILE_SOURCE_SUFFIXES:
+            continue
+        try:
+            absolute = candidate if candidate.is_absolute() else directory / candidate
+            source_inputs.append(absolute.resolve())
+        except OSError:
+            continue
+    return source_inputs == [expected]
+
+
+def compile_entry_is_unit_test(arguments: list[str]) -> bool:
+    for index, raw_argument in enumerate(arguments):
+        argument = raw_argument.strip('"')
+        if re.fullmatch(
+                r"(?:-D|/D)OLR_UNIT_TEST(?:=.*)?", argument, re.IGNORECASE):
+            return True
+        if (argument.lower() in {"-d", "/d"} and index + 1 < len(arguments)
+                and re.fullmatch(r"OLR_UNIT_TEST(?:=.*)?",
+                                 arguments[index + 1].strip('"'), re.IGNORECASE)):
+            return True
+    return False
+
+
+def select_compile_database_authority_entries(
+        root: Path, entries: tuple[Mapping[str, object], ...],
+        authority_paths: tuple[PurePosixPath, ...],
+        ) -> tuple[tuple[PurePosixPath, Mapping[str, object], list[str]], ...]:
+    by_path: dict[PurePosixPath, list[tuple[Mapping[str, object], list[str], bool]]] = {
+        path: [] for path in authority_paths
+    }
+    for entry in entries:
+        directory = Path(str(entry["directory"]))
+        candidate = Path(str(entry["file"]))
+        absolute = candidate if candidate.is_absolute() else directory / candidate
+        try:
+            relative = PurePosixPath(absolute.resolve().relative_to(root).as_posix())
+        except (OSError, ValueError):
+            continue
+        if relative not in by_path:
+            continue
+        arguments = compile_entry_arguments(entry)
+        if not arguments:
+            raise AuditInfrastructureError("compile database command is empty")
+        target = root / Path(*relative.parts)
+        correct_source = compile_entry_targets_source(arguments, directory, target)
+        by_path[relative].append((entry, arguments, correct_source))
+
+    missing = [str(path) for path, candidates in by_path.items() if not candidates]
+    if missing:
+        raise AuditInfrastructureError(
+            "compile database is missing production authority source(s): "
+            + ", ".join(missing))
+
+    selected = []
+    for relative in authority_paths:
+        candidates = by_path[relative]
+        production = [candidate for candidate in candidates
+                      if not compile_entry_is_unit_test(candidate[1])]
+        if not production:
+            raise AuditInfrastructureError(
+                f"compile database is unit-test-only for production authority source: {relative}")
+        correct = [candidate for candidate in production if candidate[2]]
+        if not correct:
+            raise AuditInfrastructureError(
+                "compile database command does not compile its declared source as the "
+                "single declared source: "
+                f"{relative}")
+        target = root / Path(*relative.parts)
+        distinct_configurations: dict[
+            tuple[str, ...], tuple[Mapping[str, object], list[str], bool]
+        ] = {}
+        for candidate in correct:
+            directory = Path(str(candidate[0]["directory"])).resolve()
+            semantic_command = (
+                os.path.normcase(str(directory)),
+                *streaming_preprocessor_command(candidate[1], target),
+            )
+            distinct_configurations.setdefault(semantic_command, candidate)
+        for entry, arguments, _correct_source in distinct_configurations.values():
+            selected.append((relative, entry, arguments))
+    return tuple(selected)
+
+
+def audit_compile_database_views(source_root: Path, database: Path,
+                                 sources: Mapping[PurePosixPath, str]) \
+        -> tuple[list[Finding], int]:
+    """Audit macro-expanded adapter views using the database's real compiler/defines."""
+    root = source_root.resolve(strict=True)
+    entries = validated_compile_database(database)
+    authority_paths = (
+        PurePosixPath("playback/gpu/gpucompositor.cpp"),
+        PurePosixPath("playback/gpu/gpuframedata.cpp"),
+    )
+    relevant = select_compile_database_authority_entries(root, entries, authority_paths)
+    findings: list[Finding] = []
+    for relative, entry, arguments in relevant:
+        source = sources.get(relative)
+        if source is None:
+            raise AuditInfrastructureError(
+                f"compiler authority source is missing: {relative}")
+        target = root / Path(*relative.parts)
+        command = streaming_preprocessor_command(arguments, target)
+        directory = Path(str(entry["directory"]))
+        watchdog = None
+        try:
+            with tempfile.TemporaryFile() as errors:
+                process = subprocess.Popen(
+                    command, cwd=str(directory), stdout=subprocess.PIPE, stderr=errors,
+                    text=True, encoding="utf-8", errors="replace")
+                timed_out = False
+                def terminate_on_timeout() -> None:
+                    nonlocal timed_out
+                    timed_out = True
+                    if process.poll() is None:
+                        process.kill()
+                watchdog = threading.Timer(60.0, terminate_on_timeout)
+                watchdog.start()
+                if process.stdout is None:
+                    raise AuditInfrastructureError(
+                        f"compiler preprocessor stdout is unavailable for {relative}")
+                compiler_view = retain_target_preprocessor_segments(
+                    process.stdout, target, directory)
+                return_code = process.wait()
+                watchdog.cancel()
+                errors.seek(0)
+                stderr = errors.read().decode("utf-8", errors="replace")
+        except AuditInfrastructureError:
+            if watchdog is not None:
+                watchdog.cancel()
+            if "process" in locals() and process.poll() is None:
+                process.kill()
+                process.wait()
+            raise
+        except (OSError, subprocess.SubprocessError) as error:
+            if watchdog is not None:
+                watchdog.cancel()
+            if "process" in locals() and process.poll() is None:
+                process.kill()
+                process.wait()
+            raise AuditInfrastructureError(
+                f"compiler preprocessor invocation failed for {relative}: {error}") from error
+        if return_code != 0:
+            raise AuditInfrastructureError(
+                f"compiler preprocessor invocation {'timed out' if timed_out else 'failed'} "
+                f"for {relative}: " + stderr[-2048:])
+        translated = translate_source(compiler_view)
+        findings.extend(audit_capability_uses(
+            relative, compiler_view, compiler_view=True,
+            compiler_translation_text=translated))
+    return findings, len(relevant)
+
+
+def profile_compiler_view(
+    source_root: Path,
+    database: Path,
+    source: PurePosixPath,
+) -> str:
+    """Run one representative real compiler view as a developer diagnostic."""
+
+    root = source_root.resolve(strict=True)
+    database = database.resolve(strict=True)
+    validated_compile_database(database)
+    authority = dependency_authority_for_root(root)
     # The diagnostic deliberately exercises a full Qt translation unit.  The
     # production defaults remain unchanged; allow the Windows stream pump and
     # Python provenance parser enough time to construct this one profile view.
@@ -9455,8 +11291,8 @@ def profile_compiler_view(
 def main(argv: tuple[str, ...] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
-    # Preserve the committed CTest interface while the compiler-authoritative
-    # lane consumes preprocessed views instead of the deleted macro table.
+    # The normal CTest invocation supplies this database; when present it is
+    # mandatory authority for the streamed real-preprocessor adapter views.
     parser.add_argument("--compile-commands", type=Path)
     parser.add_argument("--profile-view", type=Path)
     parser.add_argument("--profile-source", type=PurePosixPath)
@@ -9543,11 +11379,22 @@ def main(argv: tuple[str, ...] | None = None) -> int:
     root = args.source_root.resolve()
     sources = load_production_sources(root)
     findings = audit_raw_sources(sources)
+    compiler_views = 0
+    if args.compile_commands is not None:
+        try:
+            compiler_findings, compiler_views = audit_compile_database_views(
+                root, args.compile_commands, sources)
+            findings.extend(compiler_findings)
+        except (AuditInfrastructureError, OSError) as error:
+            print(f"FAIL: GPU capability compiler/preprocessor audit: {error}")
+            return 2
     if findings:
         for finding in sorted(findings, key=lambda item: (str(item.path), item.line, item.expression)):
             print(finding.render())
         return 1
-    print("PASS: GPU capability source audit and mutation self-tests")
+    suffix = (f"; compiler views={compiler_views}"
+              if args.compile_commands is not None else "")
+    print("PASS: GPU capability source audit and mutation self-tests" + suffix)
     return 0
 
 

@@ -6,6 +6,7 @@
 
 #include <QtGlobal>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -84,8 +85,16 @@ public:
     // frame-retire queue and the readback retainer legitimately read/stamp it
     // without a lease. Only nativeHandle() — the raw GPU handle, the one capability
     // that CAN be misused into a UAF — is guarded (see gpusurfacelease.h).
-    virtual void retainUntilFenceRetired(uint64_t fenceValue) { (void) fenceValue; }
-    virtual uint64_t pendingFenceValue() const { return 0; }
+    void retainUntilFenceRetired(uint64_t fenceValue) noexcept {
+        uint64_t previous = m_pendingFence.load(std::memory_order_relaxed);
+        while (fenceValue > previous &&
+               !m_pendingFence.compare_exchange_weak(
+                   previous, fenceValue, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+    uint64_t pendingFenceValue() const noexcept {
+        return m_pendingFence.load(std::memory_order_relaxed);
+    }
 
 protected:
     // THE enforcement point (Challenge 3): the raw GPU handle is reachable ONLY
@@ -100,6 +109,9 @@ protected:
     // This is deliberately allocation-free on the interop hot path.
     virtual GpuOwnedNativeHandle retainNativeHandle() const { return {}; }
     virtual uint32_t nativeSubresource() const { return 0; }
+
+private:
+    mutable std::atomic<uint64_t> m_pendingFence{0};
 };
 
 #endif // OLR_GPUSURFACE_H

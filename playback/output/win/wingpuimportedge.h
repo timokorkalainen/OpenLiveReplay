@@ -2,13 +2,13 @@
 #define OLR_WIN_GPU_IMPORT_EDGE_H
 
 #include "playback/output/framehandle.h"
-
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/gpubudget.h"
 #endif
 
 #include <QString>
 
+#include <cstddef>
 #include <functional>
 #include <cstdint>
 #include <memory>
@@ -56,23 +56,22 @@ public:
     bool isAvailable() const;
     bool deviceLost() const;
 
-#ifdef OLR_GPU_PIPELINE_BUILD
     static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                  FrameMetadata meta,
                                                  std::shared_ptr<GpuFence> renderFence = nullptr,
+#ifdef OLR_GPU_PIPELINE_BUILD
                                                  GpuBudgetCharge charge = {},
+#else
+                                                 std::nullptr_t charge = nullptr,
+#endif
                                                  uint64_t* submittedFenceValue = nullptr);
+#ifdef OLR_GPU_PIPELINE_BUILD
 #ifdef OLR_UNIT_TEST
     static FrameHandle makeGpuFrameHandleWithCachedCpuForTest(
         std::shared_ptr<D3D11GpuSurface> surface, FrameMetadata meta,
         std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge charge,
         uint64_t* submittedFenceValue, CpuPlanes cachedCpu);
 #endif
-#else
-    static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
-                                                 FrameMetadata meta,
-                                                 std::shared_ptr<GpuFence> renderFence = nullptr,
-                                                 uint64_t* submittedFenceValue = nullptr);
 #endif
 #ifdef _WIN32
     void setImportTapForTest(std::function<void(const FrameHandle&)> tap);

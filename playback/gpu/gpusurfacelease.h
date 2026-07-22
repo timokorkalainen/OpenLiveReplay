@@ -5,7 +5,9 @@
 
 #include <QtLogging>
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -13,6 +15,10 @@
 #include <utility>
 
 class GpuDeviceLossMonitor;
+class GpuOpScope;
+
+template <size_t N>
+class GpuScopedNativeView;
 
 struct GpuSyncReadState {
     enum class Phase : uint8_t {
@@ -26,6 +32,41 @@ struct GpuSyncReadState {
 };
 
 class GpuReadLease;
+
+// A native surface slot that can only be minted by GpuOpScope while the exact
+// GpuSurfacePack owner is retained and its synchronous read lease is active.
+// The wrapper is deliberately non-transferable. Its lifetime ends with the
+// enclosing callback; whole-tree static enforcement forbids retaining pointers,
+// references, reference_wrappers, or deferred captures beyond that boundary.
+class GpuScopedNativeSurface final {
+public:
+    GpuScopedNativeSurface(const GpuScopedNativeSurface&) = delete;
+    GpuScopedNativeSurface& operator=(const GpuScopedNativeSurface&) = delete;
+    GpuScopedNativeSurface(GpuScopedNativeSurface&&) = delete;
+    GpuScopedNativeSurface& operator=(GpuScopedNativeSurface&&) = delete;
+
+    GpuSurfaceDesc desc() const noexcept;
+    bool valid() const noexcept;
+    void* nativeHandle() const noexcept;
+    uint32_t nativeSubresource() const noexcept;
+
+private:
+    template <size_t N>
+    friend class GpuScopedNativeView;
+
+    GpuScopedNativeSurface(GpuSurface* surface, GpuSyncReadState* state) noexcept
+        : m_surface(surface), m_state(state) {}
+
+    bool authorize() const noexcept {
+        if (!m_state) return false;
+        if (m_state->phase == GpuSyncReadState::Phase::Ready)
+            m_state->phase = GpuSyncReadState::Phase::Reading;
+        return m_state->phase == GpuSyncReadState::Phase::Reading;
+    }
+
+    GpuSurface* m_surface = nullptr;
+    GpuSyncReadState* m_state = nullptr;
+};
 
 // Proof that a driver-authoritative observation declared the active GPU device dead.
 // Only GpuDeviceLossMonitor can construct it, and only backend-local authority types
@@ -91,6 +132,7 @@ public:
 
 private:
     friend class GpuSyncReadScope;
+    friend class GpuScopedNativeSurface;
 
     GpuReadLease(const std::shared_ptr<GpuSurface>& surface, GpuReadLease** registration,
                  bool accessAuthorized)
@@ -113,6 +155,12 @@ private:
           m_accessAuthorized(accessAuthorized),
           m_registration(accessAuthorized ? registration : nullptr) {
         if (m_registration) *m_registration = this;
+    }
+    static void* scopedNativeHandle(GpuSurface* surface) {
+        return surface ? surface->nativeHandle() : nullptr;
+    }
+    static uint32_t scopedNativeSubresource(GpuSurface* surface) {
+        return surface ? surface->nativeSubresource() : 0;
     }
 
     void invalidateAccess() noexcept {
@@ -215,6 +263,24 @@ public:
     }
 
 private:
+    friend class GpuOpScope;
+
+    template <typename Fn>
+    static void withRetainedBatch(Fn&& fn) {
+        using Result = std::invoke_result_t<Fn&&, GpuSyncReadState&>;
+        static_assert(std::is_same_v<Result, void>,
+                      "GpuSyncReadScope retained batch callback must return void");
+        GpuSyncReadState callbackState;
+        try {
+            std::invoke(std::forward<Fn>(fn), callbackState);
+            if (callbackState.phase == GpuSyncReadState::Phase::Reading)
+                callbackState.phase = GpuSyncReadState::Phase::Completed;
+        } catch (...) {
+            callbackState.phase = GpuSyncReadState::Phase::Violated;
+            throw;
+        }
+    }
+
     bool beginRead() noexcept {
         if (m_state.phase != GpuSyncReadState::Phase::Ready) {
             invalidateActiveLease();
@@ -245,6 +311,80 @@ private:
 
     GpuSyncReadState m_state;
     GpuReadLease* m_activeLease = nullptr;
+};
+
+inline GpuSurfaceDesc GpuScopedNativeSurface::desc() const noexcept {
+    try {
+        return m_surface && authorize() ? m_surface->desc() : GpuSurfaceDesc{};
+    } catch (...) {
+        return {};
+    }
+}
+
+inline bool GpuScopedNativeSurface::valid() const noexcept {
+    try {
+        return m_surface && authorize() && m_surface->isValid();
+    } catch (...) {
+        return false;
+    }
+}
+
+inline void* GpuScopedNativeSurface::nativeHandle() const noexcept {
+    try {
+        if (!m_surface || !authorize()) return nullptr;
+        return GpuReadLease::scopedNativeHandle(m_surface);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+inline uint32_t GpuScopedNativeSurface::nativeSubresource() const noexcept {
+    try {
+        if (!m_surface || !authorize()) return 0;
+        return GpuReadLease::scopedNativeSubresource(m_surface);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Ordered logical view of every submitted slot. Duplicate owners remain duplicate
+// slots here even though retirement storage is coalesced separately.
+template <size_t N>
+class GpuScopedNativeView final {
+public:
+    static_assert(N > 0, "A scoped native view must contain at least one slot");
+
+    GpuScopedNativeView(const GpuScopedNativeView&) = delete;
+    GpuScopedNativeView& operator=(const GpuScopedNativeView&) = delete;
+    GpuScopedNativeView(GpuScopedNativeView&&) = delete;
+    GpuScopedNativeView& operator=(GpuScopedNativeView&&) = delete;
+
+    static constexpr size_t size() noexcept { return N; }
+    const GpuScopedNativeSurface& operator[](size_t index) const noexcept {
+        if (index < N) return m_slots[index];
+        static const GpuScopedNativeSurface invalid(nullptr, nullptr);
+        return invalid;
+    }
+
+    template <size_t I>
+    const GpuScopedNativeSurface& get() const noexcept {
+        static_assert(I < N, "scoped native slot index is outside the exact submitted pack");
+        return m_slots[I];
+    }
+
+private:
+    friend class GpuOpScope;
+
+    template <typename Owners, size_t... I>
+    explicit GpuScopedNativeView(const Owners& owners, GpuSyncReadState* state,
+                                 std::index_sequence<I...>) noexcept
+        : m_slots{GpuScopedNativeSurface(owners[I].get(), state)...} {}
+
+    template <typename Owners>
+    explicit GpuScopedNativeView(const Owners& owners, GpuSyncReadState* state) noexcept
+        : GpuScopedNativeView(owners, state, std::make_index_sequence<N>{}) {}
+
+    std::array<GpuScopedNativeSurface, N> m_slots;
 };
 
 #endif // OLR_GPUSURFACELEASE_H

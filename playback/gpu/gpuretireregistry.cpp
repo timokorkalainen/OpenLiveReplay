@@ -101,8 +101,14 @@ void GpuRetireRegistry::registerRetire(std::shared_ptr<GpuSurface> surface,
     const GpuRetirePreparedHandle prepared =
         GpuReadbackRetainer::prepare(&owner, 1, fence, reservation);
     if (!prepared) return;
-    surface->retainUntilFenceRetired(ticket.value());
-    if (!GpuReadbackRetainer::publish(prepared, ticket)) GpuReadbackRetainer::release(prepared);
+    if (GpuReadbackRetainer::publish(prepared, ticket)) {
+        try {
+            surface->retainUntilFenceRetired(ticket.value());
+        } catch (...) {
+        }
+    } else {
+        GpuReadbackRetainer::release(prepared);
+    }
 }
 #endif
 

@@ -27,7 +27,7 @@ void TestGpuMicrostress::evictWhileRenderDoesNotFreeInUseSurface() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     std::weak_ptr<GpuSurface> weakSurface = surface;
 

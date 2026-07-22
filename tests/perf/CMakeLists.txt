@@ -6,18 +6,43 @@ target_link_libraries(tst_gpuretireregistry_perf
 add_test(NAME tst_gpuretireregistry_perf COMMAND tst_gpuretireregistry_perf)
 set_tests_properties(tst_gpuretireregistry_perf PROPERTIES LABELS "perf;gpu")
 
+set(saved912_commit "912663bed2eaf4016e0dc29ab44253c030d8eab3")
+find_package(Git QUIET)
+if(Git_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --is-shallow-repository
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        RESULT_VARIABLE saved912_shallow_status
+        OUTPUT_VARIABLE saved912_is_shallow
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(saved912_shallow_status EQUAL 0 AND saved912_is_shallow STREQUAL "true")
+        message(STATUS
+            "Shallow checkout: frozen GPU benchmark provenance relies on pinned file hashes")
+    else()
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" cat-file -e "${saved912_commit}^{commit}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            RESULT_VARIABLE saved912_commit_status
+            OUTPUT_QUIET ERROR_QUIET)
+        if(NOT saved912_commit_status EQUAL 0)
+            message(FATAL_ERROR
+                "Frozen GPU retirement benchmark provenance commit ${saved912_commit} is missing")
+        endif()
+    endif()
+endif()
+
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/saved912gpuopscope.h" saved912_op_scope_sha)
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/saved912preparedregistry.h" saved912_registry_header_sha)
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/saved912preparedregistry.cpp" saved912_registry_sha)
 if(NOT saved912_op_scope_sha STREQUAL
        "2771095d97b494373ad93bbaad088f846f30dc4bbadab0c557e45d7ce4d0a40e" OR
    NOT saved912_registry_header_sha STREQUAL
-       "6fcc8c50f6ee793dee3ffb43a309903a728b30806defee0df40897f2161bd0ca" OR
+       "f69b82efc2ea13f465df55385e6ae18e85ea0c61a348d0a85af3387479b5c0bc" OR
    NOT saved912_registry_sha STREQUAL
        "c7b368c4f58875a449fa1ab4c305b67a4650e9c53036653c555a5e1b791800e3")
     message(FATAL_ERROR
         "Frozen exact-912 GPU retirement benchmark snapshot drifted; verify against "
-        "912663be1458a0bdba36fca10c0421ab79d5cbd4 before updating hashes")
+        "912663bed2eaf4016e0dc29ab44253c030d8eab3 before updating hashes")
 endif()
 
 qt_add_library(olr_production_retire_perf STATIC

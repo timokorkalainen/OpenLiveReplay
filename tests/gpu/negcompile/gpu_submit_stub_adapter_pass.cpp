@@ -7,16 +7,9 @@
 #include <memory>
 
 struct StubSubmissionAdapter {
-    std::shared_ptr<GpuSurface> surface;
-
-    GpuSubmitOutcome operator()() noexcept {
-        GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
-        GpuSyncReadScope scope;
-        scope.withRead(surface, [&](const GpuReadLease& lease) noexcept {
-            (void) lease.nativeHandle();
-            outcome = GpuSubmitOutcome::NotSubmitted;
-        });
-        return outcome;
+    GpuSubmitOutcome operator()(const GpuScopedNativeView<1>& view) noexcept {
+        (void) view[0].nativeHandle();
+        return GpuSubmitOutcome::NotSubmitted;
     }
 };
 
@@ -24,7 +17,7 @@ GpuSubmissionResult stubTypedSubmissionPass(std::shared_ptr<GpuFence> fence,
                                             std::shared_ptr<GpuSurface> surface) {
     GpuRetireRegistry registry;
     GpuOpScope operation(std::move(fence), registry);
-    StubSubmissionAdapter adapter{surface};
+    StubSubmissionAdapter adapter;
     return operation.submit(
         adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{std::move(surface)}));
 }

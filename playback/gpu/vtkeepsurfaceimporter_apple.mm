@@ -15,8 +15,12 @@
 FrameHandle importVtImageBuffer(void* cvImageBufferRef, FrameMetadata meta,
                                 std::shared_ptr<GpuRhiContext> rhi,
                                 std::shared_ptr<GpuFence> renderFence) {
-    std::shared_ptr<GpuSurface> surface = wrapAppleImageBuffer(cvImageBufferRef);
-    if (!surface || !rhi) return FrameHandle();
+    if (!rhi || !rhi->isGpuBacked()) return FrameHandle();
+    const GpuSurfaceCompatibility compatibility = rhi->surfaceCompatibility();
+    if (compatibility.deviceDomainId == 0 || compatibility.authorityEpoch == 0)
+        return FrameHandle();
+    std::shared_ptr<GpuSurface> surface = wrapAppleImageBuffer(cvImageBufferRef, compatibility);
+    if (!surface) return FrameHandle();
     return importVtSurface(surface, std::move(meta), std::move(rhi), std::move(renderFence));
 }
 
@@ -24,7 +28,13 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
                             FrameMetadata meta,
                             std::shared_ptr<GpuRhiContext> rhi,
                             std::shared_ptr<GpuFence> renderFence) {
-    if (!surface || !surface->isValid() || !rhi) return FrameHandle();
+    if (!surface || !surface->isValid() || !rhi || !rhi->isGpuBacked()) return FrameHandle();
+    const GpuSurfaceCompatibility expected = rhi->surfaceCompatibility();
+    const GpuSurfaceCompatibility actual = surface->compatibility();
+    if (expected.deviceDomainId == 0 || expected.authorityEpoch == 0 ||
+        actual.deviceDomainId != expected.deviceDomainId ||
+        actual.authorityEpoch != expected.authorityEpoch)
+        return FrameHandle();
 
     const GpuSurfaceDesc desc = surface->desc();
     auto charge = GpuBudget::instance().tryCharge(gpuSurfaceBytes(*surface));
@@ -41,7 +51,7 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
         auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
-        const auto result = operation.submit(
+        const auto result = operation.submitRetained(
             adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
         if (!result.succeeded()) return FrameHandle{};
         exactRenderFence = result.producerFence;

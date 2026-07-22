@@ -303,11 +303,16 @@ void GpuRhiContext::injectDeviceLostForTest() {
     if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
 }
 
-GpuReadbackResult GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&,
+GpuReadbackResult GpuRhiContext::importAndReadback(const GpuScopedNativeSurface& surface,
                                                    FramePixelFormat) noexcept {
 #ifdef OLR_UNIT_TEST
+    void* testHandle = surface.nativeHandle();
+    m_lastReadbackHadNativeHandleForTest.store(testHandle != nullptr, std::memory_order_release);
+    m_lastReadbackSubresourceForTest.store(surface.nativeSubresource(), std::memory_order_release);
     if (const auto injected = injectedReadbackForTest()) return *injected;
 #endif
+    void* handle = surface.nativeHandle();
+    if (!surface.valid() || !handle) return {};
     try {
         if (!m_impl || !m_impl->valid) return {};
         if (m_impl->deviceLost.load(std::memory_order_acquire)) {

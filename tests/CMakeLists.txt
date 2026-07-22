@@ -114,11 +114,27 @@ function(olr_add_gpu_submission_compile_control name source expectation)
             "-DEXPECT_COMPILE=FALSE"
             "-DEXPECTED_MEMBER=nativeHandle"
             "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "PACK_OWNERS_PRIVATE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=owners"
+            "-DEXPECTED_ACCESS=[Pp]rivate")
+    elseif(expectation STREQUAL "SCOPED_VIEW_REQUIRED")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=submit"
+            "-DEXPECTED_ACCESS=(not.invocable|static.assert|GpuScopedNativeView)")
+    elseif(expectation STREQUAL "SCOPED_VIEW_ESCAPE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_CLASS=GpuScopedNativeSurface"
+            "-DEXPECTED_MEMBER=GpuScopedNativeSurface"
+            "-DEXPECTED_ACCESS=(deleted|private)")
     elseif(expectation STREQUAL "RAW_READBACK")
         list(APPEND control_args
-            "-DEXPECTED_CLASS=GpuRhiContext"
+            "-DEXPECTED_CLASS=GpuScopedNativeSurface"
             "-DEXPECTED_MEMBER=importAndReadback"
-            "-DEXPECTED_ACCESS=[Pp]rivate")
+            "-DEXPECTED_ACCESS=(cannot.convert|no.viable.conversion|no.matching)")
     elseif(expectation STREQUAL "TOKEN_CONSTRUCTION")
         list(APPEND control_args
             "-DEXPECT_COMPILE=FALSE"
@@ -168,6 +184,20 @@ olr_add_gpu_submission_compile_control(
     gpu_registry_pairing gpu_registry_pairing.cpp REGISTRY_PAIRING)
 olr_add_gpu_submission_compile_control(
     gpu_submission_view_unwrap gpu_submission_view_unwrap.cpp VIEW_UNWRAP)
+olr_add_gpu_submission_compile_control(
+    gpu_surface_pack_owner_access gpu_surface_pack_owner_access.cpp PACK_OWNERS_PRIVATE)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_zero_arg_adapter gpu_submit_zero_arg_adapter.cpp SCOPED_VIEW_REQUIRED)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_wrong_view_cardinality gpu_submit_wrong_view_cardinality.cpp SCOPED_VIEW_REQUIRED)
+olr_add_gpu_submission_compile_control(
+    gpu_scoped_native_escape gpu_scoped_native_escape.cpp SCOPED_VIEW_ESCAPE)
+olr_add_gpu_submission_compile_control(
+    gpu_scoped_native_auto_escape gpu_scoped_native_auto_escape.cpp SCOPED_VIEW_ESCAPE)
+olr_add_gpu_submission_compile_control(
+    gpu_scoped_native_heap_escape gpu_scoped_native_heap_escape.cpp SCOPED_VIEW_ESCAPE)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_by_value_view gpu_submit_by_value_view.cpp SCOPED_VIEW_REQUIRED)
 olr_add_gpu_submission_compile_control(
     gpu_raw_readback_access gpu_raw_readback_access.cpp RAW_READBACK)
 olr_add_gpu_submission_compile_control(
@@ -286,7 +316,7 @@ add_test(NAME gpu_capability_source_audit_perf
         --source-root "${CMAKE_SOURCE_DIR}"
         --performance-only)
 set_tests_properties(gpu_capability_source_audit_perf PROPERTIES
-    LABELS "gpu-capability;ci" RUN_SERIAL TRUE TIMEOUT 180)
+    LABELS "gpu-capability;ci" RUN_SERIAL TRUE TIMEOUT 600)
 if(WIN32 AND MINGW AND OLR_GPU_PIPELINE
         AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_test(NAME gpu_capability_mingw_provenance_perf

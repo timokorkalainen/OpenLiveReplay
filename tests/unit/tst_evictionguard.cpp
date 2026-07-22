@@ -10,15 +10,11 @@
 
 class FakeGpuSurface final : public GpuSurface {
 public:
-    explicit FakeGpuSurface(uint64_t pendingFence) : m_pendingFence(pendingFence) {}
+    explicit FakeGpuSurface(uint64_t pendingFence) { retainUntilFenceRetired(pendingFence); }
 
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 4, 4}; }
     bool isValid() const override { return true; }
     void* nativeHandle() const override { return nullptr; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
-
-private:
-    uint64_t m_pendingFence = 0;
 };
 
 class FakeGpuFrameData final : public IFrameData {

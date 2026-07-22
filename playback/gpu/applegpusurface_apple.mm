@@ -2,7 +2,6 @@
 
 #ifdef __APPLE__
 
-#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpusurfacelease.h"
@@ -165,15 +164,12 @@ CpuPlanes lockDownloadRgba8(CVPixelBufferRef pb) {
 
 class AppleGpuSurface final : public GpuSurface {
 public:
-    AppleGpuSurface(CVPixelBufferRef pixelBuffer, FramePixelFormat format)
+    AppleGpuSurface(CVPixelBufferRef pixelBuffer, FramePixelFormat format,
+                    GpuSurfaceCompatibility compatibility)
         : m_pixelBuffer(pixelBuffer), m_format(format),
-          m_authorityEpoch(GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()) {
-        m_device = MTLCreateSystemDefaultDevice();
-        m_deviceDomainId = gpuMetalDeviceDomainId((__bridge void*)m_device);
-    }
+          m_authorityEpoch(compatibility.authorityEpoch),
+          m_deviceDomainId(compatibility.deviceDomainId) {}
     ~AppleGpuSurface() override {
-        [m_device release];
-        m_device = nil;
         if (m_pixelBuffer) {
             CVPixelBufferRelease(m_pixelBuffer);
         }
@@ -195,17 +191,6 @@ public:
         return {m_deviceDomainId, m_authorityEpoch};
     }
 
-    void retainUntilFenceRetired(uint64_t fenceValue) override {
-        uint64_t previous = m_pendingFence.load(std::memory_order_acquire);
-        while (fenceValue > previous && !m_pendingFence.compare_exchange_weak(
-                                            previous, fenceValue, std::memory_order_acq_rel)) {
-        }
-    }
-
-    uint64_t pendingFenceValue() const override {
-        return m_pendingFence.load(std::memory_order_acquire);
-    }
-
 protected:
     // Lease-gated, mirroring the base (gpusurface.h). Kept protected on the
     // derived type too so an AppleGpuSurface* cannot re-widen handle access.
@@ -222,11 +207,9 @@ protected:
 
 private:
     CVPixelBufferRef m_pixelBuffer = nullptr;
-    id<MTLDevice> m_device = nil;
     FramePixelFormat m_format = FramePixelFormat::Nv12;
     uint64_t m_authorityEpoch = 0;
     uintptr_t m_deviceDomainId = 0;
-    std::atomic<uint64_t> m_pendingFence{0};
 };
 
 CFDictionaryRef makeIoSurfacePixelBufferAttributes(bool metalCompatible) {
@@ -260,9 +243,21 @@ CVPixelBufferRef createIoSurfacePixelBuffer(int width, int height, OSType pixelF
     return nullptr;
 }
 
+OSType expectedCvPixelFormatFor(FramePixelFormat format) {
+    switch (format) {
+    case FramePixelFormat::Nv12:
+        return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    case FramePixelFormat::Rgba8:
+        return kCVPixelFormatType_32BGRA;
+    default:
+        return 0;
+    }
+}
+
 } // namespace
 
-std::shared_ptr<GpuSurface> makeAppleNv12Surface(int width, int height) {
+std::shared_ptr<GpuSurface> makeAppleNv12Surface(int width, int height,
+                                                 GpuSurfaceCompatibility compatibility) {
     if (width <= 0 || height <= 0) return nullptr;
     if (gpuConsumeInjectedAllocFailure()) return nullptr;
 
@@ -271,11 +266,12 @@ std::shared_ptr<GpuSurface> makeAppleNv12Surface(int width, int height) {
     if (!pb) return nullptr;
 
     zeroPixelBuffer(pb);
-    auto surface = std::make_shared<AppleGpuSurface>(pb, FramePixelFormat::Nv12);
+    auto surface = std::make_shared<AppleGpuSurface>(pb, FramePixelFormat::Nv12, compatibility);
     return surface->isValid() ? surface : nullptr;
 }
 
-std::shared_ptr<GpuSurface> makeAppleRgba8Surface(int width, int height) {
+std::shared_ptr<GpuSurface> makeAppleRgba8Surface(int width, int height,
+                                                  GpuSurfaceCompatibility compatibility) {
     if (width <= 0 || height <= 0) return nullptr;
     if (gpuConsumeInjectedAllocFailure()) return nullptr;
 
@@ -283,18 +279,19 @@ std::shared_ptr<GpuSurface> makeAppleRgba8Surface(int width, int height) {
     if (!pb) return nullptr;
 
     zeroPixelBuffer(pb);
-    auto surface = std::make_shared<AppleGpuSurface>(pb, FramePixelFormat::Rgba8);
+    auto surface = std::make_shared<AppleGpuSurface>(pb, FramePixelFormat::Rgba8, compatibility);
     return surface->isValid() ? surface : nullptr;
 }
 
-std::shared_ptr<GpuSurface> wrapAppleImageBuffer(void* cvImageBufferRef) {
+std::shared_ptr<GpuSurface> wrapAppleImageBuffer(void* cvImageBufferRef,
+                                                 GpuSurfaceCompatibility compatibility) {
     if (!cvImageBufferRef) return nullptr;
 
     auto pb = static_cast<CVPixelBufferRef>(cvImageBufferRef);
     if (!CVPixelBufferGetIOSurface(pb)) return nullptr;
 
     CVPixelBufferRetain(pb);
-    auto surface = std::make_shared<AppleGpuSurface>(pb, FramePixelFormat::Nv12);
+    auto surface = std::make_shared<AppleGpuSurface>(pb, FramePixelFormat::Nv12, compatibility);
     return surface->isValid() ? surface : nullptr;
 }
 
@@ -311,6 +308,24 @@ CVPixelBufferRef retainApplePixelBufferWrapper(const std::shared_ptr<GpuSurface>
             CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
         if (createResult == kCVReturnSuccess) result = pixelBuffer;
     });
+    return result;
+}
+
+CVPixelBufferRef retainApplePixelBufferWrapper(const GpuScopedNativeSurface& surface) {
+    if (!surface.valid()) return nullptr;
+    IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(surface.nativeHandle());
+    if (!ioSurface) return nullptr;
+    const GpuSurfaceDesc desc = surface.desc();
+    CVPixelBufferRef result = nullptr;
+    const OSType expectedPixelFormat = expectedCvPixelFormatFor(desc.format);
+    if (!expectedPixelFormat) return nullptr;
+    const CVReturn rc =
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &result);
+    if (rc != kCVReturnSuccess || !result ||
+        CVPixelBufferGetPixelFormatType(result) != expectedPixelFormat) {
+        if (result) CVPixelBufferRelease(result);
+        return nullptr;
+    }
     return result;
 }
 

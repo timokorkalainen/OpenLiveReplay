@@ -21,6 +21,7 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -61,6 +62,15 @@ struct PreparedSource {
     bool present = false;
     bool uploadFromCpu = false;
     bool unsupported = false;
+};
+
+struct RenderSource {
+    CpuPlanes nv12;
+    GpuSurfaceDesc desc;
+    bool present = false;
+    bool uploadFromCpu = false;
+    bool unsupported = false;
+    size_t nativeSlot = std::numeric_limits<size_t>::max();
 };
 
 struct RenderGridResult {
@@ -112,14 +122,15 @@ int cappedFrameCount(const QList<FrameHandle>& frames) {
     return static_cast<int>(qMin<qsizetype>(kMaxGridSources, frames.size()));
 }
 
-QList<PreparedSource> prepareSources(const QList<FrameHandle>& frames) {
+QList<PreparedSource> prepareSources(const QList<FrameHandle>& frames,
+                                     const std::shared_ptr<GpuRhiContext>& rhi) {
     QList<PreparedSource> sources;
     sources.reserve(kMaxGridSources);
     const int count = cappedFrameCount(frames);
     for (int i = 0; i < count; ++i) {
         PreparedSource source;
         if (!frames.at(i).isNull()) {
-            source.surface = gpucompositor::makeInputNv12Surface(frames.at(i));
+            source.surface = gpucompositor::makeInputNv12Surface(frames.at(i), rhi);
             source.desc = source.surface ? source.surface->desc() : GpuSurfaceDesc{};
             source.present = source.surface && source.surface->isValid() &&
                              source.desc.format == FramePixelFormat::Nv12 &&
@@ -156,8 +167,9 @@ int gridRowsForCount(int count, int columns) {
     return qMax(1, int(std::ceil(double(qMax(1, count)) / double(columns))));
 }
 
-GridUniformBlock makeUniforms(const QList<PreparedSource>& sources, int frameCount, int width,
-                              int height, ColorMetadata color) {
+template <typename Source>
+GridUniformBlock makeUniforms(const QList<Source>& sources, int frameCount, int width, int height,
+                              ColorMetadata color) {
     GridUniformBlock ub;
     ub.matrix = color.matrix == ColorMatrix::Bt601 ? 0 : 1;
     ub.range = color.range == ColorRange::Video ? 1 : 0;
@@ -178,7 +190,7 @@ GridUniformBlock makeUniforms(const QList<PreparedSource>& sources, int frameCou
             ub.tileRect[i][2] = qMax(0, dstRight - dstX);
             ub.tileRect[i][3] = qMax(0, dstBottom - dstY);
         }
-        const PreparedSource& source = sources.at(i);
+        const Source& source = sources.at(i);
         if (!source.present) continue;
         ub.sourceSize[i][0] = source.desc.width;
         ub.sourceSize[i][1] = source.desc.height;
@@ -223,17 +235,19 @@ bool uploadNv12Planes(QRhiResourceUpdateBatch* updates, QRhiTexture* yTex, QRhiT
     return true;
 }
 
-RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sources, int frameCount,
+template <typename NativeAt>
+RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<RenderSource>& sources, int frameCount,
                                    int width, int height, ColorMetadata color,
-                                   GpuCompositor::ScaleQuality quality,
-                                   const std::shared_ptr<GpuSurface>& outputSurface) {
+                                   GpuCompositor::ScaleQuality quality, NativeAt&& nativeAt,
+                                   size_t outputSlot) {
     RenderGridResult result;
     if (!rhi || width <= 0 || height <= 0) return {};
     for (int i = 0; i < qMin(frameCount, sources.size()); ++i) {
         if (sources.at(i).unsupported) return {};
     }
+    const bool hasNativeOutput = outputSlot != std::numeric_limits<size_t>::max();
     const QRhiTexture::Format outputFormat =
-        outputSurface ? QRhiTexture::BGRA8 : QRhiTexture::RGBA8;
+        hasNativeOutput ? QRhiTexture::BGRA8 : QRhiTexture::RGBA8;
     if (!rhi->isTextureFormatSupported(outputFormat, QRhiTexture::RenderTarget) ||
         !rhi->isTextureFormatSupported(QRhiTexture::R8) ||
         !rhi->isTextureFormatSupported(QRhiTexture::RG8)) {
@@ -250,8 +264,10 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
 
     std::unique_ptr<gpucompositor::ImportedRgbaRenderTarget> importedOutput;
     std::unique_ptr<QRhiTexture> output;
-    if (outputSurface) {
-        importedOutput = gpucompositor::importRgbaRenderTarget(rhi, outputSurface);
+    if (hasNativeOutput) {
+        const GpuScopedNativeSurface* outputSurface = nativeAt(outputSlot);
+        if (!outputSurface) return {};
+        importedOutput = gpucompositor::importRgbaRenderTarget(rhi, *outputSurface);
         if (!importedOutput) return {};
         output.reset(
             rhi->newTexture(outputFormat, QSize(width, height), 1, QRhiTexture::RenderTarget));
@@ -282,11 +298,11 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
         rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, sizeof(GridUniformBlock)));
     if (!ubuf || !ubuf->create()) return {};
 
+    std::vector<std::unique_ptr<gpucompositor::ImportedNv12Source>> importedSources;
     std::vector<std::unique_ptr<QRhiTexture>> ownedLumaTextures;
     std::vector<std::unique_ptr<QRhiTexture>> ownedChromaTextures;
     std::vector<QRhiTexture*> lumaTextures;
     std::vector<QRhiTexture*> chromaTextures;
-    std::vector<std::unique_ptr<gpucompositor::ImportedNv12Source>> importedSources;
     ownedLumaTextures.reserve(kMaxGridSources);
     ownedChromaTextures.reserve(kMaxGridSources);
     lumaTextures.reserve(kMaxGridSources);
@@ -327,12 +343,19 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
     };
 
     for (int i = 0; i < kMaxGridSources; ++i) {
-        const PreparedSource& source = sources.at(i);
-        if (source.present && source.surface) {
+        const RenderSource& source = sources.at(i);
+        if (source.present && source.nativeSlot != std::numeric_limits<size_t>::max()) {
             const int srcW = source.desc.width;
             const int srcH = source.desc.height;
             const int chromaW = (srcW + 1) / 2;
             const int chromaH = (srcH + 1) / 2;
+            const GpuScopedNativeSurface* nativeSource = nativeAt(source.nativeSlot);
+            auto imported =
+                nativeSource ? gpucompositor::importNv12Source(rhi, *nativeSource) : nullptr;
+            if (!imported) {
+                updates->release();
+                return {};
+            }
             std::unique_ptr<QRhiTexture> yTex(rhi->newTexture(QRhiTexture::R8, QSize(srcW, srcH)));
             std::unique_ptr<QRhiTexture> uvTex(
                 rhi->newTexture(QRhiTexture::RG8, QSize(chromaW, chromaH)));
@@ -340,8 +363,7 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
                 updates->release();
                 return {};
             }
-            auto imported = gpucompositor::importNv12Source(rhi, source.surface);
-            if (!imported || !yTex->createFrom(imported->lumaNativeTexture()) ||
+            if (!yTex->createFrom(imported->lumaNativeTexture()) ||
                 !uvTex->createFrom(imported->chromaNativeTexture())) {
                 updates->release();
                 return {};
@@ -435,7 +457,7 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
     cb->setShaderResources(srb.get());
     cb->draw(3);
     QRhiResourceUpdateBatch* afterPassUpdates = nullptr;
-    if (!outputSurface) {
+    if (!hasNativeOutput) {
         afterPassUpdates = rhi->nextResourceUpdateBatch();
         if (afterPassUpdates) {
             afterPassUpdates->readBackTexture(QRhiReadbackDescription(output.get()), &readback);
@@ -445,7 +467,7 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
 
     if (rhi->endOffscreenFrame() != QRhi::FrameOpSuccess) return result;
     result.rendered = true;
-    if (!outputSurface) {
+    if (!hasNativeOutput) {
         if (!afterPassUpdates || readback.format != QRhiTexture::RGBA8 ||
             readback.pixelSize != QSize(width, height)) {
             return {};
@@ -460,11 +482,13 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
 #ifndef __APPLE__
 namespace gpucompositor {
 
-std::shared_ptr<GpuSurface> makeInputNv12Surface(const FrameHandle&) {
+std::shared_ptr<GpuSurface> makeInputNv12Surface(const FrameHandle&,
+                                                 const std::shared_ptr<GpuRhiContext>&) {
     return nullptr;
 }
 
-std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int, int) {
+std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int, int,
+                                                   const std::shared_ptr<GpuRhiContext>&) {
     return nullptr;
 }
 
@@ -472,12 +496,12 @@ bool supportsNativeOutputSurfaces() {
     return false;
 }
 
-std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi*, const std::shared_ptr<GpuSurface>&) {
+std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi*, const GpuScopedNativeSurface&) {
     return nullptr;
 }
 
-std::unique_ptr<ImportedRgbaRenderTarget>
-importRgbaRenderTarget(QRhi*, const std::shared_ptr<GpuSurface>&) {
+std::unique_ptr<ImportedRgbaRenderTarget> importRgbaRenderTarget(QRhi*,
+                                                                 const GpuScopedNativeSurface&) {
     return nullptr;
 }
 
@@ -529,8 +553,9 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
     const QList<FrameHandle> filtered = dropStaleInputs(frames, generation);
     if (m_impl && m_impl->rhi && m_impl->rhi->isGpuBacked() &&
         gpucompositor::supportsNativeOutputSurfaces()) {
-        const QList<PreparedSource> sources = prepareSources(filtered);
-        std::shared_ptr<GpuSurface> surface = gpucompositor::makeOutputRgba8Surface(width, height);
+        const QList<PreparedSource> sources = prepareSources(filtered, m_impl->rhi);
+        std::shared_ptr<GpuSurface> surface =
+            gpucompositor::makeOutputRgba8Surface(width, height, m_impl->rhi);
         if (!surface || !surface->isValid()) return FrameHandle{};
         auto budgetCharge =
             GpuBudget::instance().tryCharge(gpuSurfaceBytes(*surface), GpuBudgetTag::OutputBus);
@@ -545,22 +570,28 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
         GpuOpScope operation(renderFence, registry);
         std::array<std::shared_ptr<GpuSurface>, kMaxGridSources + 1> retirementOwners;
         size_t retirementOwnerCount = 0;
-        auto appendUniqueOwner = [&](const std::shared_ptr<GpuSurface>& owner) {
-            if (!owner) return;
-            for (size_t i = 0; i < retirementOwnerCount; ++i) {
-                if (retirementOwners[i].get() == owner.get()) return;
-            }
-            retirementOwners[retirementOwnerCount++] = owner;
-        };
+        QList<RenderSource> renderSources;
+        renderSources.reserve(sources.size());
         for (const PreparedSource& source : sources) {
-            appendUniqueOwner(source.surface);
+            RenderSource render{source.nv12, source.desc, source.present, source.uploadFromCpu,
+                                source.unsupported};
+            if (source.surface) {
+                render.nativeSlot = retirementOwnerCount;
+                retirementOwners[retirementOwnerCount++] = source.surface;
+            }
+            renderSources.append(std::move(render));
         }
-        appendUniqueOwner(surface);
+        const size_t outputSlot = retirementOwnerCount;
+        retirementOwners[retirementOwnerCount++] = surface;
         RenderGridResult renderResult;
-        auto adapter = [&]() noexcept {
+        auto adapter = [&](const auto& nativeView) noexcept {
             const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
-                renderResult = renderGridWithRhi(rhi, sources, cappedFrameCount(filtered), width,
-                                                 height, color, quality, surface);
+                auto nativeAt = [&](size_t slot) -> const GpuScopedNativeSurface* {
+                    return slot < nativeView.size() ? &nativeView[slot] : nullptr;
+                };
+                renderResult =
+                    renderGridWithRhi(rhi, renderSources, cappedFrameCount(filtered), width, height,
+                                      color, quality, nativeAt, outputSlot);
             });
             if (!invoked || !renderResult.submissionAttempted)
                 return GpuSubmitOutcome::NotSubmitted;
@@ -627,17 +658,51 @@ CpuPlanes GpuCompositor::composeGridToCpuForGeneration(const QList<FrameHandle>&
 
     const QList<FrameHandle> filtered = dropStaleInputs(frames, generation);
     if (!m_impl->rhi->isNullBackend()) {
-        const QList<PreparedSource> sources = prepareSources(filtered);
-        CpuPlanes gpu;
-        const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
-            // LOCK RULE: all QRhi resources are created, used, and destroyed on the
-            // GpuRhiContext render thread. The cadence/output thread only observes
-            // the completed readback bytes returned from this synchronous test path.
-            gpu = renderGridWithRhi(rhi, sources, cappedFrameCount(filtered), width, height, color,
-                                    quality, nullptr)
-                      .readback;
-        });
-        return invoked ? gpu : CpuPlanes{};
+        const QList<PreparedSource> sources = prepareSources(filtered, m_impl->rhi);
+        std::array<std::shared_ptr<GpuSurface>, kMaxGridSources> owners;
+        size_t ownerCount = 0;
+        QList<RenderSource> renderSources;
+        renderSources.reserve(sources.size());
+        for (const PreparedSource& source : sources) {
+            RenderSource render{source.nv12, source.desc, source.present, source.uploadFromCpu,
+                                source.unsupported};
+            if (source.surface) {
+                render.nativeSlot = ownerCount;
+                owners[ownerCount++] = source.surface;
+            }
+            renderSources.append(std::move(render));
+        }
+        RenderGridResult renderResult;
+        if (ownerCount == 0) {
+            const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
+                auto noNativeSlot = [](size_t) -> const GpuScopedNativeSurface* { return nullptr; };
+                renderResult = renderGridWithRhi(rhi, renderSources, cappedFrameCount(filtered),
+                                                 width, height, color, quality, noNativeSlot,
+                                                 std::numeric_limits<size_t>::max());
+            });
+            return invoked ? renderResult.readback : CpuPlanes{};
+        }
+
+        const std::shared_ptr<GpuFence> renderFence = m_impl->rhi->createFence();
+        if (!renderFence) return {};
+        GpuRetireRegistry registry;
+        GpuOpScope operation(renderFence, registry);
+        auto adapter = [&](const auto& nativeView) noexcept {
+            const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
+                auto nativeAt = [&](size_t slot) -> const GpuScopedNativeSurface* {
+                    return slot < nativeView.size() ? &nativeView[slot] : nullptr;
+                };
+                renderResult =
+                    renderGridWithRhi(rhi, renderSources, cappedFrameCount(filtered), width, height,
+                                      color, quality, nativeAt, std::numeric_limits<size_t>::max());
+            });
+            if (!invoked || !renderResult.submissionAttempted)
+                return GpuSubmitOutcome::NotSubmitted;
+            return renderResult.rendered ? GpuSubmitOutcome::Submitted
+                                         : GpuSubmitOutcome::SubmittedWithError;
+        };
+        const auto submission = submitCompactedOwners<1>(operation, adapter, owners, ownerCount);
+        return submission.driverAccepted() ? renderResult.readback : CpuPlanes{};
     }
 
     if (quality != ScaleQuality::NearestCompat) return CpuPlanes{};

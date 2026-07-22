@@ -45,12 +45,12 @@ public:
 
 class FakeGpuSurface final : public GpuSurface {
 public:
+    FakeGpuSurface() { retainUntilFenceRetired(1); }
     GpuSurfaceDesc desc() const override {
         return {.format = FramePixelFormat::Nv12, .width = 64, .height = 48};
     }
     bool isValid() const override { return true; }
     void* nativeHandle() const override { return reinterpret_cast<void*>(quintptr(0x1)); }
-    uint64_t pendingFenceValue() const override { return 1; }
 };
 
 class ReadyFence final : public GpuFence {

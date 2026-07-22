@@ -10,18 +10,10 @@
 #include <memory>
 
 struct MetalSubmissionAdapter {
-    std::shared_ptr<GpuSurface> surface;
-
-    GpuSubmitOutcome operator()() noexcept {
-        GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
-        GpuSyncReadScope scope;
-        scope.withRead(surface, [&](const GpuReadLease& lease) noexcept {
-            IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-            outcome =
-                ioSurface && device ? GpuSubmitOutcome::Submitted : GpuSubmitOutcome::NotSubmitted;
-        });
-        return outcome;
+    GpuSubmitOutcome operator()(const GpuScopedNativeView<1>& view) noexcept {
+        IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(view[0].nativeHandle());
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        return ioSurface && device ? GpuSubmitOutcome::Submitted : GpuSubmitOutcome::NotSubmitted;
     }
 };
 
@@ -29,7 +21,7 @@ GpuSubmissionResult metalTypedSubmissionPass(std::shared_ptr<GpuFence> fence,
                                              std::shared_ptr<GpuSurface> surface) {
     GpuRetireRegistry registry;
     GpuOpScope operation(std::move(fence), registry);
-    MetalSubmissionAdapter adapter{surface};
+    MetalSubmissionAdapter adapter;
     return operation.submit(
         adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{std::move(surface)}));
 }

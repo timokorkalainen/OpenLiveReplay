@@ -9,6 +9,7 @@
 #include <memory>
 
 class GpuFence;
+class GpuOpScope;
 class GpuSurface;
 #ifdef OLR_UNIT_TEST
 struct GpuRetirementTicketTestAuthority;
@@ -61,9 +62,11 @@ public:
     explicit GpuSurfacePack(std::array<std::shared_ptr<GpuSurface>, N> surfaces) noexcept
         : m_surfaces(std::move(surfaces)) {}
 
+private:
+    friend class GpuOpScope;
+
     const std::array<std::shared_ptr<GpuSurface>, N>& owners() const noexcept { return m_surfaces; }
 
-private:
     std::array<std::shared_ptr<GpuSurface>, N> m_surfaces;
 };
 

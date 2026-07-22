@@ -6,6 +6,7 @@
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/gpu/gpusubmission.h"
 
 #include <array>
@@ -38,9 +39,28 @@ public:
 
     template <typename BackendAdapter, size_t N>
     GpuSubmissionResult submit(BackendAdapter& adapter, GpuSurfacePack<N> surfaces) noexcept {
-        static_assert(N <= 17, "A fused GPU submission supports at most 17 surface owners");
+        using ScopedView = GpuScopedNativeView<N>;
+        static_assert(
+            std::is_nothrow_invocable_r_v<GpuSubmitOutcome, BackendAdapter&, const ScopedView&>,
+            "GPU backend adapters must be noexcept and accept the exact GpuScopedNativeView");
+        return submitImpl<true>(adapter, std::move(surfaces));
+    }
+
+    // Capability-free submission path for operations that only need exact retained
+    // ownership. The callback receives no surface/view, so it cannot touch native data.
+    template <typename BackendAdapter, size_t N>
+    GpuSubmissionResult submitRetained(BackendAdapter& adapter,
+                                       GpuSurfacePack<N> surfaces) noexcept {
         static_assert(std::is_nothrow_invocable_r_v<GpuSubmitOutcome, BackendAdapter&>,
-                      "GPU backend adapters must be noexcept and return GpuSubmitOutcome");
+                      "retained-only GPU adapters must be noexcept and accept no arguments");
+        return submitImpl<false>(adapter, std::move(surfaces));
+    }
+
+private:
+    template <bool ExposeNative, typename BackendAdapter, size_t N>
+    GpuSubmissionResult submitImpl(BackendAdapter& adapter, GpuSurfacePack<N> surfaces) noexcept {
+        static_assert(N <= 17, "A fused GPU submission supports at most 17 surface owners");
+        using ScopedView = GpuScopedNativeView<N>;
 
         GpuSubmissionResult result;
         if (m_state != State::Ready || !m_fence || GpuDeviceLossMonitor::instance().isLost())
@@ -60,11 +80,11 @@ public:
         GpuSurfaceCompatibility firstCompatibility{};
         try {
             for (size_t i = 0; i < N; ++i) {
-                const auto& owner = surfaces.owners()[i];
+                const auto& owner = surfaces.m_surfaces[i];
                 if (!owner) return result;
                 bool duplicate = false;
                 for (size_t previous = 0; previous < uniqueCount; ++previous) {
-                    if (surfaces.owners()[uniqueIndices[previous]].get() == owner.get()) {
+                    if (surfaces.m_surfaces[uniqueIndices[previous]].get() == owner.get()) {
                         duplicate = true;
                         break;
                     }
@@ -83,11 +103,11 @@ public:
         } catch (...) {
             return result;
         }
-        const std::shared_ptr<GpuSurface>* retirementOwners = surfaces.owners().data();
+        const std::shared_ptr<GpuSurface>* retirementOwners = surfaces.m_surfaces.data();
         if (uniqueCount != N) {
             coalescedOwners.emplace();
             for (size_t i = 0; i < uniqueCount; ++i)
-                (*coalescedOwners)[i] = surfaces.owners()[uniqueIndices[i]];
+                (*coalescedOwners)[i] = surfaces.m_surfaces[uniqueIndices[i]];
             retirementOwners = coalescedOwners->data();
         }
         auto prepared =
@@ -96,39 +116,56 @@ public:
 
         GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
         try {
-            auto ticket = m_fence->submitExactForRetirement(
-                preparedFence, firstCompatibility, generation, [&]() noexcept {
-                    allocationPhase.enterCallback();
-                    outcome = std::invoke(adapter);
-                    if (outcome == GpuSubmitOutcome::NotSubmitted) return false;
-                    m_driverAccepted = true;
-                    prepared.markAccepted();
-                    allocationPhase.enterPostAccept();
-                    return true;
-                });
-            result.outcome = outcome;
-            if (!prepared.accepted()) return result;
+            auto submitScoped = [&](const ScopedView* view) {
+                auto ticket = m_fence->submitExactForRetirement(
+                    preparedFence, firstCompatibility, generation, [&]() noexcept {
+                        allocationPhase.enterCallback();
+                        if constexpr (ExposeNative)
+                            outcome = std::invoke(adapter, *view);
+                        else
+                            outcome = std::invoke(adapter);
+                        if (outcome == GpuSubmitOutcome::NotSubmitted) return false;
+                        m_driverAccepted = true;
+                        prepared.markAccepted();
+                        allocationPhase.enterPostAccept();
+                        return true;
+                    });
+                result.outcome = outcome;
+                if (!prepared.accepted()) return;
 
-            if (ticket) {
-                const uint64_t ticketValue = ticket->value();
-                bool exact = true;
-                for (size_t i = 0; i < uniqueCount; ++i) {
-                    if (!m_fence->validatesRetirement(*ticket, compatibilities[i])) {
-                        exact = false;
-                        break;
+                if (ticket) {
+                    const uint64_t ticketValue = ticket->value();
+                    bool exact = true;
+                    for (size_t i = 0; i < uniqueCount; ++i) {
+                        if (!m_fence->validatesRetirement(*ticket, compatibilities[i])) {
+                            exact = false;
+                            break;
+                        }
                     }
-                }
-                if (exact && m_registry.publishPrepared(prepared, std::move(*ticket))) {
-                    result.retirement = GpuRetirementDisposition::Published;
-                    result.producerFence = m_fence;
-                    result.fenceValue = m_fenceValue = ticketValue;
+                    if (exact && m_registry.publishPrepared(prepared, std::move(*ticket))) {
+                        for (size_t i = 0; i < uniqueCount; ++i) {
+                            retirementOwners[i]->retainUntilFenceRetired(ticketValue);
+#ifdef OLR_UNIT_TEST
+                            ++s_stampCountForTest;
+#endif
+                        }
+                        result.retirement = GpuRetirementDisposition::Published;
+                        result.producerFence = std::move(m_fence);
+                        result.fenceValue = m_fenceValue = ticketValue;
+                    } else {
+                        m_registry.quarantinePrepared(prepared);
+                        result.retirement = GpuRetirementDisposition::Quarantined;
+                    }
                 } else {
                     m_registry.quarantinePrepared(prepared);
                     result.retirement = GpuRetirementDisposition::Quarantined;
                 }
+            };
+            if constexpr (ExposeNative) {
+                auto invokeScoped = [&](const ScopedView& view) { submitScoped(&view); };
+                withScopedNativeView(surfaces, invokeScoped);
             } else {
-                m_registry.quarantinePrepared(prepared);
-                result.retirement = GpuRetirementDisposition::Quarantined;
+                submitScoped(nullptr);
             }
         } catch (...) {
             result.outcome = outcome;
@@ -155,7 +192,22 @@ public:
         return result;
     }
 
+#ifdef OLR_UNIT_TEST
+public:
+    static void resetStampCountForTest() noexcept { s_stampCountForTest = 0; }
+    static size_t stampCountForTest() noexcept { return s_stampCountForTest; }
+
 private:
+    inline static thread_local size_t s_stampCountForTest = 0;
+#endif
+    template <size_t N, typename Fn>
+    static void withScopedNativeView(GpuSurfacePack<N>& surfaces, Fn& fn) {
+        GpuSyncReadScope::withRetainedBatch([&](GpuSyncReadState& state) {
+            const GpuScopedNativeView<N> view(surfaces.m_surfaces, &state);
+            std::invoke(fn, view);
+        });
+    }
+
     enum class State : uint8_t { Ready, Cancelled, Consumed };
 
     std::shared_ptr<GpuFence> m_fence;

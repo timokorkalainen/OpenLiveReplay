@@ -313,10 +313,10 @@ void compareRgbaWithinOneLsb(const CpuPlanes& actual, const CpuPlanes& expected)
 #ifdef __APPLE__
 class PendingNv12Surface final : public GpuSurface {
 public:
+    PendingNv12Surface() { retainUntilFenceRetired(1); }
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 8}; }
     bool isValid() const override { return true; }
     void* nativeHandle() const override { return nullptr; }
-    uint64_t pendingFenceValue() const override { return 1; }
 };
 
 class NeverRetiredFence final : public GpuFence {

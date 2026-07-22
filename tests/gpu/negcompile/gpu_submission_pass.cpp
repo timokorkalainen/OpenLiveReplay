@@ -16,7 +16,10 @@ protected:
 };
 
 struct SubmissionPassAdapter {
-    GpuSubmitOutcome operator()() noexcept { return GpuSubmitOutcome::NotSubmitted; }
+    GpuSubmitOutcome operator()(const GpuScopedNativeView<1>& view) noexcept {
+        return view[0].nativeHandle() ? GpuSubmitOutcome::Submitted
+                                      : GpuSubmitOutcome::NotSubmitted;
+    }
 };
 
 GpuSubmissionResult allowedOwnedSubmission(std::shared_ptr<GpuFence> fence,

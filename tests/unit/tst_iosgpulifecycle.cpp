@@ -113,7 +113,7 @@ void TestIosGpuLifecycle::offscreenMetalRenderProducesPlanes() {
     auto ctx = GpuRhiContext::create();
     if (!ctx) QSKIP("no Metal device on this host; on-device render validation is manual");
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, ctx->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     const CpuPlanes planes = submitGpuReadback(ctx, surface, FramePixelFormat::Yuv420p).planes;
     QCOMPARE(planes.format, FramePixelFormat::Yuv420p);

@@ -33,6 +33,7 @@ private slots:
     void invalidReadbackBeforeSubmissionDoesNotRetireOrLatchLoss();
     void exceptionBeforeSubmissionDoesNotRetireOrLatchLoss();
     void exceptionAfterSubmissionRetainsAndLatchesFailure();
+    void readbackConsumesPackedSurfaceNotDecoy();
     void droppingGpuHandleCreditsBudget();
 #ifdef __APPLE__
     void gpuPresentabilityDoesNotReadBack();
@@ -78,22 +79,21 @@ private:
 
 class TestSurface final : public GpuSurface {
 public:
-    explicit TestSurface(GpuSurfaceCompatibility compatibility = {0xD3F3, 1})
-        : m_compatibility(compatibility) {}
+    explicit TestSurface(GpuSurfaceCompatibility compatibility = {0xD3F3, 1},
+                         void* nativeHandle = reinterpret_cast<void*>(0xD3F3),
+                         uint32_t subresource = 0)
+        : m_compatibility(compatibility), m_nativeHandle(nativeHandle), m_subresource(subresource) {
+    }
     GpuSurfaceDesc desc() const override { return GpuSurfaceDesc{FramePixelFormat::Nv12, 64, 48}; }
     bool isValid() const override { return true; }
     GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
-    void* nativeHandle() const override { return nullptr; }
-    void retainUntilFenceRetired(uint64_t fenceValue) override {
-        m_pending.store(fenceValue, std::memory_order_release);
-    }
-    uint64_t pendingFenceValue() const override {
-        return m_pending.load(std::memory_order_acquire);
-    }
+    void* nativeHandle() const override { return m_nativeHandle; }
+    uint32_t nativeSubresource() const override { return m_subresource; }
 
 private:
     GpuSurfaceCompatibility m_compatibility;
-    std::atomic<uint64_t> m_pending{0};
+    void* m_nativeHandle = nullptr;
+    uint32_t m_subresource = 0;
 };
 
 #ifdef __APPLE__
@@ -113,7 +113,7 @@ void TestGpuFrameData::gpuBackedReportsSurface() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
@@ -139,7 +139,9 @@ void TestGpuFrameData::completedReadbackRetainReleasesImmediately() {
 
     GpuRetireRegistry registry;
     GpuOpScope operation(fence, registry);
-    auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+    auto adapter = [](const GpuScopedNativeView<1>&) noexcept {
+        return GpuSubmitOutcome::Submitted;
+    };
     const auto result = operation.submit(
         adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
     QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
@@ -301,6 +303,32 @@ void TestGpuFrameData::exceptionAfterSubmissionRetainsAndLatchesFailure() {
     GpuGenerationCounter::instance().resetForTest();
 }
 
+void TestGpuFrameData::readbackConsumesPackedSurfaceNotDecoy() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    const GpuSurfaceCompatibility compatibility{0xD3F4, monitor.currentDeviceAuthorityForTest()};
+    auto fence =
+        std::make_shared<DeferredFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
+    auto packed =
+        std::make_shared<TestSurface>(compatibility, reinterpret_cast<void*>(0xA11CE), 11);
+    auto decoy = std::make_shared<TestSurface>(compatibility, reinterpret_cast<void*>(0xDEC0), 22);
+    auto rhi = GpuRhiContext::createReadbackForTest(
+        GpuReadbackTestBehavior::InvalidBeforeSubmission, fence);
+    QVERIFY(rhi != nullptr);
+
+    (void) decoy;
+    const GpuReadbackResult result = submitGpuReadback(rhi, packed, FramePixelFormat::Yuv420p);
+
+    QCOMPARE(result.outcome, GpuSubmitOutcome::NotSubmitted);
+    QVERIFY(GpuRhiContextTestAuthority::lastReadbackHadNativeHandleForTest(rhi));
+    QCOMPARE(GpuRhiContextTestAuthority::lastReadbackSubresourceForTest(rhi), uint32_t(11));
+    QVERIFY(GpuRhiContextTestAuthority::lastReadbackSubresourceForTest(rhi) != uint32_t(22));
+    QCOMPARE(fence->signalCalls.load(std::memory_order_acquire), 0);
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+}
+
 void TestGpuFrameData::droppingGpuHandleCreditsBudget() {
     auto fence = std::make_shared<DeferredFence>();
     auto surface = std::make_shared<TestSurface>();
@@ -324,7 +352,7 @@ void TestGpuFrameData::gpuPresentabilityDoesNotReadBack() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     FrameMetadata meta;
     meta.key.feedIndex = 0;
@@ -344,7 +372,7 @@ void TestGpuFrameData::outputCacheInsertionDoesNotReadBack() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     FrameMetadata meta;
     meta.key.feedIndex = 0;
@@ -372,7 +400,7 @@ void TestGpuFrameData::readToCpuDownloadsAndCounts() {
     GpuReadbackTelemetry::instance().reset();
     gpuResetFrameReadToCpuCount();
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
@@ -415,7 +443,7 @@ void TestGpuFrameData::cpuReadbackCacheChargesRepeatedReadsOnce() {
     auto& budget = GpuBudget::instance();
     budget.reset();
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
@@ -452,7 +480,7 @@ void TestGpuFrameData::cpuReadbackCacheCreditsWhenHandleIsDestroyed() {
 
     qint64 cachedBytes = 0;
     {
-        auto surface = makeAppleNv12Surface(64, 48);
+        auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
         QVERIFY(surface != nullptr);
         FrameMetadata meta;
         meta.key.format = FramePixelFormat::Nv12;
@@ -494,7 +522,7 @@ void TestGpuFrameData::readbackMatchesCpuWithinOneLsb() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
 
-    auto surface = makeAppleNv12Surface(16, 16);
+    auto surface = makeAppleNv12Surface(16, 16, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
@@ -516,7 +544,7 @@ void TestGpuFrameData::importVtBufferProducesGpuHandle() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
@@ -537,7 +565,7 @@ void TestGpuFrameData::readbackStampsSurfacePendingFence() {
     auto renderFence = rhi->createFence();
     QVERIFY(renderFence != nullptr);
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
@@ -551,15 +579,15 @@ void TestGpuFrameData::readbackStampsSurfacePendingFence() {
 }
 
 void TestGpuFrameData::readbackRetainsSurfaceWhenEvictionSawNoPendingFence() {
-    auto surface = makeAppleNv12Surface(64, 48);
-    QVERIFY(surface != nullptr);
-    const GpuSurfaceCompatibility compatibility = surface->compatibility();
-    auto producerFence =
-        std::make_shared<DeferredFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
-    auto contextFence =
-        std::make_shared<DeferredFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
+    const uint64_t authority = GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch();
+    auto contextFence = std::make_shared<DeferredFence>(uintptr_t(0xA11), authority);
     auto rhi = GpuRhiContext::createWithReadbackFenceForTest(contextFence);
     if (!rhi) QSKIP("no RHI backend");
+    const GpuSurfaceCompatibility compatibility = rhi->surfaceCompatibility();
+    auto surface = makeAppleNv12Surface(64, 48, compatibility);
+    QVERIFY(surface != nullptr);
+    auto producerFence =
+        std::make_shared<DeferredFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
     std::weak_ptr<GpuSurface> weakSurface = surface;
 
     FrameMetadata meta;

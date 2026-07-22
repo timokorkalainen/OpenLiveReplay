@@ -637,6 +637,18 @@ class DriverPolicyTests(unittest.TestCase):
         self.assertNotIn("-L smoke", macos_commands)
         self.assertIn("-L smoke", windows_commands)
         self.assertIn("-L smoke", linux_commands)
+        self.assertIn("-E '^gpu_capability_calibration_smoke$'", linux_commands)
+        self.assertIn("prepare-linux-cgroup", linux_commands)
+        self.assertIn("-R '^gpu_capability_calibration_smoke$'", linux_commands)
+        self.assertEqual(linux_commands.count("gpu_capability_calibration_smoke"), 2)
+        self.assertLess(
+            linux_commands.index("-E '^gpu_capability_calibration_smoke$'"),
+            linux_commands.index("prepare-linux-cgroup"),
+        )
+        self.assertLess(
+            linux_commands.index("prepare-linux-cgroup"),
+            linux_commands.index("-R '^gpu_capability_calibration_smoke$'"),
+        )
         expected = {
             "macos": (macos_commands, "build-scripts/build_macos_app.sh", "build/OpenLiveReplay.app"),
             "windows": (windows_commands, "build-scripts/build_windows_app.sh", "windows_build/dist/OpenLiveReplay"),

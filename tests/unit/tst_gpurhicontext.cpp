@@ -35,6 +35,7 @@ private slots:
     void readbackFenceCreationAllowsNestedRenderEntry();
     void failedEagerReadbackFenceCreationIsTerminal();
 #ifdef __APPLE__
+    void surfaceCompatibilityTracksBoundFenceAndFailsClosed();
     void importAndReadbackProducesPlanes();
     void importAndReadbackUsesRhiForRgbaSurface();
 #endif
@@ -306,7 +307,7 @@ void TestGpuRhiContext::readbackFenceCreationAllowsNestedRenderEntry() {
     auto ctx = testContext();
     if (!ctx) QSKIP("no RHI backend on this host");
 #ifdef __APPLE__
-    std::shared_ptr<GpuSurface> surface = makeAppleNv12Surface(4, 2);
+    std::shared_ptr<GpuSurface> surface = makeAppleNv12Surface(4, 2, ctx->surfaceCompatibility());
     QVERIFY(surface != nullptr);
 #else
     auto surface = std::make_shared<TestSurface>(nullptr);
@@ -339,11 +340,37 @@ void TestGpuRhiContext::failedEagerReadbackFenceCreationIsTerminal() {
 }
 
 #ifdef __APPLE__
+void TestGpuRhiContext::surfaceCompatibilityTracksBoundFenceAndFailsClosed() {
+    auto nullContext = GpuRhiContext::createNullForTest();
+    QVERIFY(nullContext != nullptr);
+    QVERIFY(nullContext->isValid());
+    QVERIFY(nullContext->isNullBackend());
+    QVERIFY(!nullContext->isGpuBacked());
+    const GpuSurfaceCompatibility nullCompatibility = nullContext->surfaceCompatibility();
+    QCOMPARE(nullCompatibility.deviceDomainId, uintptr_t(0));
+    QCOMPARE(nullCompatibility.authorityEpoch, uint64_t(0));
+
+    auto ctx = GpuRhiContext::create();
+    if (!ctx) QSKIP("no RHI backend on this host");
+    const auto fence = GpuRhiContextTestAuthority::readbackFenceForTest(ctx);
+    QVERIFY(fence != nullptr);
+    const GpuFenceIdentity identity = fence->identity();
+    const GpuSurfaceCompatibility compatibility = ctx->surfaceCompatibility();
+    QCOMPARE(compatibility.deviceDomainId, identity.deviceDomainId);
+    QCOMPARE(compatibility.authorityEpoch, identity.authorityEpoch);
+
+    auto missingFence = GpuRhiContext::createReadbackFenceFailureForTest();
+    QVERIFY(missingFence != nullptr);
+    const GpuSurfaceCompatibility missing = missingFence->surfaceCompatibility();
+    QCOMPARE(missing.deviceDomainId, uintptr_t(0));
+    QCOMPARE(missing.authorityEpoch, uint64_t(0));
+}
+
 void TestGpuRhiContext::importAndReadbackProducesPlanes() {
     auto ctx = GpuRhiContext::create();
     if (!ctx) QSKIP("no RHI backend on this host");
 
-    auto surface = makeAppleNv12Surface(4, 2);
+    auto surface = makeAppleNv12Surface(4, 2, ctx->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     QVERIFY(fillNv12Surface(surface));
     const int before = ctx->rhiReadbackCountForTest();
@@ -370,7 +397,7 @@ void TestGpuRhiContext::importAndReadbackUsesRhiForRgbaSurface() {
     auto ctx = GpuRhiContext::create();
     if (!ctx) QSKIP("no RHI backend on this host");
 
-    auto surface = makeAppleRgba8Surface(2, 1);
+    auto surface = makeAppleRgba8Surface(2, 1, ctx->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     QVERIFY(fillRgbaSurfaceBgra(surface));
 

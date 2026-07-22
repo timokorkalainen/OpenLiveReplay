@@ -150,6 +150,26 @@ static_assert(!std::is_move_constructible<GpuSyncReadScope>::value,
               "GpuSyncReadScope must not move while a lease is registered.");
 static_assert(!std::is_move_assignable<GpuSyncReadScope>::value,
               "GpuSyncReadScope registration storage must have a stable address.");
+static_assert(!std::is_default_constructible<GpuScopedNativeSurface>::value,
+              "Only GpuOpScope may construct a scoped native surface.");
+static_assert(!std::is_copy_constructible<GpuScopedNativeSurface>::value,
+              "Scoped native surfaces must not escape by copy.");
+static_assert(!std::is_move_constructible<GpuScopedNativeSurface>::value,
+              "Scoped native surfaces must not escape by move.");
+static_assert(!std::is_copy_assignable<GpuScopedNativeSurface>::value,
+              "Scoped native surfaces must not escape by copy assignment.");
+static_assert(!std::is_move_assignable<GpuScopedNativeSurface>::value,
+              "Scoped native surfaces must not escape by move assignment.");
+static_assert(!std::is_default_constructible<GpuScopedNativeView<1>>::value,
+              "Only GpuOpScope may construct a scoped native view.");
+static_assert(!std::is_copy_constructible<GpuScopedNativeView<1>>::value,
+              "Scoped native views must not escape by copy.");
+static_assert(!std::is_move_constructible<GpuScopedNativeView<1>>::value,
+              "Scoped native views must not escape by move.");
+static_assert(!std::is_copy_assignable<GpuScopedNativeView<1>>::value,
+              "Scoped native views must not escape by copy assignment.");
+static_assert(!std::is_move_assignable<GpuScopedNativeView<1>>::value,
+              "Scoped native views must not escape by move assignment.");
 static_assert(!std::is_copy_constructible<GpuOwnedNativeHandle>::value,
               "The raw-surface native owner must remain unique.");
 static_assert(std::is_nothrow_move_constructible<GpuOwnedNativeHandle>::value,
@@ -174,19 +194,34 @@ class FakeLeaseSurface : public GpuSurface {
 public:
     FakeLeaseSurface(void* handle, bool valid,
                      GpuSurfaceCompatibility compatibility =
-                         GpuSurfaceCompatibility{0xF0, currentDeviceAuthority()})
-        : m_handle(handle), m_valid(valid), m_compatibility(compatibility) {}
-    GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 16, 0}; }
+                         GpuSurfaceCompatibility{0xF0, currentDeviceAuthority()},
+                     GpuSurfaceDesc desc = {FramePixelFormat::Nv12, 16, 16, 0},
+                     uint32_t subresource = 0)
+        : m_handle(handle), m_valid(valid), m_compatibility(compatibility), m_desc(desc),
+          m_subresource(subresource) {}
+    GpuSurfaceDesc desc() const override { return m_desc; }
     bool isValid() const override { return m_valid; }
     GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
 
 protected:
     void* nativeHandle() const override { return m_valid ? m_handle : nullptr; }
+    uint32_t nativeSubresource() const override { return m_subresource; }
 
 private:
     void* m_handle = nullptr;
     bool m_valid = false;
     GpuSurfaceCompatibility m_compatibility;
+    GpuSurfaceDesc m_desc;
+    uint32_t m_subresource = 0;
+};
+
+class ThrowingNativeHandleSurface final : public FakeLeaseSurface {
+public:
+    ThrowingNativeHandleSurface(GpuSurfaceCompatibility compatibility)
+        : FakeLeaseSurface(reinterpret_cast<void*>(0xBAD), true, compatibility) {}
+
+protected:
+    void* nativeHandle() const override { throw std::runtime_error("native handle failure"); }
 };
 
 // Fence with a test-controllable completed watermark.
@@ -277,7 +312,8 @@ private:
 
 struct ConcurrentBackendAdapter {
     std::atomic<int>* calls = nullptr;
-    GpuSubmitOutcome operator()() noexcept {
+    template <size_t N>
+    GpuSubmitOutcome operator()(const GpuScopedNativeView<N>&) noexcept {
         calls->fetch_add(1, std::memory_order_relaxed);
         return GpuSubmitOutcome::Submitted;
     }
@@ -405,7 +441,8 @@ struct FakeBackendAdapter {
     bool injectNextPreparationFailure = false;
     GpuRetireAllocationSnapshot allocationSnapshotAtCallback;
 
-    GpuSubmitOutcome operator()() noexcept {
+    template <size_t N>
+    GpuSubmitOutcome operator()(const GpuScopedNativeView<N>&) noexcept {
         ++calls;
         allocationSnapshotAtCallback = GpuRetireRegistry::allocationSnapshotForTest();
         if (injectNextPreparationFailure) GpuRetireRegistry::failNextStorageAllocationForTest();
@@ -642,6 +679,9 @@ private slots:
     void fusedSubmissionCachesEvidenceBeforeCallback();
     void fusedSubmissionRejectsNullAtEveryPackPosition();
     void fusedSubmissionCoalescesDuplicateOwners();
+    void fusedSubmissionViewPreservesLogicalSlotsAndDuplicateIdentity();
+    void fusedSubmissionScopedAccessFailureIsContained();
+    void fusedSubmissionOutOfRangeSlotFailsClosed();
     void fusedSubmissionCancellationIsPreSubmitOnly();
     void fusedSubmissionOneToFourSurfacesDoNotAllocate();
     void fusedSubmissionFifthOwnerSpillsToFixedPoolWithoutHeap();
@@ -1293,6 +1333,7 @@ void TestGpuSurfaceLease::fusedSubmissionRejectsNullAtEveryPackPosition() {
 }
 
 void TestGpuSurfaceLease::fusedSubmissionCoalescesDuplicateOwners() {
+    GpuOpScope::resetStampCountForTest();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
@@ -1312,8 +1353,112 @@ void TestGpuSurfaceLease::fusedSubmissionCoalescesDuplicateOwners() {
     QCOMPARE(adapter.calls, 1);
     QCOMPARE(fence->signalCalls(), 1);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
+    QCOMPARE(first->pendingFenceValue(), result.fenceValue);
+    QCOMPARE(second->pendingFenceValue(), result.fenceValue);
+    QCOMPARE(GpuOpScope::stampCountForTest(), size_t(2));
     fence->setCompleted(result.fenceValue);
     registry.drainCompleted();
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::fusedSubmissionViewPreservesLogicalSlotsAndDuplicateIdentity() {
+    GpuGenerationCounter::instance().resetForTest();
+    GpuRetireRegistry registry;
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x5C2, authority);
+    const GpuSurfaceDesc firstDesc{FramePixelFormat::Nv12, 32, 18, 864};
+    const GpuSurfaceDesc secondDesc{FramePixelFormat::Rgba8, 24, 12, 1152};
+    auto first =
+        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5C20), true,
+                                           GpuSurfaceCompatibility{0x5C2, authority}, firstDesc, 3);
+    auto second = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5C21), true,
+                                                     GpuSurfaceCompatibility{0x5C2, authority},
+                                                     secondDesc, 7);
+
+    int calls = 0;
+    std::array<void*, 4> handles{};
+    std::array<GpuSurfaceDesc, 4> descs{};
+    std::array<uint32_t, 4> subresources{};
+    std::array<bool, 4> valid{};
+    auto adapter = [&](const GpuScopedNativeView<4>& view) noexcept {
+        ++calls;
+        for (size_t i = 0; i < view.size(); ++i) {
+            handles[i] = view[i].nativeHandle();
+            descs[i] = view[i].desc();
+            subresources[i] = view[i].nativeSubresource();
+            valid[i] = view[i].valid();
+        }
+        return GpuSubmitOutcome::Submitted;
+    };
+    GpuOpScope operation(fence, registry);
+    const auto result = operation.submit(
+        adapter,
+        GpuSurfacePack<4>(std::array<std::shared_ptr<GpuSurface>, 4>{first, first, second, first}));
+    QCOMPARE(calls, 1);
+    QCOMPARE(handles[0], reinterpret_cast<void*>(0x5C20));
+    QCOMPARE(handles[1], reinterpret_cast<void*>(0x5C20));
+    QCOMPARE(handles[2], reinterpret_cast<void*>(0x5C21));
+    QCOMPARE(handles[3], reinterpret_cast<void*>(0x5C20));
+    QCOMPARE(descs[0].width, firstDesc.width);
+    QCOMPARE(descs[2].format, secondDesc.format);
+    QCOMPARE(subresources[0], uint32_t(3));
+    QCOMPARE(subresources[2], uint32_t(7));
+    QVERIFY(valid[0]);
+    QVERIFY(valid[2]);
+    QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(2));
+    fence->setCompleted(result.fenceValue);
+    registry.drainCompleted();
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::fusedSubmissionScopedAccessFailureIsContained() {
+    GpuOpScope::resetStampCountForTest();
+    GpuGenerationCounter::instance().resetForTest();
+    GpuRetireRegistry registry;
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x5C3, authority);
+    auto surface =
+        std::make_shared<ThrowingNativeHandleSurface>(GpuSurfaceCompatibility{0x5C3, authority});
+    int calls = 0;
+    auto adapter = [&](const GpuScopedNativeView<1>& view) noexcept {
+        ++calls;
+        return view.get<0>().nativeHandle() ? GpuSubmitOutcome::Submitted
+                                            : GpuSubmitOutcome::NotSubmitted;
+    };
+    GpuOpScope operation(fence, registry);
+    const auto result = operation.submit(
+        adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+    QCOMPARE(calls, 1);
+    QCOMPARE(result.outcome, GpuSubmitOutcome::NotSubmitted);
+    QCOMPARE(fence->signalCalls(), 0);
+    QCOMPARE(GpuOpScope::stampCountForTest(), size_t(0));
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::fusedSubmissionOutOfRangeSlotFailsClosed() {
+    GpuOpScope::resetStampCountForTest();
+    GpuGenerationCounter::instance().resetForTest();
+    GpuRetireRegistry registry;
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x5C4, authority);
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5C40), true,
+                                                      GpuSurfaceCompatibility{0x5C4, authority});
+    int calls = 0;
+    auto adapter = [&](const GpuScopedNativeView<1>& view) noexcept {
+        ++calls;
+        return view[1].nativeHandle() ? GpuSubmitOutcome::Submitted
+                                      : GpuSubmitOutcome::NotSubmitted;
+    };
+    GpuOpScope operation(fence, registry);
+    const auto result = operation.submit(
+        adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+    QCOMPARE(calls, 1);
+    QCOMPARE(result.outcome, GpuSubmitOutcome::NotSubmitted);
+    QCOMPARE(fence->signalCalls(), 0);
+    QCOMPARE(GpuOpScope::stampCountForTest(), size_t(0));
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
     GpuGenerationCounter::instance().resetForTest();
 }
 

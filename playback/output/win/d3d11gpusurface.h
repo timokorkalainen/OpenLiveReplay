@@ -31,11 +31,6 @@ public:
         return {reinterpret_cast<uintptr_t>(m_deviceIdentity.Get()), m_authorityEpoch};
     }
 
-    void retainUntilFenceRetired(uint64_t fenceValue) override;
-    uint64_t pendingFenceValue() const override {
-        return m_pendingFence.load(std::memory_order_acquire);
-    }
-
     static void setForceAllocFailureForTest(bool force);
 #ifdef OLR_UNIT_TEST
     bool aliasesTextureForTest(ID3D11Texture2D* texture) const {
@@ -66,7 +61,6 @@ private:
     UINT m_subresource = 0;
     int m_width = 0;
     int m_height = 0;
-    std::atomic<uint64_t> m_pendingFence{0};
 };
 
 #endif // _WIN32

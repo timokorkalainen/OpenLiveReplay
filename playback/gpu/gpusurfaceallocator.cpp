@@ -103,7 +103,7 @@ GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface,
                 GpuRetireRegistry registry;
                 GpuOpScope operation(renderFence, registry);
                 auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
-                const auto result = operation.submit(
+                const auto result = operation.submitRetained(
                     adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{s}));
                 if (!result.succeeded()) return FrameHandle{};
                 return makeGpuFrameHandle(std::move(s), std::move(rhi), m,

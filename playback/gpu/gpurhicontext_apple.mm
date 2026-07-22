@@ -514,6 +514,7 @@ public:
     QRhi::Implementation backend = QRhi::Null;
     bool valid = false;
     uint64_t deviceAuthorityEpoch = 0;
+    std::atomic<bool> metalCommandQueueBound{false};
     std::atomic<bool> deviceLost{false};
 #ifdef OLR_UNIT_TEST
     std::atomic<int> rhiReadbacks{0};
@@ -609,6 +610,14 @@ bool GpuRhiContext::isNullBackend() const {
     return m_impl && m_impl->backend == QRhi::Null;
 }
 
+GpuSurfaceCompatibility GpuRhiContext::surfaceCompatibility() const noexcept {
+    if (!isGpuBacked() || !m_impl || m_impl->backend != QRhi::Metal ||
+        !m_impl->metalCommandQueueBound || !m_readbackFence)
+        return {};
+    const GpuFenceIdentity identity = m_readbackFence->identity();
+    return {identity.deviceDomainId, identity.authorityEpoch};
+}
+
 bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) const {
     const auto keepAlive = weak_from_this().lock();
     if (!keepAlive || !m_impl || !m_impl->valid || !job) return false;
@@ -654,11 +663,16 @@ void GpuRhiContext::injectDeviceLostForTest() {
     if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
 }
 
-GpuReadbackResult GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& surface,
+GpuReadbackResult GpuRhiContext::importAndReadback(const GpuScopedNativeSurface& surface,
                                                    FramePixelFormat target) noexcept {
 #ifdef OLR_UNIT_TEST
+    void* testHandle = surface.nativeHandle();
+    m_lastReadbackHadNativeHandleForTest.store(testHandle != nullptr, std::memory_order_release);
+    m_lastReadbackSubresourceForTest.store(surface.nativeSubresource(), std::memory_order_release);
     if (const auto injected = injectedReadbackForTest()) return *injected;
 #endif
+    void* handle = surface.nativeHandle();
+    if (!surface.valid() || !handle) return {};
     GpuReadbackResult result;
     try {
         if (!m_impl || !m_impl->valid) return result;
@@ -666,8 +680,8 @@ GpuReadbackResult GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurf
             GpuDeviceLossMonitor::instance().recordLoss();
             return result;
         }
-        if (!surface || !surface->isValid()) return result;
-        const GpuSurfaceDesc desc = surface->desc();
+        if (!surface.valid()) return result;
+        const GpuSurfaceDesc desc = surface.desc();
 
         CVPixelBufferRef pb = retainApplePixelBufferWrapper(surface);
         if (!pb) return result;
@@ -740,9 +754,9 @@ std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
         if (!rhi) return;
         const auto* nativeHandles =
             static_cast<const QRhiMetalNativeHandles*>(rhi->nativeHandles());
-        fence = nativeHandles
-                    ? makeMetalGpuFence(nativeHandles->cmdQueue, m_impl->deviceAuthorityEpoch)
-                    : nullptr;
+        if (!nativeHandles || !nativeHandles->cmdQueue) return;
+        fence = makeMetalGpuFence(nativeHandles->cmdQueue, m_impl->deviceAuthorityEpoch);
+        if (fence) m_impl->metalCommandQueueBound = true;
     });
     return invoked ? fence : nullptr;
 }

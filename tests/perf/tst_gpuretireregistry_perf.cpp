@@ -82,15 +82,15 @@ GpuSubmissionResult submitOne(GpuRetireRegistry& registry, const std::shared_ptr
                               const std::shared_ptr<GpuSurface>& surface) {
     PerfAdapter adapter;
     GpuOpScope operation(fence, registry);
-    return operation.submit(adapter,
-                            GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+    return operation.submitRetained(
+        adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
 }
 
 GpuSubmissionResult submitFour(GpuRetireRegistry& registry, const std::shared_ptr<PerfFence>& fence,
                                const std::array<std::shared_ptr<GpuSurface>, 4>& surfaces) {
     PerfAdapter adapter;
     GpuOpScope operation(fence, registry);
-    return operation.submit(adapter, GpuSurfacePack<4>(surfaces));
+    return operation.submitRetained(adapter, GpuSurfacePack<4>(surfaces));
 }
 
 GpuSubmissionResult submitSeventeen(GpuRetireRegistry& registry,
@@ -98,7 +98,7 @@ GpuSubmissionResult submitSeventeen(GpuRetireRegistry& registry,
                                     const std::array<std::shared_ptr<GpuSurface>, 17>& surfaces) {
     PerfAdapter adapter;
     GpuOpScope operation(fence, registry);
-    return operation.submit(adapter, GpuSurfacePack<17>(surfaces));
+    return operation.submitRetained(adapter, GpuSurfacePack<17>(surfaces));
 }
 
 // Faithful saved model of the production GpuOpScope/prepared-slot path at
@@ -671,7 +671,7 @@ void TestGpuRetireRegistryPerf::implementationHasIndexedDrainAndCoherentDiagnost
     QVERIFY2(registryHeader.contains("friend class GpuOpScope") && registryPrivate >= 0 &&
                  registryPrepare > registryPrivate,
              "only private GpuOpScope authority may prepare or publish retirement batches");
-    QVERIFY2(savedRegistryHeader.contains("912663be1458a0bdba36fca10c0421ab79d5cbd4") &&
+    QVERIFY2(savedRegistryHeader.contains("912663bed2eaf4016e0dc29ab44253c030d8eab3") &&
                  savedRegistry.contains("constexpr size_t kPreparedSlotCount = 256") &&
                  savedRegistry.contains("std::array<PreparedSlot, kPreparedSlotCount>") &&
                  savedRegistry.contains("slot.ticket.emplace(std::move(ticket))") &&

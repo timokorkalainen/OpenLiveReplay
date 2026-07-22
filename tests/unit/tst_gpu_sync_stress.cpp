@@ -32,15 +32,11 @@ namespace {
 
 class StressGpuSurface final : public GpuSurface {
 public:
-    explicit StressGpuSurface(uint64_t pendingFence) : m_pendingFence(pendingFence) {}
+    explicit StressGpuSurface(uint64_t pendingFence) { retainUntilFenceRetired(pendingFence); }
 
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 4, 4}; }
     bool isValid() const override { return true; }
     void* nativeHandle() const override { return nullptr; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
-
-private:
-    uint64_t m_pendingFence = 0;
 };
 
 class StressGpuFrameData final : public IFrameData {
@@ -110,7 +106,7 @@ void TestGpuSyncStress::concurrentEvictWhileRenderNeverFreesInUse() {
     for (int feed = 0; feed < kFeeds; ++feed) {
         producers.emplace_back([&, feed] {
             for (int i = 0; i < kIters; ++i) {
-                auto surface = makeAppleNv12Surface(64, 48);
+                auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
                 if (!surface) continue;
                 FrameMetadata meta;
                 meta.key.feedIndex = feed;

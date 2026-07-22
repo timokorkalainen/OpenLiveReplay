@@ -555,6 +555,13 @@ jobs:
             -DOLR_SRT_ROOT="$SRT_ROOT"
           cmake --build build-tests --target OpenLiveReplay qt_core_media_smoke tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge tst_gpusurfaceallocator tst_streamworker_gpuencode tst_gpurhicontext tst_gpuretireregistry_perf tst_gpuretireregistry_production_perf rhi_d3d_probe
 
+      - name: Run real GPU capability source audit
+        shell: bash
+        run: |
+          test -s build-tests/compile_commands.json
+          ctest --test-dir build-tests --output-on-failure --no-tests=error \
+            -R '^gpu_capability_source_audit$'
+
       - name: Run Windows GPU import probe (diagnostic)
         shell: bash
         continue-on-error: true
@@ -742,6 +749,12 @@ jobs:
       - name: Build (app + tests)
         run: cmake --build build -- -k 0
 
+      - name: Run real GPU capability source audit
+        run: |
+          test -s build/compile_commands.json
+          ctest --test-dir build --output-on-failure --no-tests=error \
+            -R '^gpu_capability_source_audit$'
+
       - name: Shader toolchain compile (qsb / qsb bake)
         run: |
           set -euo pipefail
@@ -784,7 +797,12 @@ jobs:
 
       - name: Run static media/package smoke tests
         working-directory: build
-        run: ctest --output-on-failure --no-tests=error -L smoke
+        # CTest label matching is regex-based, so `-L smoke` also selects the
+        # delegated-cgroup `gpu-capability-smoke` test.  That test has its own
+        # supervised systemd-run gate below and must never run unsupervised.
+        run: >
+          ctest --output-on-failure --no-tests=error -L smoke
+          -E '^gpu_capability_calibration_smoke$'
 
       - name: Run delegated-cgroup GPU calibration smoke
         run: |

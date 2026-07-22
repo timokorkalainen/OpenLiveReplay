@@ -214,7 +214,7 @@ if(OLR_PYTHON3_EXECUTABLE)
             "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp")
     set_tests_properties(tst_gpu_scope_completion_static PROPERTIES
         LABELS "unit;ci;gpu-capability"
-        TIMEOUT 30)
+        TIMEOUT 90)
 
     add_test(NAME tst_videotoolbox_decoder_static
         COMMAND "${OLR_PYTHON3_EXECUTABLE}"

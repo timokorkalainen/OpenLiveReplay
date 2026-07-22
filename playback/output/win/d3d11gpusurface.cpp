@@ -46,13 +46,6 @@ D3D11GpuSurface::createKept(Microsoft::WRL::ComPtr<ID3D11Device> device,
     return surface;
 }
 
-void D3D11GpuSurface::retainUntilFenceRetired(uint64_t fenceValue) {
-    uint64_t prev = m_pendingFence.load(std::memory_order_acquire);
-    while (fenceValue > prev &&
-           !m_pendingFence.compare_exchange_weak(prev, fenceValue, std::memory_order_acq_rel)) {
-    }
-}
-
 void D3D11GpuSurface::setForceAllocFailureForTest(bool force) {
     g_forceAllocFailure.store(force, std::memory_order_release);
 }

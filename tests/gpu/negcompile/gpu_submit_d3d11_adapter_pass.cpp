@@ -8,16 +8,9 @@
 #include <memory>
 
 struct D3D11SubmissionAdapter {
-    std::shared_ptr<D3D11GpuSurface> surface;
-
-    GpuSubmitOutcome operator()() noexcept {
-        GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
-        GpuSyncReadScope scope;
-        scope.withRead(surface, [&](const GpuReadLease& lease) noexcept {
-            auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
-            outcome = texture ? GpuSubmitOutcome::Submitted : GpuSubmitOutcome::NotSubmitted;
-        });
-        return outcome;
+    GpuSubmitOutcome operator()(const GpuScopedNativeView<1>& view) noexcept {
+        auto* texture = static_cast<ID3D11Texture2D*>(view[0].nativeHandle());
+        return texture ? GpuSubmitOutcome::Submitted : GpuSubmitOutcome::NotSubmitted;
     }
 };
 
@@ -25,7 +18,7 @@ GpuSubmissionResult d3d11TypedSubmissionPass(std::shared_ptr<GpuFence> fence,
                                              std::shared_ptr<D3D11GpuSurface> surface) {
     GpuRetireRegistry registry;
     GpuOpScope operation(std::move(fence), registry);
-    D3D11SubmissionAdapter adapter{surface};
+    D3D11SubmissionAdapter adapter;
     return operation.submit(
         adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{std::move(surface)}));
 }

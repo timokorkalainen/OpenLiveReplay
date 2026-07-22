@@ -37,8 +37,8 @@ GpuReadbackResult submitGpuReadback(const std::shared_ptr<GpuRhiContext>& rhi,
 
     GpuRetireRegistry registry;
     GpuOpScope operation(readbackFence, registry);
-    auto adapter = [&]() noexcept {
-        readback = rhi->importAndReadback(surface, target);
+    auto adapter = [&](const GpuScopedNativeView<1>& view) noexcept {
+        readback = rhi->importAndReadback(view.get<0>(), target);
         return readback.outcome;
     };
     (void) operation.submit(adapter,

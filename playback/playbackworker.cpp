@@ -2852,7 +2852,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         meta.color = colorMetadataForNativeTrack(track);
                         meta.gpuGeneration = GpuGenerationCounter::instance().current();
 
-                        auto surface = wrapAppleImageBuffer(imageBuffer);
+                        auto surface =
+                            wrapAppleImageBuffer(imageBuffer, gpuRhi->surfaceCompatibility());
                         auto cpuFallback = [surface, gpuRhi]() -> CpuPlanes {
                             return submitGpuReadback(gpuRhi, surface, FramePixelFormat::Yuv420p)
                                 .planes;

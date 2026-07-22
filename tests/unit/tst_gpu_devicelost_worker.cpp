@@ -23,6 +23,7 @@
 #include <utility>
 
 #include <QElapsedTimer>
+#include <QProcess>
 #include <QSemaphore>
 #include <QThread>
 
@@ -60,6 +61,7 @@ private slots:
     void backgroundSuspendDefersGpuRebuildUntilForeground();
     void repeatedBackgroundSuspendResumeDoesNotConsumeDeviceLossBudget();
     void lossSanitizesDecoderTrackBuffers();
+    void deferredReleasesSurviveGpuWorkerThreadChurn();
     void boundedLossWaitDoesNotHoldRecoveryEpochLock();
     void lateDeadDomainProofReleasesQuarantineAutomatically();
     void tokenlessUpgradeDuringRecoveryReleasesQuarantineAutomatically();
@@ -75,11 +77,15 @@ namespace {
 
 class TestGpuSurface final : public GpuSurface {
 public:
+    explicit TestGpuSurface(GpuSurfaceCompatibility compatibility = {})
+        : m_compatibility(compatibility) {}
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 64, 48}; }
     bool isValid() const override { return true; }
-    void* nativeHandle() const override { return nullptr; }
-    void retainUntilFenceRetired(uint64_t) override {}
-    uint64_t pendingFenceValue() const override { return 0; }
+    GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
+    void* nativeHandle() const override { return reinterpret_cast<void*>(quintptr(0x1)); }
+
+private:
+    GpuSurfaceCompatibility m_compatibility;
 };
 
 class BlockingLossFence final : public GpuFence {
@@ -268,9 +274,16 @@ void TestGpuDeviceLostWorker::readbackObservedLossRecordsProcessLatch() {
 
     rhi->injectDeviceLostForTest();
     const uint64_t gen0 = GpuGenerationCounter::instance().current();
-    const CpuPlanes planes = GpuRhiContextTestAuthority::importAndReadback(
-                                 rhi, std::make_shared<TestGpuSurface>(), FramePixelFormat::Yuv420p)
-                                 .planes;
+    const auto readbackFence = GpuRhiContextTestAuthority::readbackFenceForTest(rhi);
+    QVERIFY(readbackFence);
+    const GpuFenceIdentity readbackIdentity = readbackFence->identity();
+    const CpuPlanes planes =
+        GpuRhiContextTestAuthority::importAndReadback(
+            rhi,
+            std::make_shared<TestGpuSurface>(GpuSurfaceCompatibility{
+                readbackIdentity.deviceDomainId, readbackIdentity.authorityEpoch}),
+            FramePixelFormat::Yuv420p)
+            .planes;
 
     QVERIFY(!planes.isValid());
     QVERIFY(GpuDeviceLossMonitor::instance().isLost());
@@ -519,6 +532,18 @@ void TestGpuDeviceLostWorker::repeatedBackgroundSuspendResumeDoesNotConsumeDevic
     }
 }
 
+void TestGpuDeviceLostWorker::deferredReleasesSurviveGpuWorkerThreadChurn() {
+    QProcess child;
+    child.start(QCoreApplication::applicationFilePath(),
+                {QStringLiteral("repeatedBackgroundSuspendResumeDoesNotConsumeDeviceLossBudget"),
+                 QStringLiteral("boundedLossWaitDoesNotHoldRecoveryEpochLock"),
+                 QStringLiteral("-silent")});
+    QVERIFY2(child.waitForStarted(5000), qPrintable(child.errorString()));
+    QVERIFY2(child.waitForFinished(30000), qPrintable(child.errorString()));
+    QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+    QCOMPARE(child.exitCode(), 0);
+}
+
 void TestGpuDeviceLostWorker::boundedLossWaitDoesNotHoldRecoveryEpochLock() {
     qunsetenv("OLR_GPU_PIPELINE");
     auto& monitor = GpuDeviceLossMonitor::instance();
@@ -532,11 +557,11 @@ void TestGpuDeviceLostWorker::boundedLossWaitDoesNotHoldRecoveryEpochLock() {
     auto surface = std::make_shared<CompatibleLossSurface>(deviceDomain, authority);
     SubmittedAdapter adapter;
     GpuOpScope operation(fence, registry);
-    QCOMPARE(
-        operation
-            .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
-            .retirement,
-        GpuRetirementDisposition::Published);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
 
     FrameProvider feedProvider;
     PlaybackTransport transport;
@@ -591,15 +616,17 @@ void TestGpuDeviceLostWorker::lateDeadDomainProofReleasesQuarantineAutomatically
     GpuOpScope firstOperation(firstFence, registry);
     GpuOpScope lateOperation(lateFence, registry);
     QCOMPARE(firstOperation
-                 .submit(adapter, GpuSurfacePack<1>(
-                                      std::array<std::shared_ptr<GpuSurface>, 1>{firstSurface}))
+                 .submitRetained(
+                     adapter,
+                     GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{firstSurface}))
                  .retirement,
              GpuRetirementDisposition::Published);
-    QCOMPARE(lateOperation
-                 .submit(adapter,
-                         GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{lateSurface}))
-                 .retirement,
-             GpuRetirementDisposition::Published);
+    QCOMPARE(
+        lateOperation
+            .submitRetained(
+                adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{lateSurface}))
+            .retirement,
+        GpuRetirementDisposition::Published);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
 
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, firstDomain) != 0);
@@ -644,21 +671,24 @@ void TestGpuDeviceLostWorker::tokenlessUpgradeDuringRecoveryReleasesQuarantineAu
     GpuOpScope deadOperation(deadFence, registry);
     GpuOpScope completingLiveOperation(completingLiveFence, registry);
     GpuOpScope persistentLiveOperation(persistentLiveFence, registry);
-    QCOMPARE(deadOperation
-                 .submit(adapter,
-                         GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{deadSurface}))
-                 .retirement,
-             GpuRetirementDisposition::Published);
-    QCOMPARE(completingLiveOperation
-                 .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{
-                                      completingLiveSurface}))
-                 .retirement,
-             GpuRetirementDisposition::Published);
-    QCOMPARE(persistentLiveOperation
-                 .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{
-                                      persistentLiveSurface}))
-                 .retirement,
-             GpuRetirementDisposition::Published);
+    QCOMPARE(
+        deadOperation
+            .submitRetained(
+                adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{deadSurface}))
+            .retirement,
+        GpuRetirementDisposition::Published);
+    QCOMPARE(
+        completingLiveOperation
+            .submitRetained(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{
+                                         completingLiveSurface}))
+            .retirement,
+        GpuRetirementDisposition::Published);
+    QCOMPARE(
+        persistentLiveOperation
+            .submitRetained(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{
+                                         persistentLiveSurface}))
+            .retirement,
+        GpuRetirementDisposition::Published);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 3);
 
     FrameProvider feedProvider;
@@ -720,11 +750,11 @@ void TestGpuDeviceLostWorker::acceptedProofDeliveryCompletesBeforeRebuildCanClea
     auto surface = std::make_shared<CompatibleLossSurface>(lateDomain, authority);
     SubmittedAdapter adapter;
     GpuOpScope operation(fence, registry);
-    QCOMPARE(
-        operation
-            .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
-            .retirement,
-        GpuRetirementDisposition::Published);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
 
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, firstDomain) != 0);
@@ -787,11 +817,11 @@ void TestGpuDeviceLostWorker::lateProofPublisherAndWorkerShareExactRecovery() {
     auto surface = std::make_shared<CompatibleLossSurface>(lateDomain, authority);
     SubmittedAdapter adapter;
     GpuOpScope operation(fence, registry);
-    QCOMPARE(
-        operation
-            .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
-            .retirement,
-        GpuRetirementDisposition::Published);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
 
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, firstDomain) != 0);

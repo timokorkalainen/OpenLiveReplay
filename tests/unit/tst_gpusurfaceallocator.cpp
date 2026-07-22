@@ -44,12 +44,9 @@ public:
     bool isValid() const override { return true; }
     GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
     void* nativeHandle() const override { return nullptr; }
-    void retainUntilFenceRetired(uint64_t fenceValue) override { m_pendingFence = fenceValue; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
 
 private:
     GpuSurfaceCompatibility m_compatibility;
-    uint64_t m_pendingFence = 0;
 };
 
 class TestFence final : public GpuFence {

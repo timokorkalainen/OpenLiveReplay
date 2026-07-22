@@ -48,19 +48,19 @@ public:
     explicit FakeGpuSurface(bool valid = true,
                             void* handle = reinterpret_cast<void*>(quintptr(0x1)),
                             uint64_t pendingFence = 0)
-        : m_valid(valid), m_handle(handle), m_pendingFence(pendingFence) {}
+        : m_valid(valid), m_handle(handle) {
+        retainUntilFenceRetired(pendingFence);
+    }
 
     GpuSurfaceDesc desc() const override {
         return {.format = FramePixelFormat::Nv12, .width = 64, .height = 48};
     }
     bool isValid() const override { return m_valid; }
     void* nativeHandle() const override { return m_handle; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
 
 private:
     bool m_valid = true;
     void* m_handle = nullptr;
-    uint64_t m_pendingFence = 0;
 };
 
 class ManualFence final : public GpuFence {

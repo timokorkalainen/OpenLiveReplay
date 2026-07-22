@@ -167,15 +167,11 @@ OutputBusFrame cpuFrame(qint64 index, uint64_t gpuGeneration = 0) {
 
 class CountingSurface final : public GpuSurface {
 public:
-    explicit CountingSurface(uint64_t pendingFence = 0) : m_pendingFence(pendingFence) {}
+    explicit CountingSurface(uint64_t pendingFence = 0) { retainUntilFenceRetired(pendingFence); }
 
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Yuv420p, 16, 16}; }
     bool isValid() const override { return true; }
     void* nativeHandle() const override { return nullptr; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
-
-private:
-    uint64_t m_pendingFence = 0;
 };
 
 class ReadyFence final : public GpuFence {

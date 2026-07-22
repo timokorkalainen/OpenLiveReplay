@@ -49,12 +49,9 @@ public:
     GpuSurfaceDesc desc() const override { return m_desc; }
     bool isValid() const override { return m_desc.width > 0 && m_desc.height > 0; }
     void* nativeHandle() const override { return const_cast<MarkerGpuSurface*>(this); }
-    void retainUntilFenceRetired(uint64_t fenceValue) override { m_pendingFence = fenceValue; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
 
 private:
     GpuSurfaceDesc m_desc;
-    uint64_t m_pendingFence = 0;
 };
 
 class ReadyFence final : public GpuFence {

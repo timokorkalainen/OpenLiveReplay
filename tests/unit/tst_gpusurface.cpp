@@ -11,6 +11,7 @@
 #include "playback/output/framepixelformat.h"
 #ifdef __APPLE__
 #include "playback/gpu/appleiosurface.h"
+#include "playback/gpu/gpurhicontext.h"
 #endif
 
 namespace {
@@ -121,14 +122,16 @@ void TestGpuSurface::appleSurfaceSeparatesFrameGenerationFromDeviceAuthority() {
         monitor.reset();
         GpuGenerationCounter::instance().resetForTest();
     });
-    auto oldSurface = makeAppleNv12Surface(64, 48);
-    auto oldFence = GpuFence::create();
-    if (!oldSurface || !oldFence) QSKIP("no default Metal device/fence on this host");
+    auto oldRhi = GpuRhiContext::create();
+    if (!oldRhi) QSKIP("no Metal RHI context on this host");
+    auto oldSurface = makeAppleNv12Surface(64, 48, oldRhi->surfaceCompatibility());
+    auto oldFence = oldRhi->createFence();
+    if (!oldSurface || !oldFence) QSKIP("no Metal device/fence on this host");
     QVERIFY(oldFence->sharesDeviceAuthorityWith(oldSurface));
 
     GpuGenerationCounter::instance().bump();
-    auto postSeekFence = GpuFence::create();
-    auto postSeekSurface = makeAppleNv12Surface(64, 48);
+    auto postSeekFence = oldRhi->createFence();
+    auto postSeekSurface = makeAppleNv12Surface(64, 48, oldRhi->surfaceCompatibility());
     QVERIFY(postSeekFence != nullptr);
     QVERIFY(postSeekSurface != nullptr);
     QCOMPARE(postSeekFence->identity().deviceDomainId, oldFence->identity().deviceDomainId);
@@ -137,8 +140,10 @@ void TestGpuSurface::appleSurfaceSeparatesFrameGenerationFromDeviceAuthority() {
     QVERIFY(postSeekFence->sharesDeviceAuthorityWith(postSeekSurface));
 
     monitor.beginRebuild();
-    auto rebuiltFence = GpuFence::create();
-    auto rebuiltSurface = makeAppleNv12Surface(64, 48);
+    auto rebuiltRhi = GpuRhiContext::create();
+    QVERIFY(rebuiltRhi != nullptr);
+    auto rebuiltFence = rebuiltRhi->createFence();
+    auto rebuiltSurface = makeAppleNv12Surface(64, 48, rebuiltRhi->surfaceCompatibility());
     QVERIFY(rebuiltFence != nullptr);
     QVERIFY(rebuiltSurface != nullptr);
     QCOMPARE(rebuiltFence->identity().deviceDomainId, oldFence->identity().deviceDomainId);

@@ -2,6 +2,7 @@
 #define OLR_GPURHICONTEXT_H
 
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/gpu/gpusubmission.h"
 #include "playback/output/framehandle.h"
 
@@ -102,6 +103,12 @@ public:
     bool isValid() const;
     bool isNullBackend() const;
     bool isGpuBacked() const { return isValid() && !isNullBackend(); }
+#ifdef __APPLE__
+    // Immutable compatibility of the fence minted from this context's actual
+    // QRhi Metal command queue. Empty for Null/invalid contexts or when native
+    // queue/fence initialization failed.
+    GpuSurfaceCompatibility surfaceCompatibility() const noexcept;
+#endif
 
     bool invokeOnRenderThread(const std::function<void(QRhi*)>& job) const;
     // Run a UIKit/CAMetalLayer-touching present block on the platform's present
@@ -121,7 +128,7 @@ private:
                            std::function<std::shared_ptr<GpuFence>()> readbackFenceFactory = {},
                            std::shared_ptr<std::atomic<int>> injectedFactoryCalls = {});
 
-    GpuReadbackResult importAndReadback(const std::shared_ptr<GpuSurface>& surface,
+    GpuReadbackResult importAndReadback(const GpuScopedNativeSurface& surface,
                                         FramePixelFormat target) noexcept;
     std::shared_ptr<GpuFence> readbackFence() const noexcept { return m_readbackFence; }
 
@@ -156,6 +163,8 @@ private:
     std::optional<GpuReadbackTestBehavior> m_readbackTestBehavior;
     int m_readbackFenceInitializationAttemptsForTest = 0;
     std::shared_ptr<std::atomic<int>> m_injectedReadbackFenceFactoryCallsForTest;
+    std::atomic<bool> m_lastReadbackHadNativeHandleForTest{false};
+    std::atomic<uint32_t> m_lastReadbackSubresourceForTest{0};
 #endif
 };
 
@@ -165,7 +174,7 @@ struct GpuRhiContextTestAuthority {
                                                const std::shared_ptr<GpuSurface>& surface,
                                                FramePixelFormat target) noexcept {
         if (!context) return {};
-        return context->importAndReadback(surface, target);
+        return submitGpuReadback(context, surface, target);
     }
 
     static std::shared_ptr<GpuFence>
@@ -185,6 +194,16 @@ struct GpuRhiContextTestAuthority {
                    ? context->m_injectedReadbackFenceFactoryCallsForTest->load(
                          std::memory_order_acquire)
                    : 0;
+    }
+
+    static bool lastReadbackHadNativeHandleForTest(const std::shared_ptr<GpuRhiContext>& context) {
+        return context &&
+               context->m_lastReadbackHadNativeHandleForTest.load(std::memory_order_acquire);
+    }
+
+    static uint32_t lastReadbackSubresourceForTest(const std::shared_ptr<GpuRhiContext>& context) {
+        return context ? context->m_lastReadbackSubresourceForTest.load(std::memory_order_acquire)
+                       : 0;
     }
 };
 #endif
