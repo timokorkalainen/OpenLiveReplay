@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import ctypes
 import dataclasses
+import hashlib
 import inspect
 import locale
 import os
@@ -313,7 +314,9 @@ class CompilerIdentificationTests(unittest.TestCase):
         return bytes(image)
 
     @staticmethod
-    def macho_runtime_image(*, needed: str, rpath: str) -> bytes:
+    def macho_runtime_image(
+        *, needed: str, rpath: str, dyld_environment: str | None = None
+    ) -> bytes:
         def command(kind: int, header_bytes: int, value: str) -> bytes:
             encoded = value.encode("utf-8") + b"\0"
             size = (header_bytes + len(encoded) + 7) & ~7
@@ -325,12 +328,16 @@ class CompilerIdentificationTests(unittest.TestCase):
 
         dylib = command(0xC, 24, needed)
         load_path = command(0x8000001C, 12, rpath)
-        image = bytearray(32 + len(dylib) + len(load_path))
+        commands = [dylib, load_path]
+        if dyld_environment is not None:
+            commands.append(command(0x27, 12, dyld_environment))
+        command_bytes = b"".join(commands)
+        image = bytearray(32 + len(command_bytes))
         struct.pack_into(
-            "<IIIIIIII", image, 0, 0xFEEDFACF, 0, 0, 2, 2,
-            len(dylib) + len(load_path), 0, 0,
+            "<IIIIIIII", image, 0, 0xFEEDFACF, 0, 0, 2, len(commands),
+            len(command_bytes), 0, 0,
         )
-        image[32:] = dylib + load_path
+        image[32:] = command_bytes
         return bytes(image)
 
     def test_elf_runtime_parser_retains_rpath_and_runpath(self):
@@ -378,6 +385,18 @@ class CompilerIdentificationTests(unittest.TestCase):
         )
         self.assertEqual(imports.names, ("@rpath/libchild.dylib",))
         self.assertEqual(imports.rpath, ("@loader_path/../Frameworks",))
+
+    def test_macho_runtime_parser_rejects_embedded_dyld_environment(self):
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "LC_DYLD_ENVIRONMENT"
+        ):
+            capability_command._macho_runtime_imports(
+                self.macho_runtime_image(
+                    needed="@rpath/libchild.dylib",
+                    rpath="@loader_path/../Frameworks",
+                    dyld_environment="DYLD_LIBRARY_PATH=/unattested",
+                )
+            )
 
     def test_linux_ldconfig_cache_parser_preserves_hwcap_preference(self):
         parser = getattr(capability_command, "_parse_linux_ldconfig_cache", None)
@@ -1951,13 +1970,251 @@ class ConfigurationTests(unittest.TestCase):
             "gpu_capability_command._binary_runtime_imports",
             side_effect=lambda path, **_kwargs: imports[path.resolve()],
         ):
-            paths, _aliases = capability_command._recursive_runtime_paths(
+            paths, _aliases, _cache_uuid = capability_command._recursive_runtime_paths(
                 (self.compiler.resolve(), helper.resolve()),
                 self.compiler.resolve(), self.dependency_roots, "macos", {},
                 self.build, time.monotonic() + 10.0, None,
             )
         self.assertIn(driver_transitive.resolve(), paths)
         self.assertIn(helper_transitive.resolve(), paths)
+
+    def test_macho_shared_cache_import_is_attested_without_filesystem_image(self):
+        cached = "/usr/lib/libxcselect.dylib"
+        imports = capability_command._RuntimeImports(
+            (cached,), format_kind="macho"
+        )
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports", return_value=imports
+        ), mock.patch(
+            "gpu_capability_command._macos_shared_cache_uuid",
+            return_value="11" * 16,
+        ), mock.patch(
+            "gpu_capability_command._macos_shared_cache_contains_path",
+            side_effect=lambda path: path == cached,
+            create=True,
+        ) as contains:
+            paths, aliases, cache_uuid = capability_command._recursive_runtime_paths(
+                (self.compiler.resolve(),), self.compiler.resolve(),
+                self.dependency_roots, "macos", {}, self.build,
+                time.monotonic() + 10.0, None,
+            )
+        self.assertEqual(paths, (self.compiler.resolve(),))
+        self.assertEqual(aliases, ())
+        self.assertEqual(cache_uuid, "11" * 16)
+        self.assertEqual(contains.call_count, 2)
+
+    def test_macho_absent_system_import_fails_without_shared_cache_attestation(self):
+        absent = "/usr/lib/lib-not-in-shared-cache.dylib"
+        imports = capability_command._RuntimeImports(
+            (absent,), format_kind="macho"
+        )
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports", return_value=imports
+        ), mock.patch(
+            "gpu_capability_command._macos_shared_cache_contains_path",
+            return_value=False,
+            create=True,
+        ), mock.patch(
+            "gpu_capability_command._macos_shared_cache_uuid",
+            return_value="11" * 16,
+        ), self.assertRaisesRegex(AuditInfrastructureError, "unresolved runtime import"):
+            capability_command._recursive_runtime_paths(
+                (self.compiler.resolve(),), self.compiler.resolve(),
+                self.dependency_roots, "macos", {}, self.build,
+                time.monotonic() + 10.0, None,
+            )
+
+    def test_macho_shared_cache_policy_failure_propagates_fail_closed(self):
+        cached = "/usr/lib/libxcselect.dylib"
+        imports = capability_command._RuntimeImports(
+            (cached,), format_kind="macho"
+        )
+        unavailable = AuditInfrastructureError(
+            "macOS dyld shared-cache authority is unavailable"
+        )
+        with mock.patch(
+            "gpu_capability_command._binary_runtime_imports", return_value=imports
+        ), mock.patch(
+            "gpu_capability_command._macos_shared_cache_contains_path",
+            side_effect=unavailable,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "shared-cache authority is unavailable"
+        ):
+            capability_command._recursive_runtime_paths(
+                (self.compiler.resolve(),), self.compiler.resolve(),
+                self.dependency_roots, "macos", {}, self.build,
+                time.monotonic() + 10.0, None,
+            )
+
+    def test_macos_shared_cache_query_uses_exact_dyld_policy(self):
+        cached = "/usr/lib/libxcselect.dylib"
+        probe = mock.Mock(return_value=True)
+        fake_ctypes = mock.Mock(_dyld_shared_cache_contains_path=probe)
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.dict(
+            sys.modules, {"_ctypes": fake_ctypes}
+        ):
+            self.assertTrue(
+                capability_command._macos_shared_cache_contains_path(cached)
+            )
+        probe.assert_called_once_with(cached)
+
+    def test_macos_shared_cache_query_rejects_unavailable_dyld_policy(self):
+        cached = "/usr/lib/libxcselect.dylib"
+        probe = mock.Mock(side_effect=NotImplementedError("unavailable"))
+        fake_ctypes = mock.Mock(_dyld_shared_cache_contains_path=probe)
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.dict(
+            sys.modules, {"_ctypes": fake_ctypes}
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "shared-cache authority is unavailable"
+        ):
+            capability_command._macos_shared_cache_contains_path(cached)
+
+    def test_macos_shared_cache_uuid_uses_exact_dyld_abi(self):
+        query = mock.Mock()
+
+        def fill_uuid(value):
+            for index in range(16):
+                value[index] = index + 1
+            return True
+
+        query.side_effect = fill_uuid
+        dyld = mock.Mock(_dyld_get_shared_cache_uuid=query)
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(
+            ctypes, "CDLL", return_value=dyld
+        ):
+            actual = capability_command._macos_shared_cache_uuid()
+        self.assertEqual(actual, bytes(range(1, 17)).hex())
+        self.assertEqual(query.argtypes, (ctypes.POINTER(ctypes.c_ubyte),))
+        self.assertIs(query.restype, ctypes.c_bool)
+
+    def test_macos_shared_cache_uuid_rejects_zero_generation(self):
+        authority = capability_command._MacOSSharedCacheAuthority()
+        cached = Path("/usr/lib/libxcselect.dylib")
+        with mock.patch(
+            "gpu_capability_command._macos_shared_cache_contains_path",
+            return_value=True,
+        ), mock.patch(
+            "gpu_capability_command._macos_shared_cache_uuid",
+            return_value="00" * 16,
+        ), self.assertRaisesRegex(AuditInfrastructureError, "generation is invalid"):
+            authority.contains(cached)
+
+    def test_macos_disk_and_shared_cache_ambiguity_fails_closed(self):
+        cached = "/usr/lib/libxcselect.dylib"
+        imports = capability_command._RuntimeImports(
+            (cached,), format_kind="macho"
+        )
+        authority = capability_command._MacOSSharedCacheAuthority()
+        resolved = (self.compiler.resolve(), ())
+        with mock.patch(
+            "gpu_capability_command._resolve_runtime_candidate",
+            return_value=resolved,
+        ), mock.patch(
+            "gpu_capability_command._macos_shared_cache_contains_path",
+            return_value=True,
+        ), mock.patch(
+            "gpu_capability_command._macos_shared_cache_uuid",
+            return_value="11" * 16,
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "both on disk and in the shared cache"
+        ):
+            capability_command._resolve_runtime_name(
+                cached, self.compiler.resolve(), self.compiler.resolve(),
+                "macos", imports, (), self.dependency_roots, {}, self.build,
+                macos_shared_cache=authority,
+            )
+
+    def test_macos_cache_selection_controls_fail_before_cache_probe(self):
+        imports = capability_command._RuntimeImports(
+            ("/usr/lib/libxcselect.dylib",), format_kind="macho"
+        )
+        for name in (
+            "DYLD_SHARED_CACHE_DIR", "DYLD_SHARED_REGION", "DYLD_ROOT_PATH",
+            "DYLD_OVERLAY_PATH", "DYLD_VERSIONED_FRAMEWORK_PATH",
+            "DYLD_VERSIONED_LIBRARY_PATH", "DYLD_IMAGE_SUFFIX",
+            "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
+            "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_FORCE_PLATFORM",
+        ):
+            with self.subTest(name=name), mock.patch(
+                "gpu_capability_command._binary_runtime_imports",
+                return_value=imports,
+            ), mock.patch(
+                "gpu_capability_command._macos_shared_cache_contains_path"
+            ) as contains, mock.patch(
+                "gpu_capability_command._macos_shared_cache_uuid"
+            ) as cache_uuid, self.assertRaisesRegex(
+                AuditInfrastructureError, "unsupported macOS dyld path override"
+            ):
+                capability_command._recursive_runtime_paths(
+                    (self.compiler.resolve(),), self.compiler.resolve(),
+                    self.dependency_roots, "macos", {name: "active"}, self.build,
+                    time.monotonic() + 10.0, None,
+                )
+            contains.assert_not_called()
+            cache_uuid.assert_not_called()
+
+    def test_macos_path_lists_use_literal_colons_and_reject_ambiguous_entries(self):
+        self.assertEqual(
+            tuple(path.as_posix() for path in capability_command._macos_path_list(
+                {"DYLD_LIBRARY_PATH": "/one:/two"}, "DYLD_LIBRARY_PATH"
+            )),
+            ("/one", "/two"),
+        )
+        for value in ("relative", "/one::/two", ":/one", "/one:"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                AuditInfrastructureError, "path list is invalid"
+            ):
+                capability_command._macos_path_list(
+                    {"DYLD_LIBRARY_PATH": value}, "DYLD_LIBRARY_PATH"
+                )
+
+    def test_macos_owner_validation_rejects_shared_cache_generation_change(self):
+        owner = capability_command._CompilerCapabilityOwner(
+            (), (), (), (), (), (), (), (), None, self.dependency_roots,
+            macos_shared_cache_uuid="11" * 16,
+            validate_paths=False,
+        )
+        with mock.patch(
+            "gpu_capability_command._macos_shared_cache_uuid",
+            side_effect=("11" * 16, "22" * 16),
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "shared-cache generation changed"
+        ):
+            owner.validate(content=False, deadline=time.monotonic() + 10.0)
+        owner.close()
+
+    def test_macos_negative_cache_membership_is_generation_bound(self):
+        authority = capability_command._MacOSSharedCacheAuthority()
+        candidate = Path("/usr/lib/not-in-cache.dylib")
+        with mock.patch(
+            "gpu_capability_command._macos_shared_cache_contains_path",
+            side_effect=(False, False),
+        ) as contains, mock.patch(
+            "gpu_capability_command._macos_shared_cache_uuid",
+            side_effect=("11" * 16, "11" * 16, "22" * 16),
+        ):
+            self.assertFalse(authority.contains(candidate))
+            self.assertEqual(authority.uuid, "11" * 16)
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "shared-cache generation changed"
+            ):
+                authority.validate()
+        self.assertEqual(contains.call_count, 2)
+
+    def test_macos_runtime_closure_digest_binds_shared_cache_generation(self):
+        closure = ()
+        first = capability_command._runtime_closure_digest(
+            closure, "macos", "11" * 16
+        )
+        second = capability_command._runtime_closure_digest(
+            closure, "macos", "22" * 16
+        )
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            capability_command._runtime_closure_digest(closure, "linux", ""),
+            hashlib.sha256(b"").hexdigest(),
+        )
 
     def test_windows_shared_runtime_uses_each_executable_loader_context(self):
         helper_directory = self.compiler.parent / "libexec"
@@ -1991,7 +2248,7 @@ class ConfigurationTests(unittest.TestCase):
         ), mock.patch(
             "gpu_capability_command._windows_known_dlls", return_value=frozenset()
         ):
-            paths, _aliases = capability_command._recursive_runtime_paths(
+            paths, _aliases, _cache_uuid = capability_command._recursive_runtime_paths(
                 (self.compiler.resolve(), helper.resolve()),
                 self.compiler.resolve(), self.dependency_roots, "windows", {},
                 self.build, time.monotonic() + 10.0, None,
@@ -2009,7 +2266,7 @@ class ConfigurationTests(unittest.TestCase):
         ), mock.patch(
             "gpu_capability_command._windows_known_dlls", return_value=frozenset()
         ):
-            paths, _aliases = capability_command._recursive_runtime_paths(
+            paths, _aliases, _cache_uuid = capability_command._recursive_runtime_paths(
                 (self.compiler.resolve(),), self.compiler.resolve(),
                 self.dependency_roots, "windows", {}, self.build,
                 time.monotonic() + 10.0, None,
@@ -2026,7 +2283,7 @@ class ConfigurationTests(unittest.TestCase):
         ), mock.patch(
             "gpu_capability_command._windows_known_dlls", return_value=frozenset()
         ):
-            paths, _aliases = capability_command._recursive_runtime_paths(
+            paths, _aliases, _cache_uuid = capability_command._recursive_runtime_paths(
                 (self.compiler.resolve(),), self.compiler.resolve(),
                 self.dependency_roots, "windows", {}, self.build,
                 time.monotonic() + 10.0, None,
@@ -2050,7 +2307,7 @@ class ConfigurationTests(unittest.TestCase):
         ) as parse, mock.patch(
             "gpu_capability_command._windows_known_dlls", return_value=frozenset()
         ):
-            paths, _aliases = capability_command._recursive_runtime_paths(
+            paths, _aliases, _cache_uuid = capability_command._recursive_runtime_paths(
                 (self.compiler.resolve(),), self.compiler.resolve(),
                 self.dependency_roots, "windows", {}, self.build,
                 time.monotonic() + 10.0, None,
@@ -2088,7 +2345,7 @@ class ConfigurationTests(unittest.TestCase):
         ), mock.patch(
             "gpu_capability_command._windows_known_dlls", return_value=frozenset()
         ):
-            paths, _aliases = capability_command._recursive_runtime_paths(
+            paths, _aliases, _cache_uuid = capability_command._recursive_runtime_paths(
                 (self.compiler.resolve(), helper.resolve()),
                 self.compiler.resolve(), self.dependency_roots, "windows", {},
                 self.build, time.monotonic() + 10.0, None,
@@ -2240,11 +2497,19 @@ class ConfigurationTests(unittest.TestCase):
         runtime = fallback / name
         runtime.write_bytes(b"runtime")
         imports = capability_command._RuntimeImports((name,), format_kind="macho")
-        resolved, _aliases, _inherited = capability_command._resolve_runtime_name(
-            name, self.compiler.resolve(), self.compiler.resolve(), "macos",
-            imports, (), self.dependency_roots,
-            {"DYLD_FALLBACK_LIBRARY_PATH": str(fallback)}, self.build,
-        )
+        with mock.patch(
+            "gpu_capability_command._macos_path_list",
+            side_effect=lambda _environment, variable: (
+                (fallback,)
+                if variable == "DYLD_FALLBACK_LIBRARY_PATH"
+                else ()
+            ),
+        ):
+            resolved, _aliases, _inherited = capability_command._resolve_runtime_name(
+                name, self.compiler.resolve(), self.compiler.resolve(), "macos",
+                imports, (), self.dependency_roots,
+                {"DYLD_FALLBACK_LIBRARY_PATH": str(fallback)}, self.build,
+            )
         self.assertEqual(resolved, runtime.resolve())
 
     def test_runtime_closure_spans_distinct_authority_roots(self):

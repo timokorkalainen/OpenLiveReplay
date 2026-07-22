@@ -1924,6 +1924,42 @@ class OrchestrationTests(unittest.TestCase):
             accountant.seal_phase("inspection", deadline), snapshot
         )
 
+    def test_task9_linux_attempt_accountant_rejects_any_foreign_coordinator_pid(self):
+        service = self.root / "service-with-survivor"
+        run = service / "run"
+        coordinator = run / "coordinator"
+        coordinator.mkdir(parents=True)
+        for owner in (service, run):
+            (owner / "memory.events").write_text(
+                "oom 0\noom_kill 0\nmax 0\n", encoding="ascii"
+            )
+        for name, value in (
+            ("memory.current", "1"), ("memory.peak", "2"),
+            ("memory.max", str(512 << 20)),
+            ("memory.high", str(448 << 20)),
+        ):
+            (run / name).write_text(value, encoding="ascii")
+        (coordinator / "cgroup.procs").write_text(
+            f"{os.getpid()}\n424242\n", encoding="ascii"
+        )
+
+        class Backend:
+            def coordinator_accounting_paths(_self):
+                return coordinator, run, service
+            def create_leaf(_self, *_args): return object()
+            def acknowledge_leaf(_self, *_args): return None
+            def release_leaf(_self, *_args): return None
+
+        accountant = capability_runner.LinuxCompilerAuditAttemptAccountant(
+            Backend()
+        )
+        deadline = time.monotonic() + 10.0
+        accountant.begin_phase("inspection", deadline)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "phase has survivors"
+        ):
+            accountant.seal_phase("inspection", deadline)
+
     def test_task8_public_run_and_production_limits_are_exact(self):
         self.assertEqual(
             tuple(field.name for field in dataclasses.fields(CompilerAuditRun)),
@@ -7564,6 +7600,131 @@ class ProcessCoordinatorTests(unittest.TestCase):
                 transferred.native_owner.close()
             else:
                 for stream in streams:
+                    stream.close()
+
+    def test_worker_capability_bootstrap_preserves_shared_cache_generation(self):
+        expected_uuid = "11" * 16
+        owner = self.capability.native_owner
+        owner.macos_shared_cache_uuid = expected_uuid
+        closure_digest = capability_command._runtime_closure_digest(
+            self.capability.resolved_runtime_closure,
+            "macos",
+            expected_uuid,
+        )
+        capability_digest = capability_command._compiler_capability_digest(
+            "macos",
+            self.capability.trusted_toolchain_root,
+            self.capability.executable_identity.canonical,
+            self.capability.executable_sha256,
+            closure_digest,
+            self.authority.portable_authority_digest,
+        )
+        macos_capability = dataclasses.replace(
+            self.capability,
+            platform_kind="macos",
+            resolved_runtime_closure_digest=closure_digest,
+            capability_digest=capability_digest,
+        )
+        configuration = dataclasses.replace(
+            self.configuration,
+            compiler_capability=macos_capability,
+            compiler_capability_digest=capability_digest,
+        )
+        streams = tuple(
+            os.fdopen(os.dup(stream.fileno()), "rb", closefd=True)
+            for stream in owner.streams
+        )
+        transferred = None
+        try:
+            payload = capability_runner._encode_worker_bootstrap(
+                (configuration,), self.authority, {}, AuditLimits(),
+                self.engine, time.monotonic() + 30.0,
+                transfer_cookie="a" * 64, transferred_handles={},
+            )
+            decoded = capability_runner._decode_worker_bootstrap(payload)
+            document = decoded[1][0]
+            self.assertEqual(
+                document["owner"]["macos_shared_cache_uuid"], expected_uuid
+            )
+            with mock.patch(
+                "gpu_capability_command._macos_shared_cache_uuid",
+                return_value=expected_uuid,
+            ):
+                transferred = capability_runner._compiler_capability_from_bootstrap(
+                    document, self.authority, time.monotonic() + 30.0,
+                    threading.Event(), streams,
+                )
+            self.assertEqual(
+                transferred.native_owner.macos_shared_cache_uuid, expected_uuid
+            )
+        finally:
+            owner.macos_shared_cache_uuid = ""
+            if transferred is not None:
+                transferred.native_owner.close()
+            else:
+                for stream in streams:
+                    stream.close()
+
+    def test_worker_capability_bootstrap_rejects_rebound_cache_generation_with_stale_digest(self):
+        initial_uuid = "11" * 16
+        rebound_uuid = "22" * 16
+        owner = self.capability.native_owner
+        owner.macos_shared_cache_uuid = initial_uuid
+        initial_closure_digest = capability_command._runtime_closure_digest(
+            self.capability.resolved_runtime_closure, "macos", initial_uuid
+        )
+        initial_capability_digest = capability_command._compiler_capability_digest(
+            "macos",
+            self.capability.trusted_toolchain_root,
+            self.capability.executable_identity.canonical,
+            self.capability.executable_sha256,
+            initial_closure_digest,
+            self.authority.portable_authority_digest,
+        )
+        macos_capability = dataclasses.replace(
+            self.capability,
+            platform_kind="macos",
+            resolved_runtime_closure_digest=initial_closure_digest,
+            capability_digest=initial_capability_digest,
+        )
+        configuration = dataclasses.replace(
+            self.configuration,
+            compiler_capability=macos_capability,
+            compiler_capability_digest=initial_capability_digest,
+        )
+        streams = tuple(
+            os.fdopen(os.dup(stream.fileno()), "rb", closefd=True)
+            for stream in owner.streams
+        )
+        try:
+            payload = capability_runner._encode_worker_bootstrap(
+                (configuration,), self.authority, {}, AuditLimits(),
+                self.engine, time.monotonic() + 30.0,
+                transfer_cookie="a" * 64, transferred_handles={},
+            )
+            document = capability_runner._decode_worker_bootstrap(payload)[1][0]
+            document["owner"]["macos_shared_cache_uuid"] = rebound_uuid
+            document["resolved_runtime_closure_digest"] = (
+                capability_command._runtime_closure_digest(
+                    self.capability.resolved_runtime_closure,
+                    "macos",
+                    rebound_uuid,
+                )
+            )
+            with mock.patch(
+                "gpu_capability_command._macos_shared_cache_uuid",
+                return_value=rebound_uuid,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError, "capability digest differs"
+            ):
+                capability_runner._compiler_capability_from_bootstrap(
+                    document, self.authority, time.monotonic() + 30.0,
+                    threading.Event(), streams,
+                )
+        finally:
+            owner.macos_shared_cache_uuid = ""
+            for stream in streams:
+                if not stream.closed:
                     stream.close()
 
     def test_task_frame_binds_only_receiver_held_authority_and_capability(self):

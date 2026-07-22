@@ -815,12 +815,13 @@ jobs:
             --property=MemoryAccounting=yes \
             --property=MemoryMax=1073741824 \
             --property=MemoryHigh=939524096 \
+            --property=RuntimeMaxSec=180 \
             --uid="$(id -u)" --gid="$(id -g)" \
             --working-directory="$PWD" \
             python3 tests/gpu/gpu_capability_process_tree.py \
               prepare-linux-cgroup -- \
-              ctest --test-dir build --output-on-failure --no-tests=error \
-                -R '^gpu_capability_calibration_smoke$'
+              python3 -m unittest \
+                tests.gpu.test_gpu_capability_runner.ProcessCoordinatorTests.test_task9_native_calibration_smoke_one_configuration
 
       - name: Assemble and exercise controlled Linux package
         run: |

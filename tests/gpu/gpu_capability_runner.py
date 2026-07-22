@@ -2075,6 +2075,7 @@ def _encode_worker_bootstrap(
                 "directory_snapshots": [
                     list(value) for value in owner.directory_snapshots
                 ],
+                "macos_shared_cache_uuid": owner.macos_shared_cache_uuid,
                 "transfer_offset": transfer_offsets.get(
                     configuration.compiler_capability_digest,
                     0,
@@ -2347,7 +2348,8 @@ def _compiler_capability_from_bootstrap(
     if not isinstance(owner_document, dict) or set(owner_document) != {
         "file_paths", "file_snapshots", "file_hashes", "alias_paths",
         "alias_snapshots", "directory_paths", "directory_snapshots",
-        "transfer_offset", "transfer_count", "transferred_handles",
+        "macos_shared_cache_uuid", "transfer_offset", "transfer_count",
+        "transferred_handles",
     }:
         raise AuditInfrastructureError(
             "worker compiler capability bootstrap is invalid"
@@ -2436,6 +2438,9 @@ def _compiler_capability_from_bootstrap(
             directory_snapshots,
             None,
             authority,
+            macos_shared_cache_uuid=owner_document[
+                "macos_shared_cache_uuid"
+            ],
             validate_paths=False,
         )
         capability = CompilerExecutableCapability(

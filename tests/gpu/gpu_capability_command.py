@@ -3079,6 +3079,10 @@ def _macho_runtime_imports(data) -> _RuntimeImports:
         command &= 0x7FFFFFFF
         if size < 8 or cursor + size > length:
             raise AuditInfrastructureError("compiler runtime Mach-O command is invalid")
+        if command == 0x27:
+            raise AuditInfrastructureError(
+                "compiler runtime LC_DYLD_ENVIRONMENT is unsupported"
+            )
         if command in dylib_commands:
             if size < 24:
                 raise AuditInfrastructureError("compiler runtime Mach-O dylib command is invalid")
@@ -3275,6 +3279,162 @@ def _loader_default_directories(platform_kind: str) -> tuple[Path, ...]:
     return tuple(result)
 
 
+def _macos_shared_cache_contains_path(path: str) -> bool:
+    """Ask dyld whether an absent absolute image is in its immutable shared cache."""
+
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\0" in path
+        or not PurePosixPath(path).is_absolute()
+    ):
+        raise AuditInfrastructureError(
+            "macOS dyld shared-cache path is invalid"
+        )
+    if sys.platform != "darwin":
+        raise AuditInfrastructureError(
+            "macOS dyld shared-cache authority is unavailable"
+        )
+    try:
+        from _ctypes import _dyld_shared_cache_contains_path
+    except ImportError as error:
+        raise AuditInfrastructureError(
+            "macOS dyld shared-cache authority is unavailable"
+        ) from error
+    try:
+        return bool(_dyld_shared_cache_contains_path(path))
+    except (NotImplementedError, OSError, TypeError, ValueError) as error:
+        raise AuditInfrastructureError(
+            "macOS dyld shared-cache authority is unavailable"
+        ) from error
+
+
+def _macos_shared_cache_uuid() -> str:
+    """Return the exact UUID of the active dyld shared-cache generation."""
+
+    if sys.platform != "darwin":
+        raise AuditInfrastructureError(
+            "macOS dyld shared-cache generation is unavailable"
+        )
+    try:
+        import ctypes
+
+        dyld = ctypes.CDLL(None)
+        query = dyld._dyld_get_shared_cache_uuid
+        query.argtypes = (ctypes.POINTER(ctypes.c_ubyte),)
+        query.restype = ctypes.c_bool
+        value = (ctypes.c_ubyte * 16)()
+        if not query(value):
+            raise AuditInfrastructureError(
+                "macOS dyld shared-cache generation is unavailable"
+            )
+        raw = bytes(value)
+        if raw == b"\0" * 16:
+            raise AuditInfrastructureError(
+                "macOS dyld shared-cache generation is invalid"
+            )
+        return raw.hex()
+    except AuditInfrastructureError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise AuditInfrastructureError(
+            "macOS dyld shared-cache generation is unavailable"
+        ) from error
+
+
+class _MacOSSharedCacheAuthority:
+    """Bind cache membership decisions to one stable active-cache UUID."""
+
+    def __init__(self) -> None:
+        self.uuid = ""
+
+    def contains(self, candidate: Path) -> bool:
+        name = candidate.as_posix()
+        if not PurePosixPath(name).is_absolute():
+            return False
+        first = _macos_shared_cache_contains_path(name)
+        before = _macos_shared_cache_uuid()
+        second = _macos_shared_cache_contains_path(name)
+        if first != second:
+            raise AuditInfrastructureError(
+                "macOS dyld shared-cache membership changed"
+            )
+        after = _macos_shared_cache_uuid()
+        if before != after:
+            raise AuditInfrastructureError(
+                "macOS dyld shared-cache generation changed"
+            )
+        if before == "00" * 16:
+            raise AuditInfrastructureError(
+                "macOS dyld shared-cache generation is invalid"
+            )
+        if self.uuid and self.uuid != before:
+            raise AuditInfrastructureError(
+                "macOS dyld shared-cache generation changed"
+            )
+        self.uuid = before
+        return first
+
+    def validate(self) -> str:
+        if self.uuid and _macos_shared_cache_uuid() != self.uuid:
+            raise AuditInfrastructureError(
+                "macOS dyld shared-cache generation changed"
+            )
+        return self.uuid
+
+
+def _macos_framework_partial_path(name: str) -> PurePosixPath | None:
+    marker = ".framework/"
+    marker_index = name.rfind(marker)
+    if marker_index < 0:
+        return None
+    start = name.rfind("/", 0, marker_index) + 1
+    framework = name[start:marker_index]
+    leaf = name.rsplit("/", 1)[-1]
+    if not framework or leaf != framework:
+        return None
+    return PurePosixPath(name[start:])
+
+
+def _validate_macos_dyld_environment(environment: Mapping[str, str]) -> None:
+    unsupported = (
+        "DYLD_FALLBACK_FRAMEWORK_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_FORCE_PLATFORM",
+        "DYLD_FRAMEWORK_PATH",
+        "DYLD_IMAGE_SUFFIX",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_OVERLAY_PATH",
+        "DYLD_ROOT_PATH",
+        "DYLD_SHARED_CACHE_DIR",
+        "DYLD_SHARED_REGION",
+        "DYLD_VERSIONED_FRAMEWORK_PATH",
+        "DYLD_VERSIONED_LIBRARY_PATH",
+    )
+    if any(environment.get(name) for name in unsupported):
+        raise AuditInfrastructureError(
+            "unsupported macOS dyld path override is active"
+        )
+
+
+def _macos_path_list(
+    environment: Mapping[str, str], name: str
+) -> tuple[Path, ...]:
+    value = environment.get(name)
+    if value is None:
+        return ()
+    parts = value.split(":")
+    if any(
+        not part or not PurePosixPath(part).is_absolute()
+        for part in parts
+    ):
+        raise AuditInfrastructureError(
+            f"macOS dyld path list is invalid: {name}"
+        )
+    return tuple(Path(part) for part in parts)
+
+
 def _windows_known_dlls() -> frozenset[str]:
     if os.name != "nt":
         return frozenset()
@@ -3314,7 +3474,8 @@ def _resolve_runtime_name(
     deadline: float | None = None,
     cancel_event: object | None = None,
     linux_loader_cache: Mapping[str, tuple[Path, ...]] | None = None,
-) -> tuple[Path, tuple[Path, ...], tuple[Path, ...]]:
+    macos_shared_cache: _MacOSSharedCacheAuthority | None = None,
+) -> tuple[Path | None, tuple[Path, ...], tuple[Path, ...]]:
     candidates = []
     child_inherited = inherited_rpath
     raw = Path(name)
@@ -3325,25 +3486,45 @@ def _resolve_runtime_name(
         rpaths = tuple(
             _expand_loader_path(value, importer, executable) for value in imports.rpath
         )
-        library_paths = tuple(
-            Path(value) for value in environment.get("DYLD_LIBRARY_PATH", "").split(os.pathsep)
-            if value
+        library_paths = _macos_path_list(environment, "DYLD_LIBRARY_PATH")
+        framework_paths = _macos_path_list(environment, "DYLD_FRAMEWORK_PATH")
+        fallback_paths = _macos_path_list(
+            environment, "DYLD_FALLBACK_LIBRARY_PATH"
         )
-        fallback_value = environment.get("DYLD_FALLBACK_LIBRARY_PATH")
-        fallback_paths = tuple(
-            Path(value) for value in fallback_value.split(os.pathsep) if value
-        ) if fallback_value is not None else (
-            Path.home() / "lib", Path("/usr/local/lib"), Path("/usr/lib")
+        fallback_framework_paths = _macos_path_list(
+            environment, "DYLD_FALLBACK_FRAMEWORK_PATH"
         )
+        framework_partial = _macos_framework_partial_path(name)
+        leaf = PurePosixPath(name).name
+        if framework_partial is not None:
+            candidates.extend(
+                path / Path(framework_partial.as_posix())
+                for path in framework_paths
+            )
+        else:
+            candidates.extend(path / leaf for path in library_paths)
         if name.startswith("@rpath/"):
             suffix = name[len("@rpath/"):]
             candidates.extend(path / suffix for path in (*rpaths, *inherited_rpath))
-        elif name.startswith(("@loader_path/", "@executable_path/")) or raw.is_absolute():
+        elif (
+            name.startswith(("@loader_path/", "@executable_path/"))
+            or PurePosixPath(name).is_absolute()
+        ):
             candidates.append(_expand_loader_path(name, importer, executable))
+        elif name.startswith("@"):
+            raise AuditInfrastructureError(
+                f"unsupported macOS runtime import: {name}"
+            )
         else:
-            leaf = raw.name
-            candidates.extend(path / leaf for path in library_paths)
-            candidates.extend(path / leaf for path in fallback_paths)
+            candidates.append(working_directory / leaf)
+        if not name.startswith("@"):
+            if framework_partial is not None:
+                candidates.extend(
+                    path / Path(framework_partial.as_posix())
+                    for path in fallback_framework_paths
+                )
+            else:
+                candidates.extend(path / leaf for path in fallback_paths)
         child_inherited = tuple(dict.fromkeys((*rpaths, *inherited_rpath)))
     elif loader_kind == "linux":
         local_rpath = tuple(
@@ -3398,8 +3579,22 @@ def _resolve_runtime_name(
     for candidate in candidates:
         resolved = _resolve_runtime_candidate(candidate, authority)
         if resolved is not None:
+            if (
+                loader_kind == "macos"
+                and macos_shared_cache is not None
+                and macos_shared_cache.contains(candidate)
+            ):
+                raise AuditInfrastructureError(
+                    "macOS runtime exists both on disk and in the shared cache"
+                )
             resolved_path, aliases = resolved
             return resolved_path, aliases, child_inherited
+        if (
+            loader_kind == "macos"
+            and macos_shared_cache is not None
+            and macos_shared_cache.contains(candidate)
+        ):
+            return None, (), child_inherited
     raise AuditInfrastructureError(f"unresolved runtime import: {name}")
 
 
@@ -3440,7 +3635,12 @@ def _recursive_runtime_paths(
     working_directory: Path,
     deadline: float,
     cancel_event: object | None,
-) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+) -> tuple[tuple[Path, ...], tuple[Path, ...], str]:
+    if platform_kind == "macos":
+        _validate_macos_dyld_environment(environment)
+    macos_shared_cache = (
+        _MacOSSharedCacheAuthority() if platform_kind == "macos" else None
+    )
     pending = [
         (
             seed,
@@ -3587,6 +3787,7 @@ def _recursive_runtime_paths(
                     loaded_modules=loaded_modules, known_dlls=known_dlls,
                     deadline=deadline, cancel_event=cancel_event,
                     linux_loader_cache=linux_loader_cache,
+                    macos_shared_cache=macos_shared_cache,
                 )
             except AuditInfrastructureError as error:
                 if (
@@ -3595,6 +3796,8 @@ def _recursive_runtime_paths(
                 ):
                     continue
                 raise
+            if resolved is None:
+                continue
             reserve(resolved)
             loaded_modules.setdefault(module_name, resolved)
             for alias in resolved_aliases:
@@ -3606,7 +3809,12 @@ def _recursive_runtime_paths(
                 child_inherited,
                 loaded_modules,
             ))
-    return tuple(result), tuple(aliases)
+    cache_uuid = (
+        macos_shared_cache.validate()
+        if macos_shared_cache is not None
+        else ""
+    )
+    return tuple(result), tuple(aliases), cache_uuid
 
 
 def _content_sha256(
@@ -3629,6 +3837,78 @@ def _content_sha256(
     return digest.hexdigest()
 
 
+def _runtime_closure_digest(
+    closure: Iterable[DependencyDigest],
+    platform_kind: str,
+    macos_shared_cache_uuid: str,
+) -> str:
+    if platform_kind not in {"windows", "linux", "macos"}:
+        raise AuditInfrastructureError("compiler runtime platform is invalid")
+    if (
+        not isinstance(macos_shared_cache_uuid, str)
+        or (
+            macos_shared_cache_uuid
+            and (
+                platform_kind != "macos"
+                or re.fullmatch(r"[0-9a-f]{32}", macos_shared_cache_uuid) is None
+                or macos_shared_cache_uuid == "00" * 16
+            )
+        )
+    ):
+        raise AuditInfrastructureError(
+            "compiler runtime shared-cache generation is invalid"
+        )
+    digest = hashlib.sha256()
+    digest.update(b"".join(
+        len(value).to_bytes(8, "little") + value
+        for item in closure
+        for value in (
+            item.stable_role.encode("ascii")
+            + b"\0"
+            + item.role_relative_path.as_posix().encode("utf-8")
+            + b"\0"
+            + item.sha256.encode("ascii"),
+        )
+    ))
+    if macos_shared_cache_uuid:
+        _hash_field(digest, b"olr-macos-dyld-shared-cache-v1")
+        _hash_field(digest, bytes.fromhex(macos_shared_cache_uuid))
+    return digest.hexdigest()
+
+
+def _compiler_capability_digest(
+    platform_kind: str,
+    binding: DependencyRootBinding,
+    canonical: Path,
+    executable_sha256: str,
+    closure_digest: str,
+    portable_authority_digest: str,
+) -> str:
+    if not isinstance(binding, DependencyRootBinding):
+        raise AuditInfrastructureError("compiler capability root is invalid")
+    try:
+        relative = canonical.relative_to(binding.resolved_root).as_posix()
+    except (TypeError, ValueError) as error:
+        raise AuditInfrastructureError(
+            "compiler executable capability root differs"
+        ) from error
+    digest = hashlib.sha256()
+    for value in (
+        platform_kind,
+        binding.stable_role,
+        relative,
+        executable_sha256,
+        closure_digest,
+        portable_authority_digest,
+    ):
+        if not isinstance(value, str):
+            raise AuditInfrastructureError(
+                "compiler executable capability digest input is invalid"
+            )
+        _hash_field(digest, value.encode("utf-8"))
+    return digest.hexdigest()
+
+
 class _CompilerCapabilityOwner:
     """Held executable/closure files plus exact path-chain snapshots."""
 
@@ -3645,6 +3925,7 @@ class _CompilerCapabilityOwner:
         observer: _FilesystemGenerationObserver | None,
         dependency_root_authority: DependencyRootAuthority,
         *,
+        macos_shared_cache_uuid: str = "",
         validate_paths: bool = True,
     ) -> None:
         self.streams = streams
@@ -3657,6 +3938,20 @@ class _CompilerCapabilityOwner:
         self.directory_snapshots = directory_snapshots
         self.observer = observer
         self.dependency_root_authority = dependency_root_authority
+        if (
+            not isinstance(macos_shared_cache_uuid, str)
+            or (
+                macos_shared_cache_uuid
+                and (
+                    re.fullmatch(r"[0-9a-f]{32}", macos_shared_cache_uuid) is None
+                    or macos_shared_cache_uuid == "00" * 16
+                )
+            )
+        ):
+            raise AuditInfrastructureError(
+                "compiler capability shared-cache generation is invalid"
+            )
+        self.macos_shared_cache_uuid = macos_shared_cache_uuid
         self.validate_paths = validate_paths
         self._closed = False
         self._lock = threading.Lock()
@@ -3683,6 +3978,13 @@ class _CompilerCapabilityOwner:
         _check_capability_budget(deadline, cancel_event)
         if self._closed:
             raise AuditInfrastructureError("compiler executable capability is closed")
+        if (
+            self.macos_shared_cache_uuid
+            and _macos_shared_cache_uuid() != self.macos_shared_cache_uuid
+        ):
+            raise AuditInfrastructureError(
+                "compiler capability shared-cache generation changed"
+            )
         if self.observer is not None:
             self.observer.drain()
         for stream, path, expected in zip(
@@ -3735,6 +4037,13 @@ class _CompilerCapabilityOwner:
                     )
         if self.observer is not None:
             self.observer.drain()
+        if (
+            self.macos_shared_cache_uuid
+            and _macos_shared_cache_uuid() != self.macos_shared_cache_uuid
+        ):
+            raise AuditInfrastructureError(
+                "compiler capability shared-cache generation changed"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -4176,7 +4485,7 @@ def open_compiler_executable_capability(
         "windows" if os.name == "nt"
         else ("macos" if sys.platform == "darwin" else "linux")
     )
-    candidate_paths, alias_paths = _recursive_runtime_paths(
+    candidate_paths, alias_paths, macos_shared_cache_uuid = _recursive_runtime_paths(
         tuple(candidates), canonical, authority, platform_kind,
         query_environment, query_working_directory,
         pipeline_deadline, cancel_event,
@@ -4249,30 +4558,17 @@ def open_compiler_executable_capability(
                 )
             )
         closure.sort(key=lambda item: (item.stable_role, item.role_relative_path.as_posix(), item.sha256))
-        closure_digest = hashlib.sha256(
-            b"".join(
-                len(portable_compiler_inspection_key_value).to_bytes(8, "little")
-                + portable_compiler_inspection_key_value
-                for item in closure
-                for portable_compiler_inspection_key_value in (
-                    item.stable_role.encode("ascii")
-                    + b"\0"
-                    + item.role_relative_path.as_posix().encode("utf-8")
-                    + b"\0"
-                    + item.sha256.encode("ascii"),
-                )
-            )
-        ).hexdigest()
-        capability_digest_hasher = hashlib.sha256()
-        for value in (
+        closure_digest = _runtime_closure_digest(
+            closure, platform_kind, macos_shared_cache_uuid
+        )
+        capability_digest = _compiler_capability_digest(
             platform_kind,
-            binding.stable_role,
-            canonical.relative_to(binding.resolved_root).as_posix(),
+            binding,
+            canonical,
             hashes[0],
             closure_digest,
             authority.portable_authority_digest,
-        ):
-            _hash_field(capability_digest_hasher, value.encode("utf-8"))
+        )
         owner = _CompilerCapabilityOwner(
             tuple(streams), tuple(paths), tuple(snapshots), tuple(hashes),
             tuple(alias_paths), alias_snapshots,
@@ -4283,13 +4579,14 @@ def open_compiler_executable_capability(
                 + tuple((path, False) for path in paths)
             ),
             authority,
+            macos_shared_cache_uuid=macos_shared_cache_uuid,
         )
         observer = owner.observer
         capability = CompilerExecutableCapability(
             platform_kind,
             FileIdentity(canonical, None, snapshots[0][0], snapshots[0][1], 0, False),
             hashes[0],
-            capability_digest_hasher.hexdigest(),
+            capability_digest,
             owner,
             binding,
             tuple(chain_paths),
@@ -4300,8 +4597,8 @@ def open_compiler_executable_capability(
             closure_digest,
             tuple(closure),
         )
-        owner.validate(
-            content=False, deadline=pipeline_deadline,
+        validate_compiler_executable_capability(
+            capability, authority, deadline=pipeline_deadline,
             cancel_event=cancel_event,
         )
         if compiler_family is not None and _query_driver:
@@ -4379,6 +4676,27 @@ def validate_compiler_executable_capability(
     )
     if expected_binding != capability.trusted_toolchain_root:
         raise AuditInfrastructureError("compiler executable capability root differs")
+    expected_closure_digest = _runtime_closure_digest(
+        capability.resolved_runtime_closure,
+        capability.platform_kind,
+        owner.macos_shared_cache_uuid,
+    )
+    if expected_closure_digest != capability.resolved_runtime_closure_digest:
+        raise AuditInfrastructureError(
+            "compiler runtime closure shared-cache generation differs"
+        )
+    expected_capability_digest = _compiler_capability_digest(
+        capability.platform_kind,
+        expected_binding,
+        capability.executable_identity.canonical,
+        capability.executable_sha256,
+        expected_closure_digest,
+        authority.portable_authority_digest,
+    )
+    if expected_capability_digest != capability.capability_digest:
+        raise AuditInfrastructureError(
+            "compiler executable capability digest differs"
+        )
     owner.validate(
         content=False, deadline=deadline, cancel_event=cancel_event
     )
