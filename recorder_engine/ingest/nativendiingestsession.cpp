@@ -1,13 +1,14 @@
 #include "nativendiingestsession.h"
+#include "recorder_engine/timing/smpte12m.h"
 
 #include <QByteArray>
-#include <QDir>
 #include <QLibrary>
 #include <QThread>
 
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <type_traits>
 
 extern "C" {
@@ -15,104 +16,65 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include "playback/output/ndiabi.h"
+#include "playback/output/ndiruntimepaths.h"
+#include "playback/output/ndistaticlink.h"
+
 namespace {
 
 constexpr int kCaptureTimeoutMs = 100;
-constexpr qint64 kNdiTimecodeSynthesize = std::numeric_limits<qint64>::max();
 constexpr int kNdiRecvColorFastest = 100;
 
-struct NDIlib_source_t {
-    const char* p_ndi_name = nullptr;
-    const char* p_url_address = nullptr;
-};
+using namespace olr::ndi;
 
-struct NDIlib_recv_create_v3_t {
-    NDIlib_source_t source_to_connect_to;
-    int color_format = 0;
-    int bandwidth = 0;
-    bool allow_video_fields = false;
-    const char* p_ndi_recv_name = nullptr;
-};
+int64_t sessionFrameForMs(int64_t sourcePtsMs, FrameRateQ rate) {
+    if (sourcePtsMs < 0 || !rate.valid()) return -1;
+    using I128 = __int128;
+    const I128 numerator = I128(sourcePtsMs) * rate.num;
+    const I128 denominator = I128(1000) * rate.den;
+    const I128 frame = (numerator + denominator / 2) / denominator;
+    return frame <= std::numeric_limits<int64_t>::max() ? int64_t(frame) : -1;
+}
 
-struct NDIlib_video_frame_v2_t {
-    int xres = 0;
-    int yres = 0;
-    uint32_t FourCC = 0;
-    int frame_rate_N = 0;
-    int frame_rate_D = 1;
-    float picture_aspect_ratio = 0.0f;
-    int frame_format_type = 1;
-    qint64 timecode = kNdiTimecodeSynthesize;
-    uint8_t* p_data = nullptr;
-    int line_stride_in_bytes = 0;
-    const char* p_metadata = nullptr;
-    qint64 timestamp = 0;
-};
+std::optional<TimecodeEvidence> ndiTimecodeEvidence(const NdiVideoFrame& video, int64_t sourcePtsMs,
+                                                    uint64_t sourceGeneration) {
+    constexpr int64_t kTicksPerDay = 24LL * 60 * 60 * 10'000'000;
+    if (video.timecode100ns == kTimecodeSynthesize || video.timecode100ns < 0 ||
+        video.timecode100ns >= kTicksPerDay || video.frameRateNum <= 0 || video.frameRateDen <= 0)
+        return std::nullopt;
+    const int32_t divisor = std::gcd(video.frameRateNum, video.frameRateDen);
+    const FrameRateQ rate{video.frameRateNum / divisor, video.frameRateDen / divisor};
+    using I128 = __int128;
+    if (I128(rate.num) < I128(12) * rate.den || I128(rate.num) > I128(240) * rate.den)
+        return std::nullopt;
 
-struct NDIlib_audio_frame_v3_t {
-    int sample_rate = 48000;
-    int no_channels = 2;
-    int no_samples = 0;
-    qint64 timecode = kNdiTimecodeSynthesize;
-    uint32_t FourCC = 0;
-    uint8_t* p_data = nullptr;
-    int channel_stride_in_bytes = 0;
-    const char* p_metadata = nullptr;
-    qint64 timestamp = 0;
-};
+    const I128 tickDenominator = I128(10'000'000) * rate.den;
+    const auto roundedFrameCount = [tickDenominator, rate](int64_t ticks) -> int64_t {
+        const I128 numerator = I128(ticks) * rate.num;
+        const I128 rounded = (numerator + tickDenominator / 2) / tickDenominator;
+        return rounded >= 0 && rounded <= std::numeric_limits<int64_t>::max() ? int64_t(rounded)
+                                                                              : -1;
+    };
+    int64_t frameOfDay = roundedFrameCount(video.timecode100ns);
+    const int64_t framesPerDay = roundedFrameCount(kTicksPerDay);
+    if (frameOfDay < 0 || framesPerDay <= 0) return std::nullopt;
+    frameOfDay %= framesPerDay;
 
-struct NDIlib_metadata_frame_t {
-    int length = 0;
-    qint64 timecode = kNdiTimecodeSynthesize;
-    char* p_data = nullptr;
-};
-
-enum NDIlib_frame_type_e {
-    NDIlib_frame_type_none = 0,
-    NDIlib_frame_type_video = 1,
-    NDIlib_frame_type_audio = 2,
-    NDIlib_frame_type_metadata = 3,
-    NDIlib_frame_type_error = 4,
-};
-
-using NDIlib_find_instance_t = void*;
-using NDIlib_recv_instance_t = void*;
-using NDIlib_initialize_fn = bool (*)();
-using NDIlib_destroy_fn = void (*)();
-using NDIlib_find_create_v2_fn = NDIlib_find_instance_t (*)(const void*);
-using NDIlib_find_destroy_fn = void (*)(NDIlib_find_instance_t);
-using NDIlib_find_wait_for_sources_fn = bool (*)(NDIlib_find_instance_t, uint32_t);
-using NDIlib_find_get_current_sources_fn = const NDIlib_source_t* (*) (NDIlib_find_instance_t,
-                                                                       uint32_t*);
-using NDIlib_recv_create_v3_fn = NDIlib_recv_instance_t (*)(const NDIlib_recv_create_v3_t*);
-using NDIlib_recv_destroy_fn = void (*)(NDIlib_recv_instance_t);
-using NDIlib_recv_capture_v3_fn = NDIlib_frame_type_e (*)(NDIlib_recv_instance_t,
-                                                          NDIlib_video_frame_v2_t*,
-                                                          NDIlib_audio_frame_v3_t*,
-                                                          NDIlib_metadata_frame_t*, uint32_t);
-using NDIlib_recv_free_video_v2_fn = void (*)(NDIlib_recv_instance_t,
-                                              const NDIlib_video_frame_v2_t*);
-using NDIlib_recv_free_audio_v3_fn = void (*)(NDIlib_recv_instance_t,
-                                              const NDIlib_audio_frame_v3_t*);
+    TimecodeEvidence evidence;
+    evidence.frameOfDay = frameOfDay;
+    evidence.labelRate = rate;
+    evidence.sourceGeneration = sourceGeneration;
+    evidence.timingGeneration = sourceGeneration;
+    evidence.provenance = TimecodeProvenance::Ndi;
+    evidence.arrivalSessionFrame = sessionFrameForMs(sourcePtsMs, rate);
+    evidence.sessionRate = rate;
+    evidence.quantizationBoundUs =
+        int64_t((__int128(1'000'000) * rate.den + rate.num - 1) / rate.num);
+    return evidence.valid() ? std::optional<TimecodeEvidence>(evidence) : std::nullopt;
+}
 
 QStringList ndiRuntimeLibraryCandidates() {
-    QStringList candidates;
-    const QByteArray explicitPath = qgetenv("OLR_NDI_RUNTIME_LIBRARY");
-    if (!explicitPath.isEmpty()) candidates.append(QString::fromLocal8Bit(explicitPath));
-#if defined(Q_OS_WIN)
-    const QString runtimeDir = QString::fromLocal8Bit(qgetenv("NDI_RUNTIME_DIR_V6"));
-    if (!runtimeDir.isEmpty())
-        candidates.append(QDir(runtimeDir).filePath(QStringLiteral("Processing.NDI.Lib.x64.dll")));
-    candidates.append(QStringLiteral("Processing.NDI.Lib.x64.dll"));
-#elif defined(Q_OS_MACOS)
-    candidates.append(QStringLiteral("/Library/NDI SDK for Apple/lib/macOS/libndi.dylib"));
-    candidates.append(QStringLiteral("/usr/local/lib/libndi.dylib"));
-    candidates.append(QStringLiteral("libndi.dylib"));
-#else
-    candidates.append(QStringLiteral("libndi.so"));
-#endif
-    candidates.removeDuplicates();
-    return candidates;
+    return runtimeLibraryCandidates();
 }
 
 int selectDiscoveredSourceIndex(const QStringList& discovered, const QString& wanted) {
@@ -160,11 +122,11 @@ public:
                 QThread::msleep(250);
             }
 
-            uint32_t count = 0;
+            quint32 count = 0;
             const NDIlib_source_t* sources =
                 m_findGetCurrentSources ? m_findGetCurrentSources(finder, &count) : nullptr;
             discovered.clear();
-            for (uint32_t i = 0; sources && i < count; ++i) {
+            for (quint32 i = 0; sources && i < count; ++i) {
                 discovered.append(
                     QString::fromUtf8(sources[i].p_ndi_name ? sources[i].p_ndi_name : ""));
             }
@@ -207,9 +169,9 @@ public:
         // -Werror=class-memaccess. The capture call overwrites them anyway.
         m_lastVideo = {};
         m_lastAudio = {};
-        const NDIlib_frame_type_e type =
-            m_recvCapture(m_receiver, &m_lastVideo, &m_lastAudio, nullptr, uint32_t(timeoutMs));
-        if (type == NDIlib_frame_type_video && video) {
+        const int type =
+            m_recvCapture(m_receiver, &m_lastVideo, &m_lastAudio, nullptr, quint32(timeoutMs));
+        if (type == FrameTypeVideo && video) {
             video->width = m_lastVideo.xres;
             video->height = m_lastVideo.yres;
             video->strideBytes = m_lastVideo.line_stride_in_bytes;
@@ -217,9 +179,11 @@ public:
             video->data = m_lastVideo.p_data;
             video->timestamp100ns = m_lastVideo.timestamp;
             video->timecode100ns = m_lastVideo.timecode;
+            video->frameRateNum = m_lastVideo.frame_rate_N;
+            video->frameRateDen = m_lastVideo.frame_rate_D;
             return Capture::Video;
         }
-        if (type == NDIlib_frame_type_audio && audio) {
+        if (type == FrameTypeAudio && audio) {
             audio->sampleRate = m_lastAudio.sample_rate;
             audio->channels = m_lastAudio.no_channels;
             audio->samples = m_lastAudio.no_samples;
@@ -229,7 +193,7 @@ public:
             audio->timecode100ns = m_lastAudio.timecode;
             return Capture::Audio;
         }
-        if (type == NDIlib_frame_type_error) {
+        if (type == FrameTypeError) {
             return Capture::Error;
         }
         return Capture::None;
@@ -253,6 +217,13 @@ private:
     bool ensureLoaded() {
         if (m_loaded) return true;
 
+#if defined(OLR_NDI_STATIC_LINK)
+        if (resolveStaticSymbols()) {
+            m_initialized = !m_initialize || m_initialize();
+            m_loaded = m_initialized;
+        }
+        return m_loaded;
+#else
         for (const QString& candidate : ndiRuntimeLibraryCandidates()) {
             m_library.setFileName(candidate);
             if (!m_library.load()) continue;
@@ -264,7 +235,26 @@ private:
             m_library.unload();
         }
         return false;
+#endif
     }
+
+#if defined(OLR_NDI_STATIC_LINK)
+    bool resolveStaticSymbols() {
+        m_initialize = &NDIlib_initialize;
+        m_destroy = &NDIlib_destroy;
+        m_findCreate = &NDIlib_find_create_v2;
+        m_findDestroy = &NDIlib_find_destroy;
+        m_findWaitForSources = &NDIlib_find_wait_for_sources;
+        m_findGetCurrentSources = &NDIlib_find_get_current_sources;
+        m_recvCreate = &NDIlib_recv_create_v3;
+        m_recvDestroy = &NDIlib_recv_destroy;
+        m_recvCapture = &NDIlib_recv_capture_v3;
+        m_recvFreeVideo = &NDIlib_recv_free_video_v2;
+        m_recvFreeAudio = &NDIlib_recv_free_audio_v3;
+        return m_findCreate && m_findDestroy && m_findGetCurrentSources && m_recvCreate &&
+               m_recvDestroy && m_recvCapture && m_recvFreeVideo && m_recvFreeAudio;
+    }
+#endif
 
     bool resolveSymbols() {
         m_initialize =
@@ -407,6 +397,7 @@ bool NativeNdiIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_stopRequested.store(false, std::memory_order_relaxed);
     m_lastFailureKind = IngestFailureKind::None;
     m_lastStatsAtMs = -1;
+    m_activeTimecodeRate = {};
     if (!m_externalClock) {
         m_clock->reset();
     }
@@ -419,6 +410,7 @@ bool NativeNdiIngestSession::open(const QUrl& url, const IngestCallbacks& callba
         m_lastFailureKind = IngestFailureKind::TransientNetwork;
         return false;
     }
+    if (m_sourceGeneration != std::numeric_limits<uint64_t>::max()) ++m_sourceGeneration;
     // Baseline the stall clock at connect: run() breaks if no frame arrives
     // within m_stallTimeoutMs of this (or of the last received frame).
     m_lastFrameAtMs = m_monotonic.elapsed();
@@ -448,7 +440,20 @@ void NativeNdiIngestSession::run() {
                 decoded.frame = frame;
                 decoded.sourcePtsMs = sourcePtsMs;
                 decoded.sourceTimecode100ns =
-                    video.timecode100ns == kNdiTimecodeSynthesize ? -1 : video.timecode100ns;
+                    video.timecode100ns == kTimecodeSynthesize ? -1 : video.timecode100ns;
+                // NDI timecode is real-time 100 ns since midnight. Keep the sender's
+                // canonical exact rate in the evidence and wrap rounding at one day.
+                decoded.timecodeEvidence =
+                    ndiTimecodeEvidence(video, sourcePtsMs, m_sourceGeneration);
+                if (decoded.timecodeEvidence.has_value()) {
+                    if (m_activeTimecodeRate.valid() &&
+                        !(m_activeTimecodeRate == decoded.timecodeEvidence->labelRate) &&
+                        m_sourceGeneration != std::numeric_limits<uint64_t>::max())
+                        ++m_sourceGeneration;
+                    m_activeTimecodeRate = decoded.timecodeEvidence->labelRate;
+                    decoded.timecodeEvidence->sourceGeneration = m_sourceGeneration;
+                    decoded.timecodeEvidence->timingGeneration = m_sourceGeneration;
+                }
                 m_callbacks.onVideoFrame(decoded);
             } else if (frame) {
                 av_frame_free(&frame);
@@ -464,7 +469,7 @@ void NativeNdiIngestSession::run() {
                 DecodedAudioChunk chunk;
                 chunk.startSample = sourcePtsMs * 48000 / 1000;
                 chunk.sourceTimecode100ns =
-                    audio.timecode100ns == kNdiTimecodeSynthesize ? -1 : audio.timecode100ns;
+                    audio.timecode100ns == kTimecodeSynthesize ? -1 : audio.timecode100ns;
                 chunk.pcmS16Stereo = pcm;
                 m_callbacks.onAudioChunk(std::move(chunk));
             }

@@ -78,6 +78,9 @@ ios/streamdeck-bridge/StreamDeckBridge.xcodeproj/
 .worktrees/
 .claude/worktrees/
 
+# Per-machine Codex CLI config (personal approval/sandbox preferences)
+.codex/config.toml
+
 # Python bytecode cache (e.g. from tests/e2e/lossy_udp_relay.py)
 __pycache__/
 *.pyc

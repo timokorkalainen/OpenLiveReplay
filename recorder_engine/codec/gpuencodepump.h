@@ -9,19 +9,30 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
-#include <functional>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 
 class GpuFence;
 class NativeVideoEncoder;
 
 class GpuEncodePump {
 public:
-    using PacketSink = std::function<void(const QByteArray& data, int64_t ptsTicks, bool keyframe)>;
-    using FailureSink = std::function<void()>;
+    struct JobCallbacks {
+        using PacketFunction = void (*)(void* context, uint64_t id, const QByteArray& data,
+                                        int64_t ptsTicks, bool keyframe);
+        using StateFunction = void (*)(void* context, uint64_t id);
+
+        void* context = nullptr;
+        uint64_t id = 0;
+        PacketFunction onPacket = nullptr;
+        StateFunction onFailure = nullptr;
+        StateFunction onFinished = nullptr;
+    };
+    static_assert(std::is_trivially_copyable_v<JobCallbacks>);
+    static constexpr int kMaxPacketsPerJob = 8;
 
     GpuEncodePump(NativeVideoEncoder* encoder, int maxQueue = 4,
                   std::mutex* encoderMutex = nullptr);
@@ -30,8 +41,7 @@ public:
     GpuEncodePump(const GpuEncodePump&) = delete;
     GpuEncodePump& operator=(const GpuEncodePump&) = delete;
 
-    bool submit(FrameHandle frame, int64_t ptsTicks, ColorMetadata color, PacketSink onPacket,
-                FailureSink onFailure = FailureSink{});
+    bool submit(FrameHandle frame, int64_t ptsTicks, ColorMetadata color, JobCallbacks callbacks);
 
     void start();
     void stop();
@@ -41,16 +51,29 @@ public:
     uint64_t framesEncoded() const;
 
 private:
+    struct EncodedPacket {
+        QByteArray data;
+        int64_t ptsTicks = 0;
+        bool keyframe = false;
+    };
     struct Job {
+        bool active = false;
+        uint32_t generation = 0;
         FrameHandle frame;
         GpuFrameSynchronization synchronization;
         int64_t ptsTicks = 0;
         ColorMetadata color;
-        PacketSink onPacket;
-        FailureSink onFailure;
+        JobCallbacks callbacks;
+        std::array<EncodedPacket, kMaxPacketsPerJob> packets;
+        size_t packetCount = 0;
+        bool packetOverflow = false;
     };
 
-    void failJob(Job& job);
+    void failJob(JobCallbacks callbacks);
+    size_t acquireJobSlotLocked();
+    void releaseJobSlotLocked(size_t index);
+    void enqueueJobLocked(size_t index);
+    size_t dequeueJobLocked();
 
     void run();
 
@@ -60,7 +83,13 @@ private:
     std::thread m_thread;
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
-    std::deque<Job> m_queue;
+    size_t m_slotCapacity = 0;
+    std::unique_ptr<Job[]> m_jobs;
+    std::unique_ptr<size_t[]> m_queue;
+    size_t m_queueHead = 0;
+    size_t m_queueTail = 0;
+    size_t m_queueCount = 0;
+    size_t m_nextJobSlot = 0;
     std::atomic<bool> m_running{false};
     std::atomic<uint64_t> m_drops{0};
     std::atomic<uint64_t> m_encoded{0};

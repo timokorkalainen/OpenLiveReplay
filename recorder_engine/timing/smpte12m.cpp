@@ -1,7 +1,58 @@
 #include "smpte12m.h"
+#include "timecodeevidence.h"
 
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <numeric>
+
+namespace {
+
+bool checkedTimecodeMultiplyAdd(int64_t a, int64_t b, int64_t c, int64_t* result) {
+    if (a < 0 || b < 0 || c < 0) return false;
+    if (a != 0 && b > (std::numeric_limits<int64_t>::max() - c) / a) return false;
+    *result = a * b + c;
+    return true;
+}
+
+bool normalizedRateEquals(FrameRateQ rate, int32_t numerator, int32_t denominator) {
+    if (!rate.valid()) return false;
+    const int32_t divisor = std::gcd(rate.num, rate.den);
+    return rate.num / divisor == numerator && rate.den / divisor == denominator;
+}
+
+} // namespace
+
+bool validateTimecodeLabel(const Smpte12mTimecode& tc, FrameRateQ rate) {
+    if (!tc.valid || tc.hours < 0 || tc.hours >= 24 || tc.minutes < 0 || tc.minutes >= 60 ||
+        tc.seconds < 0 || tc.seconds >= 60 || tc.frames < 0)
+        return false;
+    if (!rate.valid()) return false;
+
+    int64_t minimumRate = 0;
+    int64_t maximumRate = 0;
+    const int64_t denominator = rate.den;
+    if (!checkedTimecodeMultiplyAdd(12, denominator, 0, &minimumRate) ||
+        !checkedTimecodeMultiplyAdd(240, denominator, 0, &maximumRate) || rate.num < minimumRate ||
+        rate.num > maximumRate)
+        return false;
+
+    int64_t roundedNumerator = 0;
+    int64_t doubledDenominator = 0;
+    if (!checkedTimecodeMultiplyAdd(2, rate.num, rate.den, &roundedNumerator) ||
+        !checkedTimecodeMultiplyAdd(2, rate.den, 0, &doubledDenominator))
+        return false;
+    const int64_t nominalLabelRate = roundedNumerator / doubledDenominator;
+    if (nominalLabelRate <= 0 || tc.frames >= nominalLabelRate) return false;
+
+    if (!tc.dropFrame) return true;
+    const bool ntsc30 = normalizedRateEquals(rate, 30000, 1001);
+    const bool ntsc60 = normalizedRateEquals(rate, 60000, 1001);
+    if (!ntsc30 && !ntsc60) return false;
+
+    const int droppedLabels = ntsc60 ? 4 : 2;
+    return tc.seconds != 0 || tc.minutes % 10 == 0 || tc.frames >= droppedLabels;
+}
 
 namespace Smpte12m {
 
@@ -100,6 +151,37 @@ int64_t toFrameCount(const Smpte12mTimecode& tc, int nominalFps) {
         }
     }
     return frame;
+}
+
+int labelRate(int rateNum, int rateDen) {
+    if (rateNum <= 0 || rateDen <= 0) return 0;
+    constexpr int64_t kMinSupportedFps = 12;
+    constexpr int64_t kMaxSupportedFps = 240;
+    const int64_t numerator = rateNum;
+    const int64_t denominator = rateDen;
+    if (numerator < kMinSupportedFps * denominator || numerator > kMaxSupportedFps * denominator)
+        return 0;
+    // 64-bit intermediate: rateNum/rateDen come from attacker-controlled SPS
+    // timing_info (bounded to <=2e9 by parseSpsFrameRate), so 2*rateNum can exceed
+    // INT_MAX — computing in int would be signed-overflow UB.
+    return int((2LL * rateNum + rateDen) / (2LL * rateDen));
+}
+
+int64_t labelFrameCount(const Smpte12mTimecode& tc, int rateNum, int rateDen) {
+    if (!validateTimecodeLabel(tc, FrameRateQ{rateNum, rateDen})) return -1;
+    const int rate = labelRate(rateNum, rateDen);
+    return rate > 0 ? toFrameCount(tc, rate) : -1;
+}
+
+int64_t labelFrameCountFrom100ns(int64_t timecode100ns, int rateNum, int rateDen) {
+    constexpr int64_t kTicksPerSecond = 10'000'000;
+    constexpr int64_t kTicksPerDay = 24LL * 60 * 60 * kTicksPerSecond;
+    if (timecode100ns < 0 || timecode100ns >= kTicksPerDay) return -1;
+    const int rate = labelRate(rateNum, rateDen);
+    if (rate <= 0) return -1;
+    using I128 = __int128;
+    return static_cast<int64_t>((I128(timecode100ns) * rate + kTicksPerSecond / 2) /
+                                kTicksPerSecond);
 }
 
 int64_t to100ns(const Smpte12mTimecode& tc, int nominalFps) {

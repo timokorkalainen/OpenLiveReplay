@@ -1,0 +1,151 @@
+#ifndef H26XTIMINGCONTEXT_H
+#define H26XTIMINGCONTEXT_H
+
+#include "pespacket.h"
+#include "recorder_engine/timing/smpte12m.h"
+#include "recorder_engine/timing/timecodeevidence.h"
+
+#include <QByteArray>
+#include <QList>
+
+#include <cstdint>
+
+enum class H26xTimingSyntaxStatus : uint8_t { Valid, Unsupported, Malformed };
+
+struct H264TimingSyntax {
+    H26xTimingSyntaxStatus status = H26xTimingSyntaxStatus::Malformed;
+    FrameRateQ frameRate;
+    uint32_t numUnitsInTick = 0;
+    uint32_t timeScale = 0;
+    bool fixedFrameRate = false;
+    bool cpbDpbDelaysPresent = false;
+    uint8_t cpbRemovalDelayLength = 0;
+    uint8_t dpbOutputDelayLength = 0;
+    uint8_t timeOffsetLength = 0;
+    bool picStructPresent = false;
+};
+
+struct HevcTimingSyntax {
+    H26xTimingSyntaxStatus status = H26xTimingSyntaxStatus::Unsupported;
+    FrameRateQ frameRate;
+    uint32_t numUnitsInTick = 0;
+    uint32_t timeScale = 0;
+    uint32_t numTicksPocDiffOne = 0;
+    bool timingInfoPresent = false;
+    bool pocProportionalToTiming = false;
+    bool fieldSeq = false;
+    bool frameFieldInfoPresent = false;
+    bool generalProgressiveSource = false;
+    bool generalInterlacedSource = false;
+    bool cpbDpbDelaysPresent = false;
+    bool subPicHrdParamsPresent = false;
+    bool subPicCpbParamsInPicTimingSei = false;
+    bool fixedPicRateWithinCvsKnown = false;
+    bool fixedPicRateWithinCvs = false;
+    uint8_t auCpbRemovalDelayLength = 0;
+    uint8_t dpbOutputDelayLength = 0;
+    uint8_t dpbOutputDelayDuLength = 0;
+    uint8_t duCpbRemovalDelayIncrementLength = 0;
+    uint8_t maxSubLayersMinus1 = 0;
+    bool temporalIdNesting = false;
+    uint8_t vpsId = 0;
+    uint8_t referencedVpsId = 0;
+    uint8_t spsId = 0;
+};
+
+class H26xTimingContext {
+public:
+    H26xTimingContext();
+    H26xTimingContext(const H26xTimingContext&) = delete;
+    H26xTimingContext& operator=(const H26xTimingContext&) = delete;
+
+    bool updateParameterSets(NativeVideoCodec codec, const QList<QByteArray>& vps,
+                             const QList<QByteArray>& sps);
+    NativeVideoCodec codec() const;
+    FrameRateQ constantFrameRate() const;
+    bool fixedFrameRate() const;
+    uint64_t generation() const;
+    uint64_t identity() const;
+    const H264TimingSyntax* h264() const;
+    const HevcTimingSyntax* hevc() const;
+
+private:
+    NativeVideoCodec m_codec = NativeVideoCodec::Unknown;
+    QList<QByteArray> m_vps;
+    QList<QByteArray> m_sps;
+    uint64_t m_generation = 0;
+    uint64_t m_identity = 0;
+    H264TimingSyntax m_h264;
+    HevcTimingSyntax m_hevc;
+};
+
+namespace H26xTimingDetail {
+
+enum class TimecodeParseStatus : uint8_t { Valid, NoTimestamp, Unsupported, Malformed };
+
+struct TimecodeParseResult {
+    TimecodeParseStatus status = TimecodeParseStatus::NoTimestamp;
+    Smpte12mTimecode timecode;
+    FrameRateQ labelRate;
+    TimecodeProvenance provenance = TimecodeProvenance::H264PicTiming;
+    bool discontinuity = false;
+};
+
+struct HevcTimeCodeContinuity {
+    bool haveSeconds = false;
+    bool haveMinutes = false;
+    bool haveHours = false;
+    uint32_t seconds = 0;
+    uint32_t minutes = 0;
+    uint32_t hours = 0;
+    bool haveFrameSemantics = false;
+    uint32_t frames = 0;
+    FrameRateQ labelRate;
+    uint8_t countingType = 0;
+    bool dropFrame = false;
+};
+
+// The fields needed to validate the transition from the previous set of clock
+// timestamp syntax elements in output order (H.265 D.3.27). This is distinct
+// from HevcTimeCodeContinuity, whose omitted clock units inherit in decoding
+// order.
+struct HevcTimeCodeOutput {
+    bool present = false;
+    bool comparable = false;
+    int64_t clockTimestamp = 0;
+    uint32_t frames = 0;
+    uint32_t maxFps = 0;
+    uint8_t countingType = 0;
+    bool countDropped = false;
+    bool discontinuity = false;
+};
+
+struct HevcPictureTimingParseResult {
+    TimecodeParseStatus status = TimecodeParseStatus::NoTimestamp;
+    int picStruct = -1;
+    int sourceScanType = -1;
+};
+
+// Decode an EBSP into an RBSP while validating the NAL escape rules. A prevention
+// byte must precede 0x00..0x03, and raw 00 00 00/01/02 sequences are forbidden.
+bool unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp);
+
+// Internal parser seam shared by the public Annex-B extractor. It returns a
+// typed status so a short/reserved payload can never leak a partially filled label.
+TimecodeParseResult parseH264PicTiming(const QByteArray& payload, const H264TimingSyntax& syntax);
+HevcPictureTimingParseResult parseHevcPictureTiming(const QByteArray& payload,
+                                                    const HevcTimingSyntax& syntax);
+TimecodeParseResult parseHevcTimeCode(const QByteArray& payload, const HevcTimingSyntax& syntax,
+                                      const HevcTimeCodeContinuity* previous = nullptr,
+                                      HevcTimeCodeContinuity* next = nullptr,
+                                      int expectedClockCount = -1,
+                                      const HevcTimeCodeOutput* previousOutput = nullptr,
+                                      HevcTimeCodeOutput* firstOutput = nullptr,
+                                      HevcTimeCodeOutput* lastOutput = nullptr);
+
+TimecodeParseStatus validateHevcOutputTransition(const HevcTimeCodeOutput* previous,
+                                                 const HevcTimeCodeOutput& current);
+
+} // namespace H26xTimingDetail
+
+#endif // H26XTIMINGCONTEXT_H

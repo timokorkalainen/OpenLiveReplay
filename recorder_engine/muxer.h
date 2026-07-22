@@ -8,12 +8,15 @@
 #include <QStringList>
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
-#include <queue>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #ifdef __APPLE__
@@ -30,7 +33,54 @@ extern "C" {
 
 class Muxer {
 public:
-    using PacketWriteCallback = std::function<void(bool written)>;
+    static constexpr size_t kMaxQueuedPackets = 4096;
+    struct PacketWriteCallback {
+        using Function = void (*)(void* context, uint64_t id, bool written);
+
+        void* context = nullptr;
+        uint64_t id = 0;
+        Function function = nullptr;
+
+        void operator()(bool written) const {
+            if (function) function(context, id, written);
+        }
+        explicit operator bool() const noexcept { return function != nullptr; }
+    };
+    static_assert(std::is_trivially_copyable_v<PacketWriteCallback>);
+    struct PacketCarrierGuard {
+        using Function = bool (*)(void* context, uint64_t sessionIdentity, uint64_t epoch);
+
+        PacketCarrierGuard() noexcept
+            : context(nullptr), sessionIdentity(0), epoch(0), function(nullptr),
+              currentEpoch(nullptr) {}
+        PacketCarrierGuard(const std::atomic<uint64_t>* currentEpoch_,
+                           uint64_t expectedEpoch) noexcept
+            : context(nullptr), sessionIdentity(0), epoch(expectedEpoch), function(nullptr),
+              currentEpoch(currentEpoch_) {}
+        PacketCarrierGuard(void* context_, uint64_t sessionIdentity_, uint64_t epoch_,
+                           Function function_) noexcept
+            : context(context_), sessionIdentity(sessionIdentity_), epoch(epoch_),
+              function(function_), currentEpoch(nullptr) {}
+
+        void* context;
+        uint64_t sessionIdentity;
+        uint64_t epoch;
+        Function function;
+        const std::atomic<uint64_t>* currentEpoch;
+        bool accepts() const noexcept {
+            if (function) return function(context, sessionIdentity, epoch);
+            return !currentEpoch || epoch == 0 ||
+                   currentEpoch->load(std::memory_order_acquire) == epoch;
+        }
+    };
+    static_assert(std::is_trivially_copyable_v<PacketCarrierGuard>);
+    static constexpr size_t kMaxPacketBatch = 8;
+    struct PacketWriteRequest {
+        AVPacket* packet = nullptr;
+        PacketWriteCallback onWritten;
+        QString startTimecodeCandidate;
+        PacketCarrierGuard carrierGuard;
+    };
 
     Muxer();
     ~Muxer();
@@ -63,15 +113,21 @@ public:
               int fpsNum = 0, int fpsDen = 0);
     // Returns true when the packet was accepted into the writer queue. The optional
     // callback still reports the later disk-write result.
-    bool writePacket(AVPacket* pkt, PacketWriteCallback onWritten = PacketWriteCallback{});
+    bool writePacket(AVPacket* pkt,
+                     PacketWriteCallback onWritten = PacketWriteCallback{nullptr, 0, nullptr},
+                     const QString& startTimecodeCandidate = QString(),
+                     PacketCarrierGuard carrierGuard = PacketCarrierGuard{});
+    // All-or-nothing fixed batch admission. Every packet is cloned and every
+    // rejection condition is checked before one queue sequence is committed.
+    bool writePacketBatch(const PacketWriteRequest* packets, size_t packetCount);
     bool writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
     bool writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);
     void beginShutdownDrain();
-    // Offer a session-start timecode candidate. The header is written on the FIRST
-    // muxed packet (see ensureHeaderWritten); the FIRST well-formed candidate
-    // registered before that wins and becomes the file's "timecode" tag. Empty or
-    // malformed candidates are ignored. Thread-safe: called from every worker tick
-    // thread; guarded by m_headerMutex. A no-op once the header is written.
+    // Publish an already-accepted session-start timecode candidate to the deferred
+    // header. Per-packet producers pass candidates to writePacket(), which chooses
+    // the winner under m_qMutex in queue-acceptance order. This method is retained
+    // for explicit/up-front callers and for the writer's publication step. Empty or
+    // malformed candidates are ignored; m_headerMutex makes it thread-safe.
     void setStartTimecodeCandidate(const QString& tc);
     AVStream* getStream(int index);
     void close();
@@ -118,12 +174,17 @@ private:
     // avformat_write_header failed. Called by the writer thread before draining the
     // first queued packet, and from close() so an empty recording still gets a header.
     //
-    // LOCK ORDERING: m_headerMutex is the FIRST lock taken on any write — it is
-    // never held while acquiring m_qMutex (writePacket releases it implicitly by
-    // returning from ensureHeaderWritten before locking the queue). close() takes
-    // m_mutex, then (via ensureHeaderWritten) m_headerMutex; ensureHeaderWritten
-    // never reaches back for m_mutex, so there is no cycle.
+    // LOCK ORDERING: no path holds m_headerMutex while acquiring m_qMutex. The
+    // writer snapshots accepted candidates under m_qMutex, releases it, and only
+    // then publishes/writes the header. close() takes m_mutex, then (via
+    // ensureHeaderWritten) m_headerMutex; ensureHeaderWritten never reaches back
+    // for m_mutex, so there is no cycle.
+    enum class HeaderCommitStatus { Written, StaleAuthority, Failed };
     bool ensureHeaderWritten();
+    HeaderCommitStatus ensureHeaderWrittenForPacket(const PacketCarrierGuard& packetGuard,
+                                                    const PacketCarrierGuard& candidateGuard);
+    bool publishStartTimecodeCandidate(const QString& tc, uint64_t publicationId);
+    void undoStartTimecodeCandidatePublication(const QString& tc, uint64_t publicationId);
 
     // True while the header write should be HELD for the first source timecode:
     // unwritten header + no winning candidate yet + grace window still open. The
@@ -154,12 +215,13 @@ private:
     // The MKV header is written on the first muxed packet, not in init(), so the
     // session start timecode (the first muxed frame's TC) can be captured into the
     // "timecode" tag — live recordings observe no TC at start. m_headerMutex guards
-    // all three fields and serialises the one-time avformat_write_header. It is the
-    // FIRST lock on any write path; ensureHeaderWritten never reaches for another
-    // Muxer lock while holding it (see ensureHeaderWritten doc for ordering).
+    // all three fields and serialises the one-time avformat_write_header.
+    // ensureHeaderWritten never reaches for another Muxer lock while holding it
+    // (see ensureHeaderWritten doc for ordering).
     QMutex m_headerMutex;
     bool m_headerWritten = false;
     QString m_startTimecodeCandidate;
+    uint64_t m_startTimecodeCandidatePublicationId = 0;
     // Bounded "wait for the first source TC" grace. A live recording observes no
     // TC at start and emits BLUE/pre-connect packets (TC=-1) before the first real
     // source frame carrying a timecode. Committing the header on that first no-TC
@@ -190,16 +252,69 @@ private:
     // writer thread drains the queue and performs the blocking disk writes,
     // so worker tick threads and the GUI thread never block on a stalled disk
     // (except, by design, when a sustained stall fills the bounded queue).
-    static constexpr size_t kMaxQueued = 4096; // ~ a few seconds of packets
     struct QueuedPacket {
         AVPacket* pkt = nullptr;
         PacketWriteCallback onWritten;
+        PacketCarrierGuard carrierGuard;
+        uint64_t sequence = 0;
+    };
+    struct AcceptedCandidate {
+        QString value;
+        PacketCarrierGuard carrierGuard;
+        uint64_t sequence = 0;
+    };
+
+    template <typename T, size_t Capacity>
+    class FixedQueue {
+    public:
+        bool empty() const noexcept { return m_size == 0; }
+        size_t size() const noexcept { return m_size; }
+        static constexpr size_t capacity() noexcept { return Capacity; }
+        T& front() noexcept { return m_entries[m_head]; }
+        const T& front() const noexcept { return m_entries[m_head]; }
+        bool push(T value) noexcept {
+            if (m_size == Capacity) return false;
+            m_entries[(m_head + m_size) % Capacity] = std::move(value);
+            ++m_size;
+            return true;
+        }
+        bool push_back(T value) noexcept { return push(std::move(value)); }
+        void pop() noexcept {
+            if (empty()) return;
+            m_entries[m_head] = T{};
+            m_head = (m_head + 1) % Capacity;
+            --m_size;
+        }
+        void pop_front() noexcept { pop(); }
+        void clear() noexcept {
+            while (!empty())
+                pop();
+        }
+
+    private:
+        std::unique_ptr<T[]> m_entries = std::make_unique<T[]>(Capacity);
+        size_t m_head = 0;
+        size_t m_size = 0;
     };
 
     std::thread m_writerThread;
-    std::queue<QueuedPacket> m_pktQueue; // owns the cloned packets it holds
+    // Preallocated so an access-unit batch cannot fail after partial queue commit.
+    FixedQueue<QueuedPacket, kMaxQueuedPackets + kMaxPacketBatch> m_pktQueue;
+    uint64_t m_nextQueuedPacketSequence = 1;
     std::mutex m_qMutex;
     std::condition_variable m_qCv;
+    // First valid candidate attached to a packet actually accepted into m_pktQueue.
+    // Guarded by m_qMutex so concurrent producers resolve in queue-acceptance order.
+    QString m_acceptedStartTimecodeCandidate;
+    FixedQueue<AcceptedCandidate, kMaxQueuedPackets + kMaxPacketBatch>
+        m_acceptedStartTimecodeCandidates;
+    // Candidate admission and the writer's final boundary snapshot share
+    // m_qMutex. An empty boundary closes admission before the writer releases
+    // that mutex; a non-empty tentative selection still admits replacements so
+    // they survive if the selected carrier becomes stale before header commit.
+    enum class CandidateWindowState { Open, TentativeEmptyClosed, TentativeCandidate, Committed };
+    uint64_t m_candidateWindowGeneration = 1;
+    CandidateWindowState m_candidateWindowState = CandidateWindowState::Open;
     std::atomic<bool> m_writerRunning{false};
     std::atomic<bool> m_blockingWritesAllowed{true};
 
@@ -214,6 +329,11 @@ private:
 
 #ifdef OLR_UNIT_TEST
     friend class TestMuxer;
+    friend class TestStreamWorkerGpuEncode;
+    std::function<void()> m_afterCandidateSnapshotForTest;
+    std::function<void()> m_beforeCandidatePublicationForTest;
+    std::function<void()> m_afterCandidatePublicationForTest;
+    std::function<void()> m_beforeHeaderCommitForTest;
 #endif
 };
 

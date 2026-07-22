@@ -4229,8 +4229,10 @@ def main():
     pump_submit = function_block(encode_pump, "bool GpuEncodePump::submit")
     audit_exact_synchronization_flow(
         pump_submit, "GPU encode pump submit", require_pair_fields=False)
-    require(re.search(r"Job\s+job\s*\{[^;]*synchronization", pump_submit, re.DOTALL),
-            "GPU encode pump must store the frame's exact synchronization as one job field")
+    require(re.search(r"Job\s*&\s*job\s*=\s*m_jobs\s*\[\s*index\s*\]\s*;", pump_submit),
+            "GPU encode pump must select a bounded Job slot for the submitted frame")
+    require(re.search(r"job\s*\.\s*synchronization\s*=\s*synchronization\s*;", pump_submit),
+            "GPU encode pump must store the frame's exact synchronization in that job slot")
     pump_run = function_block(encode_pump, "void GpuEncodePump::run")
     pump_run_tokens = [token for token, _ in tokens(pump_run)]
     require("gpuFence" not in pump_run_tokens and "fenceValue" not in pump_run_tokens and

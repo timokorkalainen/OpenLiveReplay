@@ -113,16 +113,24 @@ void OutputRuntime::resetFrameIndex(qint64 nextOutputFrameIndex) {
 
 void OutputRuntime::resetPlayEpoch() {
     QMutexLocker locker(&m_mutex);
-#ifdef OLR_UNIT_TEST
-    ++m_playEpochResetCountForTest;
-#endif
-    if (dispatchActiveOnCurrentThreadLocked()) {
+    // Re-anchor barrier (Challenge 1, F1): bump the config generation so any
+    // in-flight pre-reset snapshot fails its lease re-check — dispatchDueTicksNs
+    // (m_configGeneration != configGeneration) and dispatchImmediateWithReport
+    // both re-compare it — and is discarded rather than dispatched against the
+    // freshly-cleared epoch. Placed before the dispatch-active branch so it
+    // covers the deferred-pending path too (invalidating earlier is safe: the
+    // active dispatch already passed its re-check; the next snapshot sees the new
+    // generation, and the deferred epoch clear applies before that next tick).
+    ++m_configGeneration;
+    if (m_dispatchActive) {
         m_pendingPlayEpochReset = true;
         return;
     }
-    waitForDispatchIdleLocked();
     m_dispatcher.resetPlayEpoch();
     refreshCachedStatsLocked();
+#ifdef OLR_UNIT_TEST
+    ++m_playEpochResetCountForTest;
+#endif
 }
 
 void OutputRuntime::incrementFenceWaitStalls() {
@@ -298,6 +306,24 @@ int OutputRuntime::playEpochResetCountForTest() const {
 
 bool OutputRuntime::immediateDispatchPendingForTest() const {
     return m_immediateDispatchRequests.load(std::memory_order_acquire) > 0;
+}
+
+OutputRuntime::PlayEpochStateForTest OutputRuntime::playEpochStateForTest() const {
+    QMutexLocker locker(&m_mutex);
+    return PlayEpochStateForTest{m_configGeneration, m_pendingPlayEpochReset,
+                                 m_playEpochResetCountForTest};
+}
+
+bool OutputRuntime::waitForImmediateDispatchRequestsForTest(int requests, int timeoutMs) const {
+    QElapsedTimer timer;
+    timer.start();
+    QMutexLocker locker(&m_mutex);
+    while (m_immediateDispatchRequests < requests) {
+        const qint64 remainingMs = qint64(timeoutMs) - timer.elapsed();
+        if (remainingMs <= 0) return false;
+        if (!m_dispatchIdle.wait(&m_mutex, static_cast<unsigned long>(remainingMs))) return false;
+    }
+    return true;
 }
 #endif
 
@@ -482,6 +508,9 @@ void OutputRuntime::applyPendingDispatchMutationsLocked() {
     if (m_pendingPlayEpochReset) {
         m_dispatcher.resetPlayEpoch();
         m_pendingPlayEpochReset = false;
+#ifdef OLR_UNIT_TEST
+        ++m_playEpochResetCountForTest;
+#endif
     }
     if (m_hasPendingIdentitySkip) {
         m_dispatcher.setIdentitySkip(m_pendingIdentitySkip);

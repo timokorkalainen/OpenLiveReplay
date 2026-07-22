@@ -346,12 +346,10 @@ void TestH264RoundTrip::encodedSpsCarriesRequestedColorVui() {
     memset(f->data[2], 128, f->linesize[2] * 120);
 
     bool got = false;
-    QVERIFY(enc->encode(
-        f, 0,
-        [&](const QByteArray& data, int64_t, bool) {
-            if (!data.isEmpty()) got = true;
-        },
-        &err));
+    auto capturePacket = [&](const QByteArray& data, int64_t, bool) {
+        if (!data.isEmpty()) got = true;
+    };
+    QVERIFY(enc->encode(f, 0, NativeVideoEncoder::PacketCallback::bind(capturePacket), &err));
     if (!got) QSKIP("encoder produced no priming packet");
     const QByteArray avcc = enc->avccExtradata();
     if (avcc.isEmpty()) QSKIP("encoder exposed no avcC");
@@ -387,15 +385,14 @@ void TestH264RoundTrip::encodeMuxDemuxYieldsIntraH264() {
     // Prime to obtain avcC.
     bool gotPrimePacket = false;
     bool primeKeyframe = true;
-    const bool primeOk = enc->encode(
-        source, 0,
-        [&](const QByteArray& data, int64_t, bool key) {
-            if (!data.isEmpty()) {
-                gotPrimePacket = true;
-                primeKeyframe = key;
-            }
-        },
-        &err);
+    auto capturePrimePacket = [&](const QByteArray& data, int64_t, bool key) {
+        if (!data.isEmpty()) {
+            gotPrimePacket = true;
+            primeKeyframe = key;
+        }
+    };
+    const bool primeOk =
+        enc->encode(source, 0, NativeVideoEncoder::PacketCallback::bind(capturePrimePacket), &err);
     if (!primeOk || !gotPrimePacket) {
         QSKIP("hardware H.264 encoder opened but produced no priming packet");
     }
@@ -416,22 +413,20 @@ void TestH264RoundTrip::encodeMuxDemuxYieldsIntraH264() {
     AVStream* st = m.getStream(0);
     QVERIFY(st);
     int written = 0;
+    auto writeEncodedPacket = [&](const QByteArray& data, int64_t pts, bool key) {
+        AVPacket* pkt = av_packet_alloc();
+        av_new_packet(pkt, data.size());
+        memcpy(pkt->data, data.constData(), data.size());
+        pkt->stream_index = 0;
+        pkt->pts = pkt->dts = av_rescale_q(pts, AVRational{1, 30}, st->time_base);
+        pkt->duration = av_rescale_q(1, AVRational{1, 30}, st->time_base);
+        if (key) pkt->flags |= AV_PKT_FLAG_KEY;
+        m.writePacket(pkt);
+        av_packet_free(&pkt);
+        ++written;
+    };
     for (int i = 1; i <= 6; ++i) {
-        enc->encode(
-            source, i,
-            [&](const QByteArray& data, int64_t pts, bool key) {
-                AVPacket* pkt = av_packet_alloc();
-                av_new_packet(pkt, data.size());
-                memcpy(pkt->data, data.constData(), data.size());
-                pkt->stream_index = 0;
-                pkt->pts = pkt->dts = av_rescale_q(pts, AVRational{1, 30}, st->time_base);
-                pkt->duration = av_rescale_q(1, AVRational{1, 30}, st->time_base);
-                if (key) pkt->flags |= AV_PKT_FLAG_KEY;
-                m.writePacket(pkt);
-                av_packet_free(&pkt);
-                ++written;
-            },
-            &err);
+        enc->encode(source, i, NativeVideoEncoder::PacketCallback::bind(writeEncodedPacket), &err);
     }
     m.close();
     QVERIFY(written >= 6);
@@ -623,13 +618,12 @@ void TestH264RoundTrip::keepSurfaceCallbackRejectionAllowsCpuFallback() {
     auto freeSource = qScopeGuard([&] { av_frame_free(&source); });
 
     QByteArray refPacket;
-    QVERIFY2(enc->encode(
-                 source, 0,
-                 [&](const QByteArray& data, int64_t, bool key) {
-                     if (!data.isEmpty() && key && refPacket.isEmpty()) refPacket = data;
-                 },
-                 &err),
-             qPrintable(err));
+    auto captureRefPacket = [&](const QByteArray& data, int64_t, bool key) {
+        if (!data.isEmpty() && key && refPacket.isEmpty()) refPacket = data;
+    };
+    QVERIFY2(
+        enc->encode(source, 0, NativeVideoEncoder::PacketCallback::bind(captureRefPacket), &err),
+        qPrintable(err));
     if (refPacket.isEmpty()) QSKIP("encoder produced no keyframe");
 
     H26xParameterSets refSets;
@@ -679,16 +673,15 @@ void TestH264RoundTrip::decodeGpuEncodeGpuRoundTripMatchesCpuUpload() {
 
     QByteArray refPacket;
     bool gotKeyframe = false;
-    QVERIFY2(enc->encode(
-                 source, 0,
-                 [&](const QByteArray& data, int64_t, bool key) {
-                     if (!data.isEmpty() && key && refPacket.isEmpty()) {
-                         refPacket = data;
-                         gotKeyframe = true;
-                     }
-                 },
-                 &err),
-             qPrintable(err));
+    auto captureRefPacket = [&](const QByteArray& data, int64_t, bool key) {
+        if (!data.isEmpty() && key && refPacket.isEmpty()) {
+            refPacket = data;
+            gotKeyframe = true;
+        }
+    };
+    QVERIFY2(
+        enc->encode(source, 0, NativeVideoEncoder::PacketCallback::bind(captureRefPacket), &err),
+        qPrintable(err));
     if (!gotKeyframe) QSKIP("encoder produced no keyframe");
 
     H26xParameterSets refSets;
@@ -721,12 +714,12 @@ void TestH264RoundTrip::decodeGpuEncodeGpuRoundTripMatchesCpuUpload() {
     QVERIFY2(gpuEnc != nullptr, qPrintable(err));
 
     QByteArray gpuPacket;
-    QVERIFY2(gpuEnc->encodeSurface(
-                 gpuFrame.data()->gpuSurface(), 0, gpuFrame.metadata().color,
-                 [&](const QByteArray& data, int64_t, bool key) {
-                     if (!data.isEmpty() && key && gpuPacket.isEmpty()) gpuPacket = data;
-                 },
-                 &err),
+    auto captureGpuPacket = [&](const QByteArray& data, int64_t, bool key) {
+        if (!data.isEmpty() && key && gpuPacket.isEmpty()) gpuPacket = data;
+    };
+    QVERIFY2(gpuEnc->encodeSurface(gpuFrame.data()->gpuSurface(), 0, gpuFrame.metadata().color,
+                                   NativeVideoEncoder::PacketCallback::bind(captureGpuPacket),
+                                   &err),
              qPrintable(err));
     QVERIFY(!gpuPacket.isEmpty());
 

@@ -111,6 +111,7 @@ one adapter reset may kill several owned device domains, so every current-author
 published into the same loss epoch. Real-loss tokens carry device-domain identity, and one
 token-gated registry scan releases only matching entries. Other live-device domains remain subject
 to the bounded drain, which stops traversal and driver calls when its total deadline expires.
+No recovery path waits on a fence from a device domain proven dead.
 
 ## Windows real-fault lane
 
@@ -161,7 +162,6 @@ parent merges successful JSONL checkpoints and nests any partial checkpoint besi
 stderr on abnormal exit. Recovery evidence is
 therefore taken from production worker orchestration, cache sanitization, generation rejection, and
 post-loss output submission—not inferred from a reset of a separate device on the same adapter.
-
 Logs preserve adapter identity, removal HRESULT, generation transition, fence values, registry counts, recovery timing, and child exit status.
 
 ## Performance constraints
@@ -182,7 +182,6 @@ Shared-surface reads use an aliasing `shared_ptr` to the existing surface contro
 no allocation and no extra native `AddRef`/`CFRetain`. The raw-surface encoder overload takes an
 independently retained native reference because it has no shared surface owner; that retained
 resource is ownership-safe even if a lease value survives its creating expression.
-
 Performance measurements compare the parent commit and implementation commit using repeated runs and medians:
 
 - CPU submission time per GPU operation;

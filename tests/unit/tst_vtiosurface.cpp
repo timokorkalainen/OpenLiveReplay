@@ -72,15 +72,14 @@ bool TestVtIOSurface::buildGreyIdrAccessUnit(CompressedAccessUnit* unit, int w, 
     bool keyframe = false;
     AVFrame* frame = makeGreyFrame(w, h);
     if (!frame) return false;
-    const bool ok = enc->encode(
-        frame, 0,
-        [&](const QByteArray& data, int64_t, bool key) {
-            if (!data.isEmpty()) {
-                packet = data;
-                keyframe = key;
-            }
-        },
-        &err);
+    auto capturePacket = [&](const QByteArray& data, int64_t, bool key) {
+        if (!data.isEmpty()) {
+            packet = data;
+            keyframe = key;
+        }
+    };
+    const bool ok =
+        enc->encode(frame, 0, NativeVideoEncoder::PacketCallback::bind(capturePacket), &err);
     av_frame_free(&frame);
     if (!ok || packet.isEmpty() || !keyframe) return false;
 

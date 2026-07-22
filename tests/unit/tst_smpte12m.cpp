@@ -1,6 +1,8 @@
 #include <QtTest>
 #include "recorder_engine/timing/smpte12m.h"
 
+#include <limits>
+
 class TestSmpte12m : public QObject {
     Q_OBJECT
 private slots:
@@ -11,6 +13,8 @@ private slots:
     void frameCountWraps24h();
     void to100nsMatchesFrameCount();
     void from100nsRoundTrips();
+    void labelRateRejectsImplausibleSenderRates();
+    void labelFrameCountFrom100nsIsOverflowSafe();
     void invalidFormatsEmpty();
     void parseTimecodeStringRoundTrips();
 };
@@ -70,6 +74,25 @@ void TestSmpte12m::from100nsRoundTrips() {
             QCOMPARE(rt.hours, src.hours);
         }
     }
+}
+void TestSmpte12m::labelRateRejectsImplausibleSenderRates() {
+    QCOMPARE(Smpte12m::labelRate(12, 1), 12);
+    QCOMPARE(Smpte12m::labelRate(240, 1), 240);
+    QCOMPARE(Smpte12m::labelRate(60000, 1001), 60);
+
+    QCOMPARE(Smpte12m::labelRate(11, 1), 0);
+    QCOMPARE(Smpte12m::labelRate(241, 1), 0);
+    QCOMPARE(Smpte12m::labelRate(std::numeric_limits<int>::max(), 1), 0);
+    QCOMPARE(Smpte12m::labelRate(1, std::numeric_limits<int>::max()), 0);
+}
+void TestSmpte12m::labelFrameCountFrom100nsIsOverflowSafe() {
+    QCOMPARE(Smpte12m::labelFrameCountFrom100ns(10'000'000, 60000, 1001), int64_t(60));
+    QCOMPARE(Smpte12m::labelFrameCountFrom100ns(863'999'999'999LL, 240, 1), int64_t(20'736'000));
+
+    QCOMPARE(Smpte12m::labelFrameCountFrom100ns(10'000'000, 11, 1), int64_t(-1));
+    QCOMPARE(Smpte12m::labelFrameCountFrom100ns(10'000'000, 241, 1), int64_t(-1));
+    QCOMPARE(Smpte12m::labelFrameCountFrom100ns(std::numeric_limits<int64_t>::max() - 1, 60, 1),
+             int64_t(-1));
 }
 void TestSmpte12m::invalidFormatsEmpty() {
     char buf[12];

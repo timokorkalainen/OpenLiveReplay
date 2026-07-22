@@ -57,12 +57,16 @@ QList<AnnexBNal> splitAnnexBNals(const QByteArray& bytes) {
         if (prefixSize == 0 || end <= payloadOffset) {
             continue;
         }
+        int nalEnd = end;
+        while (nalEnd > payloadOffset && bytes[nalEnd - 1] == char(0))
+            --nalEnd;
+        if (nalEnd <= payloadOffset) continue;
 
         AnnexBNal nal;
         nal.startOffset = start;
         nal.payloadOffset = payloadOffset;
         nal.endOffset = end;
-        nal.nal = bytes.mid(payloadOffset, end - payloadOffset);
+        nal.nal = bytes.mid(payloadOffset, nalEnd - payloadOffset);
         nals.append(nal);
     }
     return nals;

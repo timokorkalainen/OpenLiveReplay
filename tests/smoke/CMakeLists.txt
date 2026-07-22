@@ -53,6 +53,10 @@ add_test(NAME ios_gpu_build_config
     COMMAND "${OLR_SMOKE_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/check_ios_gpu_build_config.sh")
 set_tests_properties(ios_gpu_build_config PROPERTIES LABELS "smoke;ci" TIMEOUT 10)
 
+add_test(NAME ios_ndi_config
+    COMMAND "${OLR_SMOKE_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/check_ios_ndi_config.sh")
+set_tests_properties(ios_ndi_config PROPERTIES LABELS "smoke;ci" TIMEOUT 10)
+
 add_test(NAME linux_ffmpeg_build_config
     COMMAND "${OLR_SMOKE_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/check_linux_ffmpeg_build_config.sh")
 set_tests_properties(linux_ffmpeg_build_config PROPERTIES LABELS "smoke;ci" TIMEOUT 10)

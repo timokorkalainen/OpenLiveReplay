@@ -1,6 +1,8 @@
 #include "recorder_engine/codec/nativevideoencoder.h"
 #include "recorder_engine/codec/avcc.h"
 #include "recorder_engine/codec/colorvui.h"
+#include "recorder_engine/codec/mediafoundationasynclifecycle.h"
+#include "recorder_engine/codec/mediafoundationh264policy.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/win/d3d11gpusurface.h"
@@ -13,9 +15,12 @@
 #endif
 
 #include <QByteArray>
+#include <QDeadlineTimer>
+#include <QFileInfo>
 #include <QHash>
 #include <QList>
 #include <QString>
+#include <QThread>
 
 #include <algorithm>
 #include <cstring>
@@ -26,6 +31,7 @@
 #include <mfobjects.h>
 #include <mftransform.h>
 #include <objbase.h>
+#include <winver.h>
 // codecapi.h declares the CODECAPI_* property GUIDs with DEFINE_GUID; including
 // <initguid.h> first instantiates their definitions in this translation unit so
 // we do not depend on a specific import library (MinGW's strmiids/codecapi
@@ -203,6 +209,84 @@ void releaseActivations(IMFActivate** activates, UINT32 count) {
     CoTaskMemFree(activates);
 }
 
+QString guidString(const GUID& guid) {
+    wchar_t text[39]{};
+    return StringFromGUID2(guid, text, 39) > 0 ? QString::fromWCharArray(text) : QString();
+}
+
+QString registeredTransformModulePath(const QString& clsid) {
+    const QString subKey = QStringLiteral("CLSID\\%1\\InprocServer32").arg(clsid);
+    DWORD bytes = 0;
+    const LSTATUS sizeStatus =
+        RegGetValueW(HKEY_CLASSES_ROOT, reinterpret_cast<LPCWSTR>(subKey.utf16()), nullptr,
+                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, nullptr, &bytes);
+    if (sizeStatus != ERROR_SUCCESS || bytes < sizeof(wchar_t)) {
+        return {};
+    }
+
+    QByteArray buffer(static_cast<qsizetype>(bytes), '\0');
+    const LSTATUS valueStatus =
+        RegGetValueW(HKEY_CLASSES_ROOT, reinterpret_cast<LPCWSTR>(subKey.utf16()), nullptr,
+                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, buffer.data(), &bytes);
+    if (valueStatus != ERROR_SUCCESS) {
+        return {};
+    }
+    return QString::fromWCharArray(reinterpret_cast<const wchar_t*>(buffer.constData()));
+}
+
+QString moduleFileVersion(const QString& path) {
+    DWORD ignored = 0;
+    const DWORD size = GetFileVersionInfoSizeW(reinterpret_cast<LPCWSTR>(path.utf16()), &ignored);
+    if (size == 0 || size > DWORD(std::numeric_limits<int>::max())) {
+        return {};
+    }
+
+    QByteArray data(static_cast<qsizetype>(size), '\0');
+    if (!GetFileVersionInfoW(reinterpret_cast<LPCWSTR>(path.utf16()), 0, size, data.data())) {
+        return {};
+    }
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT infoSize = 0;
+    if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &infoSize) || !info ||
+        infoSize < sizeof(VS_FIXEDFILEINFO) || info->dwSignature != 0xfeef04bd) {
+        return {};
+    }
+    return QStringLiteral("%1.%2.%3.%4")
+        .arg(HIWORD(info->dwFileVersionMS))
+        .arg(LOWORD(info->dwFileVersionMS))
+        .arg(HIWORD(info->dwFileVersionLS))
+        .arg(LOWORD(info->dwFileVersionLS));
+}
+
+MfH264TransformIdentity transformIdentity(IMFActivate* activate) {
+    MfH264TransformIdentity identity;
+    GUID clsid{};
+    if (SUCCEEDED(activate->GetGUID(MFT_TRANSFORM_CLSID_Attribute, &clsid))) {
+        identity.clsid = guidString(clsid);
+    }
+
+    wchar_t* friendlyName = nullptr;
+    UINT32 friendlyNameLength = 0;
+    if (SUCCEEDED(activate->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &friendlyName,
+                                               &friendlyNameLength)) &&
+        friendlyName) {
+        identity.friendlyName =
+            QString::fromWCharArray(friendlyName, static_cast<qsizetype>(friendlyNameLength));
+        CoTaskMemFree(friendlyName);
+    }
+
+    const QString modulePath = registeredTransformModulePath(identity.clsid);
+    identity.moduleFileName = QFileInfo(modulePath).fileName();
+    identity.moduleVersion = moduleFileVersion(modulePath);
+    return identity;
+}
+
+QString transformIdentityDiagnostic(const MfH264TransformIdentity& identity) {
+    return QStringLiteral("clsid=%1 friendly_name=\"%2\" module=%3 version=%4")
+        .arg(identity.clsid, identity.friendlyName, identity.moduleFileName,
+             identity.moduleVersion);
+}
+
 } // namespace
 
 class MediaFoundationEncoder : public NativeVideoEncoder {
@@ -228,6 +312,7 @@ private:
     bool configureCodecApi(QString* error);
     bool configureD3DManagerForSurface(ID3D11Device* device, QString* error);
     bool beginStreaming(QString* error);
+    bool shutdownAsyncTransform(QString* error);
 
     bool buildInputSample(const AVFrame* frame, int64_t ptsTicks, ComPtr<IMFSample>* sample,
                           QString* error);
@@ -260,6 +345,7 @@ private:
     bool m_comInitialized = false;
     bool m_streaming = false;
     bool m_asyncTransform = false;
+    bool m_shutdown = false;
     int m_asyncNeedInputEvents = 0;
     LONGLONG m_sampleDuration = 0;
     LONGLONG m_nextSampleTime = 0;
@@ -269,28 +355,85 @@ private:
 };
 
 MediaFoundationEncoder::~MediaFoundationEncoder() {
-    if (m_transform) {
-        bool shutdown = false;
-        if (m_asyncTransform) {
-            // Async MFTs own an event queue and are required to expose IMFShutdown.
-            // Shut that queue down before releasing the transform; sending drain
-            // notifications without pumping its events races some hardware drivers.
-            ComPtr<IMFShutdown> asyncShutdown;
-            if (SUCCEEDED(m_transform.As(&asyncShutdown)) && asyncShutdown) {
-                shutdown = SUCCEEDED(asyncShutdown->Shutdown());
-            }
+    auto shutdownAsync = [&] { return shutdownAsyncTransform(nullptr); };
+
+    if (m_transform && m_asyncTransform && !m_shutdown) {
+        if (m_streaming) {
+            // Teardown abandons pending output. Draining an async MFT requires
+            // pumping events until METransformDrainComplete; releasing it
+            // immediately after COMMAND_DRAIN races its worker queue. Flush the
+            // queued samples instead, then shut the event queue down below.
+            (void) abortMfAsyncTransform(
+                [&](MfAsyncMessage message) {
+                    const MFT_MESSAGE_TYPE nativeMessage = message == MfAsyncMessage::Flush
+                                                               ? MFT_MESSAGE_COMMAND_FLUSH
+                                                               : MFT_MESSAGE_NOTIFY_END_STREAMING;
+                    return SUCCEEDED(m_transform->ProcessMessage(nativeMessage, 0));
+                },
+                shutdownAsync);
+        } else {
+            (void) shutdownAsync();
         }
-        if (!shutdown && m_streaming) {
-            // Destruction abandons queued output, so flush rather than drain.
-            m_transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-            m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-        }
+    } else if (m_transform && m_streaming) {
+        m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        m_transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+        m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+    }
+    if (m_transform && m_asyncTransform && !m_shutdown) {
+        // A message failure above must not skip the final event-queue shutdown.
+        (void) shutdownAsync();
     }
     m_eventGenerator.Reset();
     m_d3dDeviceManager.Reset();
     m_d3dManagerDevice.Reset();
     m_transform.Reset();
     shutdownRuntime();
+}
+
+bool MediaFoundationEncoder::shutdownAsyncTransform(QString* error) {
+    if (m_shutdown) {
+        return true;
+    }
+    ComPtr<IMFShutdown> shutdown;
+    if (FAILED(m_transform.As(&shutdown))) {
+        if (error) {
+            *error =
+                QStringLiteral("Media Foundation async encoder exposes no IMFShutdown interface");
+        }
+        return false;
+    }
+    const HRESULT shutdownHr = shutdown->Shutdown();
+    if (FAILED(shutdownHr)) {
+        if (error) {
+            *error = hrMessage(QStringLiteral("Media Foundation async encoder shutdown failed"),
+                               shutdownHr);
+        }
+        return false;
+    }
+
+    constexpr int kShutdownTimeoutMs = 2000;
+    QDeadlineTimer deadline(kShutdownTimeoutMs);
+    while (!deadline.hasExpired()) {
+        MFSHUTDOWN_STATUS status = MFSHUTDOWN_INITIATED;
+        const HRESULT statusHr = shutdown->GetShutdownStatus(&status);
+        if (SUCCEEDED(statusHr) && status == MFSHUTDOWN_COMPLETED) {
+            m_shutdown = true;
+            return true;
+        }
+        if (FAILED(statusHr)) {
+            if (error) {
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation async encoder shutdown status failed"),
+                    statusHr);
+            }
+            return false;
+        }
+        QThread::msleep(1);
+    }
+    if (error) {
+        *error = QStringLiteral("Media Foundation async encoder shutdown timed out");
+    }
+    return false;
 }
 
 bool MediaFoundationEncoder::ensureRuntime(QString* error) {
@@ -349,13 +492,36 @@ bool MediaFoundationEncoder::createTransform(QString* error) {
         return false;
     }
 
-    // Activate the first hardware encoder MFT.
-    hr = activates[0]->ActivateObject(IID_PPV_ARGS(&m_transform));
+    QList<MfH264TransformIdentity> identities;
+    identities.reserve(static_cast<qsizetype>(count));
+    for (UINT32 i = 0; i < count; ++i) {
+        identities.append(transformIdentity(activates[i]));
+    }
+    const bool allowKnownUnstable =
+        qEnvironmentVariable("OLR_ALLOW_UNSTABLE_MF_H264") == QLatin1String("1");
+    const int selected = selectMfH264TransformCandidate(identities, allowKnownUnstable);
+    if (selected < 0) {
+        const MfH264TransformIdentity rejected = identities.constFirst();
+        releaseActivations(activates, count);
+        if (error) {
+            *error = QStringLiteral("mf_h264_transform_rejected reason=known_unstable %1 "
+                                    "override=OLR_ALLOW_UNSTABLE_MF_H264=1")
+                         .arg(transformIdentityDiagnostic(rejected));
+        }
+        return false;
+    }
+
+    // Activate the first allowed hardware encoder MFT. Known-unstable candidates
+    // are rejected before their driver DLL is loaded, while later candidates
+    // remain available.
+    hr = activates[selected]->ActivateObject(IID_PPV_ARGS(&m_transform));
     releaseActivations(activates, count);
     if (FAILED(hr) || !m_transform) {
         if (error) {
             *error = hrMessage(
-                QStringLiteral("Media Foundation H.264 hardware encoder activation failed"), hr);
+                QStringLiteral("Media Foundation H.264 hardware encoder activation failed: %1")
+                    .arg(transformIdentityDiagnostic(identities[selected])),
+                hr);
         }
         return false;
     }
@@ -1325,39 +1491,75 @@ bool MediaFoundationEncoder::drainReadyAsyncEvents(const PacketCallback& onPacke
 // Signal end-of-stream + drain, then block on the pump until the MFT reports
 // METransformDrainComplete, emitting every remaining output sample.
 bool MediaFoundationEncoder::flushAsync(const PacketCallback& onPacket, QString* error) {
-    HRESULT hr = m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-    if (SUCCEEDED(hr)) {
-        hr = m_transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-    }
-    if (FAILED(hr)) {
-        if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation H.264 encoder drain failed"), hr);
-        }
-        return false;
-    }
+    constexpr int kDrainTimeoutMs = 10000;
+    constexpr int kMaxDrainPolls = 100000;
+    QDeadlineTimer deadline(kDrainTimeoutMs);
+    HRESULT messageHr = S_OK;
 
-    while (true) {
-        ComPtr<IMFMediaEvent> event;
-        hr = m_eventGenerator->GetEvent(0, &event); // block until drain completes
-        if (FAILED(hr)) {
-            if (error) {
-                *error = hrMessage(
-                    QStringLiteral("Media Foundation async encoder event query failed"), hr);
+    const MfAsyncFinalizeResult result = finalizeMfAsyncTransform(
+        [&](MfAsyncMessage message) {
+            MFT_MESSAGE_TYPE nativeMessage = MFT_MESSAGE_NOTIFY_END_OF_STREAM;
+            switch (message) {
+            case MfAsyncMessage::EndOfStream:
+                nativeMessage = MFT_MESSAGE_NOTIFY_END_OF_STREAM;
+                break;
+            case MfAsyncMessage::Drain:
+                nativeMessage = MFT_MESSAGE_COMMAND_DRAIN;
+                break;
+            case MfAsyncMessage::EndStreaming:
+                nativeMessage = MFT_MESSAGE_NOTIFY_END_STREAMING;
+                break;
+            case MfAsyncMessage::Flush:
+                return false;
             }
-            return false;
-        }
-        MediaEventType eventType = MediaEventType(0);
-        if (FAILED(event->GetType(&eventType))) {
-            continue;
-        }
-        if (eventType == METransformDrainComplete) {
-            return true;
-        }
-        bool submittedInput = true; // do not feed input while draining
-        if (!handleAsyncEvent(event.Get(), nullptr, &submittedInput, onPacket, error)) {
-            return false;
-        }
+            messageHr = m_transform->ProcessMessage(nativeMessage, 0);
+            if (FAILED(messageHr) && error) {
+                *error = hrMessage(QStringLiteral("Media Foundation H.264 encoder drain failed"),
+                                   messageHr);
+            }
+            return SUCCEEDED(messageHr);
+        },
+        [&] {
+            if (deadline.hasExpired()) {
+                if (error) {
+                    *error = QStringLiteral("Media Foundation async encoder drain timed out");
+                }
+                return MfAsyncPollResult::TimedOut;
+            }
+
+            ComPtr<IMFMediaEvent> event;
+            const HRESULT eventHr = m_eventGenerator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+            if (eventHr == MF_E_NO_EVENTS_AVAILABLE) {
+                QThread::msleep(1);
+                return MfAsyncPollResult::Continue;
+            }
+            if (FAILED(eventHr)) {
+                if (error) {
+                    *error = hrMessage(
+                        QStringLiteral("Media Foundation async encoder event query failed"),
+                        eventHr);
+                }
+                return MfAsyncPollResult::Failed;
+            }
+            MediaEventType eventType = MediaEventType(0);
+            if (FAILED(event->GetType(&eventType))) {
+                return MfAsyncPollResult::Continue;
+            }
+            if (eventType == METransformDrainComplete) {
+                return MfAsyncPollResult::DrainComplete;
+            }
+            bool submittedInput = true; // do not feed input while draining
+            return handleAsyncEvent(event.Get(), nullptr, &submittedInput, onPacket, error)
+                       ? MfAsyncPollResult::Continue
+                       : MfAsyncPollResult::Failed;
+        },
+        [&] { return shutdownAsyncTransform(error); }, kMaxDrainPolls);
+
+    if (result == MfAsyncFinalizeResult::Complete) {
+        m_streaming = false;
+        return true;
     }
+    return false;
 }
 
 bool MediaFoundationEncoder::encode(const AVFrame* frame, int64_t ptsTicks,

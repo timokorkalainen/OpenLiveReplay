@@ -15,10 +15,11 @@
 #include "ingest/ingestsession.h"
 #include "recorder_engine/codec/videocodecchoice.h"
 #include "recorder_engine/codec/nativevideoencoder.h"
-#include "timing/timecodealigner.h"
+#include "timing/timecodealignerv2.h"
 #include "timing/sourceoffsetestimator.h"
 #include "timing/timingreference.h"
 
+#include <limits>
 #include <memory>
 
 class ReplayManager : public QObject
@@ -38,7 +39,7 @@ public:
     }
 
     // Source configuration (N sources)
-    void setSourceUrls(const QStringList &urls) { m_sourceUrls = urls; }
+    void setSourceUrls(const QStringList& urls);
     void setSourceNames(const QStringList &names) { m_sourceNames = names; }
     void setSourceMetadata(const QList<QByteArray> &metadata) { m_sourceMetadata = metadata; }
     void setSourceTrims(const QList<int>& trims) { m_sourceTrims = trims; }
@@ -96,10 +97,30 @@ public:
 
     // Inter-camera timecode alignment (Phase 4 consumes these). True iff both
     // sources carried a common timecode AND their equal-TC frames coincide
-    // exactly. sourceFrameOffset() is the frame correction to ADD to source B's
-    // mapping so its equal-TC frames coincide with A (0 if either lacks TC).
-    bool sourcesFrameAligned(int a, int b) const { return m_tcAligner.sourcesAligned(a, b, 0); }
-    int64_t sourceFrameOffset(int a, int b) const { return m_tcAligner.frameOffset(a, b); }
+    // exactly. sourceFrameOffset() is the nearest whole-frame correction to ADD to
+    // source B's mapping so its equal-TC frames coincide with A (0 if either lacks TC).
+    bool sourcesFrameAligned(int a, int b) const {
+        const AlignmentOffset off = m_tcAligner.offset(a, b);
+        return off.comparable() && off.offsetUs == 0;
+    }
+    int64_t sourceFrameOffset(int a, int b) const {
+        const AlignmentOffset off = m_tcAligner.offset(a, b);
+        if (!off.comparable()) return 0;
+
+        using I128 = __int128;
+        I128 scaled = 0;
+        if (__builtin_mul_overflow(I128(off.offsetUs), I128(m_fps), &scaled)) return 0;
+        const bool negative = scaled < 0;
+        const I128 magnitude = negative ? -scaled : scaled;
+        I128 adjusted = 0;
+        if (__builtin_add_overflow(magnitude, I128(500'000), &adjusted)) return 0;
+        I128 rounded = adjusted / 1'000'000;
+        if (negative) rounded = -rounded;
+        if (rounded < I128(std::numeric_limits<int64_t>::min()) ||
+            rounded > I128(std::numeric_limits<int64_t>::max()))
+            return 0;
+        return int64_t(rounded);
+    }
 
     // Inter-camera phase servo evidence (Phase 4). The reference source is the
     // session anchor — the connected source with the highest ClockQuality (ties
@@ -121,6 +142,8 @@ public:
     // gently nudges a follower toward the reference, never fights the operator trim,
     // and a saturating phase reading clamps here rather than distorting the timeline.
     static constexpr int kMaxInterCamCorrectionMs = StreamWorker::kMaxServoTrimMs;
+    static constexpr int64_t kMaxTimecodeCorrectionBoundUs = 100'000;
+    static constexpr int32_t kMinTimecodeDriftPpm = 25;
     // Max servo movement per stats pulse (ms). The ramp: a sudden/stepping Bounded
     // phase reading moves the servo by at most this much per update, so a re-anchor
     // step can never jerk the timeline by the full correction in one tick.
@@ -179,10 +202,10 @@ signals:
 private slots:
     void onTimerTick();
 
-    // Queued from each StreamWorker::frameTimecode. Records the source's per-frame
-    // timecode (100 ns since midnight) against the session frame index it landed on
-    // so two sources' equal-TC frames can be compared (sourcesFrameAligned).
-    void onFrameTimecode(int sourceIndex, int64_t sourceTimecode100ns, int64_t sessionFrameIndex);
+    // Queued from each StreamWorker::frameTimecode after mux completion. Consumes the
+    // typed source identity, rate, uncertainty, and mux-session arrival together.
+    void onFrameTimecode(int sourceIndex, uint64_t workerInstanceIdentity, uint64_t carrierEpoch,
+                         TimecodeEvidence evidence);
 
     // Queued from each StreamWorker::statsUpdated (~1/sec). Caches the source's
     // latest IngestStats, re-runs the inter-camera phase estimation, then STAMPS the
@@ -196,6 +219,9 @@ private slots:
     void onSourcePhaseConnectionChanged(int sourceIndex, bool connected);
 
 private:
+#ifdef OLR_UNIT_TEST
+    friend class TestReplayManagerTimecode;
+#endif
     void writeBlueFrames(int64_t elapsedMs);
 
     // Re-pick the reference source (highest ClockQuality among sources that have
@@ -204,6 +230,7 @@ private:
     // Cheap and pure of side effects beyond m_referenceSource/m_offsetEstimator;
     // called on every stats pulse (no new timer — stats already arrive ~1/sec).
     void recomputeInterCamPhase();
+    void resetSourceTimecode(int sourceIndex);
 
     // Session "now" in ms, read THROUGH the TimingReference seam so the whole
     // timeline path (heartbeat + getElapsedMs) re-times atomically when the reference
@@ -273,17 +300,26 @@ private:
     std::unique_ptr<TimingReference> m_timingRef;
     QList<StreamWorker*> m_workers;  // One per SOURCE (not per view)
 
-    // Inter-camera timecode aligner. Constructed with the SHARED
-    // Smpte12m::kTimecodeNominalFps (30), NOT m_fps. WHY 30 and not m_fps: the
-    // SRT/RTMP producers encode each frame's TC to the carried 100 ns with this
-    // same constant, and the aligner decodes that 100 ns back to a TC frame count
-    // with it — using one shared constant makes producer and consumer provably
-    // agree (the value cancels in the round-trip). Inter-camera alignment is
-    // anchor-relative (a difference of two sources' frame mappings), so it is
-    // correct at ANY source rate; only the ABSOLUTE TC->frame mapping is exact
-    // solely at 30 — a documented limitation. Threading the real per-source fps
-    // end-to-end is a future refinement.
-    TimecodeAligner m_tcAligner{Smpte12m::kTimecodeNominalFps};
+    // Inter-camera timecode aligner (rate-aware). Each source is anchored with its
+    // TRUE frame rate — recovered from the SEI/SPS or NDI SDK at the producer and
+    // carried through StreamWorker::frameTimecode — so equal-TC frames are compared
+    // in exact microseconds against the session-frame axis (m_fps). A source whose
+    // rate cannot be recovered is never anchored: offset() returns Incomparable and
+    // only then may the servo use the bounded clock-offset estimate. Comparable
+    // timecode outside the correction bound is surfaced but never corrected. This
+    // replaces the earlier nominal-30 aligner, which mixed 30 fps TC frames with the
+    // real session rate and drove genuinely-aligned off-30 sources apart.
+    TimecodeAlignerV2 m_tcAligner;
+    struct SourceTimecodeIdentity {
+        bool set = false;
+        uint64_t sourceGeneration = 0;
+        uint64_t timingGeneration = 0;
+        FrameRateQ labelRate;
+        FrameRateQ sessionRate;
+        TimecodeProvenance provenance = TimecodeProvenance::Ndi;
+        bool dropFrame = false;
+    };
+    SourceTimecodeIdentity m_sourceTimecodeIdentity[TimecodeAlignerV2::kMaxSources];
 
     // Inter-camera phase servo (Phase 4). m_offsetEstimator grades each source's
     // offset-to-reference + confidence tier; m_referenceSource is the chosen anchor

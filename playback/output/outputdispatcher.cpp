@@ -163,6 +163,7 @@ void OutputDispatcher::resetFrameIndex(qint64 nextOutputFrameIndex) {
 
 void OutputDispatcher::resetPlayEpoch() {
     m_havePlayEpoch = false;
+    m_lastGoodFrame.clear();
     for (const OutputEndpoint& endpoint : m_endpoints) {
         if (!endpoint.sink || !endpoint.assignment.enabled) continue;
         endpoint.sink->discardPending();

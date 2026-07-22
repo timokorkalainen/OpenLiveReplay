@@ -9,13 +9,39 @@
 #include <QProcessEnvironment>
 #include <QtGlobal>
 
+#include <cmath>
 #include <limits>
 
+namespace {
+int32_t conservativeTimecodeDriftPpm(double referencePpm, double sourcePpm) {
+    if (!std::isfinite(referencePpm) || !std::isfinite(sourcePpm))
+        return std::numeric_limits<int32_t>::max();
+    const double magnitude = std::abs(referencePpm) + std::abs(sourcePpm);
+    const double conservative = qMax<double>(ReplayManager::kMinTimecodeDriftPpm, magnitude);
+    if (conservative >= double(std::numeric_limits<int32_t>::max()))
+        return std::numeric_limits<int32_t>::max();
+    return int32_t(std::ceil(conservative));
+}
+} // namespace
+
 ReplayManager::ReplayManager(QObject* parent) : QObject(parent) {
+    qRegisterMetaType<TimecodeEvidence>("TimecodeEvidence");
     m_muxer = new Muxer();
     m_clock = new RecordingClock();
     m_heartbeat = new QTimer(this);
     connect(m_heartbeat, &QTimer::timeout, this, &ReplayManager::onTimerTick);
+}
+
+void ReplayManager::setSourceUrls(const QStringList& urls) {
+    const qsizetype common = qMin(m_sourceUrls.size(), urls.size());
+    for (qsizetype source = 0; source < common; ++source) {
+        if (m_sourceUrls[source] != urls[source] && source <= std::numeric_limits<int>::max())
+            resetSourceTimecode(int(source));
+    }
+    for (qsizetype source = common; source < m_sourceUrls.size(); ++source) {
+        if (source <= std::numeric_limits<int>::max()) resetSourceTimecode(int(source));
+    }
+    m_sourceUrls = urls;
 }
 
 ReplayManager::~ReplayManager() {
@@ -132,18 +158,16 @@ bool ReplayManager::setupBlueEncoder() {
             return false;
         }
         bool gotPkt = false;
-        bool encOk = m_blueNativeEncoder->encode(
-            m_blueFrame, 0,
-            [&](const QByteArray& data, int64_t /*pts*/, bool /*key*/) {
-                if (data.size() <= std::numeric_limits<int>::max() &&
-                    av_new_packet(m_cachedBluePkt, static_cast<int>(data.size())) == 0) {
-                    memcpy(m_cachedBluePkt->data, data.constData(),
-                           static_cast<size_t>(data.size()));
-                    m_cachedBluePkt->flags |= AV_PKT_FLAG_KEY;
-                    gotPkt = true;
-                }
-            },
-            &err);
+        auto captureBluePacket = [&](const QByteArray& data, int64_t /*pts*/, bool /*key*/) {
+            if (data.size() <= std::numeric_limits<int>::max() &&
+                av_new_packet(m_cachedBluePkt, static_cast<int>(data.size())) == 0) {
+                memcpy(m_cachedBluePkt->data, data.constData(), static_cast<size_t>(data.size()));
+                m_cachedBluePkt->flags |= AV_PKT_FLAG_KEY;
+                gotPkt = true;
+            }
+        };
+        const bool encOk = m_blueNativeEncoder->encode(
+            m_blueFrame, 0, NativeVideoEncoder::PacketCallback::bind(captureBluePacket), &err);
         if (!encOk || !gotPkt) {
             av_packet_free(&m_cachedBluePkt);
             av_frame_free(&m_blueFrame);
@@ -296,6 +320,8 @@ void ReplayManager::startRecording() {
     // Reset the inter-camera aligner for this fresh session (drops any anchors
     // carried over from a previous recording).
     m_tcAligner.reset();
+    for (int source = 0; source < TimecodeAlignerV2::kMaxSources; ++source)
+        m_sourceTimecodeIdentity[source] = SourceTimecodeIdentity{};
 
     // Reset the inter-camera phase estimator + reference selection for this fresh
     // session, and size the per-source stats cache to the source count. Mirrors the
@@ -410,10 +436,10 @@ void ReplayManager::startRecording() {
         connect(this, &ReplayManager::masterPulse, worker, &StreamWorker::onMasterPulse,
                 Qt::QueuedConnection);
 
-        // Relay the worker's connection-state transitions to the UI. The
-        // worker emits from its capture thread, so deliver queued onto the
-        // thread ReplayManager lives on (main); UIManager then receives it
-        // there and updates its per-source connected state.
+        // Relay the worker's connection-state transitions to the UI. StreamWorker
+        // drains capture-side transitions on its QObject thread; deliver queued
+        // onto the thread ReplayManager lives on (main), where UIManager updates
+        // its per-source connected state.
         connect(worker, &StreamWorker::connectionChanged, this,
                 &ReplayManager::sourceConnectionChanged, Qt::QueuedConnection);
         // Additive: drop a source's phase-estimation eligibility when it disconnects
@@ -428,9 +454,9 @@ void ReplayManager::startRecording() {
         connect(worker, &StreamWorker::statsUpdated, this, &ReplayManager::onSourceStatsUpdated,
                 Qt::QueuedConnection);
 
-        // Forward each frame's source timecode into the aligner. The worker emits
-        // from its tick thread, so deliver queued onto the thread ReplayManager
-        // lives on (only emitted when the frame actually carried a valid TC).
+        // Forward each committed frame's source timecode into the aligner. Muxer
+        // completion may run on its writer thread, so deliver queued onto the
+        // thread ReplayManager lives on (only emitted for a valid committed TC).
         connect(worker, &StreamWorker::frameTimecode, this, &ReplayManager::onFrameTimecode,
                 Qt::QueuedConnection);
 
@@ -550,6 +576,7 @@ void ReplayManager::updateViewMapping(const QList<int>& viewSlotMap) {
 // ─── Source URL change (real FFmpeg reconnect — for user editing a URL) ─
 void ReplayManager::updateSourceUrl(int sourceIndex, const QString& url) {
     if (sourceIndex >= 0 && sourceIndex < m_sourceUrls.size()) {
+        if (m_sourceUrls[sourceIndex] != url) resetSourceTimecode(sourceIndex);
         m_sourceUrls[sourceIndex] = url;
         if (m_isRecording && sourceIndex < m_workers.size()) {
             m_workers[sourceIndex]->changeSource(url);
@@ -595,10 +622,46 @@ void ReplayManager::onTimerTick() {
     }
 }
 
-void ReplayManager::onFrameTimecode(int sourceIndex, int64_t sourceTimecode100ns,
-                                    int64_t sessionFrameIndex) {
-    // The aligner ignores negative timecodes; the worker only emits valid ones.
-    m_tcAligner.observe(sourceIndex, sourceTimecode100ns, sessionFrameIndex);
+void ReplayManager::resetSourceTimecode(int sourceIndex) {
+    if (sourceIndex < 0 || sourceIndex >= TimecodeAlignerV2::kMaxSources) return;
+    m_tcAligner.resetSource(sourceIndex);
+    m_sourceTimecodeIdentity[sourceIndex] = SourceTimecodeIdentity{};
+}
+
+void ReplayManager::onFrameTimecode(int sourceIndex, uint64_t workerInstanceIdentity,
+                                    uint64_t carrierEpoch, TimecodeEvidence evidence) {
+    if (sourceIndex < 0 || sourceIndex >= TimecodeAlignerV2::kMaxSources) return;
+    const bool hasWorker = sourceIndex < m_workers.size() && m_workers[sourceIndex];
+    if (carrierEpoch == 0) {
+        if (hasWorker || workerInstanceIdentity != 0) return;
+    } else if (!hasWorker || workerInstanceIdentity == 0 ||
+               m_workers[sourceIndex]->workerInstanceIdentity() != workerInstanceIdentity ||
+               m_workers[sourceIndex]->currentCarrierEpoch() != carrierEpoch) {
+        return;
+    }
+    if (evidence.discontinuity) {
+        resetSourceTimecode(sourceIndex);
+        return;
+    }
+
+    SourceTimecodeIdentity& identity = m_sourceTimecodeIdentity[sourceIndex];
+    const bool changed = identity.set && (identity.sourceGeneration != evidence.sourceGeneration ||
+                                          identity.timingGeneration != evidence.timingGeneration ||
+                                          !(identity.labelRate == evidence.labelRate) ||
+                                          !(identity.sessionRate == evidence.sessionRate) ||
+                                          identity.provenance != evidence.provenance ||
+                                          identity.dropFrame != evidence.dropFrame);
+    if (changed) resetSourceTimecode(sourceIndex);
+
+    SourceTimecodeIdentity& current = m_sourceTimecodeIdentity[sourceIndex];
+    current.set = true;
+    current.sourceGeneration = evidence.sourceGeneration;
+    current.timingGeneration = evidence.timingGeneration;
+    current.labelRate = evidence.labelRate;
+    current.sessionRate = evidence.sessionRate;
+    current.provenance = evidence.provenance;
+    current.dropFrame = evidence.dropFrame;
+    m_tcAligner.observe(sourceIndex, evidence);
 }
 
 void ReplayManager::onSourceStatsUpdated(int sourceIndex, IngestStats stats) {
@@ -632,9 +695,9 @@ void ReplayManager::onSourceStatsUpdated(int sourceIndex, IngestStats stats) {
 }
 
 void ReplayManager::onSourcePhaseConnectionChanged(int sourceIndex, bool connected) {
-    if (connected || sourceIndex < 0 || sourceIndex >= m_sourceHasStats.size()) {
-        return;
-    }
+    if (connected || sourceIndex < 0) return;
+    resetSourceTimecode(sourceIndex);
+    if (sourceIndex >= m_sourceHasStats.size()) return;
     // A disconnected source's cached stats are stale — drop it from eligibility so
     // reference selection re-picks among the still-live sources. A reconnect re-arms
     // it on its next stats pulse via onSourceStatsUpdated.
@@ -671,10 +734,21 @@ void ReplayManager::recomputeInterCamPhase() {
             m_referenceSource = s;
         }
     }
-    if (m_referenceSource < 0) return; // no live source yet
+    if (m_referenceSource < 0) {
+        // With no live source there will be no stats pulse to drive the normal bounded
+        // relaxation. Clear immediately so a reconnect can never inherit a stale phase
+        // correction; this is event-driven and adds no idle timer or hot-path work.
+        for (int s = 0; s < m_servoTrimMs.size(); ++s) {
+            if (m_servoTrimMs[s] == 0) continue;
+            m_servoTrimMs[s] = 0;
+            if (s < m_workers.size() && m_workers[s]) m_workers[s]->setServoTrimOffsetMs(0);
+        }
+        return;
+    }
 
     // 2. Build per-source evidence relative to the reference and feed the estimator.
     const int64_t refOffsetNs = m_lastStats[m_referenceSource].clockOffsetNs;
+    QVector<AlignmentOffset> timecodeOffsets(m_lastStats.size());
     for (int s = 0; s < m_lastStats.size(); ++s) {
         if (!m_sourceHasStats.value(s)) continue;
         const IngestStats& cur = m_lastStats[s];
@@ -685,8 +759,22 @@ void ReplayManager::recomputeInterCamPhase() {
         ev.clockPpm = cur.clockPpm;
         // FrameAccurate iff this source carries a common timecode whose equal-TC frames
         // coincide with the reference (the reference trivially aligns to itself).
-        ev.timecodeAlignedToReference =
-            (s == m_referenceSource) || m_tcAligner.sourcesAligned(m_referenceSource, s, 0);
+        AlignmentOffset offEv;
+        if (s == m_referenceSource) {
+            offEv.kind = AlignmentOffset::Kind::Exact;
+        } else {
+            const int32_t driftPpm =
+                conservativeTimecodeDriftPpm(m_lastStats[m_referenceSource].clockPpm, cur.clockPpm);
+            offEv = m_tcAligner.offset(m_referenceSource, s, driftPpm);
+        }
+        timecodeOffsets[s] = offEv;
+        const int64_t outputFrameToleranceUs =
+            (1'000'000LL + (m_fps > 0 ? m_fps : 30) - 1) / (m_fps > 0 ? m_fps : 30);
+        const bool withinFrame = offEv.comparable() && offEv.boundUs <= outputFrameToleranceUs;
+        ev.timecodeAlignedToReference = s == m_referenceSource || withinFrame;
+        ev.timecodeKind = offEv.kind;
+        ev.timecodeOffsetUs = offEv.offsetUs;
+        ev.timecodeBoundUs = offEv.boundUs;
         // Phase 5: once an external reference (PTP) is LOCKED, mark every source as
         // disciplined to facility time so the SourceOffsetEstimator promotes those
         // phase-locked to the disciplined session estimate to FrameAccurate. With the
@@ -722,28 +810,22 @@ void ReplayManager::recomputeInterCamPhase() {
     for (int s = 0; s < m_lastStats.size(); ++s) {
         int target = 0;
         if (s != m_referenceSource && m_sourceHasStats.value(s)) {
-            const ConfidenceTier tier = m_offsetEstimator.tier(s);
-            const bool servoEligible =
-                m_lastStats[s].clockLocked && tier != ConfidenceTier::Approximate;
-            if (servoEligible) {
+            const AlignmentOffset& off = timecodeOffsets[s];
+            const bool withinCorrection =
+                off.comparable() && off.boundUs <= kMaxTimecodeCorrectionBoundUs;
+            if (withinCorrection) {
                 const int64_t cap = kMaxInterCamCorrectionMs;
-                int64_t rawTargetMs;
-                if (m_tcAligner.hasTimecode(s) && m_tcAligner.hasTimecode(m_referenceSource)) {
-                    // Common timecode: lock to the EXACT TC frame offset (frame-
-                    // accurate), not the coarser clock-offset estimate. frameOffset(ref,
-                    // s) is the frame correction to ADD to s's mapping so its equal-TC
-                    // frames coincide with the reference (negative => s is late => shift
-                    // earlier); a negative servo trim pulls newer frames (earlier), so
-                    // the target is frameOffset*ms-per-frame directly. This drives a
-                    // common-TC pair to exact alignment instead of riding clock noise.
-                    const int64_t frames = m_tcAligner.frameOffset(m_referenceSource, s);
-                    rawTargetMs = frames * 1000 / qMax(1, m_fps);
-                } else {
-                    // No common TC: use the bounded clock-offset estimate.
-                    // sourcePhaseOffsetMs is POSITIVE for a late source, correction -phase.
-                    rawTargetMs = -m_offsetEstimator.offsetMs(s);
-                }
+                const int64_t rawTargetMs = off.offsetUs / 1000;
                 target = int(qBound<int64_t>(-cap, rawTargetMs, cap));
+            } else if (!off.comparable()) {
+                const ConfidenceTier tier = m_offsetEstimator.tier(s);
+                const bool servoEligible =
+                    m_lastStats[s].clockLocked && tier != ConfidenceTier::Approximate;
+                if (servoEligible) {
+                    const int64_t cap = kMaxInterCamCorrectionMs;
+                    const int64_t rawTargetMs = -m_offsetEstimator.offsetMs(s);
+                    target = int(qBound<int64_t>(-cap, rawTargetMs, cap));
+                }
             }
         }
         const int current = m_servoTrimMs[s];

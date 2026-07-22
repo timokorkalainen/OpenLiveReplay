@@ -20,5 +20,11 @@ set_tests_properties(tst_qml_codecsettings PROPERTIES
     TIMEOUT 60
     ENVIRONMENT "${olr_qml_test_environment}")
 
+set(qt_test_path_modifications
+    "QML_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}"
+    "QML2_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}")
+set_property(TEST tst_qml_codecsettings APPEND PROPERTY
+    ENVIRONMENT_MODIFICATION "${qt_test_path_modifications}")
+
 get_property(_olr_qml_tests DIRECTORY PROPERTY TESTS)
 olr_apply_windows_test_runtime(${_olr_qml_tests})

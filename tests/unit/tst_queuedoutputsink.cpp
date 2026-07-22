@@ -622,7 +622,12 @@ void TestQueuedOutputSink::submitAndFlushPreemptsQueuedFramesBehindInFlightDeliv
     QThread* flushThread =
         QThread::create([&]() { flushed = sink.submitAndFlush(frame(99), 1000); });
     flushThread->start();
-    QTest::qWait(20);
+
+    // Do not release the in-flight delivery until submitAndFlush has actually
+    // acquired the queue mutex and replaced 11/12 with 99. A fixed sleep races
+    // the flush thread's scheduler start and can let the worker drain 11/12
+    // first, which tests call ordering rather than preemption behavior.
+    QTRY_COMPARE_WITH_TIMEOUT(sink.outputStatus().lastQueuedFrameIndex, qint64(99), 500);
 
     observed->release();
     QVERIFY(flushThread->wait(1000));

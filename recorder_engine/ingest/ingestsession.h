@@ -6,8 +6,11 @@
 #include <QString>
 #include <QMetaType>
 
+#include "recorder_engine/timing/timecodeevidence.h"
+
 #include <cstdint>
 #include <functional>
+#include <optional>
 
 #if defined(OLR_GPU_PIPELINE_BUILD)
 #include "playback/output/framehandle.h"
@@ -16,6 +19,8 @@
 extern "C" {
 struct AVFrame;
 }
+
+struct DecodedFrameEvidence;
 
 enum class IngestBackendKind { NativeSrt, NativeRtmp, NativeNdi, Unsupported };
 
@@ -41,12 +46,18 @@ struct IngestBackendOptions {
 
 struct DecodedVideoFrame {
     AVFrame* frame = nullptr;
-    int64_t sourcePtsMs = 0;
+    int64_t sourcePtsMs = -1;
     int64_t sourceTimecode100ns = -1;
+    std::optional<TimecodeEvidence> timecodeEvidence;
 #if defined(OLR_GPU_PIPELINE_BUILD)
     FrameHandle gpuFrame;
+    uint64_t gpuCarrierSessionIdentity = 0;
+    uint64_t gpuCarrierEpoch = 0;
 #endif
 };
+
+DecodedVideoFrame decodedCpuVideoFrameForOutput(AVFrame* frame,
+                                                const DecodedFrameEvidence* evidence);
 
 struct DecodedAudioChunk {
     int64_t startSample = -1;
@@ -57,6 +68,8 @@ struct DecodedAudioChunk {
 #if defined(OLR_GPU_PIPELINE_BUILD)
 struct ImportedGpuVideoFrame {
     FrameHandle frame;
+    uint64_t carrierSessionIdentity = 0;
+    uint64_t carrierEpoch = 0;
 };
 #endif
 

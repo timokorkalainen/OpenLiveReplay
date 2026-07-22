@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.24)
 project(OpenLiveReplay VERSION 0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -209,7 +209,8 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/timing/driftestimator.h recorder_engine/timing/driftestimator.cpp
         recorder_engine/timing/timecode.h recorder_engine/timing/timecode.cpp
         recorder_engine/timing/smpte12m.h recorder_engine/timing/smpte12m.cpp
-        recorder_engine/timing/timecodealigner.h recorder_engine/timing/timecodealigner.cpp
+        recorder_engine/timing/timecodeevidence.h recorder_engine/timing/timecodeevidence.cpp
+        recorder_engine/timing/timecodealignerv2.h recorder_engine/timing/timecodealignerv2.cpp
         recorder_engine/timing/sourceoffsetestimator.h recorder_engine/timing/sourceoffsetestimator.cpp
         recorder_engine/timing/sourceclock.h recorder_engine/timing/sourceclock.cpp
         recorder_engine/timing/timingreference.h recorder_engine/timing/timingreference.cpp
@@ -225,6 +226,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
         recorder_engine/ingest/colorvui.h recorder_engine/ingest/colorvui.cpp
+        recorder_engine/ingest/spsframerate.h recorder_engine/ingest/spsframerate.cpp
         recorder_engine/ingest/gpudecodedframe.h recorder_engine/ingest/gpudecodedframe.cpp
         recorder_engine/codec/avcc.h recorder_engine/codec/avcc.cpp
         recorder_engine/codec/colorvui.h recorder_engine/codec/colorvui.cpp
@@ -237,7 +239,10 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/benchmark/benchmarkcache.h recorder_engine/benchmark/benchmarkcache.cpp
         recorder_engine/benchmark/runcodecbenchmark.h recorder_engine/benchmark/runcodecbenchmark.cpp
         recorder_engine/benchmark/recordgate.h recorder_engine/benchmark/recordgate.cpp
+        recorder_engine/ingest/h26xtimingcontext.h recorder_engine/ingest/h26xtimingcontext.cpp
         recorder_engine/ingest/h26xseitimecode.h recorder_engine/ingest/h26xseitimecode.cpp
+        recorder_engine/ingest/decodedframeevidencequeue.h
+        recorder_engine/ingest/decodedframeevidencequeue.cpp
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp
@@ -524,7 +529,8 @@ elseif(WIN32)
         "${OLR_FFMPEG_AVUTIL_LIBRARY}"
         "${OLR_FFMPEG_SWSCALE_LIBRARY}"
         "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
-        mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")
+        mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32 advapi32 version ws2_32
+        "${OLR_SRT_LIBRARY}")
 elseif(NOT WIN32)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativevideodecoder_stub.cpp

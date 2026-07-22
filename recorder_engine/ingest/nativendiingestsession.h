@@ -78,6 +78,8 @@ private:
     int m_stallTimeoutMs = kStallTimeoutMs;
     int64_t m_lastFrameAtMs = -1; // m_monotonic.elapsed() at the last received frame
     int64_t m_lastStatsAtMs = -1;
+    uint64_t m_sourceGeneration = 0;
+    FrameRateQ m_activeTimecodeRate;
     struct SwsContext* m_sws = nullptr;
     IngestFailureKind m_lastFailureKind = IngestFailureKind::None;
 

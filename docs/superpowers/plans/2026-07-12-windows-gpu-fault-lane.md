@@ -132,11 +132,11 @@ Flush a structured destructive checkpoint immediately after removal observation 
 recovery result checkpoint. Merge JSONL records on success; preserve parsed partial evidence plus
 raw stdout/stderr when the child fails after destructive work begins.
 
-Seed the production worker cache with a GPU frame carrying a CPU fallback and a generation identity, then submit it through a real output runtime before removal. Record recovery timing, fallback/rebuild state, and post-loss output.
+Seed the production worker cache with a GPU frame carrying a CPU fallback plus sequence and generation identities, then submit it through a real output runtime before removal. Emit output observations around the real removal and record recovery timing, blackout start/end, fallback/rebuild state, and post-loss output.
 
 - [ ] **Step 2: Enforce recovery assertions**
 
-Require generation advance, active-epoch real token, zero dead-fence waits, zero remaining readback/frame retains, rejection of the pre-loss GPU frame, CPU cache recovery, and coherent resumed output within ten seconds.
+Require generation advance, active-epoch real token, zero dead-fence waits, zero remaining readback/frame retains, no pre-loss frame after the recovery boundary, blackout within the documented bound, CPU cache recovery, and coherent CPU fallback or rebuilt GPU output within ten seconds.
 
 - [ ] **Step 3: Run the complete opt-in scenario**
 
