@@ -1038,6 +1038,47 @@ client.release_leaf(0, 0, deadline)
 
 
 class MacOSRegisteredAccountingTests(unittest.TestCase):
+    def test_native_macos_residency_uses_proc_pidinfo_taskinfo(self):
+        import ctypes
+
+        resident_bytes = 12_345_678
+
+        def proc_pidinfo(pid, flavor, argument, buffer, size):
+            self.assertEqual((pid, flavor, argument), (321, 4, 0))
+            words = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_uint64))
+            words[1] = resident_bytes
+            return size
+
+        libproc = mock.Mock(proc_pidinfo=mock.Mock(side_effect=proc_pidinfo))
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch(
+            "gpu_capability_process_tree.os.name", "posix"
+        ), mock.patch(
+            "ctypes.CDLL", return_value=libproc
+        ) as load:
+            self.assertEqual(native_process_resident_bytes(321), resident_bytes)
+        load.assert_called_once_with("/usr/lib/libproc.dylib", use_errno=True)
+        self.assertEqual(
+            libproc.proc_pidinfo.argtypes,
+            (
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                ctypes.c_void_p, ctypes.c_int,
+            ),
+        )
+        self.assertIs(libproc.proc_pidinfo.restype, ctypes.c_int)
+
+    def test_native_macos_residency_rejects_short_proc_pidinfo_result(self):
+        query = mock.Mock(
+            side_effect=lambda _pid, _flavor, _argument, _buffer, size: size - 1
+        )
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch(
+            "gpu_capability_process_tree.os.name", "posix"
+        ), mock.patch(
+            "ctypes.CDLL", return_value=mock.Mock(proc_pidinfo=query)
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "residency is unavailable"
+        ):
+            native_process_resident_bytes(321)
+
     def test_successful_group_reconciliation_is_idempotently_receipted(self):
         leader = OwnedProcessIdentity("macos", 701, "1:2")
         accountant = MacOSRegisteredPgidAccountant()

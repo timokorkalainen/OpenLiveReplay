@@ -416,6 +416,90 @@ class ProvenanceTests(unittest.TestCase):
                 deps=(self.main_identity,),
             )
 
+    def test_gcc_command_line_return_closes_implicit_bootstrap_include(self):
+        stream = (
+            b'# 0 "D:/repo/playback/a.cpp"\n'
+            b'# 0 "<built-in>"\n'
+            b'# 0 "<command-line>"\n'
+            b'# 1 "D:/repo/playback/h.h" 1 3 4\nbootstrap_token\n'
+            b'# 0 "<command-line>" 2\n'
+            b'# 1 "D:/repo/playback/a.cpp"\nint ok;\n'
+        )
+        view = self.parse(
+            stream, deps=(self.main_identity, self.header_identity)
+        )
+        self.assertEqual(
+            b"".join(token.spelling for token in view.tokens),
+            b"bootstrap_tokenintok;",
+        )
+
+        invalid = (
+            stream.replace(b'# 0 "<command-line>" 2\n',
+                           b'# 0 "<command-line>"\n'),
+            b'# 1 "D:/repo/playback/a.cpp"\nint ok;\n'
+            b'# 0 "<command-line>" 2\n',
+            b'# 0 "D:/repo/playback/a.cpp"\n'
+            b'# 1 "D:/repo/playback/h.h" 1 3 4\nbootstrap_token\n'
+            b'# 0 "<command-line>" 2\n'
+            b'# 1 "D:/repo/playback/a.cpp"\nint ok;\n',
+            b'# 0 "D:/repo/playback/a.cpp"\n'
+            b'# 0 "<command-line>"\n'
+            b'# 1 "D:/repo/playback/h.h" 1 3 4\n'
+            b'# 1 "D:/repo/playback/a.cpp" 1\n'
+            b'# 0 "<command-line>" 2\n',
+            b'# 0 "D:/repo/playback/a.cpp"\n'
+            b'# 0 "<command-line>"\n'
+            b'# 1 "D:/repo/playback/h.h"\nbootstrap_token\n'
+            b'# 0 "<command-line>" 2\n'
+            b'# 1 "D:/repo/playback/a.cpp"\nint ok;\n',
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                AuditInfrastructureError, "pseudo-file|bootstrap|line zero"
+            ):
+                self.parse(
+                    payload, deps=(self.main_identity, self.header_identity)
+                )
+
+    def test_gcc_forced_primary_source_include_returns_before_real_source(self):
+        stream = (
+            b'# 0 "D:/repo/playback/a.cpp"\n'
+            b'# 0 "<built-in>"\n'
+            b'# 0 "<command-line>"\n'
+            b'# 1 "D:/repo/playback/a.cpp" 1 3 4\n'
+            b'# 2 "D:/repo/playback/a.cpp"\nforced_token\n'
+            b'# 0 "<command-line>" 2\n'
+            b'# 1 "D:/repo/playback/a.cpp"\nint real_token;\n'
+        )
+        view = self.parse(stream, deps=(self.main_identity,))
+        self.assertEqual(
+            b"".join(token.spelling for token in view.tokens),
+            b"forced_tokenintreal_token;",
+        )
+        instances = {
+            token.location.inclusion_instance for token in view.tokens
+        }
+        self.assertEqual(len(instances), 2)
+
+    def test_gcc_command_line_parent_accepts_multiple_forced_preincludes(self):
+        stream = (
+            b'# 0 "D:/repo/playback/a.cpp"\n'
+            b'# 0 "<built-in>"\n'
+            b'# 0 "<command-line>"\n'
+            b'# 1 "D:/repo/playback/h.h" 1 3 4\nheader_token\n'
+            b'# 0 "<command-line>" 2\n'
+            b'# 1 "D:/repo/playback/a.cpp" 1 3 4\nforced_token\n'
+            b'# 0 "<command-line>" 2\n'
+            b'# 1 "D:/repo/playback/a.cpp"\nint real_token;\n'
+        )
+        view = self.parse(
+            stream, deps=(self.main_identity, self.header_identity)
+        )
+        self.assertEqual(
+            b"".join(token.spelling for token in view.tokens),
+            b"header_tokenforced_tokenintreal_token;",
+        )
+
     def test_gcc_mingw_working_directory_bootstrap_marker_is_ignored(self):
         stream = (
             b'# 0 "D:/repo/playback/a.cpp"\n'

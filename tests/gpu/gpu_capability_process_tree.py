@@ -8,6 +8,7 @@ that binds them to worker scheduling is introduced by Task 7.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import dataclasses
 import hashlib
 import hmac
@@ -166,13 +167,28 @@ def _query_job_member_identity(pid: int, native_start_identity: str) -> OwnedPro
     return OwnedProcessIdentity("windows", pid, native_start_identity)
 
 
+class _MacOSTaskInfo(ctypes.Structure):
+    _fields_ = [
+        ("virtual_size", ctypes.c_uint64),
+        ("resident_size", ctypes.c_uint64),
+        ("total_user", ctypes.c_uint64), ("total_system", ctypes.c_uint64),
+        ("threads_user", ctypes.c_uint64),
+        ("threads_system", ctypes.c_uint64),
+        *[(name, ctypes.c_int32) for name in (
+            "policy", "faults", "pageins", "cow_faults")],
+        *[(name, ctypes.c_uint32) for name in (
+            "messages_sent", "messages_received", "syscalls_mach",
+            "syscalls_unix", "csw", "threadnum", "numrunning")],
+        ("priority", ctypes.c_int32),
+    ]
+
+
 def native_process_resident_bytes(pid: int) -> int:
     """Read a live process's native resident working set without global inference."""
 
     _require_contract(isinstance(pid, int) and not isinstance(pid, bool) and pid > 0,
                       "native process PID is invalid")
     if os.name == "nt":
-        import ctypes
         from ctypes import wintypes
 
         class ProcessMemoryCounters(ctypes.Structure):
@@ -209,6 +225,29 @@ def native_process_resident_bytes(pid: int) -> int:
         except (OSError, ValueError, IndexError) as error:
             raise AuditInfrastructureError("native process residency is unavailable") from error
         return resident_pages * os.sysconf("SC_PAGE_SIZE")
+    if sys.platform == "darwin":
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            query = libproc.proc_pidinfo
+            query.argtypes = (
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                ctypes.c_void_p, ctypes.c_int,
+            )
+            query.restype = ctypes.c_int
+            task = _MacOSTaskInfo()
+            if query(
+                pid, 4, 0, ctypes.byref(task), ctypes.sizeof(task)
+            ) != ctypes.sizeof(task):
+                raise AuditInfrastructureError(
+                    "native process residency is unavailable"
+                )
+            return int(task.resident_size)
+        except AuditInfrastructureError:
+            raise
+        except (AttributeError, OSError, TypeError, ValueError) as error:
+            raise AuditInfrastructureError(
+                "native process residency is unavailable"
+            ) from error
     raise AuditInfrastructureError("native process residency query is unsupported")
 
 
@@ -2447,28 +2486,13 @@ class MacOSLibprocProvider:
                 ("start_tvusec", ctypes.c_uint64),
             ]
 
-        class TaskInfo(ctypes.Structure):
-            _fields_ = [
-                ("virtual_size", ctypes.c_uint64),
-                ("resident_size", ctypes.c_uint64),
-                ("total_user", ctypes.c_uint64), ("total_system", ctypes.c_uint64),
-                ("threads_user", ctypes.c_uint64),
-                ("threads_system", ctypes.c_uint64),
-                *[(name, ctypes.c_int32) for name in (
-                    "policy", "faults", "pageins", "cow_faults")],
-                *[(name, ctypes.c_uint32) for name in (
-                    "messages_sent", "messages_received", "syscalls_mach",
-                    "syscalls_unix", "csw", "threadnum", "numrunning")],
-                ("priority", ctypes.c_int32),
-            ]
-
         bsd = BsdInfo()
         if self._libproc.proc_pidinfo(
                 pid, 3, 0, ctypes.byref(bsd), ctypes.sizeof(bsd)) != ctypes.sizeof(bsd):
             raise AuditInfrastructureError("macOS process identity query failed")
         _require_contract(int(bsd.pid) == pid and int(bsd.pgid) == expected_pgid,
                           "foreign process in macOS registered group")
-        task = TaskInfo()
+        task = _MacOSTaskInfo()
         if self._libproc.proc_pidinfo(
                 pid, 4, 0, ctypes.byref(task), ctypes.sizeof(task)) != ctypes.sizeof(task):
             raise AuditInfrastructureError("macOS process residency query failed")

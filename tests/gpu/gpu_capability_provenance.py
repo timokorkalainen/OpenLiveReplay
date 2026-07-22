@@ -39,6 +39,7 @@ _SPOOF_MARKER = re.compile(
 _BOOTSTRAP_PSEUDO_FILES = frozenset(
     {"<built-in>", "<command-line>", "<command line>"}
 )
+_COMMAND_LINE_PSEUDO_FILES = frozenset({"<command-line>", "<command line>"})
 _DEPENDENCY_DOCUMENT_BYTES = 4 * 1024 * 1024
 _DEPENDENCY_FILE_BYTES = 256 * 1024 * 1024
 _DEPENDENCY_DOCUMENT_ENTRIES = 65_536
@@ -595,6 +596,9 @@ class PreprocessedStreamBuilder:
         "_next_instance",
         "_seen_real_code",
         "_seen_real_marker",
+        "_seen_primary_source_marker",
+        "_bootstrap_command_line_active",
+        "_bootstrap_root_entered",
         "_in_block_comment",
         "_finalized",
         "_peak_rss_bytes",
@@ -651,6 +655,9 @@ class PreprocessedStreamBuilder:
         self._next_instance = 1
         self._seen_real_code = False
         self._seen_real_marker = False
+        self._seen_primary_source_marker = False
+        self._bootstrap_command_line_active = False
+        self._bootstrap_root_entered = False
         self._in_block_comment = False
         self._finalized = False
         self._peak_rss_bytes = 0
@@ -769,17 +776,44 @@ class PreprocessedStreamBuilder:
             # It is compiler bookkeeping, not a dependency or source frame.
             return
         if line == 0:
-            if self._seen_real_marker or self._seen_real_code:
-                raise _fail("line zero is allowed only for bootstrap pseudo-files")
-            if str(path).startswith("<"):
-                if str(path) not in _BOOTSTRAP_PSEUDO_FILES:
+            pseudo_path = str(path)
+            if pseudo_path.startswith("<"):
+                if pseudo_path not in _BOOTSTRAP_PSEUDO_FILES:
                     raise _fail("unknown pseudo-file marker")
+                if (
+                    pseudo_path in _COMMAND_LINE_PSEUDO_FILES
+                    and flags == (2,)
+                    and self._bootstrap_command_line_active
+                    and self._bootstrap_root_entered
+                    and not self._seen_primary_source_marker
+                    and len(self._stack) == 1
+                ):
+                    # GCC returns from its implicit preinclude (for example,
+                    # stdc-predef.h) to the command-line bootstrap context.
+                    # Pseudo-files are not stack frames, so close the real-file
+                    # bootstrap stack explicitly before the primary source.
+                    self._stack.clear()
+                    self._current_line = 0
+                    self._bootstrap_root_entered = False
+                    return
+                if self._seen_real_marker or self._seen_real_code or flags:
+                    raise _fail(
+                        "line zero pseudo-file marker is outside bootstrap"
+                    )
+                if pseudo_path in _COMMAND_LINE_PSEUDO_FILES:
+                    self._bootstrap_command_line_active = True
             else:
+                if self._seen_real_marker or self._seen_real_code:
+                    raise _fail(
+                        "line zero is allowed only for bootstrap pseudo-files"
+                    )
                 self._marker_id(path, relative)
             return
         if str(path).startswith("<"):
             if str(path) not in _BOOTSTRAP_PSEUDO_FILES or self._seen_real_marker or self._seen_real_code:
                 raise _fail("unknown or post-code pseudo-file marker")
+            if str(path) in _COMMAND_LINE_PSEUDO_FILES and not flags:
+                self._bootstrap_command_line_active = True
             return
         if any(flag not in {1, 2, 3, 4} for flag in flags) or len(set(flags)) != len(flags):
             raise _fail("GCC marker has invalid flags")
@@ -787,6 +821,12 @@ class PreprocessedStreamBuilder:
             raise _fail("GCC marker cannot enter and return simultaneously")
         key = _path_key(path)
         self._marker_id(path, relative)
+        stack_was_empty = not self._stack
+        starts_primary_source = (
+            stack_was_empty
+            and not flags
+            and key == _path_key(self._configuration.source.canonical)
+        )
         if not self._stack:
             if 2 in flags:
                 raise _fail("GCC marker return has no ancestor")
@@ -806,6 +846,16 @@ class PreprocessedStreamBuilder:
             raise _fail("GCC unflagged cross-file transition")
         else:
             self._stack[-1].line = line
+        if starts_primary_source:
+            self._seen_primary_source_marker = True
+            self._bootstrap_command_line_active = False
+            self._bootstrap_root_entered = False
+        elif (
+            self._bootstrap_command_line_active
+            and stack_was_empty
+            and 1 in flags
+        ):
+            self._bootstrap_root_entered = True
         self._current_line = line
         self._seen_real_marker = True
 
