@@ -54,6 +54,13 @@ private:
     mutable QHash<int, std::shared_ptr<const CpuCacheEntry>> m_cpuCache;
 };
 
+// Performs the real readback only after exact-surface retirement ownership is
+// prepared. Keep GpuOpScope's submission representation private to this helper
+// so callers cannot discard the typed outcome before failure accounting.
+GpuReadbackResult submitGpuReadback(const std::shared_ptr<GpuRhiContext>& rhi,
+                                    const std::shared_ptr<GpuSurface>& surface,
+                                    FramePixelFormat target) noexcept;
+
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta);
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,

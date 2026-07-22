@@ -21,7 +21,7 @@ std::atomic<uint64_t> nextFenceInstanceId{1};
 class MetalGpuFence final : public GpuFence {
 public:
     MetalGpuFence(id<MTLSharedEvent> event, id<MTLCommandQueue> queue, uint64_t authorityEpoch)
-        : GpuFence(reinterpret_cast<uintptr_t>(queue.device), authorityEpoch),
+        : GpuFence(gpuMetalDeviceDomainId((__bridge void*)queue.device), authorityEpoch),
           m_event([event retain]), m_device([queue.device retain]), m_queue([queue retain]) {
         m_listener = [[MTLSharedEventListener alloc]
             initWithDispatchQueue:dispatch_queue_create("net.openlivereplay.gpu.render-fence",
@@ -115,6 +115,11 @@ bool GpuFence::validatesRetirement(const GpuRetirementTicket& ticket,
                surface, ticket.m_identity, ticket.m_gpuGeneration, currentGpuGeneration()) &&
            ticket.m_authoritySeal ==
                sealTicket(ticket.m_identity, ticket.m_gpuGeneration, ticket.m_value);
+}
+
+uintptr_t gpuMetalDeviceDomainId(void* metalDevice) {
+    id<MTLDevice> device = static_cast<id<MTLDevice>>(metalDevice);
+    return device ? static_cast<uintptr_t>(device.registryID) : 0;
 }
 
 std::shared_ptr<GpuFence> makeMetalGpuFence(void* metalCommandQueue, uint64_t authorityEpoch) {

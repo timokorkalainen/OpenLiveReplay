@@ -114,6 +114,11 @@ function(olr_add_gpu_submission_compile_control name source expectation)
             "-DEXPECT_COMPILE=FALSE"
             "-DEXPECTED_MEMBER=nativeHandle"
             "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "RAW_READBACK")
+        list(APPEND control_args
+            "-DEXPECTED_CLASS=GpuRhiContext"
+            "-DEXPECTED_MEMBER=importAndReadback"
+            "-DEXPECTED_ACCESS=[Pp]rivate")
     elseif(expectation STREQUAL "TOKEN_CONSTRUCTION")
         list(APPEND control_args
             "-DEXPECT_COMPILE=FALSE"
@@ -163,6 +168,8 @@ olr_add_gpu_submission_compile_control(
     gpu_registry_pairing gpu_registry_pairing.cpp REGISTRY_PAIRING)
 olr_add_gpu_submission_compile_control(
     gpu_submission_view_unwrap gpu_submission_view_unwrap.cpp VIEW_UNWRAP)
+olr_add_gpu_submission_compile_control(
+    gpu_raw_readback_access gpu_raw_readback_access.cpp RAW_READBACK)
 olr_add_gpu_submission_compile_control(
     gpu_token_construction gpu_token_abandon.cpp TOKEN_CONSTRUCTION
     OLR_NEGCOMPILE_TOKEN_CONSTRUCTION=1)
@@ -383,6 +390,12 @@ if(WIN32)
     if(NOT OLR_SRT_INCLUDE_DIR OR NOT OLR_SRT_LIBRARY)
         message(FATAL_ERROR "OpenLiveReplay Windows native SRT requires OLR_SRT_ROOT or SRT include/library paths")
     endif()
+endif()
+
+include("${CMAKE_SOURCE_DIR}/tests/cmake/OlrWindowsTestRuntime.cmake")
+if(WIN32)
+    get_property(_olr_existing_tests DIRECTORY PROPERTY TESTS)
+    olr_apply_windows_test_runtime(${_olr_existing_tests})
 endif()
 
 # --- Lightweight engine sources used by fast unit tests ---------------------
@@ -744,3 +757,27 @@ add_subdirectory(smoke)
 add_subdirectory(e2e)
 add_subdirectory(qml)
 add_subdirectory(qmlstyle)
+
+if(WIN32)
+    olr_add_ctest(NAME windows_test_runtime_legacy_fallback
+        COMMAND "${CMAKE_COMMAND}"
+            -DOLR_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DPROBE_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/legacy_runtime_probe
+            -DCMAKE_COMMAND_PATH=${CMAKE_COMMAND}
+            -DCTEST_COMMAND_PATH=${CMAKE_CTEST_COMMAND}
+            -DPROBE_GENERATOR=${CMAKE_GENERATOR}
+            -P "${CMAKE_SOURCE_DIR}/tests/cmake/run_windows_test_runtime_legacy_probe.cmake")
+    set_tests_properties(windows_test_runtime_legacy_fallback PROPERTIES
+        LABELS "formal;ci" TIMEOUT 60)
+
+    olr_add_ctest(NAME windows_test_runtime_audit
+        COMMAND "${CMAKE_COMMAND}"
+            -DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            -DQT_RUNTIME_DIR=$<TARGET_FILE_DIR:Qt6::Core>
+            -DQT_PLUGIN_DIR=${OLR_QT_TEST_PLUGIN_DIR}
+            -DFFMPEG_RUNTIME_DIR=${OLR_FFMPEG_TEST_RUNTIME_DIR}
+            -DSRT_RUNTIME_DIR=${OLR_SRT_TEST_RUNTIME_DIR}
+            -P "${CMAKE_SOURCE_DIR}/tests/cmake/audit_windows_test_runtime.cmake")
+    set_tests_properties(windows_test_runtime_audit PROPERTIES
+        LABELS "formal;ci" TIMEOUT 30)
+endif()

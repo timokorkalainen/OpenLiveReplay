@@ -293,7 +293,8 @@ bool WinGpuFaultWorkerOracle::submitWorkerFaultOperation(
 
 bool WinGpuFaultWorkerOracle::recover(QJsonObject* evidence, QString* error) {
     if (!m_impl->worker || !m_impl->preLossRhi || !evidence) return false;
-    (void) m_impl->preLossRhi->importAndReadback(nullptr, FramePixelFormat::Yuv420p);
+    (void) GpuRhiContextTestAuthority::importAndReadback(m_impl->preLossRhi, nullptr,
+                                                         FramePixelFormat::Yuv420p);
     const auto token = GpuDeviceLossMonitor::instance().realLossToken();
     if (!token || !m_impl->preLossRhi->deviceLost()) {
         if (error) *error = QStringLiteral("PlaybackWorker RHI did not publish real DXGI loss");

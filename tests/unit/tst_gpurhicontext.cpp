@@ -3,6 +3,10 @@
 // returns nullptr so callers can degrade to CPU.
 #include <QtTest>
 
+#include <QProcess>
+#include <QProcessEnvironment>
+
+#include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/gpu/gpusurfacelease.h"
@@ -13,6 +17,7 @@
 #include <IOSurface/IOSurfaceRef.h>
 #endif
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -24,6 +29,11 @@ private slots:
     void createIsNullOrValidNeverPartial();
     void deviceLostStartsFalseThenLatchesOnInject();
     void lostContextReadbackShortCircuitsRenderThread();
+    void renderThreadExceptionsReturnFailureAndRemainUsable();
+    void renderThreadCallbackMayReleaseFinalContextOwner();
+    void readbackFenceIsInitializedBeforePublication();
+    void readbackFenceCreationAllowsNestedRenderEntry();
+    void failedEagerReadbackFenceCreationIsTerminal();
 #ifdef __APPLE__
     void importAndReadbackProducesPlanes();
     void importAndReadbackUsesRhiForRgbaSurface();
@@ -128,9 +138,10 @@ void TestGpuRhiContext::deviceLostStartsFalseThenLatchesOnInject() {
     QVERIFY(ctx->deviceLost());
 
     std::atomic<int> validChecks{0};
-    const CpuPlanes planes = ctx->importAndReadback(std::make_shared<TestSurface>(&validChecks),
-                                                    FramePixelFormat::Yuv420p);
-    QVERIFY(!planes.isValid());
+    const GpuReadbackResult readback = GpuRhiContextTestAuthority::importAndReadback(
+        ctx, std::make_shared<TestSurface>(&validChecks), FramePixelFormat::Yuv420p);
+    QVERIFY(!readback.planes.isValid());
+    QCOMPARE(readback.outcome, GpuSubmitOutcome::NotSubmitted);
     QCOMPARE(validChecks.load(std::memory_order_acquire), 0);
 }
 
@@ -151,8 +162,8 @@ void TestGpuRhiContext::lostContextReadbackShortCircuitsRenderThread() {
 
     QTRY_VERIFY(entered.load(std::memory_order_acquire));
     auto readback = std::async(std::launch::async, [&] {
-        return ctx->importAndReadback(std::make_shared<TestSurface>(nullptr),
-                                      FramePixelFormat::Yuv420p);
+        return GpuRhiContextTestAuthority::importAndReadback(
+            ctx, std::make_shared<TestSurface>(nullptr), FramePixelFormat::Yuv420p);
     });
     const bool returnedImmediately =
         readback.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready;
@@ -160,9 +171,171 @@ void TestGpuRhiContext::lostContextReadbackShortCircuitsRenderThread() {
     release.store(true, std::memory_order_release);
     blocker.join();
     if (returnedImmediately) {
-        QVERIFY(!readback.get().isValid());
+        const GpuReadbackResult result = readback.get();
+        QVERIFY(!result.planes.isValid());
+        QCOMPARE(result.outcome, GpuSubmitOutcome::NotSubmitted);
     }
     QVERIFY(returnedImmediately);
+}
+
+void TestGpuRhiContext::renderThreadExceptionsReturnFailureAndRemainUsable() {
+    constexpr auto childEnvironment = "OLR_GPU_RHI_THROWING_INVOKE_CHILD";
+    if (!qEnvironmentVariableIsSet(childEnvironment)) {
+        QProcess child;
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert(QString::fromLatin1(childEnvironment), QStringLiteral("1"));
+        child.setProcessEnvironment(environment);
+        child.setProcessChannelMode(QProcess::MergedChannels);
+        child.start(QCoreApplication::applicationFilePath(),
+                    {QStringLiteral("renderThreadExceptionsReturnFailureAndRemainUsable")});
+
+        QVERIFY(child.waitForStarted(5000));
+        const bool finished = child.waitForFinished(10000);
+        if (!finished) {
+            child.kill();
+            (void) child.waitForFinished(5000);
+        }
+        const QByteArray output = child.readAll();
+        QVERIFY2(finished, output.constData());
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QVERIFY2(child.exitCode() == 0, output.constData());
+        return;
+    }
+
+    auto ctx = testContext();
+    if (!ctx) QSKIP("no RHI backend on this host");
+
+    QVERIFY(!ctx->invokeOnRenderThread([](QRhi*) { throw 0; }));
+    bool externalRecovery = false;
+    QVERIFY(ctx->invokeOnRenderThread([&](QRhi*) { externalRecovery = true; }));
+    QVERIFY(externalRecovery);
+
+    bool inlineFailure = true;
+    bool inlineRecovery = false;
+    QVERIFY(ctx->invokeOnRenderThread([&](QRhi*) {
+        inlineFailure = ctx->invokeOnRenderThread([](QRhi*) { throw 0; });
+        inlineRecovery = ctx->invokeOnRenderThread([](QRhi*) {});
+    }));
+    QVERIFY(!inlineFailure);
+    QVERIFY(inlineRecovery);
+}
+
+void TestGpuRhiContext::renderThreadCallbackMayReleaseFinalContextOwner() {
+    constexpr auto childEnvironment = "OLR_GPU_RHI_FINAL_OWNER_CHILD";
+    if (!qEnvironmentVariableIsSet(childEnvironment)) {
+        QProcess child;
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert(QString::fromLatin1(childEnvironment), QStringLiteral("1"));
+        child.setProcessEnvironment(environment);
+        child.setProcessChannelMode(QProcess::MergedChannels);
+        child.start(QCoreApplication::applicationFilePath(),
+                    {QStringLiteral("renderThreadCallbackMayReleaseFinalContextOwner")});
+
+        QVERIFY(child.waitForStarted(5000));
+        const bool finished = child.waitForFinished(10000);
+        if (!finished) {
+            child.kill();
+            (void) child.waitForFinished(5000);
+        }
+        const QByteArray output = child.readAll();
+        QVERIFY2(finished, output.constData());
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QVERIFY2(child.exitCode() == 0, output.constData());
+        return;
+    }
+
+    auto ctx = testContext();
+    if (!ctx) QSKIP("no RHI backend on this host");
+    std::weak_ptr<GpuRhiContext> weakContext = ctx;
+    bool callbackRan = false;
+
+    QVERIFY(ctx->invokeOnRenderThread([owner = std::move(ctx), &callbackRan](QRhi*) mutable {
+        callbackRan = true;
+        owner.reset();
+    }));
+
+    QVERIFY(callbackRan);
+    QVERIFY(weakContext.expired());
+}
+
+void TestGpuRhiContext::readbackFenceIsInitializedBeforePublication() {
+    auto ctx = testContext();
+    if (!ctx) QSKIP("no RHI backend on this host");
+
+    const std::shared_ptr<GpuFence> publishedFence =
+        GpuRhiContextTestAuthority::readbackFenceForTest(ctx);
+    QVERIFY(publishedFence != nullptr);
+    QCOMPARE(GpuRhiContextTestAuthority::readbackFenceInitializationAttemptsForTest(ctx), 1);
+
+    constexpr int callerCount = 8;
+    std::array<std::future<std::shared_ptr<GpuFence>>, callerCount> callers;
+    for (auto& caller : callers) {
+        caller = std::async(std::launch::async, [ctx] {
+            return GpuRhiContextTestAuthority::readbackFenceForTest(ctx);
+        });
+    }
+    for (auto& caller : callers)
+        QCOMPARE(caller.get(), publishedFence);
+    QCOMPARE(GpuRhiContextTestAuthority::readbackFenceInitializationAttemptsForTest(ctx), 1);
+}
+
+void TestGpuRhiContext::readbackFenceCreationAllowsNestedRenderEntry() {
+    constexpr auto childEnvironment = "OLR_GPU_RHI_NESTED_READBACK_CHILD";
+    if (!qEnvironmentVariableIsSet(childEnvironment)) {
+        QProcess child;
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert(QString::fromLatin1(childEnvironment), QStringLiteral("1"));
+        child.setProcessEnvironment(environment);
+        child.setProcessChannelMode(QProcess::MergedChannels);
+        child.start(QCoreApplication::applicationFilePath(),
+                    {QStringLiteral("readbackFenceCreationAllowsNestedRenderEntry")});
+
+        QVERIFY(child.waitForStarted(5000));
+        const bool finished = child.waitForFinished(10000);
+        if (!finished) {
+            child.kill();
+            (void) child.waitForFinished(5000);
+        }
+        const QByteArray output = child.readAll();
+        QVERIFY2(finished, output.constData());
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QVERIFY2(child.exitCode() == 0, output.constData());
+        return;
+    }
+
+    auto ctx = testContext();
+    if (!ctx) QSKIP("no RHI backend on this host");
+#ifdef __APPLE__
+    std::shared_ptr<GpuSurface> surface = makeAppleNv12Surface(4, 2);
+    QVERIFY(surface != nullptr);
+#else
+    auto surface = std::make_shared<TestSurface>(nullptr);
+#endif
+    bool nestedReturned = false;
+    const bool invoked = ctx->invokeOnRenderThread([&](QRhi*) {
+        (void) submitGpuReadback(ctx, surface, FramePixelFormat::Yuv420p);
+        (void) GpuRhiContextTestAuthority::importAndReadback(ctx, surface,
+                                                             FramePixelFormat::Yuv420p);
+        nestedReturned = true;
+    });
+
+    QVERIFY(invoked);
+    QVERIFY(nestedReturned);
+    QVERIFY(GpuRhiContextTestAuthority::readbackFenceForTest(ctx) != nullptr);
+}
+
+void TestGpuRhiContext::failedEagerReadbackFenceCreationIsTerminal() {
+    auto ctx = GpuRhiContext::createReadbackFenceFailureForTest();
+    QVERIFY(ctx != nullptr);
+    QVERIFY(ctx->isValid());
+    auto surface = std::make_shared<TestSurface>(nullptr);
+
+    (void) submitGpuReadback(ctx, surface, FramePixelFormat::Yuv420p);
+    (void) submitGpuReadback(ctx, surface, FramePixelFormat::Yuv420p);
+
+    QCOMPARE(GpuRhiContextTestAuthority::readbackFenceInitializationAttemptsForTest(ctx), 1);
+    QCOMPARE(GpuRhiContextTestAuthority::injectedReadbackFenceFactoryCallsForTest(ctx), 1);
+    QVERIFY(GpuRhiContextTestAuthority::readbackFenceForTest(ctx) == nullptr);
 }
 
 #ifdef __APPLE__
@@ -174,12 +347,15 @@ void TestGpuRhiContext::importAndReadbackProducesPlanes() {
     QVERIFY(surface != nullptr);
     QVERIFY(fillNv12Surface(surface));
     const int before = ctx->rhiReadbackCountForTest();
-    const CpuPlanes planes = ctx->importAndReadback(surface, FramePixelFormat::Yuv420p);
+    const GpuReadbackResult readback =
+        GpuRhiContextTestAuthority::importAndReadback(ctx, surface, FramePixelFormat::Yuv420p);
+    const CpuPlanes& planes = readback.planes;
     const int after = ctx->rhiReadbackCountForTest();
     QCOMPARE(planes.format, FramePixelFormat::Yuv420p);
     QCOMPARE(planes.width, 4);
     QCOMPARE(planes.height, 2);
     QVERIFY(planes.isValid());
+    QCOMPARE(readback.outcome, GpuSubmitOutcome::Submitted);
     QCOMPARE(static_cast<uchar>(planes.plane[0][0]), uchar(0x10));
     QCOMPARE(static_cast<uchar>(planes.plane[0][1]), uchar(0x11));
     QCOMPARE(static_cast<uchar>(planes.plane[0][4]), uchar(0x14));
@@ -199,13 +375,16 @@ void TestGpuRhiContext::importAndReadbackUsesRhiForRgbaSurface() {
     QVERIFY(fillRgbaSurfaceBgra(surface));
 
     const int before = ctx->rhiReadbackCountForTest();
-    const CpuPlanes planes = ctx->importAndReadback(surface, FramePixelFormat::Rgba8);
+    const GpuReadbackResult readback =
+        GpuRhiContextTestAuthority::importAndReadback(ctx, surface, FramePixelFormat::Rgba8);
+    const CpuPlanes& planes = readback.planes;
     const int after = ctx->rhiReadbackCountForTest();
 
     QCOMPARE(planes.format, FramePixelFormat::Rgba8);
     QCOMPARE(planes.width, 2);
     QCOMPARE(planes.height, 1);
     QVERIFY(planes.isValid());
+    QCOMPARE(readback.outcome, GpuSubmitOutcome::Submitted);
     QVERIFY(planes.plane[0].size() >= 8);
     QCOMPARE(static_cast<uchar>(planes.plane[0][0]), uchar(0x10));
     QCOMPARE(static_cast<uchar>(planes.plane[0][1]), uchar(0x20));

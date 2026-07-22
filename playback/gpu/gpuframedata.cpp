@@ -27,6 +27,25 @@ qint64 cpuPlanesBytes(const CpuPlanes& planes) {
 }
 } // namespace
 
+GpuReadbackResult submitGpuReadback(const std::shared_ptr<GpuRhiContext>& rhi,
+                                    const std::shared_ptr<GpuSurface>& surface,
+                                    FramePixelFormat target) noexcept {
+    GpuReadbackResult readback;
+    if (!rhi || !surface) return readback;
+    const std::shared_ptr<GpuFence> readbackFence = rhi->readbackFence();
+    if (!readbackFence) return readback;
+
+    GpuRetireRegistry registry;
+    GpuOpScope operation(readbackFence, registry);
+    auto adapter = [&]() noexcept {
+        readback = rhi->importAndReadback(surface, target);
+        return readback.outcome;
+    };
+    (void) operation.submit(adapter,
+                            GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+    return readback;
+}
+
 struct GpuFrameData::CpuCacheEntry {
     CpuCacheEntry(CpuPlanes cachedPlanes, GpuBudgetCharge cacheCharge)
         : planes(std::move(cachedPlanes)), charge(std::move(cacheCharge)) {}
@@ -89,7 +108,7 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
             : target;
     CpuPlanes planes;
     if (rhi) {
-        planes = rhi->importAndReadback(surface, readbackTarget);
+        planes = std::move(submitGpuReadback(rhi, surface, readbackTarget).planes);
     } else {
 #ifdef __APPLE__
         planes = readAppleSurfaceToCpu(surface, readbackTarget, m_color);
@@ -107,13 +126,6 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
     if (planes.isValid()) {
         m_readCount.fetch_add(1, std::memory_order_acq_rel);
         gpuRecordFrameReadToCpuReadback();
-        if (m_renderFence && surface) {
-            GpuRetireRegistry registry;
-            GpuOpScope operation(m_renderFence, registry);
-            auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
-            (void) operation.submit(
-                adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
-        }
         QMutexLocker locker(&m_cacheMutex);
         const auto cached = m_cpuCache.constFind(int(target));
         if (cached != m_cpuCache.cend()) return cached.value()->planes;

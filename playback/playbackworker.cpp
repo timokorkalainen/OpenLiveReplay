@@ -2854,9 +2854,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
 
                         auto surface = wrapAppleImageBuffer(imageBuffer);
                         auto cpuFallback = [surface, gpuRhi]() -> CpuPlanes {
-                            return gpuRhi ? gpuRhi->importAndReadback(surface,
-                                                                      FramePixelFormat::Yuv420p)
-                                          : CpuPlanes{};
+                            return submitGpuReadback(gpuRhi, surface, FramePixelFormat::Yuv420p)
+                                .planes;
                         };
                         GpuMintResult mint = mintGpuOrDegrade(std::move(surface), gpuRhi, meta,
                                                               renderFence, cpuFallback);

@@ -513,6 +513,7 @@ void verifyMultiNodePoolExhaustionIsAtomic(uintptr_t deviceDomain, uint64_t auth
     QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
 }
 
+#ifndef QT_NO_DEBUG
 bool isExpectedCheckedContractTermination(QProcess::ExitStatus status, int exitCode) {
 #ifdef Q_OS_WIN
     constexpr quint32 windowsFailFastAssertionStatus = 0xC0000602u;
@@ -601,6 +602,7 @@ QString childProcessDiagnostic(const ChildProcessResult& result) {
         .arg(result.errorString)
         .arg(QString::fromLocal8Bit(result.output));
 }
+#endif
 
 } // namespace
 
@@ -2297,7 +2299,7 @@ void TestGpuSurfaceLease::multiNodePreparedBatchRejectsStaleAbaToken() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     auto fence = std::make_shared<FakeFence>(deviceDomain, authorityEpoch);
-    auto makeOwners = [deviceDomain, authorityEpoch](uintptr_t base) {
+    auto makeOwners = [authorityEpoch](uintptr_t base) {
         std::array<std::shared_ptr<GpuSurface>, 6> owners;
         for (size_t i = 0; i < owners.size(); ++i)
             owners[i] = std::make_shared<FakeLeaseSurface>(

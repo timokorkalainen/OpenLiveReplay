@@ -55,3 +55,6 @@ target_link_libraries(tst_gpuretireregistry_production_perf
 add_test(NAME tst_gpuretireregistry_production_perf
     COMMAND tst_gpuretireregistry_production_perf)
 set_tests_properties(tst_gpuretireregistry_production_perf PROPERTIES LABELS "perf;gpu")
+
+get_property(_olr_perf_tests DIRECTORY PROPERTY TESTS)
+olr_apply_windows_test_runtime(${_olr_perf_tests})

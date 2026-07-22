@@ -268,8 +268,9 @@ void TestGpuDeviceLostWorker::readbackObservedLossRecordsProcessLatch() {
 
     rhi->injectDeviceLostForTest();
     const uint64_t gen0 = GpuGenerationCounter::instance().current();
-    const CpuPlanes planes =
-        rhi->importAndReadback(std::make_shared<TestGpuSurface>(), FramePixelFormat::Yuv420p);
+    const CpuPlanes planes = GpuRhiContextTestAuthority::importAndReadback(
+                                 rhi, std::make_shared<TestGpuSurface>(), FramePixelFormat::Yuv420p)
+                                 .planes;
 
     QVERIFY(!planes.isValid());
     QVERIFY(GpuDeviceLossMonitor::instance().isLost());

@@ -512,15 +512,6 @@ elseif(WIN32)
         playback/output/win/wingpuimportedge.cpp
         playback/output/win/d3d11gpusurface.cpp
         playback/output/win/d3dfence.cpp)
-    if(NOT OLR_GPU_PIPELINE)
-        target_sources(OpenLiveReplay PRIVATE
-            playback/gpu/gpureadbackretainer.h playback/gpu/gpureadbackretainer.cpp
-            playback/gpu/gpuretireregistry.h playback/gpu/gpuretireregistry.cpp
-            playback/gpu/gpuopscope.h playback/gpu/gpuopscope.cpp
-            playback/gpu/gpudevicelossmonitor.h playback/gpu/gpudevicelossmonitor.cpp
-            playback/gpu/gpurecoverycoordinator.h playback/gpu/gpurecoverycoordinator.cpp
-            playback/gpu/gpugeneration.h playback/gpu/gpugeneration.cpp)
-    endif()
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -543,6 +534,16 @@ elseif(NOT WIN32)
         playback/gpu/gpufence.h playback/gpu/gpufence_stub.cpp
         playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp
         playback/output/win/wingpuimportedge_stub.cpp)
+endif()
+
+if(NOT OLR_GPU_PIPELINE)
+    target_sources(OpenLiveReplay PRIVATE
+        playback/gpu/gpureadbackretainer.h playback/gpu/gpureadbackretainer.cpp
+        playback/gpu/gpuretireregistry.h playback/gpu/gpuretireregistry.cpp
+        playback/gpu/gpuopscope.h playback/gpu/gpuopscope.cpp
+        playback/gpu/gpudevicelossmonitor.h playback/gpu/gpudevicelossmonitor.cpp
+        playback/gpu/gpurecoverycoordinator.h playback/gpu/gpurecoverycoordinator.cpp
+        playback/gpu/gpugeneration.h playback/gpu/gpugeneration.cpp)
 endif()
 
 if(OLR_GPU_PIPELINE)

@@ -48,3 +48,6 @@ set_tests_properties(win_gpu_fault_real PROPERTIES
     RUN_SERIAL TRUE
     RESOURCE_LOCK windows_gpu_fault_device
     SKIP_RETURN_CODE 77)
+
+get_property(_olr_gpu_fault_tests DIRECTORY PROPERTY TESTS)
+olr_apply_windows_test_runtime(${_olr_gpu_fault_tests})

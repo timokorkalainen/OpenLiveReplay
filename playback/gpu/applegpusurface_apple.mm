@@ -3,6 +3,7 @@
 #ifdef __APPLE__
 
 #include "playback/gpu/gpudevicelossmonitor.h"
+#include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/formatcanon.h"
@@ -168,6 +169,7 @@ public:
         : m_pixelBuffer(pixelBuffer), m_format(format),
           m_authorityEpoch(GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()) {
         m_device = MTLCreateSystemDefaultDevice();
+        m_deviceDomainId = gpuMetalDeviceDomainId((__bridge void*)m_device);
     }
     ~AppleGpuSurface() override {
         [m_device release];
@@ -190,7 +192,7 @@ public:
 
     bool isValid() const override { return m_pixelBuffer != nullptr && nativeHandle() != nullptr; }
     GpuSurfaceCompatibility compatibility() const override {
-        return {reinterpret_cast<uintptr_t>((__bridge void*)m_device), m_authorityEpoch};
+        return {m_deviceDomainId, m_authorityEpoch};
     }
 
     void retainUntilFenceRetired(uint64_t fenceValue) override {
@@ -223,6 +225,7 @@ private:
     id<MTLDevice> m_device = nil;
     FramePixelFormat m_format = FramePixelFormat::Nv12;
     uint64_t m_authorityEpoch = 0;
+    uintptr_t m_deviceDomainId = 0;
     std::atomic<uint64_t> m_pendingFence{0};
 };
 

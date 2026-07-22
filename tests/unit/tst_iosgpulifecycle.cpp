@@ -6,6 +6,7 @@
 #include <QThread>
 
 #include "playback/gpu/gpudevicelossmonitor.h"
+#include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/iosgpulifecyclesink.h"
@@ -114,7 +115,7 @@ void TestIosGpuLifecycle::offscreenMetalRenderProducesPlanes() {
 
     auto surface = makeAppleNv12Surface(64, 48);
     QVERIFY(surface != nullptr);
-    const CpuPlanes planes = ctx->importAndReadback(surface, FramePixelFormat::Yuv420p);
+    const CpuPlanes planes = submitGpuReadback(ctx, surface, FramePixelFormat::Yuv420p).planes;
     QCOMPARE(planes.format, FramePixelFormat::Yuv420p);
     QCOMPARE(planes.width, 64);
     QCOMPARE(planes.height, 48);

@@ -104,6 +104,7 @@ private:
 };
 
 #ifdef __APPLE__
+uintptr_t gpuMetalDeviceDomainId(void* metalDevice);
 std::shared_ptr<GpuFence> makeMetalGpuFence(void* metalCommandQueue, uint64_t authorityEpoch);
 #endif
 

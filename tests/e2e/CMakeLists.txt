@@ -210,7 +210,8 @@ if(OLR_PYTHON3_EXECUTABLE)
             "${CMAKE_SOURCE_DIR}/playback/output/outputbusengine.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
             "${CMAKE_SOURCE_DIR}/recorder_engine/codec/gpuencodepump.cpp"
-            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm")
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp")
     set_tests_properties(tst_gpu_scope_completion_static PROPERTIES
         LABELS "unit;ci;gpu-capability"
         TIMEOUT 30)
@@ -1136,3 +1137,6 @@ elseif(WIN32)
         SKIP_RETURN_CODE 77
         ENVIRONMENT "${_olr_windows_tool_env}")
 endif()
+
+get_property(_olr_e2e_tests DIRECTORY PROPERTY TESTS)
+olr_apply_windows_test_runtime(${_olr_e2e_tests})

@@ -4,3 +4,9 @@
 # rewrite them to CRLF.
 *.sh text eol=lf
 .githooks/* text eol=lf
+
+# These byte-for-byte benchmark snapshots are guarded by SHA-256 at configure
+# time. Keep their checkout representation identical on every platform.
+tests/perf/saved912gpuopscope.h text eol=lf
+tests/perf/saved912preparedregistry.h text eol=lf
+tests/perf/saved912preparedregistry.cpp text eol=lf

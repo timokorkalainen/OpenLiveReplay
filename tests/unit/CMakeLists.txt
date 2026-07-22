@@ -11,7 +11,7 @@ function(olr_add_unit_test name)
             COMMAND_EXPAND_LISTS
             COMMENT "Copying ${name} runtime DLLs")
     endif()
-    add_test(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
+    olr_add_ctest(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
     # Headless + deterministic; fail fast rather than hang CI.
     set_tests_properties(${name} PROPERTIES
         LABELS "unit;ci"
@@ -144,6 +144,7 @@ if(WIN32)
     set_tests_properties(tst_qtpreviewsink PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
 endif()
+
 olr_add_unit_test(tst_colormetadatapolicy olr_test_playback)
 olr_add_unit_test(tst_colormetadataplumb olr_test_playback)
 olr_add_unit_test(tst_outputdispatcher olr_test_playback)
@@ -385,3 +386,6 @@ if(OLR_GPU_PIPELINE)
         "TestGpuSurfaceLease::fusedSubmissionQuarantinesZeroSignal()"
         registry.pendingRetainCount)
 endif()
+
+get_property(_olr_unit_tests DIRECTORY PROPERTY TESTS)
+olr_apply_windows_test_runtime(${_olr_unit_tests})
