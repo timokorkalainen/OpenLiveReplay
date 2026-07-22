@@ -1,5 +1,6 @@
 #include "nativevideodecoder.h"
 #include "nativeframecopy.h"
+#include "recorder_engine/codec/mediafoundationasynclifecycle.h"
 #include "recorder_engine/mediafoundationruntime.h"
 
 #ifdef _WIN32
@@ -9,7 +10,9 @@
 #endif
 
 #include <QByteArray>
+#include <QDeadlineTimer>
 #include <QStringList>
+#include <QThread>
 #include <QtGlobal>
 
 #include <algorithm>
@@ -438,14 +441,38 @@ void NativeVideoDecoder::Impl::shutdownRuntime() {
 
 void NativeVideoDecoder::Impl::reset() {
     if (transform) {
-        bool shutdown = false;
         if (asyncTransform) {
+            MfAsyncShutdownResult shutdownResult = MfAsyncShutdownResult::ShutdownFailed;
             ComPtr<IMFShutdown> asyncShutdown;
             if (SUCCEEDED(transform.As(&asyncShutdown)) && asyncShutdown) {
-                shutdown = SUCCEEDED(asyncShutdown->Shutdown());
+                constexpr int kShutdownTimeoutMs = 2000;
+                QDeadlineTimer deadline(kShutdownTimeoutMs);
+                shutdownResult = completeMfAsyncShutdown(
+                    [&] { return SUCCEEDED(asyncShutdown->Shutdown()); },
+                    [&] {
+                        MFSHUTDOWN_STATUS status = MFSHUTDOWN_INITIATED;
+                        if (FAILED(asyncShutdown->GetShutdownStatus(&status))) {
+                            return MfAsyncShutdownStatus::Failed;
+                        }
+                        return status == MFSHUTDOWN_COMPLETED ? MfAsyncShutdownStatus::Completed
+                                                              : MfAsyncShutdownStatus::Initiated;
+                    },
+                    [&] { return deadline.hasExpired(); }, [] { QThread::msleep(1); });
             }
-        }
-        if (!shutdown) {
+            if (shutdownResult == MfAsyncShutdownResult::ShutdownFailed) {
+                // Preserve the pre-shutdown fallback when IMFShutdown is unavailable
+                // or rejects the request. The references are still retained below.
+                transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+                transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            }
+            // Detach without releasing on any incomplete shutdown. This intentionally
+            // keeps one reference to every object in the async ownership graph for the
+            // process lifetime without allocating in the pressure/teardown path.
+            retainMfAsyncResourcesIfIncomplete(
+                shutdownResult, [&] { (void) transform.Detach(); },
+                [&] { (void) eventGenerator.Detach(); }, [&] { (void) deviceManager.Detach(); },
+                [&] { (void) d3dDevice.Detach(); });
+        } else {
             transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
         }

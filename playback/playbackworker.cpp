@@ -2125,6 +2125,12 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
         m_forceLiveOutputSnapshots.store(64, std::memory_order_release);
         refreshOutputAfterSeekCommit();
     }
+    if (m_gpuRecoveryParticipantId != 0) {
+        GpuDeviceLossMonitor::instance().unregisterRecoveryParticipant(m_gpuRecoveryParticipantId);
+        m_gpuRecoveryParticipantId = 0;
+    }
+    m_gpuPendingRecoveryGeneration = 0;
+    m_gpuRebuildDeferredForSuspend.store(false, std::memory_order_release);
 }
 
 void PlaybackWorker::resumeDeferredGpuRebuild() {
