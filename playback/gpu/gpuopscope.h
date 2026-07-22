@@ -137,7 +137,7 @@ private:
                     const uint64_t ticketValue = ticket->value();
                     bool exact = true;
                     for (size_t i = 0; i < uniqueCount; ++i) {
-                        if (!m_fence->validatesRetirement(*ticket, compatibilities[i])) {
+                        if (!m_fence->validatesIssuedRetirement(*ticket, compatibilities[i])) {
                             exact = false;
                             break;
                         }

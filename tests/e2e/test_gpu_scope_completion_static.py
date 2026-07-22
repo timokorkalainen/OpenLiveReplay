@@ -4217,7 +4217,8 @@ def main():
         function_block(async_readback, "bool AsyncGpuReadbackSink::prewarmReadback"),
         "asynchronous readback prewarm", True)
     audit_exact_synchronization_flow(
-        function_block(decklink, "bool waitForNativeGpuProducer"), "DeckLink producer wait")
+        function_block(decklink, "NativeGpuProducerStatus waitForNativeGpuProducer"),
+        "DeckLink producer wait")
     audit_exact_synchronization_flow(
         function_block(output_bus, "OutputBusFrame OutputBusEngine::renderSingleSource"),
         "output bus reuse", require_pair_fields=False)

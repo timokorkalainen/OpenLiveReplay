@@ -690,6 +690,7 @@ private slots:
     void allocationProbeCountsRealInjectedHeapEventsByPhase();
     void fusedSubmissionNotSubmittedReleasesPreparedOwners();
     void fusedSubmissionPublishesSubmittedOwners();
+    void acceptedSubmissionPublishesWhenGenerationChangesInsideCallback();
     void fusedSubmissionPublishesSubmittedWithErrorOwners();
     void fusedSubmissionQuarantinesZeroSignal();
     void fusedSubmissionQuarantinesPostAcceptThrow();
@@ -1654,6 +1655,40 @@ void TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedOwners() {
     fence->setCompleted(result.fenceValue);
     registry.drainCompleted();
     GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::acceptedSubmissionPublishesWhenGenerationChangesInsideCallback() {
+    GpuDeviceLossMonitor::instance().reset();
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t domain = 0xD066;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
+    const uint64_t generation = GpuGenerationCounter::instance().current();
+    auto fence = std::make_shared<FakeFence>(domain, authorityEpoch);
+    auto surface = std::make_shared<FakeLeaseSurface>(
+        reinterpret_cast<void*>(0xD066), true, GpuSurfaceCompatibility{domain, authorityEpoch});
+    std::weak_ptr<GpuSurface> weakSurface = surface;
+    GpuRetireRegistry registry;
+    auto adapter = [&](const auto&) noexcept {
+        GpuGenerationCounter::instance().bump();
+        return GpuSubmitOutcome::Submitted;
+    };
+
+    GpuOpScope operation(fence, registry);
+    const auto result = operation.submit(
+        adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+
+    QCOMPARE(GpuGenerationCounter::instance().current(), generation + 1);
+    QCOMPARE(result.outcome, GpuSubmitOutcome::Submitted);
+    QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
+    QCOMPARE(result.fenceValue, uint64_t(1));
+    QCOMPARE(surface->pendingFenceValue(), result.fenceValue);
+    QVERIFY(!GpuDeviceLossMonitor::instance().isLost());
+
+    surface.reset();
+    QVERIFY(!weakSurface.expired());
+    fence->setCompleted(result.fenceValue);
+    registry.drainCompleted();
+    QVERIFY(weakSurface.expired());
 }
 
 void TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedWithErrorOwners() {

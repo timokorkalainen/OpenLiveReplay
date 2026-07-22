@@ -313,14 +313,24 @@ void compareRgbaWithinOneLsb(const CpuPlanes& actual, const CpuPlanes& expected)
 #ifdef __APPLE__
 class PendingNv12Surface final : public GpuSurface {
 public:
-    PendingNv12Surface() { retainUntilFenceRetired(1); }
+    explicit PendingNv12Surface(GpuSurfaceCompatibility compatibility)
+        : m_compatibility(compatibility) {
+        retainUntilFenceRetired(1);
+    }
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 8}; }
     bool isValid() const override { return true; }
-    void* nativeHandle() const override { return nullptr; }
+    GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
+    void* nativeHandle() const override { return const_cast<PendingNv12Surface*>(this); }
+
+private:
+    GpuSurfaceCompatibility m_compatibility;
 };
 
 class NeverRetiredFence final : public GpuFence {
 public:
+    explicit NeverRetiredFence(GpuSurfaceCompatibility compatibility)
+        : GpuFence(compatibility.deviceDomainId, compatibility.authorityEpoch) {}
+
     uint64_t signal() override { return 1; }
     bool wait(uint64_t, int timeoutMs) override {
         waits.fetch_add(1, std::memory_order_acq_rel);
@@ -776,13 +786,14 @@ void TestGpuCompositor::gpuNv12AliasUsesBoundedFenceWait() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
 
-    auto fence = std::make_shared<NeverRetiredFence>();
+    const GpuSurfaceCompatibility compatibility = rhi->surfaceCompatibility();
+    auto fence = std::make_shared<NeverRetiredFence>(compatibility);
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 16;
     meta.key.height = 8;
-    FrameHandle gpuFrame = makeGpuFrameHandle(std::make_shared<PendingNv12Surface>(), rhi, meta,
-                                              fence, 1, GpuBudgetCharge{});
+    FrameHandle gpuFrame = makeGpuFrameHandle(std::make_shared<PendingNv12Surface>(compatibility),
+                                              rhi, meta, fence, 1, GpuBudgetCharge{});
 
     auto aliased = GpuCompositor::uploadFrameToNv12SurfaceForTest(gpuFrame, rhi);
 

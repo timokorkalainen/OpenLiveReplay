@@ -58,8 +58,10 @@ SOURCE_SUFFIXES = frozenset({
 COMPILE_SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".m", ".mm"})
 FIRST_PARTY_EXCLUDED_PARTS = frozenset({
     "deps", "dependencies", "docs", "external", "handoff-notes", "node_modules",
-    "tests", "third_party", "third-party", "vendor", "vendors", "linux_build",
-    "windows_build", "_deps",
+    "tests", "third_party", "third-party", "vendor", "vendors", "_deps",
+})
+GENERATED_TOP_LEVEL_BUILD_ROOTS = frozenset({
+    "ios_build", "linux_build", "macos_build", "windows_build",
 })
 LEASE_HEADER = PurePosixPath("playback/gpu/gpusurfacelease.h")
 REGISTRY_HEADER = PurePosixPath("playback/gpu/gpuretireregistry.h")
@@ -7368,6 +7370,8 @@ def audit_sources(sources: Mapping[PurePosixPath, str]) -> list[Finding]:
 def is_production_path(path: PurePosixPath) -> bool:
     if not path.parts or path.suffix.lower() not in SOURCE_SUFFIXES:
         return False
+    if path.parts[0].lower() in GENERATED_TOP_LEVEL_BUILD_ROOTS:
+        return False
     for part in path.parts[:-1]:
         lowered = part.lower()
         if (lowered in FIRST_PARTY_EXCLUDED_PARTS or lowered == "build"
@@ -8560,7 +8564,12 @@ def mutation_self_tests() -> None:
         PurePosixPath("build-review/source.cpp"), PurePosixPath("docs/source.cpp"),
         PurePosixPath("handoff-notes/source.cpp"), PurePosixPath("third_party/source.cpp"),
         PurePosixPath("vendor/source.cpp"), PurePosixPath("dependencies/source.cpp"),
+        PurePosixPath("ios_build/source.cpp"),
+        PurePosixPath("linux_build/source.cpp"),
+        PurePosixPath("macos_build/source.cpp"),
         PurePosixPath("windows_build/source.cpp"),
+        PurePosixPath("macos_build/dist/ffmpeg/include/libavutil/bprint.h"),
+        PurePosixPath("macos_build/dist/srt/include/srt/srt.h"),
         PurePosixPath("windows_build/dist/dependency.cpp"),
         PurePosixPath(".claude/worktrees/source.cpp"),
     )

@@ -3,6 +3,7 @@ import dataclasses
 import contextlib
 import io
 import inspect
+import json
 import os
 import re
 import shutil
@@ -57,6 +58,37 @@ from gpu_capability_source_audit import (  # noqa: E402
     view_has_capability_spelling,
     _audit_preprocessed_view_unfiltered,
 )
+
+
+class ProductionSourceDiscoveryTests(unittest.TestCase):
+    def test_generated_dependency_roots_do_not_hide_nested_first_party_paths(self):
+        self.assertIsInstance(
+            capability_audit.GENERATED_TOP_LEVEL_BUILD_ROOTS, frozenset
+        )
+        generated = (
+            PurePosixPath("ios_build/dist/ffmpeg/include/libavutil/bprint.h"),
+            PurePosixPath("linux_build/dist/srt/include/srt/srt.h"),
+            PurePosixPath("macos_build/dist/ffmpeg/include/libavutil/bprint.h"),
+            PurePosixPath("macos_build/dist/srt/include/srt/srt.h"),
+            PurePosixPath("windows_build/dist/ffmpeg/include/libavutil/bprint.h"),
+        )
+        first_party = (
+            PurePosixPath("playback/macos_build/backend.mm"),
+            PurePosixPath("playback/windows_build/backend.cpp"),
+            PurePosixPath("custom_build/backend.cpp"),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in generated + first_party:
+                path = root.joinpath(*relative.parts)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("// fixture\n", encoding="utf-8")
+
+            discovered = set(capability_audit.load_production_sources(root))
+
+        self.assertTrue(set(generated).isdisjoint(discovered))
+        self.assertTrue(set(first_party).issubset(discovered))
 
 
 def _reference_audit_pipeline_streaming(sources, compact_results):
@@ -1230,10 +1262,14 @@ class CompilerAuditLaneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "compile_commands.json"
-            database.write_text("[]", encoding="utf-8")
             source_path = root / Path(*relative.parts)
             source_path.parent.mkdir(parents=True)
             source_path.write_text("int profile;\n", encoding="utf-8")
+            database.write_text(json.dumps([{
+                "directory": str(root),
+                "file": str(source_path),
+                "arguments": ["fixture-compiler", "-c", str(source_path)],
+            }]), encoding="utf-8")
             identity = self.identity(relative.as_posix(), canonical=str(source_path))
             configuration = self.configuration(identity)
             view = self.view(((identity, 1, 1, b"int profile ;"),))
@@ -1505,9 +1541,9 @@ class CompilerAuditLaneTests(unittest.TestCase):
             ))
 
         expected_counts = {
-            "mutation-authoritative": 181,
-            "mutation-source-only": 31,
-            "mutation-raw": 33,
+            "mutation-authoritative": 242,
+            "mutation-source-only": 40,
+            "mutation-raw": 44,
             "live-forbidden": 6,
             "live-safe": 7,
         }
@@ -1518,8 +1554,8 @@ class CompilerAuditLaneTests(unittest.TestCase):
                 for category in expected_counts
             }
             self.assertEqual(observed_counts, expected_counts)
-            self.assertEqual(len(entries), 258)
-            self.assertEqual(len({(item[2], item[3]) for item in entries}), 186)
+            self.assertEqual(len(entries), 339)
+            self.assertEqual(len({(item[2], item[3]) for item in entries}), 249)
             self.assertEqual(
                 {item[1] for item in entries if item[0] == "live-forbidden"},
                 set(FORBIDDEN_OUTPUT_ORACLES),

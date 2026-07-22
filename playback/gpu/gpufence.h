@@ -75,6 +75,21 @@ protected:
 
 private:
     friend class GpuOpScope;
+    // Post-accept validation for the exact ticket this fence just minted. A
+    // generation change may race after the driver accepts work; that work must
+    // still retain its owners until this fence retires even though downstream
+    // consumers will drop the now-stale frame generation.
+    bool validatesIssuedRetirement(const GpuRetirementTicket& ticket,
+                                   const GpuSurfaceCompatibility& surface) const noexcept {
+        return ticket.m_fence.get() == this && ticket.m_identity == identity() &&
+               ticket.m_identity.instanceId != 0 && ticket.m_value != 0 &&
+               ticket.m_gpuGeneration != 0 && surface.deviceDomainId != 0 &&
+               surface.authorityEpoch != 0 &&
+               ticket.m_identity.deviceDomainId == surface.deviceDomainId &&
+               ticket.m_identity.authorityEpoch == surface.authorityEpoch &&
+               ticket.m_authoritySeal ==
+                   sealTicket(ticket.m_identity, ticket.m_gpuGeneration, ticket.m_value);
+    }
     static uint64_t currentGpuGeneration() noexcept;
     static uint64_t mixAuthorityWord(uint64_t state, uint64_t word) noexcept {
         state ^= word + 0x9e3779b97f4a7c15ULL + (state << 6) + (state >> 2);

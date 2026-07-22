@@ -761,6 +761,42 @@ class WindowsProcessTreeAccountingTests(unittest.TestCase):
 
 
 class LinuxSupervisorContractTests(unittest.TestCase):
+    def test_coordinator_accounting_paths_match_fixed_supervisor_topology(self) -> None:
+        token = bytes(range(32)).hex()
+        client = LinuxRendezvousClient({
+            "OLR_CGROUP_RENDEZVOUS_PATH": "/tmp/olr-rendezvous.sock",
+            "OLR_CGROUP_RENDEZVOUS_TOKEN": token,
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            service = Path(temporary).resolve()
+            run = service / "run"
+            coordinator = run / "coordinator"
+            coordinator.mkdir(parents=True)
+            with mock.patch(
+                    "gpu_capability_process_tree._current_linux_cgroup_path",
+                    return_value=coordinator):
+                self.assertEqual(
+                    client.coordinator_accounting_paths(),
+                    (coordinator, run, service),
+                )
+
+            invalid_paths = (
+                run / "wrong-coordinator",
+                service / "wrong-run" / "coordinator",
+                service / "missing-run" / "coordinator",
+            )
+            invalid_paths[0].mkdir()
+            invalid_paths[1].mkdir(parents=True)
+            for path in invalid_paths:
+                with self.subTest(path=path):
+                    with mock.patch(
+                            "gpu_capability_process_tree._current_linux_cgroup_path",
+                            return_value=path):
+                        with self.assertRaisesRegex(
+                                AuditInfrastructureError,
+                                "coordinator cgroup differs"):
+                            client.coordinator_accounting_paths()
+
     def test_missing_memory_controller_fails_without_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -973,6 +1009,7 @@ from gpu_capability_process_tree import (LinuxRendezvousClient,
 client = LinuxRendezvousClient(os.environ)
 deadline = time.monotonic() + 20
 client.hello(deadline)
+client.coordinator_accounting_paths()
 carrier = client.create_leaf(0, 0, deadline)
 worker = subprocess.Popen((sys.executable, '-c', 'import time; time.sleep(20)'))
 try:

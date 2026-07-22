@@ -54,11 +54,8 @@ uint64_t GpuFence::currentGpuGeneration() noexcept {
 
 bool GpuFence::validatesRetirement(const GpuRetirementTicket& ticket,
                                    const GpuSurfaceCompatibility& surface) const noexcept {
-    return ticket.m_fence.get() == this && ticket.m_identity == identity() && ticket.m_value != 0 &&
-           gpuSubmissionDetail::matchesSurfaceEvidence(
-               surface, ticket.m_identity, ticket.m_gpuGeneration, currentGpuGeneration()) &&
-           ticket.m_authoritySeal ==
-               sealTicket(ticket.m_identity, ticket.m_gpuGeneration, ticket.m_value);
+    return validatesIssuedRetirement(ticket, surface) &&
+           ticket.m_gpuGeneration == currentGpuGeneration();
 }
 
 std::shared_ptr<GpuFence> GpuFence::create() {

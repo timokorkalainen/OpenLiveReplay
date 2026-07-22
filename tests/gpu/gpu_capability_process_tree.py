@@ -1983,7 +1983,7 @@ class LinuxRendezvousClient:
         service_root = run.parent
         _require_contract(
             coordinator.name == "coordinator"
-            and run.name == self._run_id
+            and run.name == "run"
             and coordinator.is_dir()
             and run.is_dir()
             and service_root.is_dir(),
