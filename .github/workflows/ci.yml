@@ -749,12 +749,6 @@ jobs:
       - name: Build (app + tests)
         run: cmake --build build -- -k 0
 
-      - name: Run real GPU capability source audit
-        run: |
-          test -s build/compile_commands.json
-          ctest --test-dir build --output-on-failure --no-tests=error \
-            -R '^gpu_capability_source_audit$'
-
       - name: Shader toolchain compile (qsb / qsb bake)
         run: |
           set -euo pipefail
@@ -781,6 +775,12 @@ jobs:
             echo "$dump" | grep -q "GLSL" || { echo "no GLSL target in $stage"; exit 1; }
           done
           echo "Shader toolchain OK: pass-through .qsb baked multi-target."
+
+      - name: Run real GPU capability source audit
+        run: |
+          test -s build-gpu/compile_commands.json
+          ctest --test-dir build-gpu --output-on-failure --no-tests=error \
+            -R '^gpu_capability_source_audit$'
 
       - name: ccache stats
         if: always()

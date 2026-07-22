@@ -6,6 +6,7 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 
+#include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"

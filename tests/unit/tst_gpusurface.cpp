@@ -11,7 +11,9 @@
 #include "playback/output/framepixelformat.h"
 #ifdef __APPLE__
 #include "playback/gpu/appleiosurface.h"
+#ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/gpurhicontext.h"
+#endif
 #endif
 
 namespace {
@@ -42,7 +44,9 @@ private slots:
     void appleSurfaceIsIoSurfaceBacked();
     void appleSurfaceRespectsInjectedAllocFailure();
     void appleSurfaceTracksPendingFence();
+#ifdef OLR_GPU_PIPELINE_BUILD
     void appleSurfaceSeparatesFrameGenerationFromDeviceAuthority();
+#endif
     void applePixelBufferWrapperOutlivesSurfaceOwner();
 #endif
 };
@@ -114,6 +118,7 @@ void TestGpuSurface::appleSurfaceTracksPendingFence() {
     QCOMPARE(surface->pendingFenceValue(), uint64_t(9));
 }
 
+#ifdef OLR_GPU_PIPELINE_BUILD
 void TestGpuSurface::appleSurfaceSeparatesFrameGenerationFromDeviceAuthority() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
@@ -152,6 +157,7 @@ void TestGpuSurface::appleSurfaceSeparatesFrameGenerationFromDeviceAuthority() {
     QVERIFY(!rebuiltFence->sharesDeviceAuthorityWith(oldSurface));
     QVERIFY(rebuiltFence->sharesDeviceAuthorityWith(rebuiltSurface));
 }
+#endif
 
 void TestGpuSurface::applePixelBufferWrapperOutlivesSurfaceOwner() {
     auto surface = makeAppleNv12Surface(64, 48);
