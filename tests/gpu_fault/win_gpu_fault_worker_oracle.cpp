@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <QVector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -50,6 +51,7 @@ public:
         QMutexLocker locker(&m_mutex);
         ++m_submitCount;
         m_lastFrame = frame.video;
+        m_submittedGpuGenerations.append(frame.video.metadata().gpuGeneration);
         return !frame.video.isNull();
     }
     int submitCount() const {
@@ -64,12 +66,18 @@ public:
         QMutexLocker locker(&m_mutex);
         m_lastFrame = FrameHandle{};
     }
+    int submissionsForGpuGeneration(uint64_t generation) const {
+        QMutexLocker locker(&m_mutex);
+        return int(std::count(m_submittedGpuGenerations.cbegin(), m_submittedGpuGenerations.cend(),
+                              generation));
+    }
 
 private:
     mutable QMutex m_mutex;
     bool m_active = false;
     int m_submitCount = 0;
     FrameHandle m_lastFrame;
+    QVector<uint64_t> m_submittedGpuGenerations;
 };
 
 OutputTargetAssignment oracleAssignment() {
@@ -125,6 +133,8 @@ struct WinGpuFaultWorkerOracle::Impl {
     uint64_t generationBefore = 0;
     uint64_t deviceAuthorityEpoch = 0;
     ComPtr<ID3D11Device> device;
+    bool productionPollObservedRemoval = false;
+    QElapsedTimer removalToSinkTimer;
 };
 
 WinGpuFaultWorkerOracle::WinGpuFaultWorkerOracle() : m_impl(std::make_unique<Impl>()) {}
@@ -240,6 +250,30 @@ void* WinGpuFaultWorkerOracle::d3dDevice() const {
     return m_impl ? m_impl->device.Get() : nullptr;
 }
 
+WinGpuFaultRemovalObservation WinGpuFaultWorkerOracle::pollWorkerDeviceLoss() {
+    WinGpuFaultRemovalObservation observation;
+    if (!m_impl || !m_impl->device || !m_impl->preLossRhi) return observation;
+
+    const HRESULT reason = m_impl->device->GetDeviceRemovedReason();
+    observation.hresult = int64_t(reason);
+    if (!FAILED(reason)) return observation;
+
+    const bool workerRhiObserved = m_impl->preLossRhi->pollDeviceLoss();
+    const auto token = GpuDeviceLossMonitor::instance().realLossToken();
+    ComPtr<IUnknown> deviceIdentity;
+    const uintptr_t expectedDomain = SUCCEEDED(m_impl->device.As(&deviceIdentity))
+                                         ? reinterpret_cast<uintptr_t>(deviceIdentity.Get())
+                                         : 0;
+    observation.productionPollObserved = workerRhiObserved && m_impl->preLossRhi->deviceLost() &&
+                                         token.has_value() && expectedDomain != 0 &&
+                                         token->deviceDomainId() == expectedDomain;
+    observation.generation = observation.productionPollObserved ? token->observedGeneration() : 0;
+    m_impl->productionPollObservedRemoval = observation.productionPollObserved;
+    if (observation.productionPollObserved && !m_impl->removalToSinkTimer.isValid())
+        m_impl->removalToSinkTimer.start();
+    return observation;
+}
+
 bool WinGpuFaultWorkerOracle::invokeOnRenderThread(
     const std::function<void(void*)>& operation) const {
     if (!m_impl || !m_impl->preLossRhi || !operation) return false;
@@ -293,13 +327,22 @@ bool WinGpuFaultWorkerOracle::submitWorkerFaultOperation(
 
 bool WinGpuFaultWorkerOracle::recover(QJsonObject* evidence, QString* error) {
     if (!m_impl->worker || !m_impl->preLossRhi || !evidence) return false;
-    (void) GpuRhiContextTestAuthority::importAndReadback(m_impl->preLossRhi, nullptr,
-                                                         FramePixelFormat::Yuv420p);
     const auto token = GpuDeviceLossMonitor::instance().realLossToken();
-    if (!token || !m_impl->preLossRhi->deviceLost()) {
+    if (!token || !m_impl->preLossRhi->deviceLost() || !m_impl->productionPollObservedRemoval ||
+        !m_impl->removalToSinkTimer.isValid()) {
         if (error) *error = QStringLiteral("PlaybackWorker RHI did not publish real DXGI loss");
         return false;
     }
+    if (m_impl->worker->isRunning()) {
+        if (error) *error = QStringLiteral("worker-oracle requires an unstarted owned worker");
+        return false;
+    }
+
+    // The oracle exclusively owns this unstarted worker. Therefore the runtime pointer
+    // obtained below cannot be replaced concurrently; all endpoint and recovery calls are
+    // synchronous on this thread. The timer started at the exact successful production poll,
+    // before the child emitted its removal checkpoint, and runs through the first coherent
+    // recovered sink submit.
 
     const uint64_t generationAfter = GpuGenerationCounter::instance().current();
     bool staleRejected = false;
@@ -310,10 +353,31 @@ bool WinGpuFaultWorkerOracle::recover(QJsonObject* evidence, QString* error) {
                         staleFrame->isStaleForGeneration(generationAfter);
     }
 
-    QElapsedTimer recoveryTimer;
-    recoveryTimer.start();
+    OutputRuntime* runtime = nullptr;
+    {
+        QMutexLocker locker(&m_impl->worker->m_outputRuntimeMutex);
+        runtime = m_impl->worker->m_outputRuntime.get();
+    }
+    if (!runtime) {
+        if (error) *error = QStringLiteral("worker-oracle output runtime is unavailable at loss");
+        return false;
+    }
+    const int staleGenerationSubmitsBefore =
+        m_impl->sink.submissionsForGpuGeneration(m_impl->generationBefore);
+    const int staleProbeSubmitsBefore = m_impl->sink.submitCount();
+    m_impl->sink.clearLastFrame();
+    runtime->setIdentitySkip(false);
+    runtime->setEndpoints({{oracleAssignment(), &m_impl->sink}});
+    runtime->dispatchImmediate();
+    const FrameHandle staleProbeFrame = m_impl->sink.lastFrame();
+    const bool staleExcludedFromSink =
+        m_impl->sink.submitCount() > staleProbeSubmitsBefore &&
+        m_impl->sink.submissionsForGpuGeneration(m_impl->generationBefore) ==
+            staleGenerationSubmitsBefore &&
+        !staleProbeFrame.isNull() && !staleProbeFrame.isGpuBacked() &&
+        staleProbeFrame.metadata().key.isPlaceholder;
+
     m_impl->worker->handleGpuDeviceLoss();
-    const qint64 recoveryMs = recoveryTimer.elapsed();
 
     const OutputRuntimeSnapshot snapshot = m_impl->worker->makeOutputSnapshot();
     const auto recovered = snapshot.cache.videoFrameAt(0, 0);
@@ -333,7 +397,7 @@ bool WinGpuFaultWorkerOracle::recover(QJsonObject* evidence, QString* error) {
                                 recovered->metadata().gpuGeneration == 0 &&
                                 recoveredMetadataMatches(recovered->metadata());
     const int submitsBefore = m_impl->sink.submitCount();
-    OutputRuntime* runtime = nullptr;
+    runtime = nullptr;
     {
         QMutexLocker locker(&m_impl->worker->m_outputRuntimeMutex);
         runtime = m_impl->worker->m_outputRuntime.get();
@@ -357,6 +421,8 @@ bool WinGpuFaultWorkerOracle::recover(QJsonObject* evidence, QString* error) {
         lastFrame.metadata().color == recovered->metadata().color &&
         !lastFrame.isStaleForGeneration(generationAfter) &&
         sameCpuPlanes(lastCpu, m_impl->expectedCpu);
+    const bool recoveryReachedSink = outputResumed;
+    const qint64 recoveryMs = m_impl->removalToSinkTimer.elapsed();
     const bool coherentState =
         m_impl->worker->gpuPipelineState() == PlaybackWorker::GpuPipelineState::Gpu ||
         m_impl->worker->gpuPipelineState() == PlaybackWorker::GpuPipelineState::CpuFallback;
@@ -366,8 +432,12 @@ bool WinGpuFaultWorkerOracle::recover(QJsonObject* evidence, QString* error) {
     evidence->insert(QStringLiteral("workerGenerationBefore"), double(m_impl->generationBefore));
     evidence->insert(QStringLiteral("workerGenerationAfter"), double(generationAfter));
     evidence->insert(QStringLiteral("workerStaleFrameRejected"), staleRejected);
+    evidence->insert(QStringLiteral("workerProductionPollObservedRemoval"),
+                     m_impl->productionPollObservedRemoval);
+    evidence->insert(QStringLiteral("workerStaleFrameExcludedFromSink"), staleExcludedFromSink);
     evidence->insert(QStringLiteral("workerCacheRecoveredToCpu"), cacheRecovered);
     evidence->insert(QStringLiteral("workerOutputResumed"), outputResumed);
+    evidence->insert(QStringLiteral("workerRecoveryReachedSink"), recoveryReachedSink);
     evidence->insert(QStringLiteral("workerRecoveryMs"), double(recoveryMs));
     evidence->insert(QStringLiteral("workerCoherentState"), coherentState);
     evidence->insert(
@@ -377,14 +447,16 @@ bool WinGpuFaultWorkerOracle::recover(QJsonObject* evidence, QString* error) {
     evidence->insert(QStringLiteral("workerRetainedSurfaceReleased"),
                      workerRetainedSurfaceReleased);
 
-    if (generationAfter <= m_impl->generationBefore || !staleRejected || !cacheRecovered ||
-        !outputResumed || !coherentState || !workerRetainedSurfaceReleased || recoveryMs > 10000) {
+    if (generationAfter <= m_impl->generationBefore || !staleRejected ||
+        !m_impl->productionPollObservedRemoval || !staleExcludedFromSink || !cacheRecovered ||
+        !outputResumed || !recoveryReachedSink || !coherentState ||
+        !workerRetainedSurfaceReleased || recoveryMs > 10000) {
         if (error) {
             *error =
                 QStringLiteral(
                     "PlaybackWorker recovery oracle failed: generation=%1 stale=%2 cache=%3 "
                     "recovered=%4 recoveredGpu=%5 recoveredGeneration=%6 metadata=%7 output=%8 "
-                    "coherent=%9 released=%10 ms=%11")
+                    "productionPoll=%9 sinkExcluded=%10 coherent=%11 released=%12 ms=%13")
                     .arg(generationAfter > m_impl->generationBefore)
                     .arg(staleRejected)
                     .arg(cacheRecovered)
@@ -393,6 +465,8 @@ bool WinGpuFaultWorkerOracle::recover(QJsonObject* evidence, QString* error) {
                     .arg(recovered ? recovered->metadata().gpuGeneration : UINT64_MAX)
                     .arg(recovered && recoveredMetadataMatches(recovered->metadata()))
                     .arg(outputResumed)
+                    .arg(m_impl->productionPollObservedRemoval)
+                    .arg(staleExcludedFromSink)
                     .arg(coherentState)
                     .arg(workerRetainedSurfaceReleased)
                     .arg(recoveryMs);

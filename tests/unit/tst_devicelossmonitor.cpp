@@ -52,6 +52,12 @@ private slots:
     void stalePublicationAfterClearIsRejected();
     void rebuildAuthorityRejectsOldDeviceAcceptsReplacement();
     void currentAuthorityPublicationTracksGuardedEpoch();
+    void coordinatedParticipantsAdvanceAuthorityOnceAndClearAfterAllAcknowledge();
+    void replacementAuthorityWaitsForEveryOldDomainCleanup();
+    void lateGraphJoinsRecoveryWithoutOwningAnOldDevice();
+    void noDeviceRegistrationRemainsCleanupAcknowledgedIfLossStartsImmediately();
+    void replacementDeviceLossRestartsRecoveryEpoch();
+    void staleRecoveryTicketCannotClearNewerLoss();
     void validatedRecoveryRunsOnceForConcurrentWorkers();
     void validatedRecoveryCallbackRunsAfterEpochUnlock();
     void validatedRecoveryRejectsMismatchedLossGeneration();
@@ -63,6 +69,184 @@ private slots:
     void retiredGenerationsPruneCompletedWithoutErasingActiveOrNewer();
     void resetReturnsToPristine();
 };
+
+void TestDeviceLossMonitor::
+    coordinatedParticipantsAdvanceAuthorityOnceAndClearAfterAllAcknowledge() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t firstParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t secondParticipant = monitor.registerRecoveryParticipant();
+    QVERIFY(firstParticipant != 0);
+    QVERIFY(secondParticipant != 0);
+    QVERIFY(firstParticipant != secondParticipant);
+
+    const uint64_t initialAuthority = monitor.currentDeviceAuthorityEpoch();
+    const uint64_t lossGeneration = monitor.recordLoss();
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(firstParticipant, lossGeneration));
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(secondParticipant, lossGeneration));
+    const GpuRecoveryTicket first = monitor.beginRebuild(firstParticipant);
+    const uint64_t replacementAuthority = monitor.currentDeviceAuthorityEpoch();
+    const GpuRecoveryTicket second = monitor.beginRebuild(secondParticipant);
+
+    QVERIFY(first.isValid());
+    QVERIFY(second.isValid());
+    QCOMPARE(first.lossGeneration(), lossGeneration);
+    QCOMPARE(second.lossGeneration(), lossGeneration);
+    QCOMPARE(first.authorityEpoch(), replacementAuthority);
+    QCOMPARE(second.authorityEpoch(), replacementAuthority);
+    QVERIFY(replacementAuthority != initialAuthority);
+    QCOMPARE(monitor.currentDeviceAuthorityEpoch(), replacementAuthority);
+
+    QVERIFY(monitor.clearForRebuild(first));
+    QVERIFY(monitor.isLost());
+    QVERIFY(monitor.clearForRebuild(second));
+    QVERIFY(!monitor.isLost());
+
+    monitor.unregisterRecoveryParticipant(firstParticipant);
+    monitor.unregisterRecoveryParticipant(secondParticipant);
+    monitor.reset();
+}
+
+void TestDeviceLossMonitor::staleRecoveryTicketCannotClearNewerLoss() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t oldParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t oldGeneration = monitor.recordLoss();
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(oldParticipant, oldGeneration));
+    const GpuRecoveryTicket stale = monitor.beginRebuild(oldParticipant);
+    QVERIFY(stale.isValid());
+    QCOMPARE(stale.lossGeneration(), oldGeneration);
+
+    // Teardown is an acknowledgement for the old participant. A later graph and
+    // loss must not be clearable by work that retained the old immutable ticket.
+    monitor.unregisterRecoveryParticipant(oldParticipant);
+    QVERIFY(!monitor.isLost());
+    const uint64_t newParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t newGeneration = monitor.recordLoss();
+    QVERIFY(newGeneration > oldGeneration);
+
+    QVERIFY(!monitor.clearForRebuild(stale));
+    QVERIFY(monitor.isLost());
+    QCOMPARE(monitor.currentLossGenerationForTest(), newGeneration);
+
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(newParticipant, newGeneration));
+    const GpuRecoveryTicket current = monitor.beginRebuild(newParticipant);
+    QVERIFY(current.isValid());
+    QVERIFY(monitor.clearForRebuild(current));
+    QVERIFY(!monitor.isLost());
+    monitor.unregisterRecoveryParticipant(newParticipant);
+    monitor.reset();
+}
+
+void TestDeviceLossMonitor::replacementAuthorityWaitsForEveryOldDomainCleanup() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t firstParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t delayedParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t oldAuthority = monitor.currentDeviceAuthorityEpoch();
+    const uint64_t generation = monitor.recordLoss();
+
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(firstParticipant, generation));
+    QVERIFY(!monitor.beginRebuild(firstParticipant).isValid());
+    QCOMPARE(monitor.currentDeviceAuthorityEpoch(), oldAuthority);
+
+    // The delayed participant still owns an old-authority device. Its proof must
+    // remain acceptable until it has polled and acknowledged local cleanup.
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(oldAuthority, 0xA16), generation);
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(delayedParticipant, generation));
+
+    const GpuRecoveryTicket delayed = monitor.beginRebuild(delayedParticipant);
+    const GpuRecoveryTicket first = monitor.beginRebuild(firstParticipant);
+    QVERIFY(delayed.isValid());
+    QVERIFY(first.isValid());
+    QVERIFY(monitor.currentDeviceAuthorityEpoch() != oldAuthority);
+    QCOMPARE(delayed.authorityEpoch(), first.authorityEpoch());
+    QVERIFY(monitor.clearForRebuild(delayed));
+    QVERIFY(monitor.clearForRebuild(first));
+    QVERIFY(!monitor.isLost());
+    monitor.unregisterRecoveryParticipant(firstParticipant);
+    monitor.unregisterRecoveryParticipant(delayedParticipant);
+    monitor.reset();
+}
+
+void TestDeviceLossMonitor::lateGraphJoinsRecoveryWithoutOwningAnOldDevice() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t oldParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t generation = monitor.recordLoss();
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(oldParticipant, generation));
+    const GpuRecoveryTicket oldTicket = monitor.beginRebuild(oldParticipant);
+    QVERIFY(oldTicket.isValid());
+
+    // This registration races after recovery began, but before commit. The new
+    // graph owns no old-authority device, so it joins already cleanup-acknowledged.
+    const uint64_t lateParticipant = monitor.registerRecoveryParticipant(false);
+    const GpuRecoveryTicket lateTicket = monitor.beginRebuild(lateParticipant);
+    QVERIFY(lateTicket.isValid());
+    QCOMPARE(lateTicket.lossGeneration(), generation);
+    QCOMPARE(lateTicket.authorityEpoch(), oldTicket.authorityEpoch());
+
+    QVERIFY(monitor.clearForRebuild(oldTicket));
+    QVERIFY(monitor.isLost());
+    QVERIFY(monitor.clearForRebuild(lateTicket));
+    QVERIFY(!monitor.isLost());
+    monitor.unregisterRecoveryParticipant(oldParticipant);
+    monitor.unregisterRecoveryParticipant(lateParticipant);
+    monitor.reset();
+}
+
+void TestDeviceLossMonitor::
+    noDeviceRegistrationRemainsCleanupAcknowledgedIfLossStartsImmediately() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+
+    const GpuRecoveryRegistration registration = monitor.registerRecoveryParticipantSnapshot(false);
+    QVERIFY(registration.isValid());
+    QCOMPARE(registration.lossGeneration(), uint64_t(0));
+
+    // This is the former initializeOutputGraph race: loss begins after the atomic
+    // registration snapshot. The participant is coherently treated as part of the
+    // new loss and the barrier waits until its normal worker path acknowledges cleanup.
+    const uint64_t generation = monitor.recordLoss();
+    QVERIFY(!monitor.beginRebuild(registration.participantId()).isValid());
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(registration.participantId(), generation));
+    const GpuRecoveryTicket ticket = monitor.beginRebuild(registration.participantId());
+    QVERIFY(ticket.isValid());
+    QCOMPARE(ticket.lossGeneration(), generation);
+    QVERIFY(monitor.clearForRebuild(ticket));
+    QVERIFY(!monitor.isLost());
+
+    monitor.unregisterRecoveryParticipant(registration.participantId());
+    monitor.reset();
+}
+
+void TestDeviceLossMonitor::replacementDeviceLossRestartsRecoveryEpoch() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t firstParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t delayedParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t oldGeneration = monitor.recordLoss();
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(firstParticipant, oldGeneration));
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(delayedParticipant, oldGeneration));
+    const GpuRecoveryTicket first = monitor.beginRebuild(firstParticipant);
+    const GpuRecoveryTicket delayed = monitor.beginRebuild(delayedParticipant);
+    QVERIFY(first.isValid());
+    QVERIFY(delayed.isValid());
+    QVERIFY(monitor.clearForRebuild(first));
+    QVERIFY(monitor.isLost());
+
+    const uint64_t replacementLoss =
+        GpuDeviceLossMonitorTestAuthority::publish(first.authorityEpoch(), 0xA17);
+    QVERIFY(replacementLoss > oldGeneration);
+    QCOMPARE(monitor.currentLossGenerationForTest(), replacementLoss);
+    QVERIFY(!monitor.clearForRebuild(delayed));
+    QVERIFY(monitor.isLost());
+
+    monitor.unregisterRecoveryParticipant(firstParticipant);
+    monitor.unregisterRecoveryParticipant(delayedParticipant);
+    QVERIFY(!monitor.isLost());
+    monitor.reset();
+}
 
 void TestDeviceLossMonitor::validatedRecoveryRejectsMismatchedLossGeneration() {
     auto& monitor = GpuDeviceLossMonitor::instance();
@@ -528,6 +712,7 @@ void TestDeviceLossMonitor::currentAuthorityPublicationTracksGuardedEpoch() {
     QVERIFY(monitor.isCurrentDeviceAuthority(initialAuthority));
     QVERIFY(!monitor.isCurrentDeviceAuthority(0));
 
+    monitor.recordLoss();
     monitor.beginRebuild();
     const uint64_t replacementAuthority = GpuDeviceLossMonitorTestAuthority::capture();
     QVERIFY(replacementAuthority != initialAuthority);

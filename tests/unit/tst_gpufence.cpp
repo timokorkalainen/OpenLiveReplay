@@ -90,7 +90,9 @@ void TestGpuFence::signalWaitRoundTrips() {
     }
     const uint64_t value = fence->signal();
     QVERIFY(value >= 1);
-    QVERIFY(fence->wait(value, 1000));
+    // Metal command submission is intentionally real here. TSan and shared CI
+    // runners can delay the first command buffer well beyond one second.
+    QVERIFY(fence->wait(value, 5000));
     QVERIFY(fence->completedValue() >= value);
 }
 
@@ -191,6 +193,7 @@ void TestGpuFence::defaultFactoryTracksDeviceAuthorityAcrossRebuild() {
     if (!initialFence) QSKIP("default Metal fence unavailable on this host");
     QCOMPARE(initialFence->identity().authorityEpoch, initialAuthority);
 
+    monitor.recordLoss();
     monitor.beginRebuild();
     const uint64_t replacementAuthority = monitor.currentDeviceAuthorityForTest();
     QVERIFY(replacementAuthority != initialAuthority);

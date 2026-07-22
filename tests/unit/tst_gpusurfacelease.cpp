@@ -825,6 +825,7 @@ void TestGpuSurfaceLease::staleCoherentAuthorityIsRejectedAfterRebuild() {
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t staleAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    monitor.recordLoss();
     monitor.beginRebuild();
     const uint64_t replacementAuthority = GpuDeviceLossMonitorTestAuthority::capture();
     QVERIFY(replacementAuthority != staleAuthority);

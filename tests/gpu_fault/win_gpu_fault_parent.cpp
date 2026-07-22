@@ -91,8 +91,9 @@ bool runChild(const QString& child, const QString& mode, int timeoutMs, QJsonObj
             QStringLiteral("OLR_GPU_FAULT_EXPECTED_LUID_LOW"),
             QString::number(quint64(admission->value(QStringLiteral("luidLow")).toDouble())));
     }
-    const bool requiresJob =
-        mode == QStringLiteral("--trigger-tdr") || mode == QStringLiteral("--verify-job");
+    const bool requiresJob = mode == QStringLiteral("--trigger-tdr") ||
+                             mode == QStringLiteral("--verify-job") ||
+                             mode == QStringLiteral("--verify-job-tree");
     ChildJob job;
     QString jobName;
     if (requiresJob) {
@@ -172,6 +173,32 @@ bool appendEvidence(const QJsonObject& evidence, QString* error) {
     return file.write(record) == record.size() && file.flush();
 }
 
+bool processExitedAfterWatchdog(qint64 processId, QString* error) {
+    if (processId <= 0) {
+        if (error) *error = QStringLiteral("watchdog child reported no descendant process id");
+        return false;
+    }
+    HANDLE process =
+        OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, DWORD(processId));
+    if (!process) {
+        const DWORD openError = GetLastError();
+        if (openError == ERROR_INVALID_PARAMETER) return true;
+        if (error)
+            *error = QStringLiteral("cannot inspect watchdog descendant %1 (Win32 %2)")
+                         .arg(processId)
+                         .arg(openError);
+        return false;
+    }
+    const DWORD waitResult = WaitForSingleObject(process, 5000);
+    CloseHandle(process);
+    if (waitResult == WAIT_OBJECT_0) return true;
+    if (error)
+        *error = QStringLiteral("watchdog left descendant %1 running (wait=%2)")
+                     .arg(processId)
+                     .arg(waitResult);
+    return false;
+}
+
 int selfTest(const QString& child) {
     QString error;
     QJsonObject decoded;
@@ -185,11 +212,40 @@ int selfTest(const QString& child) {
                             {QStringLiteral("finalCompleted"), 5},
                             {QStringLiteral("pendingFinally"), 0},
                             {QStringLiteral("waitCount"), 1},
-                            {QStringLiteral("waited"), true}};
+                            {QStringLiteral("waited"), true},
+                            {QStringLiteral("calibrationGroups"), 4},
+                            {QStringLiteral("calibrationElapsedNs"), 20000000},
+                            {QStringLiteral("calibrationWarmupElapsedNs"), 120000000},
+                            {QStringLiteral("calibrationWarmupHardCeilingMs"), 500},
+                            {QStringLiteral("calibrationAttempts"), 2},
+                            {QStringLiteral("calibrationTargetNs"), 20000000},
+                            {QStringLiteral("calibrationMaxGroups"), 4096},
+                            {QStringLiteral("calibrationReachedTarget"), true},
+                            {QStringLiteral("calibrationHardCeilingMs"), 100}};
     if (!winGpuFault::validateFenceEvidence(fence, &error)) return 2;
     QJsonObject badFence = fence;
     badFence.insert(QStringLiteral("signalCount"), 2);
     if (winGpuFault::validateFenceEvidence(badFence, &error)) return 3;
+    QJsonObject uncalibratedFence = fence;
+    uncalibratedFence.insert(QStringLiteral("calibrationGroups"), 0);
+    uncalibratedFence.insert(QStringLiteral("calibrationElapsedNs"), 0);
+    if (winGpuFault::validateFenceEvidence(uncalibratedFence, &error)) return 15;
+    QJsonObject forgedCalibration = fence;
+    forgedCalibration.insert(QStringLiteral("calibrationElapsedNs"), 1);
+    forgedCalibration.insert(QStringLiteral("calibrationReachedTarget"), true);
+    if (winGpuFault::validateFenceEvidence(forgedCalibration, &error)) return 19;
+    QJsonObject oversizedCalibration = fence;
+    oversizedCalibration.insert(QStringLiteral("calibrationGroups"), 4097);
+    if (winGpuFault::validateFenceEvidence(oversizedCalibration, &error)) return 20;
+    QJsonObject forgedCalibrationMax = fence;
+    forgedCalibrationMax.insert(QStringLiteral("calibrationMaxGroups"), 65535);
+    if (winGpuFault::validateFenceEvidence(forgedCalibrationMax, &error)) return 21;
+    QJsonObject excessiveCalibrationAttempts = fence;
+    excessiveCalibrationAttempts.insert(QStringLiteral("calibrationAttempts"), 9);
+    if (winGpuFault::validateFenceEvidence(excessiveCalibrationAttempts, &error)) return 22;
+    QJsonObject forgedWarmup = fence;
+    forgedWarmup.insert(QStringLiteral("calibrationWarmupElapsedNs"), 500000000);
+    if (winGpuFault::validateFenceEvidence(forgedWarmup, &error)) return 23;
 
     const QJsonObject tdr{{QStringLiteral("mode"), QStringLiteral("trigger-tdr")},
                           {QStringLiteral("destructiveStarted"), true},
@@ -216,8 +272,11 @@ int selfTest(const QString& child) {
                           {QStringLiteral("workerGenerationBefore"), 7},
                           {QStringLiteral("workerGenerationAfter"), 8},
                           {QStringLiteral("workerStaleFrameRejected"), true},
+                          {QStringLiteral("workerProductionPollObservedRemoval"), true},
+                          {QStringLiteral("workerStaleFrameExcludedFromSink"), true},
                           {QStringLiteral("workerCacheRecoveredToCpu"), true},
                           {QStringLiteral("workerOutputResumed"), true},
+                          {QStringLiteral("workerRecoveryReachedSink"), true},
                           {QStringLiteral("workerCoherentState"), true},
                           {QStringLiteral("recoveryComplete"), true},
                           {QStringLiteral("workerAbandonedRetains"), 1},
@@ -227,6 +286,18 @@ int selfTest(const QString& child) {
     QJsonObject badTdr = tdr;
     badTdr.insert(QStringLiteral("removedHresult"), 0);
     if (winGpuFault::validateTdrEvidence(badTdr, &error)) return 5;
+    QJsonObject bypassedProductionPoll = tdr;
+    bypassedProductionPoll.insert(QStringLiteral("workerProductionPollObservedRemoval"), false);
+    if (winGpuFault::validateTdrEvidence(bypassedProductionPoll, &error)) return 16;
+    QJsonObject staleReachedSink = tdr;
+    staleReachedSink.insert(QStringLiteral("workerStaleFrameExcludedFromSink"), false);
+    if (winGpuFault::validateTdrEvidence(staleReachedSink, &error)) return 17;
+    QJsonObject recoveryStoppedBeforeSink = tdr;
+    recoveryStoppedBeforeSink.insert(QStringLiteral("workerRecoveryReachedSink"), false);
+    if (winGpuFault::validateTdrEvidence(recoveryStoppedBeforeSink, &error)) return 18;
+    QJsonObject missingRecoveryDuration = tdr;
+    missingRecoveryDuration.remove(QStringLiteral("workerRecoveryMs"));
+    if (winGpuFault::validateTdrEvidence(missingRecoveryDuration, &error)) return 26;
 
     winGpuFault::TdrPolicySnapshot policy;
     if (!winGpuFault::validateTdrPolicy(policy, &error)) return 6;
@@ -250,6 +321,20 @@ int selfTest(const QString& child) {
         !runChild(child, QStringLiteral("--verify-job"), 10000, &jobEvidence, &error) ||
         !jobEvidence.value(QStringLiteral("jobContained")).toBool())
         return 12;
+
+    QJsonObject treeEvidence;
+    QString treeError;
+    if (runChild(child, QStringLiteral("--verify-job-tree"), 1000, &treeEvidence, &treeError))
+        return 24;
+    const QJsonObject treeCheckpoint =
+        treeEvidence.value(QStringLiteral("destructiveEvidence")).toObject();
+    if (treeEvidence.value(QStringLiteral("reason")) != QStringLiteral("watchdog-timeout") ||
+        treeCheckpoint.value(QStringLiteral("mode")) != QStringLiteral("verify-job-tree") ||
+        !treeCheckpoint.value(QStringLiteral("jobContained")).toBool() ||
+        !treeCheckpoint.value(QStringLiteral("descendantStarted")).toBool() ||
+        !processExitedAfterWatchdog(
+            qint64(treeCheckpoint.value(QStringLiteral("descendantPid")).toDouble()), &error))
+        return 25;
 
     QJsonObject mergedEvidence;
     const QByteArray checkpoints =

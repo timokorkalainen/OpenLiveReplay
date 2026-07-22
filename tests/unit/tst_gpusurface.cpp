@@ -139,6 +139,7 @@ void TestGpuSurface::appleSurfaceSeparatesFrameGenerationFromDeviceAuthority() {
     QVERIFY(postSeekFence->sharesDeviceAuthorityWith(oldSurface));
     QVERIFY(postSeekFence->sharesDeviceAuthorityWith(postSeekSurface));
 
+    monitor.recordLoss();
     monitor.beginRebuild();
     auto rebuiltRhi = GpuRhiContext::create();
     QVERIFY(rebuiltRhi != nullptr);

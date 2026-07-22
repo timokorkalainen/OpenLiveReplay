@@ -15,6 +15,7 @@
 
 class GpuFence;
 class GpuRhiContext;
+class QSemaphore;
 class QRhi;
 
 struct GpuReadbackResult {
@@ -93,6 +94,11 @@ public:
     static uint64_t captureD3D11RemovalAuthorityForTest();
     static D3D11RemovalObservationForTest observeD3D11RemovalForTest(void* device,
                                                                      uint64_t deviceAuthorityEpoch);
+    bool queueBlockingRenderJobForTest(const std::shared_ptr<QSemaphore>& entered,
+                                       const std::shared_ptr<QSemaphore>& release,
+                                       const std::shared_ptr<QSemaphore>& exited);
+    static uint64_t quarantinedContextCountForTest();
+    void injectPollOnlyDeviceLostForTest();
 #endif
 #endif
     ~GpuRhiContext();

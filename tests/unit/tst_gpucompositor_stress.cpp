@@ -122,6 +122,19 @@ void TestGpuCompositorStress::concurrentComposeAndChecksumValidate() {
     stop.store(true, std::memory_order_release);
     bumper.join();
 
+    // Continuous generation churn may correctly reject every raced submission:
+    // exact-generation retirement is fail-closed. Prove the compositor resumes
+    // immediately once the generation is stable, and include that output in the
+    // same checksum oracle.
+    const CpuPlanes stable =
+        comp->composeGridToCpu(frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY2(stable.isValid(), "compositor did not resume after generation churn stopped");
+    ++validFrames;
+    if (stable.plane[0].size() != oracle.plane[0].size())
+        wrongSize = stable.plane[0].size();
+    else
+        worstDelta = qMax(worstDelta, maxChannelDelta(stable.plane[0], oracle.plane[0]));
+
     QVERIFY2(validFrames > 0, "stress produced no successful compositor readbacks");
     QCOMPARE(wrongSize, qsizetype(-1));
     QVERIFY2(worstDelta <= 1,

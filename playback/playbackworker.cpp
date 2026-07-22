@@ -1352,8 +1352,87 @@ bool PlaybackWorker::consumeGpuDeviceLossRebuildBudget() {
 }
 
 void PlaybackWorker::drainGpuDeviceLossEvents() const {
-    while (GpuDeviceLossMonitor::instance().consumeLossEvent())
-        m_gpuDeviceLossEvents.fetch_add(1, std::memory_order_acq_rel);
+    const uint64_t observed = GpuDeviceLossMonitor::instance().lossCount();
+    uint64_t previous = m_gpuLastObservedLossCount.load(std::memory_order_acquire);
+    while (observed > previous) {
+        if (m_gpuLastObservedLossCount.compare_exchange_weak(
+                previous, observed, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            m_gpuDeviceLossEvents.fetch_add(qint64(observed - previous), std::memory_order_acq_rel);
+            return;
+        }
+    }
+    if (observed < previous) m_gpuLastObservedLossCount.store(observed, std::memory_order_release);
+}
+
+void PlaybackWorker::cleanupGpuRetirementsForDeviceLoss(bool allowTokenlessTestGate,
+                                                        bool pollBackends) {
+    constexpr int kDeviceLossReadbackDrainMs = 100;
+    if (pollBackends) {
+        const auto gpuRhi = std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire);
+        if (gpuRhi) (void) gpuRhi->pollDeviceLoss();
+#ifdef _WIN32
+        if (m_winGpuImportEdge) (void) m_winGpuImportEdge->deviceLost();
+#endif
+    }
+    auto& lossMonitor = GpuDeviceLossMonitor::instance();
+    GpuRetireRegistry registry;
+    GpuValidatedLossResult recovery =
+        lossMonitor.withValidatedDeadDomains([&](const GpuValidatedDeadDomains& deadDomains) {
+            return registry.abandonAllNoWait(deadDomains);
+        });
+    if (recovery.status == GpuValidatedLossStatus::Rejected) {
+#ifdef OLR_UNIT_TEST
+        if (allowTokenlessTestGate && m_gpuBeforeTokenlessRecoveryEnteredForTest) {
+            m_gpuBeforeTokenlessRecoveryEnteredForTest->release();
+            if (m_gpuContinueTokenlessRecoveryForTest)
+                m_gpuContinueTokenlessRecoveryForTest->acquire();
+        }
+#else
+        (void) allowTokenlessTestGate;
+#endif
+        recovery = lossMonitor.withCoordinatedTokenlessRecovery([&]() { return qsizetype(0); });
+    }
+    registry.drainWithBoundedWait(kDeviceLossReadbackDrainMs);
+#ifdef OLR_UNIT_TEST
+    m_gpuLastAbandonedRetainsForTest.store(recovery.abandoned, std::memory_order_release);
+#endif
+}
+
+bool PlaybackWorker::completeCoordinatedGpuRebuild(bool consumeRebuildBudget) {
+    if (m_gpuRecoveryParticipantId == 0 || m_gpuPendingRecoveryGeneration == 0) return false;
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    const GpuRecoveryTicket ticket = monitor.beginRebuild(m_gpuRecoveryParticipantId);
+    if (!ticket.isValid() || ticket.lossGeneration() != m_gpuPendingRecoveryGeneration)
+        return false;
+
+    const bool permitted = !consumeRebuildBudget || consumeGpuDeviceLossRebuildBudget();
+    const bool rebuilt = permitted && rebuildGpuSpine();
+    m_gpuRebuildDeferredForSuspend.store(false, std::memory_order_release);
+#ifdef OLR_UNIT_TEST
+    if (m_gpuBeforeRecoveryCommitForTest) {
+        m_gpuBeforeRecoveryCommitForTest->release();
+        if (m_gpuContinueRecoveryCommitForTest) m_gpuContinueRecoveryCommitForTest->acquire();
+    }
+#endif
+    if (!monitor.clearForRebuild(ticket)) {
+        m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::RebuildPending),
+                                 std::memory_order_release);
+        return false;
+    }
+    m_gpuLastHandledLossGeneration = m_gpuPendingRecoveryGeneration;
+    m_gpuPendingRecoveryGeneration = 0;
+    if (!rebuilt) {
+        m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
+                                 std::memory_order_release);
+    } else if (monitor.isLost()) {
+        m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::RebuildPending),
+                                 std::memory_order_release);
+    }
+    if (!rebuilt) {
+        monitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId);
+        m_gpuRecoveryParticipantId = 0;
+    }
+    return true;
 }
 
 void PlaybackWorker::sanitizeCacheForDeviceLossLocked(OutputFrameCache* cache, int* recoveredFrames,
@@ -1386,20 +1465,60 @@ void PlaybackWorker::sanitizeTrackBufferForDeviceLossLocked(TrackBuffer* buffer,
 }
 
 void PlaybackWorker::handleGpuDeviceLoss() {
+    auto& lossMonitor = GpuDeviceLossMonitor::instance();
+    const uint64_t pendingGeneration = lossMonitor.currentLossGeneration();
+    if (pendingGeneration != 0 && pendingGeneration == m_gpuLastHandledLossGeneration) return;
     const GpuPipelineState state = gpuPipelineState();
     if (state == GpuPipelineState::CpuFallback) return;
     if (state == GpuPipelineState::RebuildPending) {
-        if (m_gpuRebuildDeferredForSuspend.load(std::memory_order_acquire) &&
-            !gpuLifecycleSuspended()) {
-            resumeDeferredGpuRebuild();
+        if (pendingGeneration == 0 && m_gpuPendingRecoveryGeneration == 0 &&
+            std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire)) {
+            m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::Gpu),
+                                     std::memory_order_release);
+            {
+                QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+                if (m_outputRuntime)
+                    m_outputRuntime->setGpuRhiContext(
+                        std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire));
+            }
+            rebuildOutputEndpoints();
+            m_forceLiveOutputSnapshotsOnNextAttach.store(true, std::memory_order_release);
+            m_forceLiveOutputSnapshots.store(64, std::memory_order_release);
+            return;
         }
-        return;
+        const bool newerLossNeedsCleanup = pendingGeneration != 0 &&
+                                           pendingGeneration != m_gpuPendingRecoveryGeneration &&
+                                           pendingGeneration != m_gpuLastHandledLossGeneration;
+        if (!newerLossNeedsCleanup) {
+            if (m_gpuRebuildDeferredForSuspend.load(std::memory_order_acquire) &&
+                !gpuLifecycleSuspended()) {
+                resumeDeferredGpuRebuild();
+            } else if (!gpuLifecycleSuspended() && m_gpuPendingRecoveryGeneration != 0 &&
+                       completeCoordinatedGpuRebuild(true)) {
+                {
+                    QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+                    if (m_outputRuntime)
+                        m_outputRuntime->setGpuRhiContext(
+                            gpuPipelineState() == GpuPipelineState::Gpu
+                                ? std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire)
+                                : std::shared_ptr<GpuRhiContext>{});
+                }
+                rebuildOutputEndpoints();
+                if (gpuPipelineState() == GpuPipelineState::Gpu) {
+                    m_forceLiveOutputSnapshotsOnNextAttach.store(true, std::memory_order_release);
+                    m_forceLiveOutputSnapshots.store(64, std::memory_order_release);
+                }
+            }
+            return;
+        }
     }
 
     detachOutputEndpointsForDeviceLoss();
     m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::RebuildPending),
                              std::memory_order_release);
-    const uint64_t lossGeneration = GpuDeviceLossMonitor::instance().recordLoss();
+    if (m_gpuRecoveryParticipantId == 0)
+        m_gpuRecoveryParticipantId = lossMonitor.registerRecoveryParticipant();
+    const uint64_t lossGeneration = lossMonitor.recordLoss();
     m_committedGpuGeneration.store(lossGeneration, std::memory_order_release);
     int recoveredFrames = 0;
     int removedGpuFrames = 0;
@@ -1447,40 +1566,7 @@ void PlaybackWorker::handleGpuDeviceLoss() {
     // a bounded per-fence wait — safe because the live Null/WARP device's fences do
     // advance. LOCK RULE: the readback retainer has its own leaf mutex; this takes
     // no m_bufferMutex, matching the fence resets below.
-    {
-        constexpr int kDeviceLossReadbackDrainMs = 100; // bounded; live-device fences advance
-        // Poll every device authority before snapshotting the tokens. One backend
-        // may already have published a token while another owned device is also
-        // dead; stopping after the first token would strand the second domain.
-        const auto gpuRhi = std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire);
-        if (gpuRhi) (void) gpuRhi->pollDeviceLoss();
-#ifdef _WIN32
-        if (m_winGpuImportEdge) (void) m_winGpuImportEdge->deviceLost();
-#endif
-        auto& lossMonitor = GpuDeviceLossMonitor::instance();
-        GpuRetireRegistry registry;
-        GpuValidatedLossResult recovery =
-            lossMonitor.withValidatedDeadDomains([&](const GpuValidatedDeadDomains& deadDomains) {
-                return registry.abandonAllNoWait(deadDomains);
-            });
-        if (recovery.status == GpuValidatedLossStatus::Rejected) {
-#ifdef OLR_UNIT_TEST
-            if (m_gpuBeforeTokenlessRecoveryEnteredForTest) {
-                m_gpuBeforeTokenlessRecoveryEnteredForTest->release();
-                if (m_gpuContinueTokenlessRecoveryForTest)
-                    m_gpuContinueTokenlessRecoveryForTest->acquire();
-            }
-#endif
-            recovery = lossMonitor.withCoordinatedTokenlessRecovery([&]() { return qsizetype(0); });
-        }
-        // Exact-key coordination owns only authoritative dead-domain abandonment.
-        // Every worker recovery still owns one bounded pass for unmatched live
-        // domains, even when a proof publisher led the exact-key abandonment.
-        registry.drainWithBoundedWait(kDeviceLossReadbackDrainMs);
-#ifdef OLR_UNIT_TEST
-        m_gpuLastAbandonedRetainsForTest.store(recovery.abandoned, std::memory_order_release);
-#endif
-    }
+    cleanupGpuRetirementsForDeviceLoss(true);
 
     // LOCK RULE: this method is entered from the worker decode thread with no
     // m_bufferMutex held. Do not wait old fences here; a removed device may never
@@ -1498,6 +1584,9 @@ void PlaybackWorker::handleGpuDeviceLoss() {
     m_winGpuImportTried = false;
 #endif
 
+    m_gpuPendingRecoveryGeneration = lossGeneration;
+    if (!lossMonitor.acknowledgeRecoveryCleanup(m_gpuRecoveryParticipantId, lossGeneration)) return;
+
     m_forceLiveOutputSnapshotsOnNextAttach.store(true, std::memory_order_release);
     if (gpuLifecycleSuspended()) {
         m_gpuRebuildDeferredForSuspend.store(true, std::memory_order_release);
@@ -1509,22 +1598,17 @@ void PlaybackWorker::handleGpuDeviceLoss() {
         return;
     }
 
-    const bool rebuilt = consumeGpuDeviceLossRebuildBudget() && rebuildGpuSpine();
-    if (!rebuilt) {
-        m_gpuRebuildDeferredForSuspend.store(false, std::memory_order_release);
-        m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
-                                 std::memory_order_release);
-    } else {
-        m_gpuRebuildDeferredForSuspend.store(false, std::memory_order_release);
-    }
+    const bool recoveryCompleted = completeCoordinatedGpuRebuild(true);
     {
         QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
         if (m_outputRuntime)
             m_outputRuntime->setGpuRhiContext(
-                std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire));
+                gpuPipelineState() == GpuPipelineState::Gpu
+                    ? std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire)
+                    : std::shared_ptr<GpuRhiContext>{});
     }
     rebuildOutputEndpoints();
-    if (recoveredPlayhead.has_value()) {
+    if (recoveryCompleted && recoveredPlayhead.has_value()) {
         m_committedPlayheadMs.store(*recoveredPlayhead, std::memory_order_release);
         m_lastVisiblePlayheadMs.store(*recoveredPlayhead, std::memory_order_release);
         m_outputPlayheadCacheGuarded.store(true, std::memory_order_release);
@@ -1799,17 +1883,14 @@ void PlaybackWorker::resumeDeferredGpuRebuild() {
         return;
     }
 
-    const bool rebuilt = rebuildGpuSpine();
-    if (!rebuilt) {
-        m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
-                                 std::memory_order_release);
-    }
-    m_gpuRebuildDeferredForSuspend.store(false, std::memory_order_release);
+    if (!completeCoordinatedGpuRebuild(false)) return;
+    const bool rebuilt = gpuPipelineState() == GpuPipelineState::Gpu;
     {
         QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
         if (m_outputRuntime)
             m_outputRuntime->setGpuRhiContext(
-                std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire));
+                rebuilt ? std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire)
+                        : std::shared_ptr<GpuRhiContext>{});
     }
     rebuildOutputEndpoints();
     if (rebuilt) {
@@ -1832,10 +1913,6 @@ bool PlaybackWorker::rebuildGpuSpine() {
     if (!gpuPipelineEnabled()) return false;
     if (gpuLifecycleSuspended()) return false;
 
-    // Revoke every old backend's loss-mint authority before a replacement can be
-    // created. A failed rebuild keeps the loss latch set; a later retry begins a
-    // fresh authority epoch again.
-    GpuDeviceLossMonitor::instance().beginRebuild();
     auto rhi = GpuRhiContext::create();
     if (!rhi || !rhi->isValid() || rhi->deviceLost()) return false;
 
@@ -1861,7 +1938,6 @@ bool PlaybackWorker::rebuildGpuSpine() {
     std::atomic_store_explicit(&m_stagingFence, std::move(stagingFence), std::memory_order_release);
     m_stagedFenceValue.store(0, std::memory_order_release);
     m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::Gpu), std::memory_order_release);
-    GpuDeviceLossMonitor::instance().clearForRebuild();
     return true;
 }
 
@@ -2005,6 +2081,8 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
 #ifdef OLR_GPU_PIPELINE_BUILD
     gpuResetFrameReadToCpuCount();
     m_gpuDeviceLossEvents.store(0, std::memory_order_release);
+    m_gpuLastObservedLossCount.store(GpuDeviceLossMonitor::instance().lossCount(),
+                                     std::memory_order_release);
     m_injectGpuDeviceLossForTest.store(false, std::memory_order_release);
     m_forceLiveOutputSnapshotsOnNextAttach.store(false, std::memory_order_release);
     m_forceLiveOutputSnapshots.store(0, std::memory_order_release);
@@ -2016,7 +2094,8 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     m_lastPressureWarningMs = -1;
     m_lastPressureLevel1Ms = -1;
     m_lastNativeDecoderPoolFlushMs = -1;
-    GpuDeviceLossMonitor::instance().reset();
+    m_gpuLastHandledLossGeneration = 0;
+    m_gpuPendingRecoveryGeneration = 0;
     m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
                              std::memory_order_release);
     std::atomic_store_explicit(&m_gpuRhi, std::shared_ptr<GpuRhiContext>{},
@@ -2028,9 +2107,25 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
                                std::memory_order_release);
     m_stagedFenceValue.store(0, std::memory_order_release);
     if (gpuPipelineEnabled()) {
-        const uint64_t graphGeneration = GpuGenerationCounter::instance().bump();
+        auto& lossMonitor = GpuDeviceLossMonitor::instance();
+        const GpuRecoveryRegistration registration =
+            lossMonitor.registerRecoveryParticipantSnapshot(false);
+        m_gpuRecoveryParticipantId = registration.participantId();
+        const uint64_t graphGeneration = GpuGenerationCounter::instance().current();
         m_committedGpuGeneration.store(graphGeneration, std::memory_order_release);
-        rebuildGpuSpine();
+        if (registration.lossGeneration() != 0) {
+            m_gpuPendingRecoveryGeneration = registration.lossGeneration();
+            m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::RebuildPending),
+                                     std::memory_order_release);
+            if (gpuLifecycleSuspended()) {
+                m_gpuRebuildDeferredForSuspend.store(true, std::memory_order_release);
+            } else {
+                (void) completeCoordinatedGpuRebuild(false);
+            }
+        } else if (m_gpuRecoveryParticipantId != 0 && !rebuildGpuSpine()) {
+            lossMonitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId);
+            m_gpuRecoveryParticipantId = 0;
+        }
     }
     configureGpuBudget();
 #endif
@@ -2096,13 +2191,22 @@ void PlaybackWorker::shutdownOutputGraph() {
     }
 #ifdef OLR_GPU_PIPELINE_BUILD
     const auto gpuRhi = std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire);
-    bool deviceLost = GpuDeviceLossMonitor::instance().isLost() || (gpuRhi && gpuRhi->deviceLost());
+    bool deviceLost = GpuDeviceLossMonitor::instance().isLost();
+    const bool rhiLost = gpuRhi && gpuRhi->pollDeviceLoss();
+    const bool rhiPreviouslyLost = gpuRhi && gpuRhi->deviceLost();
 #ifdef _WIN32
-    deviceLost = deviceLost || (m_winGpuImportEdge && m_winGpuImportEdge->deviceLost());
+    // Poll every owned domain before taking the validated-proof snapshot. Do not
+    // short-circuit after one backend reports loss: an adapter reset may retire
+    // both QRhi and import-edge domains, and each exact identity must be published.
+    const bool importEdgeLost = m_winGpuImportEdge && m_winGpuImportEdge->deviceLost();
+    deviceLost = deviceLost || rhiLost || rhiPreviouslyLost || importEdgeLost;
+#else
+    deviceLost = deviceLost || rhiLost || rhiPreviouslyLost;
 #endif
     if (deviceLost) {
-        // LOCK RULE: graph teardown after device loss must not force-wait dead
-        // fences. Discard pending retire entries and let the dead RHI spine go.
+        // Publish every still-observable old-domain proof and clean the process-wide
+        // retirement registry before this graph acknowledges teardown.
+        cleanupGpuRetirementsForDeviceLoss(false, false);
         QMutexLocker bufferLocker(&m_bufferMutex);
         m_gpuFrameRetireQueue = GpuFrameRetireQueue();
     } else {
@@ -2121,7 +2225,11 @@ void PlaybackWorker::shutdownOutputGraph() {
     m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
                              std::memory_order_release);
     m_memoryPressureLatched.store(false, std::memory_order_release);
-    GpuDeviceLossMonitor::instance().reset();
+    if (m_gpuRecoveryParticipantId != 0) {
+        GpuDeviceLossMonitor::instance().unregisterRecoveryParticipant(m_gpuRecoveryParticipantId);
+        m_gpuRecoveryParticipantId = 0;
+    }
+    m_gpuPendingRecoveryGeneration = 0;
 #endif
 }
 
@@ -4514,7 +4622,9 @@ void PlaybackWorker::run() {
             }
         }
         const bool deviceLossPending = gpuDeviceLossPending();
-        if (deviceLossPending && gpuPipelineState() == GpuPipelineState::Gpu) {
+        const GpuPipelineState pipelineState = gpuPipelineState();
+        if ((deviceLossPending && pipelineState != GpuPipelineState::CpuFallback) ||
+            pipelineState == GpuPipelineState::RebuildPending) {
             handleGpuDeviceLoss();
         }
         sampleGpuMemoryPressure(wallClock.elapsed());

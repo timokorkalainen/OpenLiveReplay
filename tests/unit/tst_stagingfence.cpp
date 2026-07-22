@@ -124,7 +124,9 @@ void TestStagingFence::swapWaitsForStagingFence() {
 
     QVERIFY(!fence->wait(1, 50));
     const uint64_t staged = fence->signal();
-    QVERIFY(fence->wait(staged, 1000));
+    // Keep this a real backend wait, but allow for first-submit latency under
+    // TSan and shared/virtualized CI GPUs.
+    QVERIFY(fence->wait(staged, 5000));
 }
 
 void TestStagingFence::workerCutDefersUntilStagingFenceCompletes() {

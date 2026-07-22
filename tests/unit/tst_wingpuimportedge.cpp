@@ -411,6 +411,7 @@ void TestWinGpuImportEdge::frameGenerationBumpKeepsLiveDeviceAuthority() {
     QVERIFY(persistentFence->wait(submittedFenceValue, 2000));
     GpuRetireRegistry{}.drainCompleted();
 
+    monitor.recordLoss();
     monitor.beginRebuild();
     QVERIFY(monitor.currentDeviceAuthorityForTest() != deviceAuthority);
     auto staleSurface = D3D11GpuSurface::createKept(device, texture, 0, 64, 64, deviceAuthority);

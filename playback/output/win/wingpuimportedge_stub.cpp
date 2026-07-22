@@ -49,7 +49,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
 #else
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface>,
                                                         FrameMetadata, std::shared_ptr<GpuFence>,
-                                                        uint64_t*) {
+                                                        std::nullptr_t, uint64_t*) {
 #endif
     return FrameHandle();
 }

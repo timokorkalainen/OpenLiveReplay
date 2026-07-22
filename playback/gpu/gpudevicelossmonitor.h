@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 #include <functional>
 #include <limits>
@@ -54,6 +55,42 @@ class QSemaphore;
 struct GpuDeviceLossMonitorTestAuthority;
 #endif
 
+class GpuRecoveryTicket final {
+public:
+    bool isValid() const noexcept { return m_lossGeneration != 0 && m_participantId != 0; }
+    uint64_t lossGeneration() const noexcept { return m_lossGeneration; }
+    uint64_t authorityEpoch() const noexcept { return m_authorityEpoch; }
+
+private:
+    friend class GpuDeviceLossMonitor;
+    GpuRecoveryTicket(uint64_t lossGeneration, uint64_t proofRevision, uint64_t authorityEpoch,
+                      uint64_t recoveryRevision, uint64_t participantId) noexcept
+        : m_lossGeneration(lossGeneration), m_proofRevision(proofRevision),
+          m_authorityEpoch(authorityEpoch), m_recoveryRevision(recoveryRevision),
+          m_participantId(participantId) {}
+
+    uint64_t m_lossGeneration = 0;
+    uint64_t m_proofRevision = 0;
+    uint64_t m_authorityEpoch = 0;
+    uint64_t m_recoveryRevision = 0;
+    uint64_t m_participantId = 0;
+};
+
+class GpuRecoveryRegistration final {
+public:
+    bool isValid() const noexcept { return m_participantId != 0; }
+    uint64_t participantId() const noexcept { return m_participantId; }
+    uint64_t lossGeneration() const noexcept { return m_lossGeneration; }
+
+private:
+    friend class GpuDeviceLossMonitor;
+    GpuRecoveryRegistration(uint64_t participantId, uint64_t lossGeneration) noexcept
+        : m_participantId(participantId), m_lossGeneration(lossGeneration) {}
+
+    uint64_t m_participantId = 0;
+    uint64_t m_lossGeneration = 0;
+};
+
 // Process-wide GPU device-loss latch. A loss is a hard-down for a live tool:
 // recordLoss() bumps GpuGenerationCounter so every FrameHandle stamped under
 // the dead device is stale, and consumeLossEvent() drains telemetry events.
@@ -68,6 +105,9 @@ public:
     }
     uint64_t currentDeviceAuthorityEpoch() const noexcept {
         return m_publishedDeviceAuthorityEpoch.load(std::memory_order_acquire);
+    }
+    uint64_t currentLossGeneration() const noexcept {
+        return m_lossGeneration.load(std::memory_order_acquire);
     }
     uint64_t lossCount() const;
 
@@ -146,6 +186,15 @@ public:
     }
 
     bool consumeLossEvent();
+    // Output graphs register for process-wide recovery coordination. A loss snapshots
+    // the then-live participants; replacement authority is minted once, and the latch
+    // clears only after every snapshotted participant has acknowledged teardown/rebuild.
+    uint64_t registerRecoveryParticipant(bool ownsCurrentDevice = true);
+    GpuRecoveryRegistration registerRecoveryParticipantSnapshot(bool ownsCurrentDevice = true);
+    void unregisterRecoveryParticipant(uint64_t participantId);
+    bool acknowledgeRecoveryCleanup(uint64_t participantId, uint64_t lossGeneration);
+    GpuRecoveryTicket beginRebuild(uint64_t participantId);
+    bool clearForRebuild(const GpuRecoveryTicket& ticket);
     // Invalidate authorities owned by the old device before constructing its
     // replacement. The loss latch remains set until clearForRebuild() commits a
     // successful rebuild.
@@ -155,6 +204,9 @@ public:
 #ifdef OLR_UNIT_TEST
     uint64_t currentDeviceAuthorityForTest() const noexcept {
         return currentDeviceAuthorityEpoch();
+    }
+    uint64_t currentLossGenerationForTest() const noexcept {
+        return m_lossGeneration.load(std::memory_order_acquire);
     }
 #endif
 
@@ -169,6 +221,9 @@ private:
     uint64_t captureDeviceAuthorityEpoch() const;
     uint64_t publishRealDeviceLoss(DeadDeviceToken::Provenance provenance,
                                    uint64_t deviceAuthorityEpoch, uintptr_t deviceDomainId);
+    void beginLossEpochLocked(uint64_t generation);
+    void beginRecoveryLocked(uint64_t generation);
+    uint64_t clearLossEpochLocked();
 #ifdef OLR_UNIT_TEST
     void noteRecoveryAttemptForTest();
 #endif
@@ -188,6 +243,15 @@ private:
     uint64_t m_realLossRevision = 0;                // guarded by m_epochMutex
     uint64_t m_deliveredProofRevision = 0;          // guarded by m_epochMutex
     bool m_tokenlessRecoveryObserved = false;       // guarded by m_epochMutex
+    uint64_t m_nextRecoveryParticipantId = 1;       // guarded by m_epochMutex
+    std::unordered_set<uint64_t> m_recoveryParticipants;            // guarded by m_epochMutex
+    std::unordered_set<uint64_t> m_pendingRecoveryParticipants;     // guarded by m_epochMutex
+    std::unordered_set<uint64_t> m_cleanupAcknowledgedParticipants; // guarded by m_epochMutex
+    uint64_t m_recoveryGeneration = 0;                              // guarded by m_epochMutex
+    uint64_t m_recoveryRevision = 0;                                // guarded by m_epochMutex
+    uint64_t m_recoveryAuthorityEpoch = 0;                          // guarded by m_epochMutex
+    uint64_t m_cleanupAuthorityEpoch = 0;                           // guarded by m_epochMutex
+    uint64_t m_cleanupGeneration = 0;                               // guarded by m_epochMutex
 #ifdef OLR_UNIT_TEST
     QSemaphore* m_proofAcceptedForTest = nullptr;
     QSemaphore* m_continueProofDeliveryForTest = nullptr;

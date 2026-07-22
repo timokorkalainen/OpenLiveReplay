@@ -85,6 +85,8 @@ class PlaybackWorker : public QThread {
     std::atomic<qint64> m_gpuLastAbandonedRetainsForTest{0};
     QSemaphore* m_gpuBeforeTokenlessRecoveryEnteredForTest = nullptr;
     QSemaphore* m_gpuContinueTokenlessRecoveryForTest = nullptr;
+    QSemaphore* m_gpuBeforeRecoveryCommitForTest = nullptr;
+    QSemaphore* m_gpuContinueRecoveryCommitForTest = nullptr;
 #endif
 public:
     struct ResidencyWindowParams {
@@ -396,6 +398,8 @@ private:
     bool gpuDeviceLossPending() const;
     bool consumeGpuDeviceLossRebuildBudget();
     void drainGpuDeviceLossEvents() const;
+    void cleanupGpuRetirementsForDeviceLoss(bool allowTokenlessTestGate, bool pollBackends = true);
+    bool completeCoordinatedGpuRebuild(bool consumeRebuildBudget);
     void handleGpuDeviceLoss();
     void sampleGpuMemoryPressure(qint64 nowMs);
     void evaluateGpuMemoryPressure(uint64_t availableBytes, bool memoryWarning, qint64 nowMs);
@@ -623,6 +627,10 @@ private:
 #ifdef OLR_GPU_PIPELINE_BUILD
     std::shared_ptr<GpuFence> m_renderFence;
     mutable std::atomic<qint64> m_gpuDeviceLossEvents{0};
+    mutable std::atomic<uint64_t> m_gpuLastObservedLossCount{0};
+    uint64_t m_gpuRecoveryParticipantId = 0;     // output-graph lifecycle; worker thread mutates
+    uint64_t m_gpuLastHandledLossGeneration = 0; // worker thread only
+    uint64_t m_gpuPendingRecoveryGeneration = 0; // worker thread only
     std::atomic<bool> m_injectGpuDeviceLossForTest{false};
     std::atomic<bool> m_forceLiveOutputSnapshotsOnNextAttach{false};
     mutable std::atomic<int> m_forceLiveOutputSnapshots{0};

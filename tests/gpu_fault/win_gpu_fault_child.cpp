@@ -15,6 +15,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QJsonObject>
+#include <QProcess>
 #include <QThread>
 
 #include <d3d11.h>
@@ -202,6 +203,132 @@ QByteArray loadShader(const QString& name, QString* error) {
     return file.readAll();
 }
 
+struct DispatchCalibration {
+    UINT groups = 0;
+    qint64 elapsedNs = 0;
+    qint64 warmupElapsedNs = 0;
+    int attempts = 0;
+    bool reachedTarget = false;
+};
+
+constexpr qint64 kDispatchCalibrationTargetNs = 20'000'000;
+constexpr int kDispatchCalibrationHardCeilingMs = 100;
+constexpr int kDispatchWarmupHardCeilingMs = 500;
+
+bool measureDispatch(HardwareDevice& gpu, ID3D11ComputeShader* shader,
+                     ID3D11UnorderedAccessView* uav, UINT groups, qint64* elapsedNs,
+                     int hardCeilingMs, QString* error) {
+    if (!gpu.device || !gpu.context || !shader || !uav || groups == 0 || !elapsedNs) return false;
+
+    D3D11_QUERY_DESC queryDesc{};
+    queryDesc.Query = D3D11_QUERY_EVENT;
+    ComPtr<ID3D11Query> completion;
+    if (FAILED(gpu.device->CreateQuery(&queryDesc, &completion)) || !completion) {
+        if (error) *error = QStringLiteral("dispatch calibration query allocation failed");
+        return false;
+    }
+
+    gpu.context->CSSetShader(shader, nullptr, 0);
+    ID3D11UnorderedAccessView* rawUav = uav;
+    gpu.context->CSSetUnorderedAccessViews(0, 1, &rawUav, nullptr);
+    QElapsedTimer timer;
+    timer.start();
+    // Submit one group per command. A single wide dispatch can run all groups in parallel and
+    // therefore does not scale monotonically across adapters; this sequence preserves a bounded,
+    // measured queue depth while each individual command remains tiny.
+    for (UINT group = 0; group < groups; ++group) {
+        gpu.context->Dispatch(1, 1, 1);
+        if ((group & 63u) == 63u && timer.elapsed() >= hardCeilingMs) {
+            if (error)
+                *error = QStringLiteral("dispatch calibration submission exceeded %1 ms ceiling, "
+                                        "submittedGroups=%2 requestedGroups=%3")
+                             .arg(hardCeilingMs)
+                             .arg(group + 1)
+                             .arg(groups);
+            return false;
+        }
+    }
+    gpu.context->End(completion.Get());
+    gpu.context->Flush();
+
+    for (;;) {
+        BOOL completed = FALSE;
+        const HRESULT queryHr = gpu.context->GetData(
+            completion.Get(), &completed, sizeof(completed), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (queryHr == S_OK && completed) {
+            *elapsedNs = qMax<qint64>(1, timer.nsecsElapsed());
+            if (*elapsedNs < qint64(hardCeilingMs) * 1'000'000) return true;
+            if (error)
+                *error = QStringLiteral(
+                             "dispatch calibration completed beyond %1 ms ceiling, groups=%2, "
+                             "elapsedNs=%3")
+                             .arg(hardCeilingMs)
+                             .arg(groups)
+                             .arg(*elapsedNs);
+            return false;
+        }
+        if (FAILED(queryHr)) {
+            if (error)
+                *error = QStringLiteral("dispatch calibration query failed (0x%1), groups=%2")
+                             .arg(quint32(queryHr), 8, 16, QLatin1Char('0'))
+                             .arg(groups);
+            return false;
+        }
+        if (timer.elapsed() >= hardCeilingMs) {
+            if (error) {
+                const HRESULT removal = gpu.device->GetDeviceRemovedReason();
+                *error = QStringLiteral("dispatch calibration exceeded %1 ms ceiling, groups=%2, "
+                                        "removed=0x%3")
+                             .arg(hardCeilingMs)
+                             .arg(groups)
+                             .arg(quint32(removal), 8, 16, QLatin1Char('0'));
+            }
+            return false;
+        }
+        QThread::msleep(1);
+    }
+}
+
+bool calibrateDispatch(HardwareDevice& gpu, ID3D11ComputeShader* shader,
+                       ID3D11UnorderedAccessView* uav, DispatchCalibration* calibration,
+                       QString* error) {
+    if (!calibration) return false;
+    // Exclude one-time driver shader translation from workload calibration. This warm-up is
+    // one deliberately tiny group; the larger allowance covers CPU-side first-use latency,
+    // while every workload used to prove fence incompleteness retains the 100 ms ceiling.
+    if (!measureDispatch(gpu, shader, uav, 1, &calibration->warmupElapsedNs,
+                         kDispatchWarmupHardCeilingMs, error))
+        return false;
+    UINT groups = 1;
+    for (int attempt = 1; attempt <= winGpuFault::kFenceCalibrationMaxAttempts; ++attempt) {
+        qint64 elapsedNs = 0;
+        if (!measureDispatch(gpu, shader, uav, groups, &elapsedNs,
+                             kDispatchCalibrationHardCeilingMs, error))
+            return false;
+        calibration->groups = groups;
+        calibration->elapsedNs = elapsedNs;
+        calibration->attempts = attempt;
+        if (elapsedNs >= kDispatchCalibrationTargetNs) {
+            calibration->reachedTarget = true;
+            return true;
+        }
+        if (groups >= UINT(winGpuFault::kFenceCalibrationMaxGroups)) break;
+
+        const qint64 requiredGrowth = (kDispatchCalibrationTargetNs + elapsedNs - 1) / elapsedNs;
+        const UINT boundedGrowth = UINT(qBound(qint64(2), requiredGrowth, qint64(4)));
+        groups = qMin(UINT(winGpuFault::kFenceCalibrationMaxGroups), groups * boundedGrowth);
+    }
+    if (error) {
+        *error = QStringLiteral("dispatch calibration could not reach %1 ns below safe bounds: "
+                                "groups=%2 elapsedNs=%3 attempts=%4")
+                     .arg(kDispatchCalibrationTargetNs)
+                     .arg(calibration->groups)
+                     .arg(calibration->elapsedNs)
+                     .arg(calibration->attempts);
+    }
+    return false;
+}
+
 bool createDispatchResources(HardwareDevice& gpu, ComPtr<ID3D11UnorderedAccessView>* uav,
                              std::shared_ptr<D3D11GpuSurface>* surface, QString* error) {
     D3D11_BUFFER_DESC bufferDesc{};
@@ -308,17 +435,23 @@ int probeFence() {
     if (!nativeFence) return 4;
     auto fence = std::make_shared<MeasuredFence>(nativeFence);
 
+    DispatchCalibration calibration;
+    if (!calibrateDispatch(gpu, shader.Get(), uav.Get(), &calibration, &error)) {
+        std::fprintf(stderr, "%s\n", qPrintable(error));
+        return 5;
+    }
     gpu.context->CSSetShader(shader.Get(), nullptr, 0);
     ID3D11UnorderedAccessView* rawUav = uav.Get();
     gpu.context->CSSetUnorderedAccessViews(0, 1, &rawUav, nullptr);
-    gpu.context->Dispatch(1, 1, 1);
+    for (UINT group = 0; group < calibration.groups; ++group)
+        gpu.context->Dispatch(1, 1, 1);
 
     GpuRetireRegistry registry;
     GpuOpScope operation(fence, registry);
     auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
     const auto submission = operation.submitRetained(
         adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
-    if (!submission.succeeded()) return 5;
+    if (!submission.succeeded()) return 6;
     const uint64_t signalValue = operation.fenceValue();
     const uint64_t initialCompleted = fence->completedValue();
     const qsizetype pendingInitially = registry.pendingRetainCount();
@@ -334,8 +467,58 @@ int probeFence() {
                 {QStringLiteral("waited"), waited},
                 {QStringLiteral("finalCompleted"), double(finalCompleted)},
                 {QStringLiteral("pendingFinally"), int(registry.pendingRetainCount())},
-                {QStringLiteral("waitCount"), fence->waitCount()}});
-    return 0;
+                {QStringLiteral("waitCount"), fence->waitCount()},
+                {QStringLiteral("calibrationGroups"), int(calibration.groups)},
+                {QStringLiteral("calibrationElapsedNs"), double(calibration.elapsedNs)},
+                {QStringLiteral("calibrationWarmupElapsedNs"), double(calibration.warmupElapsedNs)},
+                {QStringLiteral("calibrationWarmupHardCeilingMs"), kDispatchWarmupHardCeilingMs},
+                {QStringLiteral("calibrationAttempts"), calibration.attempts},
+                {QStringLiteral("calibrationTargetNs"), double(kDispatchCalibrationTargetNs)},
+                {QStringLiteral("calibrationMaxGroups"), winGpuFault::kFenceCalibrationMaxGroups},
+                {QStringLiteral("calibrationReachedTarget"), calibration.reachedTarget},
+                {QStringLiteral("calibrationHardCeilingMs"), kDispatchCalibrationHardCeilingMs}});
+    return initialCompleted < signalValue && pendingInitially > 0 && waited &&
+                   finalCompleted >= signalValue && registry.pendingRetainCount() == 0
+               ? 0
+               : 7;
+}
+
+int verifyJobTreeWatchdog() {
+    QString error;
+    if (!waitForNamedJobContainment(&error)) {
+        std::fprintf(stderr, "%s\n", qPrintable(error));
+        return 66;
+    }
+
+    QProcess descendant;
+    descendant.setProgram(QCoreApplication::applicationFilePath());
+    descendant.setArguments({QStringLiteral("--job-tree-leaf")});
+    descendant.start();
+    if (!descendant.waitForStarted(5000)) {
+        std::fprintf(stderr, "cannot start watchdog descendant: %s\n",
+                     qPrintable(descendant.errorString()));
+        return 69;
+    }
+    emitObject({{QStringLiteral("mode"), QStringLiteral("verify-job-tree")},
+                {QStringLiteral("jobContained"), true},
+                {QStringLiteral("descendantStarted"), true},
+                {QStringLiteral("descendantPid"), double(descendant.processId())}});
+
+    // The parent intentionally times out this mode and terminates the Job Object. The call must
+    // never return normally: kill-on-close/TerminateJobObject must end both this process and the
+    // inherited descendant without any GPU work.
+    descendant.waitForFinished(-1);
+    return 70;
+}
+
+int waitAsJobTreeLeaf() {
+    QString error;
+    if (!waitForNamedJobContainment(&error)) {
+        std::fprintf(stderr, "%s\n", qPrintable(error));
+        return 66;
+    }
+    Sleep(INFINITE);
+    return 70;
 }
 
 int triggerTdr(const winGpuFault::TdrPolicySnapshot& policy) {
@@ -417,10 +600,10 @@ int triggerTdr(const winGpuFault::TdrPolicySnapshot& policy) {
 
     QElapsedTimer timer;
     timer.start();
-    D3D11RemovalObservationForTest removal;
-    while (timer.elapsed() < 30000 && removal.hresult >= 0) {
+    WinGpuFaultRemovalObservation removal;
+    while (timer.elapsed() < 30000 && !removal.productionPollObserved) {
         QThread::msleep(50);
-        removal = GpuRhiContext::observeD3D11RemovalForTest(gpu.device.Get(), deviceAuthorityEpoch);
+        removal = workerOracle.pollWorkerDeviceLoss();
     }
     const uint64_t generationAfter = removal.generation;
     const auto token = monitor.realLossToken();
@@ -443,11 +626,12 @@ int triggerTdr(const winGpuFault::TdrPolicySnapshot& policy) {
         {QStringLiteral("deadFenceWaits"), fence->waitCount()},
         {QStringLiteral("elapsedMs"), double(timer.elapsed())},
         {QStringLiteral("removalObserved"), removal.hresult < 0 && removal.generation != 0},
+        {QStringLiteral("productionPollObservedRemoval"), removal.productionPollObserved},
         {QStringLiteral("recoveryComplete"), false}};
     mergeObject(&evidence, winGpuFault::tdrPolicyEvidence(policy));
     emitObject(evidence);
 
-    if (removal.hresult >= 0 || removal.generation == 0) {
+    if (removal.hresult >= 0 || removal.generation == 0 || !removal.productionPollObserved) {
         std::fprintf(stderr, "authoritative DXGI removal was not observed\n");
         return 6;
     }
@@ -491,6 +675,8 @@ int main(int argc, char** argv) {
                     {QStringLiteral("jobContained"), true}});
         return 0;
     }
+    if (args.contains(QStringLiteral("--verify-job-tree"))) return verifyJobTreeWatchdog();
+    if (args.contains(QStringLiteral("--job-tree-leaf"))) return waitAsJobTreeLeaf();
     if (args.contains(QStringLiteral("--trigger-tdr"))) {
         const QString token = qEnvironmentVariable("OLR_GPU_FAULT_CHILD_TOKEN");
         if (qEnvironmentVariableIntValue("OLR_GPU_FAULT_LANE") != 1 || token.isEmpty() ||
