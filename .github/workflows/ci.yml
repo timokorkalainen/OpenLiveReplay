@@ -521,7 +521,6 @@ jobs:
           set -euo pipefail
           export OLR_QT_ROOT="${QT_ROOT_DIR//\\//}"
           # Task 9's reference lane is the exact Qt tools_mingw1310 kit.
-          newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1 || true; }
           QT_TOOLS_DIR="$(cd "$OLR_QT_ROOT/../.." && pwd)/Tools"
           OLR_MINGW_ROOT="$QT_TOOLS_DIR/mingw1310_64"
           [ -x "$OLR_MINGW_ROOT/bin/g++.exe" ] || {
@@ -529,7 +528,7 @@ jobs:
             exit 1
           }
           NINJA_BIN="$(command -v ninja || true)"
-          [ -n "$NINJA_BIN" ] || NINJA_BIN="$(newest "$QT_TOOLS_DIR"/Ninja/ninja.exe)"
+          [ -n "$NINJA_BIN" ] || NINJA_BIN="$(find "$QT_TOOLS_DIR/Ninja" -maxdepth 1 -type f -name ninja.exe -print | sort -V | tail -1)"
           NINJA_DIR="$(dirname "$NINJA_BIN")"
           HOST_PYTHON="$(command -v python)"
           export PATH="$OLR_MINGW_ROOT/bin:$NINJA_DIR:$PATH"
@@ -602,7 +601,8 @@ jobs:
           ffmpeg_root="$(cd windows_build/dist/ffmpeg && pwd)"
           srt_root="$(cd windows_build/dist/srt && pwd)"
           mkdir -p "$RUNNER_TEMP/gpu-perf"
-          export OLR_GPU_PERF_EVIDENCE_DIR="$(to_msys "$RUNNER_TEMP/gpu-perf")"
+          OLR_GPU_PERF_EVIDENCE_DIR="$(to_msys "$RUNNER_TEMP/gpu-perf")"
+          export OLR_GPU_PERF_EVIDENCE_DIR
           export PATH="$mingw_root/bin:$qt_root/bin:$ffmpeg_root/bin:$ffmpeg_root/lib:$srt_root/bin:$srt_root/lib:$PATH"
           ctest --test-dir build-tests --output-on-failure --no-tests=error \
             -R '^gpu_capability_mingw_provenance_perf$'
