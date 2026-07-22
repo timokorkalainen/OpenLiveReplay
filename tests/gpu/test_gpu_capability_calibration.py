@@ -12,11 +12,13 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import gpu_capability_calibration as capability_calibration  # noqa: E402
 from gpu_capability_calibration import (  # noqa: E402
     CalibrationAttemptFailure,
     MACOS_RSS_RECYCLE_DISABLED,
     WORKER_DECISION_SCHEMA,
     CALIBRATION_INCLUDED_STAGES,
+    RealCalibrationRunner,
     _calibrate_platform_worker_count_with_runner,
     _native_measured_sample_passes,
     _linux_cpu_quota_capacity_from_paths,
@@ -27,6 +29,7 @@ from gpu_capability_calibration import (  # noqa: E402
     finalize_platform_worker_decision,
     load_worker_decision,
     reference_calibration_envelope,
+    run_real_calibration_smoke,
     platform_worker_decision_key,
     platform_tag,
     worker_decision_key,
@@ -36,6 +39,8 @@ from gpu_capability_calibration import (  # noqa: E402
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
     AuditLimits,
+    CanonicalAuditContentSummary,
+    CompilerAuditRun,
     MacOSPostReturnSample,
     LinuxCalibrationEnvelope,
     LinuxPhaseSnapshot,
@@ -48,9 +53,11 @@ from gpu_capability_model import (  # noqa: E402
     MacOSRunMemoryMeasurements,
     MacOSWorkerCalibrationSample,
     MacOSWorkerCountDecision,
+    StreamingAuditMeasurements,
     WorkerCalibrationSample,
     WorkerCountDecision,
     WorkerStageTimings,
+    WorkerRuntimeContract,
     WindowsPhaseSnapshot,
     WindowsPostReturnSample,
     WindowsRunMemoryMeasurements,
@@ -145,8 +152,10 @@ class WorkerDecisionCodecTests(unittest.TestCase):
             platform_tag(), "a" * 64, "b" * 64, "c" * 64,
             "d" * 64, 1)
         timings = WorkerStageTimings(1.0, 1.0, 1.0, 1.0)
-        phase = WindowsPhaseSnapshot("windows", "inspection", _windows_memory(), 0)
-        task_phase = WindowsPhaseSnapshot("windows", "tasks", _windows_memory(), 1)
+        phase = WindowsPhaseSnapshot("windows", "inspection", _windows_memory(), ())
+        task_phase = WindowsPhaseSnapshot(
+            "windows", "tasks", _windows_memory(), ((0, 0),)
+        )
         sample = WorkerCalibrationSample(
             platform_kind="windows", worker_count=1, configuration_count=251,
             elapsed_seconds=100.0, memory=_windows_memory(),
@@ -364,6 +373,186 @@ class WorkerDecisionCodecTests(unittest.TestCase):
         self.assertEqual(len(set(runner.caches)), 8)
         self.assertEqual(decision.selected_workers, 3)
         self.assertEqual(decision.attempted_worker_counts, (2, 1, 3, 4))
+
+        artifact = self.path.with_name("fake-multi-count.json")
+        write_platform_worker_decision_atomic(artifact, decision)
+        with mock.patch("gpu_capability_calibration.effective_worker_capacity",
+                        return_value=4), mock.patch(
+                            "gpu_capability_calibration.platform_tag",
+                            return_value=key.platform_tag):
+            decoded = load_platform_worker_decision(artifact, "windows", key)
+        self.assertEqual(decoded.attempted_worker_counts, (2, 1, 3, 4))
+        self.assertEqual(tuple(sample.worker_count for sample in decoded.samples),
+                         (2, 1, 3, 4))
+
+    def test_real_native_smoke_runs_one_candidate_without_decision_emission(self):
+        limits = dataclasses.replace(AuditLimits(), workers=4)
+
+        for platform_kind in ("linux", "macos"):
+            with self.subTest(platform=platform_kind):
+                calls = []
+
+                def full_pipeline_attempt(*, kind, worker_count,
+                                          runtime_parameters, cache_root,
+                                          included_stages, preparation,
+                                          operation_deadline,
+                                          cleanup_deadline):
+                    calls.append((kind, worker_count, cache_root,
+                                  tuple(cache_root.iterdir())))
+                    self.assertEqual(preparation.configuration_count, 1)
+                    self.assertEqual(included_stages,
+                                     CALIBRATION_INCLUDED_STAGES)
+                    self.assertEqual(
+                        operation_deadline, preparation.operation_deadline
+                    )
+                    self.assertEqual(
+                        cleanup_deadline, preparation.cleanup_deadline
+                    )
+                    if platform_kind == "linux":
+                        memory = LinuxRunMemoryMeasurements(
+                            100, 200, 1000, 900, 0, 0, 0, 0, 0, 0, 0,
+                            True)
+                        inspection = LinuxPhaseSnapshot(
+                            "linux", "inspection", memory, 0)
+                        tasks = LinuxPhaseSnapshot("linux", "tasks", memory, 1)
+                        recycle = (runtime_parameters.recycle_rss_bytes
+                                   if runtime_parameters else 1000)
+                    else:
+                        memory = MacOSRunMemoryMeasurements(
+                            300, 100, 200, 0, 0, True)
+                        inspection = MacOSPhaseSnapshot(
+                            "macos", "inspection", memory, 0)
+                        tasks = MacOSPhaseSnapshot("macos", "tasks", memory, 1)
+                        recycle = MACOS_RSS_RECYCLE_DISABLED
+                    maximum_tasks = (runtime_parameters.maximum_tasks_per_worker
+                                     if runtime_parameters else 1)
+                    measurements = StreamingAuditMeasurements(
+                        time.monotonic(), 10, 1, 0, 1, 1, 2, 1, memory,
+                        1, 1, 1, 0, 1, 1, 1,
+                        WorkerRuntimeContract(
+                            worker_count, maximum_tasks, recycle,
+                            time.monotonic() + 30),
+                        cache_root, (worker_count,),
+                        ("enumerate-production", "collect", "snapshot", "cache",
+                         "schedule", "finalize", "decode", "coverage", "raw",
+                         "source-only", "shutdown-reap"),
+                        inspection, tasks)
+                    return CompilerAuditRun(
+                        CanonicalAuditContentSummary(
+                            "a" * 64, ("b" * 64,), 0, 1, 0),
+                        measurements)
+
+                runner = RealCalibrationRunner(
+                    platform_kind, full_pipeline_attempt=full_pipeline_attempt)
+                root = Path(self.temporary.name)
+                command = root / f"{platform_kind}-compile_commands.json"
+                command.touch()
+                with mock.patch(
+                        "gpu_capability_calibration.effective_worker_capacity",
+                        return_value=4), mock.patch(
+                            "gpu_capability_calibration.write_platform_worker_decision_atomic",
+                            side_effect=AssertionError("smoke emitted a decision")), mock.patch(
+                            "gpu_capability_calibration.write_worker_decision_atomic",
+                            side_effect=AssertionError("smoke emitted a decision")):
+                    readiness = run_real_calibration_smoke(
+                        runner, root, (command,), root, limits)
+
+                self.assertEqual(readiness.platform_kind, platform_kind)
+                self.assertEqual(readiness.candidate_worker_counts,
+                                 (2, 1, 3, 4))
+                self.assertEqual(readiness.attempted_worker_count, 1)
+                self.assertFalse(hasattr(readiness, "key"))
+                self.assertEqual(tuple((kind, count)
+                                       for kind, count, _cache, _empty in calls),
+                                 (("pilot", 1), ("measured", 1)))
+                self.assertEqual(len({cache for _kind, _count, cache, _empty
+                                      in calls}), 2)
+                self.assertTrue(all(empty == ()
+                                    for _kind, _count, _cache, empty in calls))
+
+    def test_real_native_smoke_uses_one_deadline_through_cleanup(self):
+        clock = [0.0]
+        operation_deadlines = []
+        cleanup_deadlines = []
+        cleanups = []
+        root = Path(self.temporary.name)
+        preparation = None
+
+        class FakeTemporaryDirectory:
+            count = 0
+
+            def __init__(_self, *, prefix, dir):
+                type(_self).count += 1
+                _self.name = str(Path(dir) / f"{prefix}{type(_self).count}")
+                Path(_self.name).mkdir(parents=True)
+
+            def cleanup(_self):
+                cleanups.append((Path(_self.name).name, clock[0]))
+                clock[0] += 5.0 if len(cleanups) == 1 else 6.0
+
+        runner = RealCalibrationRunner(
+            "linux", full_pipeline_attempt=lambda **_kwargs: None
+        )
+
+        def prepare(
+            *_args,
+            smoke_only=False,
+            operation_deadline=None,
+            cleanup_deadline=None,
+        ):
+            nonlocal preparation
+            self.assertTrue(smoke_only)
+            self.assertEqual(operation_deadline, 140.0)
+            self.assertEqual(cleanup_deadline, 170.0)
+            preparation = capability_calibration.CalibrationSmokePreparation(
+                "linux", root, (root / "compile_commands.json",), root,
+                AuditLimits(workers=1), 1, (1,), operation_deadline,
+                cleanup_deadline,
+            )
+            return preparation
+
+        pilot = (
+            LinuxPostReturnSample(
+                "linux", 0, 0, 1, 0, 1, 1, 2, 3, True, True
+            ),
+        )
+
+        def run(*, kind, operation_deadline, cleanup_deadline, **_kwargs):
+            operation_deadlines.append(operation_deadline)
+            cleanup_deadlines.append(cleanup_deadline)
+            clock[0] += 100.0 if kind == "pilot" else 60.0
+            return pilot if kind == "pilot" else object()
+
+        runner.prepare = prepare
+        runner.run = run
+        with mock.patch.object(
+            capability_calibration.time, "monotonic", side_effect=lambda: clock[0]
+        ), mock.patch.object(
+            capability_calibration.tempfile,
+            "TemporaryDirectory",
+            FakeTemporaryDirectory,
+        ), self.assertRaisesRegex(AuditInfrastructureError, "smoke deadline"):
+            run_real_calibration_smoke(
+                runner,
+                root,
+                (root / "compile_commands.json",),
+                root,
+                AuditLimits(workers=1),
+            )
+
+        self.assertEqual(operation_deadlines, [140.0, 140.0])
+        self.assertEqual(cleanup_deadlines, [170.0, 170.0])
+        self.assertEqual(len(cleanups), 2)
+        self.assertEqual(clock[0], 171.0)
+
+    def test_real_native_smoke_rejects_more_than_one_configuration(self):
+        root = Path(self.temporary.name)
+        runner = RealCalibrationRunner("linux", full_pipeline_attempt=lambda **_: ())
+        with self.assertRaisesRegex(AuditInfrastructureError,
+                                    "exactly one configuration"):
+            run_real_calibration_smoke(
+                runner, root, (root / "one.json", root / "two.json"), root,
+                AuditLimits())
 
     def test_linux_and_macos_fake_runners_cover_stages_and_clean_rejection(self):
         timings = WorkerStageTimings(1, 1, 1, 1)

@@ -299,7 +299,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-test-macos:
     name: Build + Test (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     needs: changes
     if: ${{ needs.changes.outputs.app == 'true' }}
     steps:
@@ -380,6 +380,12 @@ jobs:
         # local pre-push hook and are excluded defensively; the playback e2e gate
         # below adds worker-level coverage on top of the unit label.
         run: ctest --output-on-failure --repeat until-pass:2 -L ci -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
+
+      - name: Run native GPU calibration smoke
+        working-directory: build
+        run: >
+          ctest --output-on-failure --no-tests=error
+          -R '^gpu_capability_calibration_smoke$'
 
       - name: Run GPU async-readback, budget, seek-prefetch, and device-loss e2e gates
         working-directory: build
@@ -464,11 +470,16 @@ jobs:
   # ---------------------------------------------------------------------------
   build-test-windows:
     name: Build + Test (Windows, MinGW)
-    runs-on: windows-latest
+    runs-on: windows-2022
     needs: changes
     if: ${{ needs.changes.outputs.app == 'true' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
 
       # Qt reorganised the Windows online-repository layout in 6.11, and the current
       # aqtinstall (3.3.0, used by install-qt-action) cannot locate the 6.11.x Windows
@@ -509,12 +520,14 @@ jobs:
         run: |
           set -euo pipefail
           export OLR_QT_ROOT="${QT_ROOT_DIR//\\//}"
-          # Discover the newest MinGW kit + Ninja the same way the build scripts do.
-          # shellcheck disable=SC2012
+          # Task 9's reference lane is the exact Qt tools_mingw1310 kit.
           newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1 || true; }
           QT_TOOLS_DIR="$(cd "$OLR_QT_ROOT/../.." && pwd)/Tools"
-          : "${OLR_MINGW_ROOT:=$(newest "$QT_TOOLS_DIR"/mingw*_64)}"
-          [ -n "${OLR_MINGW_ROOT:-}" ] || OLR_MINGW_ROOT="$(newest C:/Qt/Tools/mingw*_64)"
+          OLR_MINGW_ROOT="$QT_TOOLS_DIR/mingw1310_64"
+          [ -x "$OLR_MINGW_ROOT/bin/g++.exe" ] || {
+            echo "::error::exact tools_mingw1310_64 compiler is unavailable"
+            exit 1
+          }
           NINJA_BIN="$(command -v ninja || true)"
           [ -n "$NINJA_BIN" ] || NINJA_BIN="$(newest "$QT_TOOLS_DIR"/Ninja/ninja.exe)"
           NINJA_DIR="$(dirname "$NINJA_BIN")"
@@ -579,15 +592,20 @@ jobs:
             esac
             printf '%s' "$p"
           }
-          newest() { find "$@" -maxdepth 0 -type d 2>/dev/null | sort -V | tail -1 || true; }
           qt_root="$(to_msys "$QT_ROOT_DIR")"
           qt_tools_dir="$(cd "$qt_root/../.." && pwd)/Tools"
-          mingw_root="$(to_msys "$(newest "$qt_tools_dir"/mingw*_64)")"
+          mingw_root="$qt_tools_dir/mingw1310_64"
+          [ -x "$mingw_root/bin/g++.exe" ] || {
+            echo "::error::exact tools_mingw1310_64 compiler is unavailable"
+            exit 1
+          }
           ffmpeg_root="$(cd windows_build/dist/ffmpeg && pwd)"
           srt_root="$(cd windows_build/dist/srt && pwd)"
           mkdir -p "$RUNNER_TEMP/gpu-perf"
           export OLR_GPU_PERF_EVIDENCE_DIR="$(to_msys "$RUNNER_TEMP/gpu-perf")"
           export PATH="$mingw_root/bin:$qt_root/bin:$ffmpeg_root/bin:$ffmpeg_root/lib:$srt_root/bin:$srt_root/lib:$PATH"
+          ctest --test-dir build-tests --output-on-failure --no-tests=error \
+            -R '^gpu_capability_mingw_provenance_perf$'
           ctest --test-dir build-tests --output-on-failure \
             -R '^(tst_nativeaacdecoder|tst_gpufence|tst_wingpuimportedge|tst_gpusurfaceallocator|tst_streamworker_gpuencode|tst_gpurhicontext|tst_gpuretireregistry_perf|tst_gpuretireregistry_production_perf)$'
           gpu_test="$(find build-tests -type f \( -name tst_gpucompositor -o -name tst_gpucompositor.exe \) -print -quit)"
@@ -655,7 +673,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-test-linux:
     name: Build + Test (Linux, GCC)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: ${{ needs.changes.outputs.app == 'true' }}
     steps:
@@ -767,6 +785,24 @@ jobs:
       - name: Run static media/package smoke tests
         working-directory: build
         run: ctest --output-on-failure --no-tests=error -L smoke
+
+      - name: Run delegated-cgroup GPU calibration smoke
+        run: |
+          set -euo pipefail
+          unit="olr-gpu-calibration-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo systemd-run \
+            --unit="$unit" --wait --collect \
+            --property=Type=exec \
+            --property=Delegate=yes \
+            --property=MemoryAccounting=yes \
+            --property=MemoryMax=1073741824 \
+            --property=MemoryHigh=939524096 \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --working-directory="$PWD" \
+            python3 tests/gpu/gpu_capability_process_tree.py \
+              prepare-linux-cgroup -- \
+              ctest --test-dir build --output-on-failure --no-tests=error \
+                -R '^gpu_capability_calibration_smoke$'
 
       - name: Assemble and exercise controlled Linux package
         run: |

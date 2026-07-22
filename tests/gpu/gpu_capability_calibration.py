@@ -21,6 +21,7 @@ from gpu_capability_model import (
     AuditInfrastructureError,
     AuditLimits,
     CalibrationRejection,
+    CompilerAuditRun,
     DecisionConfigurationRecord,
     DependencyRootAuthority,
     LinuxPostReturnSample,
@@ -59,6 +60,8 @@ WORKER_DECISION_MAX_BYTES = 16 * 1024 * 1024
 REFERENCE_ENVELOPE_SCHEMA_BYTES = b"olr-gpu-reference-envelope-v1"
 MACOS_RSS_RECYCLE_DISABLED = (1 << 64) - 1
 WINDOWS_COLD_RSS_CEILING_BYTES = 448 << 20
+CALIBRATION_SMOKE_SECONDS = 170.0
+CALIBRATION_SMOKE_CLEANUP_RESERVE_SECONDS = 30.0
 
 CALIBRATION_INCLUDED_STAGES = (
     "enumerate-production", "collect-configurations", "snapshot-production",
@@ -71,6 +74,10 @@ CALIBRATION_FAILURE_CODES = frozenset({
     "deadline", "native-memory-limit", "native-accounting-incomplete",
     "protocol", "pipeline-failure", "cleanup-failure",
 })
+CALIBRATION_SMOKE_PIPELINE_STAGES = (
+    "enumerate-production", "collect", "snapshot", "cache", "schedule",
+    "finalize", "decode", "coverage", "raw", "source-only", "shutdown-reap",
+)
 
 
 class CalibrationAttemptFailure(AuditInfrastructureError):
@@ -662,12 +669,25 @@ def _decode_timings(value: object) -> WorkerStageTimings:
 
 def _decode_phase(value: object) -> WindowsPhaseSnapshot:
     item = _expect_keys(value, {"platform_kind", "phase", "memory",
-                                "archived_generation_count"})
+                                "archived_generation_identities"})
     _require_contract(item["platform_kind"] == "windows"
                       and item["phase"] in {"inspection", "tasks"})
+    identities = item["archived_generation_identities"]
+    _require_contract(
+        isinstance(identities, list)
+        and all(
+            isinstance(identity, list)
+            and len(identity) == 2
+            for identity in identities
+        )
+    )
     return WindowsPhaseSnapshot("windows", item["phase"],
                                 _decode_memory(item["memory"]),
-                                _integer(item["archived_generation_count"]))
+                                tuple(
+                                    (_integer(identity[0]),
+                                     _integer(identity[1]))
+                                    for identity in identities
+                                ))
 
 
 def _decode_post_sample(value: object) -> WindowsPostReturnSample:
@@ -1325,34 +1345,359 @@ def finalize_platform_worker_decision(
 
 
 class RealCalibrationRunner:
-    """Construction seam for Task 10's real native top-level calibration."""
+    """Decision scheduler seam plus Task 9's native one-count smoke lane."""
 
-    def __init__(self, platform_kind: str) -> None:
+    def __init__(self, platform_kind: str, *,
+                 full_pipeline_attempt: object | None = None) -> None:
         if platform_kind not in {"windows", "linux", "macos"}:
             raise AuditInfrastructureError("calibration platform is invalid")
         self.platform_kind = platform_kind
+        self._full_pipeline_attempt = full_pipeline_attempt
+        self._smoke_preparation: CalibrationSmokePreparation | None = None
+        self._smoke_cache_roots: set[Path] = set()
 
-    def prepare(self, *_args: object) -> tuple[WorkerDecisionKey, int, str]:
-        raise AuditInfrastructureError(
-            "real calibration runner integration belongs to Task 10")
+    def prepare(
+        self,
+        *args: object,
+        smoke_only: bool = False,
+        operation_deadline: float | None = None,
+        cleanup_deadline: float | None = None,
+    ) -> object:
+        if not smoke_only:
+            raise AuditInfrastructureError(
+                "real calibration runner integration belongs to Task 10")
+        if (
+            self.platform_kind not in {"linux", "macos"}
+            or len(args) != 5
+            or args[0] != self.platform_kind
+            or not isinstance(args[1], Path)
+            or not isinstance(args[2], tuple)
+            or len(args[2]) != 1
+            or not isinstance(args[2][0], Path)
+            or not isinstance(args[3], Path)
+            or not isinstance(args[4], AuditLimits)
+            or not callable(self._full_pipeline_attempt)
+            or not isinstance(operation_deadline, (int, float))
+            or isinstance(operation_deadline, bool)
+            or not isinstance(cleanup_deadline, (int, float))
+            or isinstance(cleanup_deadline, bool)
+            or not math.isfinite(float(operation_deadline))
+            or not math.isfinite(float(cleanup_deadline))
+            or time.monotonic() >= operation_deadline
+            or cleanup_deadline - operation_deadline
+            != CALIBRATION_SMOKE_CLEANUP_RESERVE_SECONDS
+        ):
+            message = ("real calibration smoke requires exactly one configuration"
+                       if isinstance(args[2] if len(args) > 2 else None, tuple)
+                       and len(args[2]) != 1
+                       else "real calibration smoke preparation is invalid")
+            raise AuditInfrastructureError(message)
+        capacity = effective_worker_capacity(args[4])
+        if capacity > args[4].workers:
+            raise AuditInfrastructureError(
+                "calibration runner capacity exceeds limits")
+        preparation = CalibrationSmokePreparation(
+            platform_kind=self.platform_kind,
+            source_root=args[1],
+            compile_commands=args[2],
+            cache_parent=args[3],
+            limits=args[4],
+            configuration_count=1,
+            candidate_worker_counts=allowed_worker_counts(capacity),
+            operation_deadline=float(operation_deadline),
+            cleanup_deadline=float(cleanup_deadline),
+        )
+        self._smoke_preparation = preparation
+        self._smoke_cache_roots.clear()
+        return preparation
 
     def run(self, *, kind: str, **kwargs: object) -> object:
-        """Execute one already-prepared decision-bound scheduler run.
+        """Execute a decision-bound audit or a non-authoritative smoke run.
 
-        Task 10 owns native decision production and the full calibration
-        lifecycle.  Task 7 nevertheless owns the real scheduling boundary, so
-        an accepted decision must enter the scheduler here instead of through a
-        test-only wrapper.
+        Task 10 owns native decision production and exhaustive calibration.
+        The smoke lane accepts only the bounded output of the existing full
+        pipeline and never constructs or persists a worker decision.
         """
 
         decision = kwargs.get("decision")
-        if (
-            kind != "decision-audit"
-            or getattr(decision, "platform_kind", None) != self.platform_kind
-        ):
+        if kind == "decision-audit":
+            if getattr(decision, "platform_kind", None) != self.platform_kind:
+                raise AuditInfrastructureError(
+                    "real calibration runner operation is invalid")
+            return schedule_decision_configuration_audits(**kwargs)
+        if kind not in {"pilot", "measured"}:
             raise AuditInfrastructureError(
                 "real calibration runner operation is invalid")
-        return schedule_decision_configuration_audits(**kwargs)
+        preparation = kwargs.pop("preparation", None)
+        worker_count = kwargs.get("worker_count")
+        cache_root = kwargs.get("cache_root")
+        included_stages = kwargs.get("included_stages")
+        runtime_parameters = kwargs.get("runtime_parameters")
+        operation_deadline = kwargs.get("operation_deadline")
+        cleanup_deadline = kwargs.get("cleanup_deadline")
+        try:
+            resolved_cache = cache_root.resolve(strict=True)
+            resolved_parent = preparation.cache_parent.resolve(strict=True)
+        except (AttributeError, OSError) as error:
+            raise AuditInfrastructureError(
+                "real calibration smoke cache is invalid") from error
+        if (
+            preparation is not self._smoke_preparation
+            or not isinstance(preparation, CalibrationSmokePreparation)
+            or worker_count not in preparation.candidate_worker_counts
+            or included_stages != CALIBRATION_INCLUDED_STAGES
+            or (kind == "pilot" and runtime_parameters is not None)
+            or (kind == "measured"
+                and not isinstance(runtime_parameters, PilotRuntimeParameters))
+            or resolved_cache.parent != resolved_parent
+            or resolved_cache in self._smoke_cache_roots
+            or any(resolved_cache.iterdir())
+            or operation_deadline != preparation.operation_deadline
+            or cleanup_deadline != preparation.cleanup_deadline
+            or time.monotonic() >= preparation.operation_deadline
+        ):
+            raise AuditInfrastructureError(
+                "real calibration smoke operation is invalid")
+        self._smoke_cache_roots.add(resolved_cache)
+        audit_run = self._full_pipeline_attempt(
+            kind=kind,
+            worker_count=worker_count,
+            runtime_parameters=runtime_parameters,
+            cache_root=cache_root,
+            included_stages=included_stages,
+            preparation=preparation,
+            operation_deadline=preparation.operation_deadline,
+            cleanup_deadline=preparation.cleanup_deadline,
+        )
+        if not isinstance(audit_run, CompilerAuditRun):
+            raise AuditInfrastructureError(
+                "real calibration smoke full-pipeline result is invalid")
+        measurements = audit_run.measurements
+        if (
+            measurements.configuration_count != 1
+            or measurements.memory_backend != self.platform_kind
+            or measurements.cache_root.resolve() != resolved_cache
+            or measurements.worker_counts_started != (worker_count,)
+            or measurements.runtime_contract.workers != worker_count
+            or measurements.audit_compiler_invocations != 2
+            or measurements.included_stages != CALIBRATION_SMOKE_PIPELINE_STAGES
+            or measurements.inspection_phase_snapshot.phase != "inspection"
+            or measurements.task_phase_snapshot.phase != "tasks"
+            or len(audit_run.summary.configuration_digests) != 1
+        ):
+            raise AuditInfrastructureError(
+                "real calibration smoke full-pipeline measurements are invalid")
+        memory = measurements.memory
+        if self.platform_kind == "linux":
+            events_zero = all(getattr(memory, name) == 0 for name in (
+                "cgroup_oom_count_delta", "cgroup_oom_kill_count_delta",
+                "cgroup_max_event_count_delta", "service_root_oom_count_delta",
+                "service_root_oom_kill_count_delta",
+                "service_root_max_event_count_delta"))
+            post_samples = tuple(LinuxPostReturnSample(
+                "linux", slot, 0, 1, 0,
+                memory.cgroup_current_accounted_memory_bytes,
+                memory.cgroup_peak_accounted_memory_bytes,
+                memory.cgroup_memory_high_bytes,
+                memory.cgroup_memory_max_bytes,
+                events_zero,
+                memory.accounting_complete,
+            ) for slot in range(worker_count))
+            surviving_count = memory.surviving_cgroup_process_count
+        else:
+            post_samples = tuple(MacOSPostReturnSample(
+                "macos", slot, 0, 1, 0,
+                memory.maximum_observed_owned_group_resident_bytes,
+                memory.surviving_registered_process_count,
+                memory.known_unreconciled_descendant_count,
+                memory.accounting_complete,
+            ) for slot in range(worker_count))
+            surviving_count = memory.surviving_registered_process_count
+        if kind == "pilot":
+            if surviving_count != 0:
+                raise AuditInfrastructureError(
+                    "real calibration smoke containment is invalid")
+            return post_samples
+        runtime = measurements.runtime_contract
+        if (runtime.maximum_tasks_per_worker
+                != runtime_parameters.maximum_tasks_per_worker
+                or runtime.recycle_rss_bytes
+                != runtime_parameters.recycle_rss_bytes):
+            raise AuditInfrastructureError(
+                "real calibration smoke runtime differs")
+        timings = WorkerStageTimings(
+            measurements.elapsed_seconds, measurements.elapsed_seconds,
+            measurements.elapsed_seconds, measurements.elapsed_seconds)
+        common = dict(
+            platform_kind=self.platform_kind,
+            worker_count=worker_count,
+            configuration_count=1,
+            elapsed_seconds=measurements.elapsed_seconds,
+            maximum_tasks_per_worker=runtime.maximum_tasks_per_worker,
+            recycle_rss_bytes=runtime.recycle_rss_bytes,
+            memory=memory,
+            inspection_probe_invocations=(
+                measurements.inspection_probe_invocations),
+            audit_compiler_invocations=measurements.audit_compiler_invocations,
+            stdout_bytes=measurements.stdout_bytes,
+            cache_bytes=measurements.cache_bytes,
+            cache_entries=measurements.cache_entries,
+            pilot_eligible=runtime_parameters.pilot_eligible,
+            surviving_owned_process_count=surviving_count,
+            included_stages=CALIBRATION_INCLUDED_STAGES,
+            post_return_samples=post_samples,
+            stage_p50_seconds=timings,
+            stage_p95_seconds=timings,
+            inspection_phase_snapshot=measurements.inspection_phase_snapshot,
+            task_phase_snapshot=measurements.task_phase_snapshot,
+        )
+        sample = (LinuxWorkerCalibrationSample(**common)
+                  if self.platform_kind == "linux"
+                  else MacOSWorkerCalibrationSample(**common))
+        if not _native_measured_sample_passes(sample, self.platform_kind):
+            raise AuditInfrastructureError(
+                "real calibration smoke measured result is invalid")
+        return sample
+
+
+@dataclasses.dataclass(frozen=True)
+class CalibrationSmokePreparation:
+    platform_kind: str
+    source_root: Path
+    compile_commands: tuple[Path, ...]
+    cache_parent: Path
+    limits: AuditLimits
+    configuration_count: int
+    candidate_worker_counts: tuple[int, ...]
+    operation_deadline: float
+    cleanup_deadline: float
+
+
+@dataclasses.dataclass(frozen=True)
+class CalibrationSmokeReadiness:
+    """Non-authoritative smoke result; deliberately has no decision key."""
+
+    platform_kind: str
+    candidate_worker_counts: tuple[int, ...]
+    attempted_worker_count: int
+    pilot: tuple[object, ...]
+    runtime_parameters: PilotRuntimeParameters
+    measured: object
+
+
+def run_real_calibration_smoke(
+    runner: RealCalibrationRunner,
+    source_root: Path,
+    compile_commands: tuple[Path, ...],
+    cache_parent: Path,
+    limits: AuditLimits,
+) -> CalibrationSmokeReadiness:
+    """Run one native full-pipeline candidate without producing an artifact."""
+
+    if not isinstance(runner, RealCalibrationRunner):
+        raise AuditInfrastructureError("real calibration smoke runner is invalid")
+    started = time.monotonic()
+    cleanup_deadline = started + CALIBRATION_SMOKE_SECONDS
+    operation_deadline = (
+        cleanup_deadline - CALIBRATION_SMOKE_CLEANUP_RESERVE_SECONDS
+    )
+    _require_contract(
+        0.0 < operation_deadline - started < cleanup_deadline - started < 180.0,
+        "real calibration smoke deadline is invalid",
+    )
+    preparation = runner.prepare(
+        runner.platform_kind, source_root, compile_commands, cache_parent, limits,
+        smoke_only=True,
+        operation_deadline=operation_deadline,
+        cleanup_deadline=cleanup_deadline)
+    if not isinstance(preparation, CalibrationSmokePreparation):
+        raise AuditInfrastructureError(
+            "real calibration smoke preparation is invalid")
+    cache_parent.mkdir(parents=True, exist_ok=True)
+    # Task 9 proves the real native path with one configuration and therefore
+    # one schedulable worker. Exhaustive candidate selection remains Task 10;
+    # the full ordering is retained above for codec/readiness validation only.
+    worker_count = 1
+    _require_contract(worker_count in preparation.candidate_worker_counts)
+    pilot_directory = tempfile.TemporaryDirectory(
+        prefix=f"gpu-calibration-smoke-{worker_count}-pilot-",
+        dir=cache_parent,
+    )
+    pilot_error = None
+    try:
+        _require_contract(
+            time.monotonic() < operation_deadline,
+            "real calibration smoke deadline expired",
+        )
+        pilot = runner.run(
+            kind="pilot", worker_count=worker_count, runtime_parameters=None,
+            cache_root=Path(pilot_directory.name),
+            included_stages=CALIBRATION_INCLUDED_STAGES,
+            preparation=preparation,
+            operation_deadline=operation_deadline,
+            cleanup_deadline=cleanup_deadline)
+    except BaseException as error:
+        pilot_error = error
+        raise
+    finally:
+        try:
+            pilot_directory.cleanup()
+            _require_contract(
+                time.monotonic() < cleanup_deadline,
+                "real calibration smoke deadline expired during cleanup",
+            )
+        except BaseException as cleanup_error:
+            if pilot_error is not None:
+                pilot_error.add_note(
+                    f"pilot cache cleanup also failed: {cleanup_error!r}"
+                )
+            else:
+                raise
+    parameters = derive_pilot_runtime_parameters(
+        pilot, worker_count, preparation.configuration_count)
+    measured_directory = tempfile.TemporaryDirectory(
+        prefix=f"gpu-calibration-smoke-{worker_count}-measured-",
+        dir=cache_parent,
+    )
+    measured_error = None
+    try:
+        _require_contract(
+            time.monotonic() < operation_deadline,
+            "real calibration smoke deadline expired",
+        )
+        measured = runner.run(
+            kind="measured", worker_count=worker_count,
+            runtime_parameters=parameters,
+            cache_root=Path(measured_directory.name),
+            included_stages=CALIBRATION_INCLUDED_STAGES,
+            preparation=preparation,
+            operation_deadline=operation_deadline,
+            cleanup_deadline=cleanup_deadline)
+    except BaseException as error:
+        measured_error = error
+        raise
+    finally:
+        try:
+            measured_directory.cleanup()
+            _require_contract(
+                time.monotonic() < cleanup_deadline,
+                "real calibration smoke deadline expired during cleanup",
+            )
+        except BaseException as cleanup_error:
+            if measured_error is not None:
+                measured_error.add_note(
+                    f"measured cache cleanup also failed: {cleanup_error!r}"
+                )
+            else:
+                raise
+    return CalibrationSmokeReadiness(
+        platform_kind=preparation.platform_kind,
+        candidate_worker_counts=preparation.candidate_worker_counts,
+        attempted_worker_count=worker_count,
+        pilot=pilot,
+        runtime_parameters=parameters,
+        measured=measured,
+    )
 
 
 def _calibrate_platform_worker_count_with_runner(

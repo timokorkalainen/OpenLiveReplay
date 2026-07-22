@@ -43,6 +43,7 @@ from gpu_capability_model import (
     DependencyRootAuthority,
     DependencyRootBinding,
     FileIdentity,
+    MacOSInspectionExecPermit,
     PreprocessConfiguration,
     ProcessStartIdentity,
     portable_compiler_inspection_key,
@@ -341,6 +342,18 @@ class CompilerProcessHandleCarrier:
     @property
     def completed(self) -> bool:
         return self._completed
+
+    @property
+    def windows_process_handle(self) -> int:
+        if (
+            self.event.process_start.platform_kind != "windows"
+            or self._completed
+            or self._windows_process_handle is None
+        ):
+            raise AuditInfrastructureError(
+                "Windows compiler process handle is unavailable"
+            )
+        return int(self._windows_process_handle)
 
     def complete_after_exit(self) -> None:
         if self._completed:
@@ -683,6 +696,14 @@ def _validate_macos_compiler_exec_permit(
     task_id: str | None,
     generation: int | None,
 ) -> None:
+    if worker_index is None and task_id is None and generation is None:
+        if (
+            not isinstance(permit, MacOSInspectionExecPermit)
+            or permit.pid != process_start.pid
+            or permit.pgid != process_start.pid
+        ):
+            raise AuditInfrastructureError("macOS inspection exec permit differs")
+        return
     if (
         not isinstance(permit, CompilerExecPermit)
         or permit.worker_index != worker_index
@@ -2063,35 +2084,44 @@ def _run_probe_command(
     ) as stderr_stream:
         process: subprocess.Popen[bytes] | None = None
         carrier: CompilerProcessHandleCarrier | None = None
+        preparation = None
         try:
-            launch_command = containment.prepare_command(command)
-            process, carrier = launch_compiler_process(
-                launch_command,
-                cwd=cwd,
-                environment=environment,
-                containment=containment,
-                platform_kind=capability.platform_kind,
-                stdin=(subprocess.PIPE if containment.requires_handshake else subprocess.DEVNULL),
-                stdout=stdout_stream,
-                stderr=stderr_stream,
-                launch_options=launch_options,
-                purpose=CompilerLaunchPurpose.INSPECTION,
-                launch_observer=launch_observer,
-            )
-        except OSError as error:
-            if os.name != "nt":
-                containment.terminate()
-            containment.close()
-            raise AuditInfrastructureError(f"compiler version probe failed: {compiler}") from error
-        except AuditInfrastructureError:
-            if process is not None:
-                if os.name != "nt":
-                    containment.terminate()
-                process.kill()
-                process.wait(timeout=1.0)
-            containment.close()
-            raise
-        try:
+            try:
+                prepare = getattr(
+                    launch_observer, "prepare_compiler_inspection_launch", None
+                )
+                if callable(prepare):
+                    preparation = prepare(capability, pipeline_deadline)
+                launch_command = containment.prepare_command(command)
+                process, carrier = launch_compiler_process(
+                    launch_command,
+                    cwd=cwd,
+                    environment=environment,
+                    containment=containment,
+                    platform_kind=capability.platform_kind,
+                    stdin=(
+                        subprocess.PIPE
+                        if containment.requires_handshake
+                        else subprocess.DEVNULL
+                    ),
+                    stdout=stdout_stream,
+                    stderr=stderr_stream,
+                    launch_options=launch_options,
+                    purpose=CompilerLaunchPurpose.INSPECTION,
+                    launch_observer=launch_observer,
+                )
+                finish_preparation = getattr(
+                    launch_observer,
+                    "finish_compiler_inspection_launch_preparation",
+                    None,
+                )
+                if callable(finish_preparation):
+                    finish_preparation(preparation)
+                preparation = None
+            except OSError as error:
+                raise AuditInfrastructureError(
+                    f"compiler version probe failed: {compiler}"
+                ) from error
             deadline = min(
                 time.monotonic() + _VERSION_SECONDS,
                 pipeline_deadline if pipeline_deadline is not None else float("inf"),
@@ -2111,9 +2141,6 @@ def _run_probe_command(
                     break
                 time.sleep(0.01)
             if failure is not None:
-                containment.terminate()
-                process.kill()
-                process.wait(timeout=1.0)
                 raise AuditInfrastructureError(failure)
             returncode = process.wait(timeout=1.0)
             if carrier is None:
@@ -2123,26 +2150,57 @@ def _run_probe_command(
             carrier.complete_after_exit()
         finally:
             active_error = sys.exc_info()[1]
-            # Closing the Windows job or killing the POSIX process group also
-            # removes descendants after a nominally successful parent exit.
-            try:
-                if os.name != "nt":
-                    containment.terminate()
+            cleanup_errors: list[tuple[str, BaseException]] = []
+
+            def cleanup(label: str, action) -> None:
+                try:
+                    action()
+                except BaseException as error:
+                    cleanup_errors.append((label, error))
+
+            if preparation is not None:
+                cancel_preparation = getattr(
+                    launch_observer,
+                    "cancel_compiler_inspection_launch_preparation",
+                    None,
+                )
+                if callable(cancel_preparation):
+                    cleanup(
+                        "inspection launch preparation cancellation",
+                        lambda: cancel_preparation(preparation),
+                    )
+            # Closing the Windows Job or killing the POSIX process group removes
+            # descendants even when preparation fails immediately after launch.
+            cleanup("probe containment termination", containment.terminate)
+            if process is not None and (
+                carrier is None or not carrier.completed
+            ):
+                running = True
+                try:
+                    running = process.poll() is None
+                except BaseException as error:
+                    cleanup_errors.append(("probe process poll", error))
+                if running:
+                    cleanup("probe process kill", process.kill)
+                    cleanup(
+                        "probe process wait",
+                        lambda: process.wait(timeout=1.0),
+                    )
                 if carrier is not None and not carrier.completed:
-                    try:
-                        if process is not None and process.poll() is None:
-                            process.kill()
-                            process.wait(timeout=1.0)
-                        carrier.complete_after_exit()
-                    except AuditInfrastructureError as error:
-                        if active_error is not None:
-                            active_error.add_note(
-                                f"process carrier completion also failed: {error}"
-                            )
-                        else:
-                            raise
-            finally:
-                containment.close()
+                    cleanup(
+                        "process carrier completion",
+                        carrier.complete_after_exit,
+                    )
+            cleanup("probe containment close", containment.close)
+            if active_error is not None:
+                for label, error in cleanup_errors:
+                    active_error.add_note(f"{label} also failed: {error}")
+            elif cleanup_errors:
+                primary_label, primary_cleanup = cleanup_errors[0]
+                for label, error in cleanup_errors[1:]:
+                    primary_cleanup.add_note(f"{label} also failed: {error}")
+                primary_cleanup.add_note(f"cleanup operation: {primary_label}")
+                raise primary_cleanup
         observed = os.fstat(stdout_stream.fileno()).st_size + os.fstat(
             stderr_stream.fileno()
         ).st_size

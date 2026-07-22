@@ -12,6 +12,7 @@ import math
 import multiprocessing
 import os
 import queue
+import secrets
 import selectors
 import shutil
 import signal
@@ -105,6 +106,7 @@ from gpu_capability_model import (
     LinuxRunMemoryMeasurements,
     LinuxPhaseSnapshot,
     MacOSPhaseSnapshot,
+    MacOSInspectionPgidReported,
     MacOSRunMemoryMeasurements,
     MacOSWorkerSessionReported,
     WorkerCapabilitiesAccepted,
@@ -170,6 +172,30 @@ def _scheduler_cache_publication_event(_event: CachePublicationRequested) -> Non
 
 def _scheduler_initial_digest_map_event(_initial_digest_map) -> None:
     """Test observer for the exact outer-owned initial production map."""
+
+
+def _generation_teardown_transition(_label: str, _state) -> None:
+    """Fault-injection boundary after one teardown transition commits."""
+
+
+def _generation_teardown_before_transition(_label: str, _state) -> None:
+    """Fault-injection boundary before one teardown transition begins."""
+
+
+def _generation_setup_transition(_label: str, _state) -> None:
+    """Fault-injection boundary after one setup acquisition commits."""
+
+
+def _generation_setup_before_transition(_label: str, _state) -> None:
+    """Fault-injection boundary before one setup acquisition begins."""
+
+
+def _shutdown_transition(_label: str, _reactor) -> None:
+    """Fault-injection boundary after one shutdown transition commits."""
+
+
+def _shutdown_before_transition(_label: str, _reactor) -> None:
+    """Fault-injection boundary before one shutdown transition begins."""
 
 
 _CONDITIONALLY_SELECTED_TRANSLATION_UNITS = MappingProxyType({
@@ -1649,10 +1675,41 @@ def _windows_capability_streams(handles: tuple[int, ...]) -> tuple[object, ...]:
         ) from error
 
 
+def _generation_duplicate_stream_before_close(
+    _duplicate, _stream_index: int
+) -> None:
+    return None
+
+
+def _generation_duplicate_stream_close(
+    _duplicate, _stream_index: int
+) -> None:
+    return None
+
+
+def _generation_release_transition(
+    _kind: str,
+    _stage: str,
+    _position: str,
+    _worker_index: int,
+    _generation: int,
+) -> None:
+    return None
+
+
+def _macos_reconciliation_completed(
+    _scope: str,
+    _worker_index: int,
+    _generation: int,
+    _pgid: int,
+) -> None:
+    return None
+
+
 class _GenerationCompilerCapabilityDuplicate:
     __slots__ = (
         "registry", "digest", "worker_index", "generation", "streams",
-        "transferred_pid", "closed",
+        "transferred_pid", "closed", "_closed_stream_indices",
     )
 
     def __init__(
@@ -1670,17 +1727,32 @@ class _GenerationCompilerCapabilityDuplicate:
         self.streams = streams
         self.transferred_pid: int | None = None
         self.closed = False
+        self._closed_stream_indices: set[int] = set()
 
     def close(self) -> None:
         if self.closed:
             return
         errors = []
-        for stream in reversed(self.streams):
+        for stream_index in reversed(range(len(self.streams))):
+            if stream_index in self._closed_stream_indices:
+                continue
+            stream = self.streams[stream_index]
             try:
+                _generation_duplicate_stream_before_close(
+                    self, stream_index
+                )
                 stream.close()
             except BaseException as error:
+                if getattr(stream, "closed", False) is True:
+                    self._closed_stream_indices.add(stream_index)
                 errors.append(error)
-        self.closed = True
+                continue
+            self._closed_stream_indices.add(stream_index)
+            try:
+                _generation_duplicate_stream_close(self, stream_index)
+            except BaseException as error:
+                errors.append(error)
+        self.closed = len(self._closed_stream_indices) == len(self.streams)
         if errors:
             raise AuditInfrastructureError(
                 "compiler capability generation duplicate cleanup failed"
@@ -1699,6 +1771,10 @@ class CompilerCapabilityRegistry:
             tuple[int, int], dict[str, _GenerationCompilerCapabilityDuplicate]
         ] = {}
         self._acknowledged_generations: set[tuple[int, int]] = set()
+        self._released_generations: set[tuple[int, int]] = set()
+        self._acknowledgement_removal_incomplete: set[
+            tuple[int, int]
+        ] = set()
         self._closed = False
         self._lock = threading.Lock()
 
@@ -1738,7 +1814,11 @@ class CompilerCapabilityRegistry:
             )
         key = (worker_index, generation)
         with self._lock:
-            if self._closed or key in self._acknowledged_generations:
+            if (
+                self._closed
+                or key in self._acknowledged_generations
+                or key in self._released_generations
+            ):
                 raise AuditInfrastructureError(
                     "compiler capability generation is unavailable"
                 )
@@ -1801,51 +1881,97 @@ class CompilerCapabilityRegistry:
             duplicates = self._generation_duplicates.get(key)
             if (
                 duplicates is None
-                or key in self._acknowledged_generations
+                and key in self._acknowledged_generations
+                and key in self._acknowledgement_removal_incomplete
+            ):
+                self._acknowledgement_removal_incomplete.discard(key)
+                return
+            if (
+                duplicates is None
                 or capability_digests != tuple(sorted(duplicates))
                 or any(
-                    duplicate.transferred_pid is None or duplicate.closed
+                    duplicate.transferred_pid is None
                     for duplicate in duplicates.values()
                 )
             ):
                 raise AuditInfrastructureError(
                     "compiler capability generation acknowledgement differs"
                 )
-            errors = []
-            for digest in reversed(sorted(duplicates)):
-                try:
-                    duplicates[digest].close()
-                except BaseException as error:
-                    errors.append(error)
-            del self._generation_duplicates[key]
-            self._acknowledged_generations.add(key)
-            if errors:
-                raise AuditInfrastructureError(
-                    "compiler capability generation acknowledgement cleanup failed"
-                ) from errors[0]
+            if key not in self._acknowledged_generations:
+                errors = []
+                for digest in reversed(sorted(duplicates)):
+                    try:
+                        duplicates[digest].close()
+                    except BaseException as error:
+                        errors.append(error)
+                if errors:
+                    raise AuditInfrastructureError(
+                        "compiler capability generation acknowledgement cleanup failed"
+                    ) from errors[0]
+                _generation_release_transition(
+                    "acknowledge", "terminal", "before", *key
+                )
+                self._acknowledged_generations.add(key)
+                _generation_release_transition(
+                    "acknowledge", "terminal", "after", *key
+                )
+            if key in self._generation_duplicates:
+                _generation_release_transition(
+                    "acknowledge", "remove", "before", *key
+                )
+                self._acknowledgement_removal_incomplete.add(key)
+                del self._generation_duplicates[key]
+                _generation_release_transition(
+                    "acknowledge", "remove", "after", *key
+                )
+                self._acknowledgement_removal_incomplete.discard(key)
 
     def release_generation(self, worker_index: int, generation: int) -> None:
         key = (worker_index, generation)
         with self._lock:
-            duplicates = self._generation_duplicates.pop(key, None)
+            if (
+                key in self._released_generations
+                and key not in self._generation_duplicates
+                and key not in self._acknowledged_generations
+            ):
+                return
+            duplicates = self._generation_duplicates.get(key)
             acknowledged = key in self._acknowledged_generations
-            self._acknowledged_generations.discard(key)
-            if duplicates is None:
-                if not acknowledged:
+            if key not in self._released_generations:
+                if duplicates is None and not acknowledged:
                     raise AuditInfrastructureError(
                         "compiler capability generation is unavailable"
                     )
-                return
-            errors = []
-            for digest in reversed(sorted(duplicates)):
-                try:
-                    duplicates[digest].close()
-                except BaseException as error:
-                    errors.append(error)
-            if errors:
-                raise AuditInfrastructureError(
-                    "compiler capability generation release failed"
-                ) from errors[0]
+                errors = []
+                if duplicates is not None:
+                    for digest in reversed(sorted(duplicates)):
+                        try:
+                            duplicates[digest].close()
+                        except BaseException as error:
+                            errors.append(error)
+                if errors:
+                    raise AuditInfrastructureError(
+                        "compiler capability generation release failed"
+                    ) from errors[0]
+                _generation_release_transition(
+                    "release", "terminal", "before", *key
+                )
+                self._released_generations.add(key)
+                _generation_release_transition(
+                    "release", "terminal", "after", *key
+                )
+            if (
+                key in self._generation_duplicates
+                or key in self._acknowledged_generations
+            ):
+                _generation_release_transition(
+                    "release", "remove", "before", *key
+                )
+                self._generation_duplicates.pop(key, None)
+                self._acknowledged_generations.discard(key)
+                _generation_release_transition(
+                    "release", "remove", "after", *key
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -2757,13 +2883,23 @@ class _GenerationState:
         "payload_receiver", "contained", "ready", "pending", "launch_events",
         "tasks_completed", "expects_retire", "maximum_resident_bytes",
         "active_descendants", "capabilities_accepted",
-        "scratch_root", "native_carrier",
+        "scratch_root", "native_carrier", "teardown_completed",
+        "startup_receiver", "task_receiver", "command_receiver",
+        "event_sender", "payload_sender", "capability_transfer_parent",
+        "capability_transfer_child", "platform_kind", "process_started",
+        "native_generation_acquired", "generation_job_created",
+        "generation_job_assigned", "generation_job_assignment_state",
+        "registry_generation_acquired",
+        "native_create_requested", "process_start_attempted",
+        "identity_confirmed", "promoted", "setup_completed",
+        "setup_finalized",
     )
 
     def __init__(
-        self, worker_index, generation, process, tree, identity,
-        startup_sender, task_sender, command_sender, event_receiver,
-        payload_receiver, scratch_root, native_carrier=None,
+        self, worker_index, generation, process=None, tree=None, identity=None,
+        startup_sender=None, task_sender=None, command_sender=None,
+        event_receiver=None, payload_receiver=None, scratch_root=None,
+        native_carrier=None,
     ) -> None:
         self.worker_index = worker_index
         self.generation = generation
@@ -2786,6 +2922,27 @@ class _GenerationState:
         self.active_descendants = {}
         self.scratch_root = scratch_root
         self.native_carrier = native_carrier
+        self.teardown_completed: set[str] = set()
+        self.startup_receiver = None
+        self.task_receiver = None
+        self.command_receiver = None
+        self.event_sender = None
+        self.payload_sender = None
+        self.capability_transfer_parent = None
+        self.capability_transfer_child = None
+        self.platform_kind = None
+        self.process_started = False
+        self.native_generation_acquired = native_carrier is not None
+        self.generation_job_created = False
+        self.generation_job_assigned = False
+        self.generation_job_assignment_state = None
+        self.registry_generation_acquired = False
+        self.native_create_requested = False
+        self.process_start_attempted = False
+        self.identity_confirmed = False
+        self.promoted = False
+        self.setup_completed: set[str] = set()
+        self.setup_finalized = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -3125,6 +3282,93 @@ def _worker_scratch_parent() -> Path:
     return Path(tempfile.gettempdir())
 
 
+def _release_generation_job_accounting(
+    run_accountant, state, deadline: float, accounting_lock
+) -> None:
+    acquired = getattr(state, "generation_job_created", None)
+    if acquired is False:
+        return
+    archive_generation_job = getattr(
+        run_accountant, "archive_generation_job", None
+    )
+    discard_generation_job = getattr(
+        run_accountant, "discard_generation_job", None
+    )
+    assignment_completed = getattr(
+        run_accountant, "generation_job_assignment_completed", None
+    )
+    assignment_state = getattr(
+        run_accountant, "generation_job_assignment_state", None
+    )
+    if callable(assignment_state):
+        state_value = assignment_state(
+            state.worker_index, state.generation
+        )
+        if state_value not in {
+            "unassigned", "aggregate-only", "generation-assigned"
+        }:
+            raise AuditInfrastructureError(
+                "generation Job assignment progress differs"
+            )
+    elif callable(assignment_completed):
+        assigned = assignment_completed(
+            state.worker_index, state.generation
+        )
+        if not isinstance(assigned, bool):
+            raise AuditInfrastructureError(
+                "generation Job assignment progress differs"
+            )
+        state_value = "generation-assigned" if assigned else "unassigned"
+    else:
+        assigned = getattr(state, "generation_job_assigned", True)
+        state_value = "generation-assigned" if assigned else "unassigned"
+    state.generation_job_assignment_state = state_value
+    state.generation_job_assigned = state_value == "generation-assigned"
+    if state_value == "generation-assigned" and callable(
+        archive_generation_job
+    ):
+        with accounting_lock:
+            archive_generation_job(
+                state.worker_index, state.generation, deadline
+            )
+        return
+    if state_value == "aggregate-only":
+        finalize_partial = getattr(
+            run_accountant,
+            "finalize_aggregate_only_generation_job",
+            None,
+        )
+        if callable(finalize_partial):
+            with accounting_lock:
+                finalize_partial(state.worker_index, state.generation)
+            return
+    if state_value == "unassigned" and callable(discard_generation_job):
+        with accounting_lock:
+            discard_generation_job(state.worker_index, state.generation)
+        return
+    if acquired is not None:
+        raise AuditInfrastructureError(
+            "generation accounting cleanup authority is unavailable"
+        )
+
+
+def _generation_has_accounted_processes(state) -> bool:
+    if getattr(state, "generation_job_created", False):
+        assignment_state = getattr(
+            state, "generation_job_assignment_state", None
+        )
+        if assignment_state is not None:
+            if assignment_state not in {
+                "unassigned", "aggregate-only", "generation-assigned"
+            }:
+                raise AuditInfrastructureError(
+                    "generation Job assignment progress differs"
+                )
+            return assignment_state != "unassigned"
+        return getattr(state, "generation_job_assigned", False)
+    return getattr(state, "process_started", True)
+
+
 class _LinuxGenerationLifecycle:
     """Bind each spawned generation to a Task-6 rendezvous-owned cgroup leaf."""
 
@@ -3140,10 +3384,14 @@ class _LinuxGenerationLifecycle:
         self.client = client
         self.deadline = float(deadline)
         self.live: dict[tuple[int, int], LinuxWorkerContainment] = {}
+        self.requested: set[tuple[int, int]] = set()
+        self.released: set[tuple[int, int]] = set()
+        self._external_release_progress: set[tuple[int, int]] = set()
         self.run_path: Path | None = None
         self.service_root: Path | None = None
         self.baseline_run_events: dict[str, int] | None = None
         self.baseline_service_events: dict[str, int] | None = None
+        self._sealed_task_phase_snapshot: LinuxPhaseSnapshot | None = None
 
     @staticmethod
     def _read_events(path: Path) -> dict[str, int]:
@@ -3181,13 +3429,15 @@ class _LinuxGenerationLifecycle:
     def create_generation(self, worker_index: int,
                           generation: int) -> LinuxWorkerContainment:
         key = (worker_index, generation)
-        if key in self.live:
+        if key in self.live or key in self.requested or key in self.released:
             raise AuditInfrastructureError("Linux generation leaf is duplicated")
+        self.requested.add(key)
         carrier = self.client.create_leaf(
             worker_index, generation, self.deadline
         )
         if not isinstance(carrier, LinuxWorkerContainment):
             raise AuditInfrastructureError("Linux generation leaf carrier is invalid")
+        self.live[key] = carrier
         run_path = Path(carrier.cgroup_run_path)
         if self.run_path is None:
             self.run_path = run_path
@@ -3205,7 +3455,6 @@ class _LinuxGenerationLifecycle:
                 )
         elif self.run_path != run_path:
             raise AuditInfrastructureError("Linux generation run cgroup differs")
-        self.live[key] = carrier
         return carrier
 
     def accept_worker_contained(self, event: WorkerContained,
@@ -3245,15 +3494,50 @@ class _LinuxGenerationLifecycle:
         raise AuditInfrastructureError("Linux generation cgroup cleanup timed out")
 
     def release_generation(self, worker_index: int, generation: int,
-                           carrier: LinuxWorkerContainment, deadline: float,
+                           carrier: LinuxWorkerContainment | None, deadline: float,
                            *, force: bool) -> None:
         key = (worker_index, generation)
-        if self.live.get(key) is not carrier:
+        if key in self.released and key not in self.live and key not in self.requested:
+            return
+        actual = self.live.get(key)
+        if key not in self.requested:
             raise AuditInfrastructureError("Linux generation leaf differs")
-        if force:
-            self._force_empty(carrier, deadline)
-        self.client.release_leaf(worker_index, generation, deadline)
-        del self.live[key]
+        if carrier is not None and actual is not carrier:
+            raise AuditInfrastructureError("Linux generation leaf differs")
+        if force and actual is not None:
+            self._force_empty(actual, deadline)
+        external_progress = getattr(
+            self, "_external_release_progress", None
+        )
+        if external_progress is None:
+            external_progress = set()
+            self._external_release_progress = external_progress
+        if key not in external_progress:
+            _generation_release_transition(
+                "linux", "external", "before", *key
+            )
+            self.client.release_leaf(worker_index, generation, deadline)
+            external_progress.add(key)
+            _generation_release_transition(
+                "linux", "external", "after", *key
+            )
+        if key not in self.released:
+            _generation_release_transition(
+                "linux", "terminal", "before", *key
+            )
+            self.released.add(key)
+            _generation_release_transition(
+                "linux", "terminal", "after", *key
+            )
+        if key in self.live or key in self.requested:
+            _generation_release_transition(
+                "linux", "remove", "before", *key
+            )
+            self.live.pop(key, None)
+            self.requested.discard(key)
+            _generation_release_transition(
+                "linux", "remove", "after", *key
+            )
 
     def memory_measurements(self, *, require_empty: bool) -> LinuxRunMemoryMeasurements:
         if (
@@ -3312,14 +3596,23 @@ class _LinuxGenerationLifecycle:
         return values
 
     def seal_task_phase(self, archived_generation_count: int) -> LinuxPhaseSnapshot:
-        if self.live:
+        existing = getattr(self, "_sealed_task_phase_snapshot", None)
+        if existing is not None:
+            if existing.archived_generation_count != archived_generation_count:
+                raise AuditInfrastructureError(
+                    "Linux task phase generation count differs"
+                )
+            return existing
+        if self.live or self.requested:
             raise AuditInfrastructureError("Linux generation leaves remain")
-        return LinuxPhaseSnapshot(
+        snapshot = LinuxPhaseSnapshot(
             "linux",
             "tasks",
             self.memory_measurements(require_empty=True),
             archived_generation_count,
         )
+        self._sealed_task_phase_snapshot = snapshot
+        return snapshot
 
 
 class _MacOSGenerationLifecycle:
@@ -3377,10 +3670,37 @@ class _MacOSGenerationLifecycle:
         self.deadline = float(deadline)
         self.worker_groups: dict[tuple[int, int], int] = {}
         self.compiler_groups: dict[tuple[int, int, int], list[int]] = {}
+        self._worker_session_intents: dict[
+            tuple[int, int], MacOSWorkerSessionReported
+        ] = {}
+        self._compiler_adoption_intents: dict[
+            tuple[int, int, int, int], CompilerPgidReported
+        ] = {}
+        self._compiler_permit_receipts: dict[
+            tuple[int, int, int, int], CompilerExecPermit
+        ] = {}
+        self.released_generations: set[tuple[int, int]] = set()
+        self._release_reconciliation_progress: set[
+            tuple[int, int, int]
+        ] = set()
+        self._sealed_task_phase_snapshot: MacOSPhaseSnapshot | None = None
 
     def accept_worker_session(self, report: MacOSWorkerSessionReported) -> None:
         key = (report.worker_index, report.generation)
+        intents = getattr(self, "_worker_session_intents", None)
+        if intents is None:
+            intents = {}
+            self._worker_session_intents = intents
+        existing_intent = intents.get(key)
+        if existing_intent is not None and existing_intent != report:
+            raise AuditInfrastructureError(
+                "macOS worker session intent differs"
+            )
+        if key in self.released_generations:
+            raise AuditInfrastructureError("macOS worker PGID is duplicated")
         if key in self.worker_groups:
+            if existing_intent == report and self.worker_groups[key] == report.pgid:
+                return
             raise AuditInfrastructureError("macOS worker PGID is duplicated")
         identity, _resident, _parent = self.provider._identity_and_residency(
             report.pid, report.pgid
@@ -3390,6 +3710,8 @@ class _MacOSGenerationLifecycle:
         )
         if identity != expected:
             raise AuditInfrastructureError("macOS worker session identity differs")
+        if existing_intent is None:
+            intents[key] = report
         self.accountant.register_group(
             report.pgid, identity,
             f"worker:{report.worker_index}:{report.generation}",
@@ -3397,19 +3719,49 @@ class _MacOSGenerationLifecycle:
         self.worker_groups[key] = report.pgid
 
     def permit_compiler(self, report: CompilerPgidReported) -> CompilerExecPermit:
-        permit = self.permit_authority.permit_compiler(report)
         key = (report.worker_index, report.generation, report.task_id)
+        adoption_key = (*key, report.pgid)
+        intents = getattr(self, "_compiler_adoption_intents", None)
+        if intents is None:
+            intents = {}
+            self._compiler_adoption_intents = intents
+        existing_intent = intents.get(adoption_key)
+        if existing_intent is None:
+            intents[adoption_key] = report
+        elif existing_intent != report:
+            raise AuditInfrastructureError(
+                "macOS compiler adoption intent differs"
+            )
+        receipts = getattr(self, "_compiler_permit_receipts", None)
+        if receipts is None:
+            receipts = {}
+            self._compiler_permit_receipts = receipts
         groups = self.compiler_groups.setdefault(key, [])
         if report.pgid in groups:
+            permit = receipts.get(adoption_key)
+            if permit is not None:
+                return permit
             raise AuditInfrastructureError("macOS compiler PGID is duplicated")
+        permit = self.permit_authority.permit_compiler(report)
+        receipts[adoption_key] = permit
         groups.append(report.pgid)
         return permit
 
     def reconcile_task(self, worker_index: int, generation: int,
                        task_id: int) -> None:
         key = (worker_index, generation, task_id)
-        for pgid in self.compiler_groups.pop(key, []):
-            self.accountant.reconcile_group(pgid, self.provider)
+        groups = self.compiler_groups.get(key, [])
+        while groups:
+            pgid = groups[0]
+            if self.accountant.reconcile_group(pgid, self.provider) is not True:
+                raise AuditInfrastructureError(
+                    "macOS compiler PGID reconciliation did not complete"
+                )
+            _macos_reconciliation_completed(
+                "reconcile-task", worker_index, generation, pgid
+            )
+            del groups[0]
+        self.compiler_groups.pop(key, None)
 
     def observe(self) -> None:
         self.provider.observe(self.accountant, _current_process_rss_bytes())
@@ -3430,32 +3782,96 @@ class _MacOSGenerationLifecycle:
 
     def release_generation(self, worker_index: int, generation: int,
                            _carrier, deadline: float, *, force: bool) -> None:
+        worker_key = (worker_index, generation)
+        if (
+            worker_key in self.released_generations
+            and worker_key not in self.worker_groups
+            and not any(key[:2] == worker_key for key in self.compiler_groups)
+        ):
+            return
+        progress = getattr(self, "_release_reconciliation_progress", None)
+        if progress is None:
+            progress = set()
+            self._release_reconciliation_progress = progress
         remaining = [key for key in self.compiler_groups
                      if key[:2] == (worker_index, generation)]
         for key in remaining:
-            if force:
-                for pgid in self.compiler_groups[key]:
+            for pgid in self.compiler_groups[key]:
+                progress_key = (worker_index, generation, pgid)
+                if progress_key in progress:
+                    continue
+                if force:
                     self._kill_and_wait_empty(pgid, deadline)
-            self.reconcile_task(*key)
-        pgid = self.worker_groups.pop((worker_index, generation), None)
-        if pgid is None:
+                if self.accountant.reconcile_group(
+                    pgid, self.provider
+                ) is not True:
+                    raise AuditInfrastructureError(
+                        "macOS compiler PGID reconciliation did not complete"
+                    )
+                _macos_reconciliation_completed(
+                    "release-compiler", worker_index, generation, pgid
+                )
+                progress.add(progress_key)
+        pgid = self.worker_groups.get(worker_key)
+        if pgid is None and worker_key not in self.released_generations:
             raise AuditInfrastructureError("macOS worker PGID is unavailable")
-        if force:
-            self._kill_and_wait_empty(pgid, deadline)
-        if time.monotonic() >= deadline:
-            raise AuditInfrastructureError("macOS PGID reconciliation deadline exceeded")
-        self.accountant.reconcile_group(pgid, self.provider)
+        worker_progress = (worker_index, generation, pgid)
+        if pgid is not None and worker_progress not in progress:
+            if force:
+                self._kill_and_wait_empty(pgid, deadline)
+            if time.monotonic() >= deadline:
+                raise AuditInfrastructureError(
+                    "macOS PGID reconciliation deadline exceeded"
+                )
+            if self.accountant.reconcile_group(pgid, self.provider) is not True:
+                raise AuditInfrastructureError(
+                    "macOS worker PGID reconciliation did not complete"
+                )
+            _macos_reconciliation_completed(
+                "release-worker", worker_index, generation, pgid
+            )
+            progress.add(worker_progress)
+        if worker_key not in self.released_generations:
+            _generation_release_transition(
+                "macos", "terminal", "before", *worker_key
+            )
+            self.released_generations.add(worker_key)
+            _generation_release_transition(
+                "macos", "terminal", "after", *worker_key
+            )
+        if worker_key in self.worker_groups or any(
+            key[:2] == worker_key for key in self.compiler_groups
+        ):
+            _generation_release_transition(
+                "macos", "remove", "before", *worker_key
+            )
+            self.worker_groups.pop(worker_key, None)
+            for key in tuple(self.compiler_groups):
+                if key[:2] == worker_key:
+                    self.compiler_groups.pop(key)
+            _generation_release_transition(
+                "macos", "remove", "after", *worker_key
+            )
 
     def seal_task_phase(self, archived_generation_count: int) -> MacOSPhaseSnapshot:
+        existing = getattr(self, "_sealed_task_phase_snapshot", None)
+        if existing is not None:
+            if existing.archived_generation_count != archived_generation_count:
+                raise AuditInfrastructureError(
+                    "macOS task phase generation count differs"
+                )
+            return existing
         if self.worker_groups or self.compiler_groups:
             raise AuditInfrastructureError("macOS registered PGID survivors remain")
         self.observe()
-        return MacOSPhaseSnapshot(
+        snapshot = MacOSPhaseSnapshot(
             "macos",
             "tasks",
             self.accountant.memory_measurements(),
             archived_generation_count,
         )
+        self._sealed_task_phase_snapshot = snapshot
+        return snapshot
 
 
 class GenerationReactor:
@@ -3475,6 +3891,7 @@ class GenerationReactor:
         capability_registry,
         result_budget: CompactResultMemoryBudget,
         worker_count: int,
+        cleanup_deadline: float,
     ) -> None:
         self.configurations = configurations
         self.dependency_roots = dependency_roots
@@ -3483,6 +3900,16 @@ class GenerationReactor:
         self.limits = limits
         self.engine = engine
         self.runtime_contract = runtime_contract
+        if (
+            not isinstance(cleanup_deadline, (int, float))
+            or isinstance(cleanup_deadline, bool)
+            or not math.isfinite(float(cleanup_deadline))
+            or cleanup_deadline < runtime_contract.pipeline_deadline
+        ):
+            raise AuditInfrastructureError(
+                "worker cleanup deadline is invalid"
+            )
+        self.cleanup_deadline = float(cleanup_deadline)
         self.run_accountant = run_accountant
         self.capability_registry = capability_registry
         self.result_budget = result_budget
@@ -3524,10 +3951,17 @@ class GenerationReactor:
             tuple[_GenerationState, object]
         ] = collections.deque()
         self.task_phase_snapshot = None
+        self._lifecycle_task_phase_snapshot = None
+        self._run_accountant_task_phase_snapshot = None
+        self._task_phase_raw_snapshot = None
+        self._task_phase_memory = None
+        self._task_phase_generation_identities = None
+        self._sealed_task_phase_snapshot = None
         self._accounting_stop = threading.Event()
         self._accounting_lock = threading.Lock()
         self._accounting_error: BaseException | None = None
         self._accounting_thread = None
+        self._shutdown_completed: set[str] = set()
         self._closed = False
         self.native_lifecycle = None
         if sys.platform.startswith("linux"):
@@ -3560,7 +3994,11 @@ class GenerationReactor:
             self._wait_all_ready()
         except BaseException as error:
             try:
-                self.abort_and_reap(time.monotonic() + _FAILURE_REAP_SECONDS)
+                self.abort_and_reap_until_closed(
+                    emergency_cleanup_deadline(
+                        _generation_cleanup_ceiling(self)
+                    )
+                )
             except BaseException as cleanup_error:
                 error.add_note(
                     f"worker startup cleanup also failed: {cleanup_error}"
@@ -3629,19 +4067,13 @@ class GenerationReactor:
             )
         generation = self.next_generations[worker_index]
         self.next_generations[worker_index] += 1
-        setup_cleanups: list[tuple[str, object]] = []
+        state = _GenerationState(worker_index, generation)
+        self.states[worker_index] = state
 
         def own_pair(pair, label):
+            del label
             first, second = pair
-            setup_cleanups.append((label, first.close))
-            setup_cleanups.append((label, second.close))
             return first, second
-
-        def remove_setup_scratch(path):
-            try:
-                shutil.rmtree(path)
-            except FileNotFoundError:
-                pass
 
         native_carrier = None
         try:
@@ -3649,31 +4081,38 @@ class GenerationReactor:
                 BoundedFrameChannel.create(TASK_MAX_BYTES),
                 "startup channel setup cleanup",
             )
+            state.startup_receiver = startup_receiver
+            state.startup_sender = startup_sender
             task_receiver, task_sender = own_pair(
                 BoundedFrameChannel.create(TASK_MAX_BYTES),
                 "task channel setup cleanup",
             )
+            state.task_receiver = task_receiver
+            state.task_sender = task_sender
             command_receiver, command_sender = own_pair(
                 BoundedFrameChannel.create(COMMAND_MAX_BYTES),
                 "command channel setup cleanup",
             )
+            state.command_receiver = command_receiver
+            state.command_sender = command_sender
             event_receiver, event_sender = own_pair(
                 BoundedFrameChannel.create(CONTROL_MAX_BYTES),
                 "event channel setup cleanup",
             )
+            state.event_receiver = event_receiver
+            state.event_sender = event_sender
             payload_receiver, payload_sender = own_pair(
                 BoundedPayloadChannel.create(),
                 "payload channel setup cleanup",
             )
+            state.payload_receiver = payload_receiver
+            state.payload_sender = payload_sender
             scratch_root = Path(tempfile.mkdtemp(
                 prefix=f".gpu-capability-worker-{worker_index}-{generation}-",
                 dir=_worker_scratch_parent(),
             ))
-            setup_cleanups.append((
-                "worker scratch setup cleanup",
-                lambda path=scratch_root: remove_setup_scratch(path),
-            ))
             scratch_root = scratch_root.resolve()
+            state.scratch_root = scratch_root
             capability_transfer_parent = None
             capability_transfer_child = None
             if os.name != "nt":
@@ -3681,65 +4120,88 @@ class GenerationReactor:
                     socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET),
                     "capability socket setup cleanup",
                 )
+                state.capability_transfer_parent = capability_transfer_parent
+                state.capability_transfer_child = capability_transfer_child
             platform_kind = (
                 "windows" if os.name == "nt"
                 else ("macos" if sys.platform == "darwin" else "linux")
             )
+            state.platform_kind = platform_kind
             from gpu_capability_process_tree import OwnedProcessIdentity, OwnedProcessTree
 
             tree = OwnedProcessTree(
                 platform_kind, f"audit-worker-{worker_index}-{generation}"
             )
-            native_carrier = (
-                self.native_lifecycle.create_generation(worker_index, generation)
-                if isinstance(self.native_lifecycle, _LinuxGenerationLifecycle)
-                else None
-            )
-            if native_carrier is not None:
-                setup_cleanups.append((
-                    "native generation setup cleanup",
-                    lambda carrier=native_carrier: self.native_lifecycle.release_generation(
+            state.tree = tree
+
+            def create_native_leaf():
+                state.native_create_requested = True
+                carrier = self.native_lifecycle.create_generation(
+                    worker_index, generation
+                )
+                state.native_carrier = carrier
+                state.native_generation_acquired = True
+                return carrier
+
+            native_carrier = None
+            if isinstance(self.native_lifecycle, _LinuxGenerationLifecycle):
+                native_carrier = self._complete_generation_setup_transition(
+                    state, "native-leaf-create", create_native_leaf
+                )
+
+            def construct_process():
+                created = self.context.Process(
+                    target=_audit_worker_generation_main,
+                    args=(
                         worker_index,
                         generation,
-                        carrier,
-                        time.monotonic() + _FAILURE_REAP_SECONDS,
-                        force=True,
+                        startup_receiver,
+                        task_receiver,
+                        command_receiver,
+                        event_sender,
+                        payload_sender,
+                        capability_transfer_child,
+                        state.native_carrier,
+                        str(scratch_root),
+                        self.cancel_event,
+                        str(self.cache_root),
+                        self.runtime_contract.pipeline_deadline,
+                        self.runtime_contract.maximum_tasks_per_worker,
+                        self.runtime_contract.recycle_rss_bytes,
                     ),
-                ))
-            process = self.context.Process(
-                target=_audit_worker_generation_main,
-                args=(
-                    worker_index,
-                    generation,
-                    startup_receiver,
-                    task_receiver,
-                    command_receiver,
-                    event_sender,
-                    payload_sender,
-                    capability_transfer_child,
-                    native_carrier,
-                    str(scratch_root),
-                    self.cancel_event,
-                    str(self.cache_root),
-                    self.runtime_contract.pipeline_deadline,
-                    self.runtime_contract.maximum_tasks_per_worker,
-                    self.runtime_contract.recycle_rss_bytes,
-                ),
-                name=f"gpu-audit-{worker_index}-{generation}",
+                    name=f"gpu-audit-{worker_index}-{generation}",
+                )
+                state.process = created
+                return created
+
+            process = self._complete_generation_setup_transition(
+                state, "process-construct", construct_process
             )
         except BaseException as setup_error:
-            for label, cleanup in reversed(setup_cleanups):
-                try:
-                    cleanup()
-                except BaseException as cleanup_error:
-                    setup_error.add_note(f"{label} also failed: {cleanup_error}")
+            try:
+                cleanup_failures = self.abort_and_reap_until_closed(
+                    emergency_cleanup_deadline(
+                        _generation_cleanup_ceiling(self)
+                    )
+                )
+                for cleanup_error in cleanup_failures:
+                    setup_error.add_note(
+                        f"worker setup cleanup retry failed: {cleanup_error}"
+                    )
+                    for note in getattr(cleanup_error, "__notes__", ()):
+                        setup_error.add_note(
+                            f"worker setup cleanup detail: {note}"
+                        )
+            except BaseException as cleanup_error:
+                setup_error.add_note(
+                    f"worker setup cleanup also failed: {cleanup_error}"
+                )
             raise setup_error
         generation_job_created = False
         generation_duplicates: list[
             tuple[str, _GenerationCompilerCapabilityDuplicate]
         ] = []
         release_generation = None
-        state = None
         try:
             duplicate_for_generation = getattr(
                 self.capability_registry,
@@ -3774,32 +4236,63 @@ class GenerationReactor:
                 configuration.compiler_capability_digest
                 for configuration in self.configurations
             }):
-                duplicate = duplicate_for_generation(
-                    digest, worker_index, generation
+                def acquire_registry_duplicate(digest=digest):
+                    duplicate = duplicate_for_generation(
+                        digest, worker_index, generation
+                    )
+                    state.registry_generation_acquired = True
+                    if (
+                        not isinstance(
+                            duplicate, _GenerationCompilerCapabilityDuplicate
+                        )
+                        or duplicate.digest != digest
+                        or duplicate.worker_index != worker_index
+                        or duplicate.generation != generation
+                        or duplicate.closed
+                    ):
+                        raise AuditInfrastructureError(
+                            "compiler capability generation duplicate differs"
+                        )
+                    generation_duplicates.append((digest, duplicate))
+                    self.registry_generation_duplicates[
+                        (worker_index, generation)
+                    ] = tuple(generation_duplicates)
+                    return duplicate
+
+                self._complete_generation_setup_transition(
+                    state,
+                    f"registry-duplicate:{digest}",
+                    acquire_registry_duplicate,
                 )
-                if (
-                    not isinstance(
-                        duplicate, _GenerationCompilerCapabilityDuplicate
-                    )
-                    or duplicate.digest != digest
-                    or duplicate.worker_index != worker_index
-                    or duplicate.generation != generation
-                    or duplicate.closed
-                ):
-                    raise AuditInfrastructureError(
-                        "compiler capability generation duplicate differs"
-                    )
-                generation_duplicates.append((digest, duplicate))
             create_generation_job = getattr(
                 self.run_accountant, "create_generation_job", None
             )
             if callable(create_generation_job):
-                with self._accounting_lock:
-                    create_generation_job(worker_index, generation)
-                generation_job_created = True
-            process.start()
+                def create_job():
+                    with self._accounting_lock:
+                        create_generation_job(worker_index, generation)
+                    state.generation_job_created = True
+
+                self._complete_generation_setup_transition(
+                    state, "accounting-job-create", create_job
+                )
+                generation_job_created = state.generation_job_created
+
+            def start_process():
+                state.process_start_attempted = True
+                try:
+                    process.start()
+                finally:
+                    pid = getattr(process, "pid", None)
+                    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                        state.process_started = True
+
+            self._complete_generation_setup_transition(
+                state, "process-start", start_process
+            )
             if capability_transfer_child is not None:
                 capability_transfer_child.close()
+                state.capability_transfer_child = None
             if not isinstance(process.pid, int) or process.pid <= 0:
                 raise AuditInfrastructureError(
                     "worker process identity is unavailable"
@@ -3810,42 +4303,45 @@ class GenerationReactor:
                 f"spawn-{process.pid}-{generation}-{time.monotonic_ns()}",
             )
             tree.register(identity, None, "audit-worker")
+            state.identity = identity
+            state.identity_confirmed = True
             assign_generation_process = getattr(
                 self.run_accountant, "assign_generation_process", None
             )
             if callable(assign_generation_process):
-                with self._accounting_lock:
-                    assign_generation_process(
-                        worker_index,
-                        generation,
-                        int(process.sentinel),
-                        process.pid,
-                        f"worker:{worker_index}:{generation}",
-                    )
-            state = _GenerationState(
-                worker_index,
-                generation,
-                process,
-                tree,
-                identity,
-                startup_sender,
-                task_sender,
-                command_sender,
-                event_receiver,
-                payload_receiver,
-                scratch_root,
-                native_carrier,
+                def assign_job():
+                    with self._accounting_lock:
+                        assign_generation_process(
+                            worker_index,
+                            generation,
+                            int(process.sentinel),
+                            process.pid,
+                            f"worker:{worker_index}:{generation}",
+                        )
+                    state.generation_job_assigned = True
+
+                self._complete_generation_setup_transition(
+                    state, "accounting-job-assign", assign_job
+                )
+
+            def promote_state():
+                if process.pid not in self.worker_pids:
+                    self.worker_pids.append(process.pid)
+                state.promoted = True
+
+            self._complete_generation_setup_transition(
+                state, "state-promotion", promote_state
             )
-            self.states[worker_index] = state
-            self.registry_generation_duplicates[(
-                worker_index, generation
-            )] = tuple(generation_duplicates)
-            self.worker_pids.append(process.pid)
             startup_receiver.close()
+            state.startup_receiver = None
             task_receiver.close()
+            state.task_receiver = None
             command_receiver.close()
+            state.command_receiver = None
             event_sender.close()
+            state.event_sender = None
             payload_sender.close()
+            state.payload_sender = None
             capability_sources: dict[str, CompilerExecutableCapability] = {}
             for configuration in self.configurations:
                 existing = capability_sources.setdefault(
@@ -3910,115 +4406,32 @@ class GenerationReactor:
                         ) from startup_error
                 raise
             startup_sender.close()
+            state.startup_sender = None
             if capability_transfer_parent is not None:
                 capability_transfer_parent.close()
+                state.capability_transfer_parent = None
+            state.setup_finalized = True
             return state
         except BaseException as spawn_error:
-            def note_cleanup(label, action):
-                try:
-                    action()
-                except BaseException as cleanup_error:
-                    spawn_error.add_note(f"{label} also failed: {cleanup_error}")
-
-            note_cleanup("worker cancellation cleanup", self.cancel_event.set)
-            for endpoint in (
-                startup_receiver, startup_sender, task_receiver, task_sender,
-                command_receiver, command_sender, event_receiver, event_sender,
-            ):
-                note_cleanup("worker endpoint cleanup", endpoint.close)
-            for endpoint in (payload_receiver, payload_sender):
-                note_cleanup("worker payload endpoint cleanup", endpoint.close)
-            for endpoint in (
-                capability_transfer_parent, capability_transfer_child
-            ):
-                if endpoint is not None:
-                    note_cleanup(
-                        "compiler capability transfer endpoint cleanup",
-                        endpoint.close,
-                    )
-            alive = None
-            if process.pid is not None:
-                try:
-                    alive = process.is_alive()
-                except BaseException as cleanup_error:
-                    spawn_error.add_note(
-                        f"worker liveness cleanup also failed: {cleanup_error}"
-                    )
-            if alive is not False:
-                note_cleanup("worker termination cleanup", process.terminate)
-            if process.pid is not None:
-                note_cleanup(
-                    "worker join cleanup", lambda: process.join(timeout=1.0)
-                )
-                still_alive = None
-                try:
-                    still_alive = process.is_alive()
-                except BaseException as cleanup_error:
-                    spawn_error.add_note(
-                        "worker post-join liveness cleanup also failed: "
-                        f"{cleanup_error}"
-                    )
-                if still_alive is not False:
-                    note_cleanup("worker kill cleanup", process.kill)
-                    note_cleanup(
-                        "worker post-kill join cleanup",
-                        lambda: process.join(timeout=1.0),
-                    )
             try:
-                shutil.rmtree(scratch_root)
-            except FileNotFoundError:
-                pass
+                cleanup_failures = self.abort_and_reap_until_closed(
+                    emergency_cleanup_deadline(
+                        _generation_cleanup_ceiling(self)
+                    )
+                )
+                for cleanup_error in cleanup_failures:
+                    spawn_error.add_note(
+                        f"worker reactor cleanup retry failed: {cleanup_error}"
+                    )
+                    for note in getattr(cleanup_error, "__notes__", ()):
+                        spawn_error.add_note(
+                            f"worker reactor cleanup detail: {note}"
+                        )
             except BaseException as cleanup_error:
                 spawn_error.add_note(
-                    f"worker scratch cleanup also failed: {cleanup_error}"
+                    "worker reactor cleanup also failed: "
+                    f"{cleanup_error}"
                 )
-            if generation_job_created:
-                archive_generation_job = getattr(
-                    self.run_accountant, "archive_generation_job", None
-                )
-                if callable(archive_generation_job):
-                    try:
-                        with self._accounting_lock:
-                            archive_generation_job(
-                                worker_index,
-                                generation,
-                                time.monotonic() + _FAILURE_REAP_SECONDS,
-                            )
-                    except BaseException as cleanup_error:
-                        spawn_error.add_note(
-                            "generation accounting cleanup also failed: "
-                            f"{cleanup_error}"
-                        )
-            if generation_duplicates and callable(release_generation):
-                try:
-                    release_generation(worker_index, generation)
-                except BaseException as cleanup_error:
-                    spawn_error.add_note(
-                        "compiler capability generation cleanup also failed: "
-                        f"{cleanup_error}"
-                    )
-            if native_carrier is not None and isinstance(
-                self.native_lifecycle, _LinuxGenerationLifecycle
-            ):
-                try:
-                    self.native_lifecycle.release_generation(
-                        worker_index,
-                        generation,
-                        native_carrier,
-                        time.monotonic() + _FAILURE_REAP_SECONDS,
-                        force=True,
-                    )
-                except BaseException as cleanup_error:
-                    spawn_error.add_note(
-                        f"Linux generation cleanup also failed: {cleanup_error}"
-                    )
-            if state is not None and self.states[worker_index] is state:
-                self.states[worker_index] = None
-            self.registry_generation_duplicates.pop(
-                (worker_index, generation), None
-            )
-            if process.pid in self.worker_pids:
-                self.worker_pids.remove(process.pid)
             raise spawn_error
 
     def _wait_all_ready(self) -> None:
@@ -4273,6 +4686,7 @@ class GenerationReactor:
                             )
                         self.native_lifecycle.accept_worker_session(event)
                         state.contained = True
+                        state.native_generation_acquired = True
                     elif isinstance(event, CompilerPgidReported):
                         if (
                             state.pending is None
@@ -4605,71 +5019,290 @@ class GenerationReactor:
             raise AuditInfrastructureError(
                 "worker generation exited unsuccessfully"
             )
-        if self.native_lifecycle is not None:
-            self.native_lifecycle.release_generation(
-                state.worker_index,
-                state.generation,
-                state.native_carrier,
-                self.runtime_contract.pipeline_deadline,
-                force=False,
+        self._generation_progress(state).add("process-reaped")
+        self._teardown_generation_ownership(
+            state, self.runtime_contract.pipeline_deadline, force=False
+        )
+
+    @staticmethod
+    def _generation_progress(state) -> set[str]:
+        progress = getattr(state, "teardown_completed", None)
+        if progress is None:
+            progress = set()
+            state.teardown_completed = progress
+        if not isinstance(progress, set) or any(
+            not isinstance(label, str) for label in progress
+        ):
+            raise AuditInfrastructureError(
+                "generation teardown progress is invalid"
             )
+        return progress
+
+    @staticmethod
+    def _complete_generation_setup_transition(state, label: str, action):
+        progress = getattr(state, "setup_completed", None)
+        if progress is None:
+            progress = set()
+            state.setup_completed = progress
+        if not isinstance(progress, set) or any(
+            not isinstance(value, str) for value in progress
+        ):
+            raise AuditInfrastructureError(
+                "generation setup progress is invalid"
+            )
+        if label in progress:
+            return None
+        _generation_setup_before_transition(label, state)
+        result = action()
+        progress.add(label)
+        _generation_setup_transition(label, state)
+        return result
+
+    def _complete_generation_transition(
+        self, state, label: str, action
+    ) -> None:
+        progress = self._generation_progress(state)
+        if label in progress:
+            return
+        _generation_teardown_before_transition(label, state)
+        action()
+        progress.add(label)
+        _generation_teardown_transition(label, state)
+
+    def _release_generation_process_tree(self, state) -> None:
         from gpu_capability_process_tree import native_process_resident_bytes
 
-        for pid, identity in tuple(state.active_descendants.items()):
+        tree = getattr(state, "tree", None)
+        identity = getattr(state, "identity", None)
+        active_descendants = getattr(state, "active_descendants", None)
+        if tree is None or identity is None or active_descendants is None:
+            return
+        for pid, descendant_identity in tuple(active_descendants.items()):
             try:
                 native_process_resident_bytes(pid)
             except AuditInfrastructureError:
-                state.tree.mark_exited(identity)
-                state.tree.reap(identity)
-                state.active_descendants.pop(pid)
+                tree.mark_exited(descendant_identity)
+                tree.reap(descendant_identity)
+                active_descendants.pop(pid)
             else:
                 raise AuditInfrastructureError(
                     "worker process-tree survivors remain"
                 )
-        state.tree.mark_exited(state.identity)
-        state.tree.reap(state.identity)
-        if state.tree.surviving_owned_process_count != 0:
+        tree.mark_exited(identity)
+        tree.reap(identity)
+        if tree.surviving_owned_process_count != 0:
             raise AuditInfrastructureError(
                 "worker process-tree survivors remain"
             )
-        self.registry_generation_duplicates.pop(
-            (state.worker_index, state.generation), None
-        )
-        release_generation = getattr(
-            self.capability_registry, "release_generation", None
-        )
-        if callable(release_generation):
-            release_generation(state.worker_index, state.generation)
-        self.archived_generation_telemetry.append((
-            state.worker_index, state.generation, state.maximum_resident_bytes
-        ))
-        try:
-            shutil.rmtree(state.scratch_root)
-        except FileNotFoundError:
-            pass
-        self.archived_scratch_roots.append(state.scratch_root)
-        archive_generation_job = getattr(
-            self.run_accountant, "archive_generation_job", None
-        )
-        if callable(archive_generation_job):
-            with self._accounting_lock:
-                archive_generation_job(
+
+    def _teardown_generation_ownership(
+        self, state, deadline: float, *, force: bool
+    ) -> None:
+        key = (state.worker_index, state.generation)
+
+        def release_native():
+            acquired = getattr(
+                state,
+                "native_generation_acquired",
+                self.native_lifecycle is not None,
+            )
+            acquired = acquired or getattr(
+                state, "native_create_requested", False
+            )
+            if self.native_lifecycle is not None and acquired:
+                self.native_lifecycle.release_generation(
                     state.worker_index,
                     state.generation,
-                    self.runtime_contract.pipeline_deadline,
+                    state.native_carrier,
+                    deadline,
+                    force=force,
                 )
-        for endpoint in (
-            state.startup_sender, state.task_sender, state.command_sender,
-            state.event_receiver,
+
+        self._complete_generation_transition(
+            state, "native-release", release_native
+        )
+        self._complete_generation_transition(
+            state,
+            "process-tree-release",
+            lambda: self._release_generation_process_tree(state),
+        )
+
+        def archive_accounting():
+            _release_generation_job_accounting(
+                self.run_accountant,
+                state,
+                deadline,
+                self._accounting_lock,
+            )
+
+        self._complete_generation_transition(
+            state, "accounting-archive", archive_accounting
+        )
+
+        def detach_publication():
+            self.publication_requests = collections.deque(
+                request for request in self.publication_requests
+                if request[:2] != key
+            )
+            if (
+                self.active_publication is not None
+                and self.active_publication[:2] == key
+            ):
+                self.active_publication = None
+
+        self._complete_generation_transition(
+            state, "publication-detach", detach_publication
+        )
+        pending = state.pending
+
+        def release_reservation():
+            if pending is not None and not pending.reservation.released:
+                pending.reservation.release_worker_transport_capability(
+                    pending.capability, "worker-failure"
+                )
+
+        self._complete_generation_transition(
+            state, "reservation-release", release_reservation
+        )
+
+        def release_registry():
+            release_generation = getattr(
+                self.capability_registry, "release_generation", None
+            )
+            acquired = getattr(state, "registry_generation_acquired", None)
+            if callable(release_generation) and acquired is not False:
+                release_generation(state.worker_index, state.generation)
+
+        self._complete_generation_transition(
+            state, "registry-release", release_registry
+        )
+        self._complete_generation_transition(
+            state,
+            "registry-duplicate-pop",
+            lambda: self.registry_generation_duplicates.pop(key, None),
+        )
+        telemetry = (
+            state.worker_index,
+            state.generation,
+            getattr(state, "maximum_resident_bytes", 0),
+        )
+
+        def append_telemetry():
+            required = _generation_has_accounted_processes(state)
+            if required and telemetry not in self.archived_generation_telemetry:
+                self.archived_generation_telemetry.append(telemetry)
+
+        self._complete_generation_transition(
+            state, "telemetry-append", append_telemetry
+        )
+
+        def remove_scratch():
+            if state.scratch_root is None:
+                return
+            try:
+                shutil.rmtree(state.scratch_root)
+            except FileNotFoundError:
+                pass
+
+        self._complete_generation_transition(
+            state, "scratch-removal", remove_scratch
+        )
+        def append_scratch():
+            if (
+                state.scratch_root is not None
+                and state.scratch_root not in self.archived_scratch_roots
+            ):
+                self.archived_scratch_roots.append(state.scratch_root)
+
+        self._complete_generation_transition(
+            state, "scratch-append", append_scratch
+        )
+
+        def release_queued():
+            if pending is not None and not pending.queued_ownership.released:
+                pending.queued_ownership.release()
+
+        self._complete_generation_transition(
+            state, "queued-release", release_queued
+        )
+        for label, endpoint in (
+            ("startup-receiver-close", getattr(state, "startup_receiver", None)),
+            ("startup-endpoint-close", state.startup_sender),
+            ("task-receiver-close", getattr(state, "task_receiver", None)),
+            ("task-endpoint-close", state.task_sender),
+            ("command-receiver-close", getattr(state, "command_receiver", None)),
+            ("command-endpoint-close", state.command_sender),
+            ("event-endpoint-close", state.event_receiver),
+            ("event-sender-close", getattr(state, "event_sender", None)),
+            ("payload-endpoint-close", state.payload_receiver),
+            ("payload-sender-close", getattr(state, "payload_sender", None)),
+            (
+                "capability-transfer-parent-close",
+                getattr(state, "capability_transfer_parent", None),
+            ),
+            (
+                "capability-transfer-child-close",
+                getattr(state, "capability_transfer_child", None),
+            ),
         ):
-            endpoint.close()
-        try:
-            state.payload_receiver.close()
-        except BaseException:
-            pass
-        self.states[state.worker_index] = None
+            if endpoint is not None:
+                self._complete_generation_transition(
+                    state, label, endpoint.close
+                )
+
+        def remove_deferred_events():
+            deferred_events = getattr(self, "deferred_events", None)
+            if deferred_events is None:
+                return
+            self.deferred_events = collections.deque(
+                item for item in deferred_events if item[0] is not state
+            )
+
+        self._complete_generation_transition(
+            state, "deferred-events-remove", remove_deferred_events
+        )
+
+        def remove_worker_pid():
+            process = getattr(state, "process", None)
+            pid = getattr(process, "pid", None)
+            worker_pids = getattr(self, "worker_pids", None)
+            if (
+                not getattr(state, "setup_finalized", True)
+                and worker_pids is not None
+                and pid in worker_pids
+            ):
+                worker_pids.remove(pid)
+
+        self._complete_generation_transition(
+            state, "worker-pid-remove", remove_worker_pid
+        )
+        self._complete_generation_transition(
+            state,
+            "state-clear",
+            lambda: self.states.__setitem__(state.worker_index, None),
+        )
 
     def shutdown_reap(self, deadline: float) -> None:
+        try:
+            self._shutdown_reap_normal(deadline)
+        except BaseException as primary_error:
+            try:
+                self.abort_and_reap_until_closed(
+                    emergency_cleanup_deadline(
+                        _generation_cleanup_ceiling(
+                            self, fallback_deadline=deadline
+                        )
+                    )
+                )
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"emergency generation cleanup also failed: {cleanup_error!r}")
+                for note in getattr(cleanup_error, "__notes__", ()):
+                    primary_error.add_note(
+                        f"emergency generation cleanup detail: {note}")
+            raise
+
+    def _shutdown_reap_normal(self, deadline: float) -> None:
         if self._closed:
             return
         for state in tuple(self.states):
@@ -4694,22 +5327,306 @@ class GenerationReactor:
                 )
             self._archive_generation(state, require_stopped=True)
             remaining -= 1
-        self._stop_accounting_pump()
-        if isinstance(self.native_lifecycle, _LinuxGenerationLifecycle):
-            self.task_phase_snapshot = self.native_lifecycle.seal_task_phase(
-                len(self.archived_generation_telemetry)
-            )
-        elif isinstance(self.native_lifecycle, _MacOSGenerationLifecycle):
-            self.task_phase_snapshot = self.native_lifecycle.seal_task_phase(
-                len(self.archived_generation_telemetry)
-            )
-        seal_phase = getattr(self.run_accountant, "seal_phase", None)
-        snapshot = getattr(self.run_accountant, "snapshot", None)
-        if callable(seal_phase):
-            seal_phase(deadline, _current_process_rss_bytes())
-        if callable(snapshot):
-            self.task_phase_snapshot = snapshot()
+        self._finalize_shutdown(deadline)
         self._closed = True
+
+    def _shutdown_progress(self) -> set[str]:
+        progress = getattr(self, "_shutdown_completed", None)
+        if progress is None:
+            progress = set()
+            self._shutdown_completed = progress
+        if not isinstance(progress, set) or any(
+            not isinstance(label, str) for label in progress
+        ):
+            raise AuditInfrastructureError(
+                "generation shutdown progress is invalid"
+            )
+        return progress
+
+    def _complete_shutdown_transition(self, label: str, action) -> None:
+        progress = self._shutdown_progress()
+        if label in progress:
+            return
+        _shutdown_before_transition(label, self)
+        action()
+        progress.add(label)
+        _shutdown_transition(label, self)
+
+    def _finalize_shutdown(self, deadline: float) -> None:
+        def require_empty_queues():
+            if (
+                any(state is not None for state in self.states)
+                or getattr(self, "publication_requests", ())
+                or getattr(self, "active_publication", None) is not None
+                or getattr(self, "deferred_events", ())
+            ):
+                raise AuditInfrastructureError(
+                    "generation shutdown queues are not empty"
+                )
+
+        self._complete_shutdown_transition(
+            "queues-empty", require_empty_queues
+        )
+        self._complete_shutdown_transition(
+            "accounting-pump-stop", self._stop_accounting_pump
+        )
+
+        def seal_lifecycle_snapshot():
+            snapshot = getattr(
+                self, "_lifecycle_task_phase_snapshot", None
+            )
+            if (
+                snapshot is None
+                and isinstance(
+                    self.native_lifecycle, _LinuxGenerationLifecycle
+                )
+            ):
+                snapshot = self.native_lifecycle.seal_task_phase(
+                    len(self.archived_generation_telemetry)
+                )
+                self._lifecycle_task_phase_snapshot = snapshot
+            if isinstance(self.native_lifecycle, _LinuxGenerationLifecycle):
+                if type(snapshot) is not LinuxPhaseSnapshot:
+                    raise AuditInfrastructureError(
+                        "Linux task phase snapshot differs"
+                    )
+            elif (
+                snapshot is None
+                and isinstance(
+                    self.native_lifecycle, _MacOSGenerationLifecycle
+                )
+            ):
+                snapshot = self.native_lifecycle.seal_task_phase(
+                    len(self.archived_generation_telemetry)
+                )
+                self._lifecycle_task_phase_snapshot = snapshot
+            if isinstance(self.native_lifecycle, _MacOSGenerationLifecycle):
+                if type(snapshot) is not MacOSPhaseSnapshot:
+                    raise AuditInfrastructureError(
+                        "macOS task phase snapshot differs"
+                    )
+
+        self._complete_shutdown_transition(
+            "lifecycle-task-snapshot", seal_lifecycle_snapshot
+        )
+
+        def seal_task_phase_native():
+            if _is_unix_attempt_accountant(self.run_accountant):
+                snapshot = getattr(
+                    self, "_run_accountant_task_phase_snapshot", None
+                )
+                if snapshot is None:
+                    lifecycle_snapshot = getattr(
+                        self, "_lifecycle_task_phase_snapshot", None
+                    )
+                    if (
+                        type(self.run_accountant)
+                        is LinuxCompilerAuditAttemptAccountant
+                        and type(lifecycle_snapshot) is LinuxPhaseSnapshot
+                    ):
+                        snapshot = (
+                            self.run_accountant
+                            .seal_phase_from_lifecycle_snapshot(
+                                "tasks", deadline, lifecycle_snapshot
+                            )
+                        )
+                    else:
+                        snapshot = self.run_accountant.seal_phase(
+                            "tasks", deadline
+                        )
+                    self._run_accountant_task_phase_snapshot = snapshot
+                expected_type = (
+                    LinuxPhaseSnapshot
+                    if isinstance(
+                        self.run_accountant,
+                        LinuxCompilerAuditAttemptAccountant,
+                    )
+                    else MacOSPhaseSnapshot
+                )
+                if type(snapshot) is not expected_type:
+                    raise AuditInfrastructureError(
+                        "Unix attempt task phase snapshot differs"
+                    )
+            elif _is_windows_native_accountant(self.run_accountant):
+                self.run_accountant.seal_phase(
+                    deadline, _current_process_rss_bytes()
+                )
+
+        self._complete_shutdown_transition(
+            "task-phase-native-seal", seal_task_phase_native
+        )
+
+        def capture_raw_snapshot():
+            if _is_windows_native_accountant(self.run_accountant):
+                from gpu_capability_process_tree import (
+                    WindowsJobAccountingSnapshot,
+                )
+                captured = self.run_accountant.snapshot()
+                if type(captured) is not WindowsJobAccountingSnapshot:
+                    raise AuditInfrastructureError(
+                        "Windows phase accounting snapshot differs"
+                    )
+                self._task_phase_raw_snapshot = captured
+            elif _is_unix_attempt_accountant(self.run_accountant):
+                captured = getattr(
+                    self, "_run_accountant_task_phase_snapshot", None
+                )
+                expected_type = (
+                    LinuxPhaseSnapshot
+                    if isinstance(
+                        self.run_accountant,
+                        LinuxCompilerAuditAttemptAccountant,
+                    )
+                    else MacOSPhaseSnapshot
+                )
+                if type(captured) is not expected_type:
+                    raise AuditInfrastructureError(
+                        "Unix attempt task phase snapshot differs"
+                    )
+                self._task_phase_raw_snapshot = captured
+
+        self._complete_shutdown_transition(
+            "task-phase-raw-snapshot", capture_raw_snapshot
+        )
+
+        def validate_phase_memory():
+            from gpu_capability_process_tree import WindowsJobAccountingSnapshot
+
+            raw = getattr(self, "_task_phase_raw_snapshot", None)
+            if _is_windows_native_accountant(self.run_accountant):
+                if type(raw) is not WindowsJobAccountingSnapshot:
+                    raise AuditInfrastructureError(
+                        "Windows phase accounting snapshot differs"
+                    )
+                memory = raw.memory_measurements()
+                if type(memory) is not WindowsRunMemoryMeasurements:
+                    raise AuditInfrastructureError(
+                        "Windows phase memory accounting differs"
+                    )
+                if (
+                    not memory.accounting_complete
+                    or memory.surviving_job_process_count != 0
+                ):
+                    raise AuditInfrastructureError(
+                        "Windows tasks phase survivors remain"
+                    )
+                identities = _canonical_archived_generation_identities(
+                    self.archived_generation_telemetry
+                )
+                _validate_windows_phase_generation_identities(
+                    raw.archived_generation_identities,
+                    identities,
+                    "tasks",
+                )
+                self._task_phase_generation_identities = identities
+                self._task_phase_memory = memory
+                return
+            if _is_unix_attempt_accountant(self.run_accountant):
+                if type(raw) is LinuxPhaseSnapshot:
+                    platform_kind = "linux"
+                    expected_memory_type = LinuxRunMemoryMeasurements
+                elif type(raw) is MacOSPhaseSnapshot:
+                    platform_kind = "macos"
+                    expected_memory_type = MacOSRunMemoryMeasurements
+                else:
+                    raise AuditInfrastructureError(
+                        "Unix lifecycle task phase snapshot differs"
+                    )
+                expected_count = len(self.archived_generation_telemetry)
+                lifecycle_snapshot = getattr(
+                    self, "_lifecycle_task_phase_snapshot", None
+                )
+                if (
+                    raw.platform_kind != platform_kind
+                    or raw.phase != "tasks"
+                    or raw.archived_generation_count != 0
+                    or type(lifecycle_snapshot) is not type(raw)
+                    or lifecycle_snapshot.platform_kind != platform_kind
+                    or lifecycle_snapshot.phase != "tasks"
+                    or lifecycle_snapshot.archived_generation_count
+                    != expected_count
+                ):
+                    raise AuditInfrastructureError(
+                        "Unix task phase snapshots differ"
+                    )
+                memory = raw.memory
+                if (
+                    type(memory) is not expected_memory_type
+                    or memory != lifecycle_snapshot.memory
+                ):
+                    raise AuditInfrastructureError(
+                        "Unix lifecycle and attempt phase memory differ"
+                    )
+                if type(memory) is LinuxRunMemoryMeasurements:
+                    complete = (
+                        platform_kind == "linux"
+                        and memory.accounting_complete
+                        and memory.surviving_cgroup_process_count == 0
+                    )
+                elif type(memory) is MacOSRunMemoryMeasurements:
+                    complete = (
+                        platform_kind == "macos"
+                        and memory.accounting_complete
+                        and memory.surviving_registered_process_count == 0
+                        and memory.known_unreconciled_descendant_count == 0
+                    )
+                else:
+                    raise AuditInfrastructureError(
+                        "Unix attempt task phase memory backend differs"
+                    )
+                if not complete:
+                    raise AuditInfrastructureError(
+                        "Unix attempt task phase survivors remain"
+                    )
+                self._task_phase_generation_identities = expected_count
+                self._task_phase_memory = memory
+
+        self._complete_shutdown_transition(
+            "task-phase-memory-validation", validate_phase_memory
+        )
+
+        def construct_typed_snapshot():
+            memory = getattr(self, "_task_phase_memory", None)
+            if memory is None:
+                return
+            if type(memory) is WindowsRunMemoryMeasurements:
+                platform_kind = "windows"
+            elif type(memory) is LinuxRunMemoryMeasurements:
+                platform_kind = "linux"
+            elif type(memory) is MacOSRunMemoryMeasurements:
+                platform_kind = "macos"
+            else:
+                raise AuditInfrastructureError(
+                    "task phase memory backend differs"
+                )
+            self._sealed_task_phase_snapshot = (
+                _construct_task_phase_snapshot(
+                    platform_kind,
+                    "tasks",
+                    memory,
+                    self._task_phase_generation_identities,
+                )
+            )
+
+        self._complete_shutdown_transition(
+            "task-phase-typed-snapshot", construct_typed_snapshot
+        )
+
+        def store_task_phase_snapshot():
+            snapshot = getattr(self, "_sealed_task_phase_snapshot", None)
+            if snapshot is not None:
+                if not isinstance(
+                    snapshot,
+                    (WindowsPhaseSnapshot, LinuxPhaseSnapshot, MacOSPhaseSnapshot),
+                ):
+                    raise AuditInfrastructureError(
+                        "sealed task phase snapshot differs"
+                    )
+                self.task_phase_snapshot = snapshot
+
+        self._complete_shutdown_transition(
+            "task-phase-snapshot-store", store_task_phase_snapshot
+        )
 
     def abort_and_reap(self, deadline: float) -> None:
         cleanup_errors: list[tuple[str, BaseException]] = []
@@ -4725,94 +5642,88 @@ class GenerationReactor:
         for state in tuple(self.states):
             if state is None:
                 continue
-            alive = attempt("worker liveness", state.process.is_alive)
-            if alive is not False:
-                attempt("worker termination", state.process.terminate)
-            remaining = max(0.0, deadline - time.monotonic())
-            attempt(
-                "worker join",
-                lambda: state.process.join(timeout=remaining),
-            )
-            still_alive = attempt("worker post-join liveness", state.process.is_alive)
-            if still_alive is not False:
-                attempt("worker kill", state.process.kill)
-                attempt(
-                    "worker post-kill join",
-                    lambda: state.process.join(timeout=max(
-                        0.0, deadline - time.monotonic()
-                    )),
+            progress = self._generation_progress(state)
+            if "process-reaped" not in progress:
+                process = getattr(state, "process", None)
+                process_started = getattr(
+                    state, "process_started", process is not None
                 )
-            if self.native_lifecycle is not None:
-                attempt(
-                    "native generation release",
-                    lambda: self.native_lifecycle.release_generation(
-                        state.worker_index,
-                        state.generation,
-                        state.native_carrier,
-                        deadline,
-                        force=True,
-                    ),
+                start_attempted = getattr(
+                    state, "process_start_attempted", process_started
                 )
-            archive_generation_job = getattr(
-                self.run_accountant, "archive_generation_job", None
-            )
-            if callable(archive_generation_job):
-                def archive():
-                    with self._accounting_lock:
-                        archive_generation_job(
-                            state.worker_index, state.generation, deadline
+                if process is None or (not process_started and not start_attempted):
+                    progress.add("process-reaped")
+                    try:
+                        self._teardown_generation_ownership(
+                            state, deadline, force=True
                         )
-
-                attempt("generation accounting archive", archive)
-            pending = state.pending
-            if pending is not None and not pending.reservation.released:
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append((
+                            "generation ownership teardown", cleanup_error
+                        ))
+                    continue
+                alive = attempt("worker liveness", process.is_alive)
+                if alive is False and not process_started:
+                    progress.add("process-reaped")
+                    try:
+                        self._teardown_generation_ownership(
+                            state, deadline, force=True
+                        )
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append((
+                            "generation ownership teardown", cleanup_error
+                        ))
+                    continue
+                if alive is not False:
+                    attempt("worker termination", process.terminate)
                 attempt(
-                    "worker transport reservation release",
-                    lambda: pending.reservation.release_worker_transport_capability(
-                        pending.capability, "worker-failure"
-                    ),
+                    "worker join",
+                    lambda: process.join(timeout=max(
+                        0.0, deadline - time.monotonic())),
                 )
-            self.registry_generation_duplicates.pop(
-                (state.worker_index, state.generation), None
-            )
-            release_generation = getattr(
-                self.capability_registry, "release_generation", None
-            )
-            if callable(release_generation):
-                attempt(
-                    "compiler capability generation release",
-                    lambda: release_generation(
-                        state.worker_index, state.generation
-                    ),
+                still_alive = attempt(
+                    "worker post-join liveness", process.is_alive
                 )
-
-            def remove_scratch():
-                try:
-                    shutil.rmtree(state.scratch_root)
-                except FileNotFoundError:
-                    pass
-
-            attempt("worker scratch removal", remove_scratch)
-            self.archived_scratch_roots.append(state.scratch_root)
-            if (
-                pending is not None
-                and not pending.queued_ownership.released
-            ):
-                attempt(
-                    "queued transport ownership release",
-                    pending.queued_ownership.release,
+                if still_alive is not False:
+                    attempt("worker kill", process.kill)
+                    attempt(
+                        "worker post-kill join",
+                        lambda: process.join(timeout=max(
+                            0.0, deadline - time.monotonic())),
+                    )
+                    still_alive = attempt(
+                        "worker post-kill liveness", process.is_alive
+                    )
+                if still_alive is not False:
+                    cleanup_errors.append((
+                        "worker reap confirmation",
+                        AuditInfrastructureError(
+                            "worker liveness remains unconfirmed"
+                        ),
+                    ))
+                    continue
+                progress.add("process-reaped")
+            try:
+                self._teardown_generation_ownership(
+                    state, deadline, force=True
                 )
-            for endpoint in (
-                state.startup_sender, state.task_sender,
-                state.command_sender, state.event_receiver,
-            ):
-                attempt("worker endpoint close", endpoint.close)
-            attempt("worker payload endpoint close", state.payload_receiver.close)
-            self.states[state.worker_index] = None
-        self.publication_requests.clear()
-        self.active_publication = None
-        attempt("accounting pump stop", self._stop_accounting_pump)
-        self._closed = True
+            except BaseException as cleanup_error:
+                cleanup_errors.append((
+                    "generation ownership teardown", cleanup_error
+                ))
+        all_reaped = all(state is None for state in self.states)
+        if all_reaped:
+            try:
+                self._finalize_shutdown(deadline)
+            except BaseException as cleanup_error:
+                cleanup_errors.append((
+                    "generation shutdown finalization", cleanup_error
+                ))
+        self._closed = (
+            all_reaped
+            and "task-phase-snapshot-store" in self._shutdown_progress()
+            and not cleanup_errors
+        )
         if cleanup_errors:
             error = AuditInfrastructureError(
                 "generation cleanup is incomplete"
@@ -4820,6 +5731,41 @@ class GenerationReactor:
             for label, additional in cleanup_errors:
                 error.add_note(f"{label} failed: {additional}")
             raise error from cleanup_errors[0][1]
+
+    def abort_and_reap_until_closed(
+        self, deadline: float
+    ) -> tuple[BaseException, ...]:
+        if (
+            not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or not math.isfinite(deadline)
+        ):
+            raise AuditInfrastructureError(
+                "worker abort retry deadline is invalid"
+            )
+        cleanup_ceiling = getattr(self, "cleanup_deadline", deadline)
+        deadline = min(float(deadline), float(cleanup_ceiling))
+        failures: list[BaseException] = []
+        while not getattr(self, "_closed", False) and time.monotonic() < deadline:
+            try:
+                self.abort_and_reap(deadline)
+            except BaseException as cleanup_error:
+                failures.append(cleanup_error)
+                if self._closed:
+                    break
+                time.sleep(0.001)
+        if getattr(self, "_closed", False):
+            return tuple(failures)
+        error = AuditInfrastructureError(
+            "generation cleanup did not reach closed state"
+        )
+        for failure in failures:
+            error.add_note(f"cleanup retry failed: {failure!r}")
+            for note in getattr(failure, "__notes__", ()):
+                error.add_note(f"cleanup retry detail: {note}")
+        if failures:
+            raise error from failures[-1]
+        raise error
 
 
 def _enforce_platform_memory_contract(tree_sample, compact_observer) -> None:
@@ -4894,6 +5840,7 @@ class _ScheduledAuditSession:
         cache_maximum_encoded_result_bytes: int = 0,
         cache_maximum_conservative_decoded_bytes: int = 0,
         cache_maximum_conservative_retained_bytes: int = 0,
+        cleanup_deadline: float | None = None,
     ) -> None:
         if (
             not isinstance(reorder_pending_count, int)
@@ -4948,6 +5895,21 @@ class _ScheduledAuditSession:
         self.audit_compiler_invocations = audit_compiler_invocations
         self.expected_audit_compiler_invocations = 2 * cache_misses
         self.runtime_contract = runtime_contract
+        selected_cleanup_deadline = (
+            runtime_contract.pipeline_deadline
+            if cleanup_deadline is None
+            else cleanup_deadline
+        )
+        if (
+            not isinstance(selected_cleanup_deadline, (int, float))
+            or isinstance(selected_cleanup_deadline, bool)
+            or not math.isfinite(float(selected_cleanup_deadline))
+            or selected_cleanup_deadline < runtime_contract.pipeline_deadline
+        ):
+            raise AuditInfrastructureError(
+                "scheduled cleanup deadline is invalid"
+            )
+        self.cleanup_deadline = float(selected_cleanup_deadline)
         self.cache_root = cache_root
         self.result_budget = result_budget
         self.compact_accounting_observer = compact_accounting_observer
@@ -5023,14 +5985,18 @@ class _ScheduledAuditSession:
             raise AuditInfrastructureError("worker shutdown deadline is invalid")
         if self._shutdown:
             return
-        self.reactor.shutdown_reap(deadline)
+        self.reactor.shutdown_reap(
+            min(float(deadline), self.runtime_contract.pipeline_deadline)
+        )
         self._shutdown = True
 
     def abort_and_reap(self, deadline: float) -> None:
         if self._shutdown:
             return
         if self.reactor is not None:
-            self.reactor.abort_and_reap(deadline)
+            self.reactor.abort_and_reap_until_closed(
+                min(float(deadline), self.cleanup_deadline)
+            )
         self._shutdown = True
 
 
@@ -5048,6 +6014,7 @@ def schedule_configuration_audits(
     inspection_probe_invocations: int,
     run_accountant,
     compact_observer: CompactAccountingObserver,
+    cleanup_deadline: float | None = None,
 ) -> _ScheduledAuditSession:
     """Validate all warm entries before creating any native worker resource."""
     _scheduler_initial_digest_map_event(initial_digest_map)
@@ -5070,6 +6037,19 @@ def schedule_configuration_audits(
         or not isinstance(compact_observer, CompactAccountingObserver)
     ):
         raise AuditInfrastructureError("audit scheduler inputs are invalid")
+    selected_cleanup_deadline = (
+        runtime_contract.pipeline_deadline
+        if cleanup_deadline is None
+        else cleanup_deadline
+    )
+    if (
+        not isinstance(selected_cleanup_deadline, (int, float))
+        or isinstance(selected_cleanup_deadline, bool)
+        or not math.isfinite(float(selected_cleanup_deadline))
+        or selected_cleanup_deadline < runtime_contract.pipeline_deadline
+    ):
+        raise AuditInfrastructureError("audit scheduler cleanup deadline is invalid")
+    selected_cleanup_deadline = float(selected_cleanup_deadline)
     if time.monotonic() >= runtime_contract.pipeline_deadline:
         raise AuditInfrastructureError("pipeline deadline exceeded before scheduling")
     authority = validate_dependency_root_authority(dependency_roots)
@@ -5155,6 +6135,7 @@ def schedule_configuration_audits(
                 cache_maximum_encoded_result_bytes=cache_measurements[0],
                 cache_maximum_conservative_decoded_bytes=cache_measurements[1],
                 cache_maximum_conservative_retained_bytes=cache_measurements[2],
+                cleanup_deadline=selected_cleanup_deadline,
             )
 
         miss_digests = {configuration.digest for configuration in batch.misses}
@@ -5175,6 +6156,7 @@ def schedule_configuration_audits(
             capability_registry=capability_registry,
             result_budget=result_budget,
             worker_count=worker_count,
+            cleanup_deadline=selected_cleanup_deadline,
         )
         ordinals = {
             configuration.digest: ordinal
@@ -5251,7 +6233,9 @@ def schedule_configuration_audits(
             aggregate = aggregator.finish()
         except BaseException as error:
             try:
-                reactor.abort_and_reap(time.monotonic() + _FAILURE_REAP_SECONDS)
+                reactor.abort_and_reap_until_closed(
+                    emergency_cleanup_deadline(selected_cleanup_deadline)
+                )
             except BaseException as cleanup_error:
                 error.add_note(
                     f"worker emergency cleanup also failed: {cleanup_error}"
@@ -5274,6 +6258,7 @@ def schedule_configuration_audits(
             cache_maximum_encoded_result_bytes=cache_measurements[0],
             cache_maximum_conservative_decoded_bytes=cache_measurements[1],
             cache_maximum_conservative_retained_bytes=cache_measurements[2],
+            cleanup_deadline=selected_cleanup_deadline,
         )
     except BaseException:
         raise
@@ -9352,24 +10337,482 @@ def bounded_uninspected_configuration_digest(
     return digest.hexdigest()
 
 
-def emergency_cleanup_deadline() -> float:
-    return time.monotonic() + _FAILURE_REAP_SECONDS
+def _generation_cleanup_ceiling(
+    reactor: GenerationReactor,
+    *,
+    fallback_deadline: float | None = None,
+) -> float:
+    configured = getattr(reactor, "cleanup_deadline", None)
+    if configured is not None:
+        return float(configured)
+    runtime_contract = getattr(reactor, "runtime_contract", None)
+    if runtime_contract is None:
+        if fallback_deadline is None:
+            raise AuditInfrastructureError(
+                "worker cleanup ceiling is unavailable"
+            )
+        return float(fallback_deadline)
+    return (
+        float(runtime_contract.pipeline_deadline)
+        + _FAILURE_REAP_SECONDS
+    )
+
+
+def emergency_cleanup_deadline(cleanup_ceiling: float) -> float:
+    if (
+        not isinstance(cleanup_ceiling, (int, float))
+        or isinstance(cleanup_ceiling, bool)
+        or not math.isfinite(float(cleanup_ceiling))
+    ):
+        raise AuditInfrastructureError(
+            "emergency cleanup ceiling is invalid"
+        )
+    return min(
+        time.monotonic() + _FAILURE_REAP_SECONDS,
+        float(cleanup_ceiling),
+    )
+
+
+def _attempt_phase_seal_transition(
+    _platform: str, _stage: str, _position: str, _phase: str
+) -> None:
+    return None
+
+
+class LinuxCompilerAuditAttemptAccountant:
+    """Account inspection and task phases in one delegated native cgroup run."""
+
+    def __init__(self, rendezvous_client) -> None:
+        required = (
+            "coordinator_accounting_paths", "create_leaf",
+            "acknowledge_leaf", "release_leaf",
+        )
+        if not all(callable(getattr(rendezvous_client, name, None))
+                   for name in required):
+            raise AuditInfrastructureError(
+                "Linux attempt accountant authority is incomplete")
+        coordinator, run, service_root = (
+            rendezvous_client.coordinator_accounting_paths())
+        if not all(isinstance(path, Path) for path in (
+                coordinator, run, service_root)):
+            raise AuditInfrastructureError(
+                "Linux attempt accountant cgroup authority is invalid")
+        self._client = rendezvous_client
+        self._coordinator = coordinator
+        self._run = run
+        self._service_root = service_root
+        self._baseline_run = self._read_events(run / "memory.events")
+        self._baseline_service = self._read_events(
+            service_root / "memory.events")
+        self.inspection_probe_invocations = 0
+        self._phase: str | None = None
+        self._sealed: set[str] = set()
+        self._sealed_snapshots: dict[str, LinuxPhaseSnapshot] = {}
+        self._active_carriers: dict[ProcessStartIdentity, object] = {}
+        self._pending_inspection: tuple[str, object] | None = None
+
+    @staticmethod
+    def _read_events(path: Path) -> dict[str, int]:
+        return _LinuxGenerationLifecycle._read_events(path)
+
+    @staticmethod
+    def _read_integer(path: Path) -> int:
+        return _LinuxGenerationLifecycle._read_integer(path)
+
+    def hello(self, deadline: float) -> None:
+        hello = getattr(self._client, "hello", None)
+        if not callable(hello):
+            raise AuditInfrastructureError(
+                "Linux rendezvous hello authority is unavailable")
+        hello(deadline)
+
+    def create_leaf(self, worker_index: int, generation: int, deadline: float):
+        return self._client.create_leaf(worker_index, generation, deadline)
+
+    def acknowledge_leaf(self, worker_index: int, generation: int,
+                         worker_pid: int, carrier, deadline: float) -> None:
+        self._client.acknowledge_leaf(
+            worker_index, generation, worker_pid, carrier, deadline)
+
+    def release_leaf(self, worker_index: int, generation: int,
+                     deadline: float) -> None:
+        self._client.release_leaf(worker_index, generation, deadline)
+
+    def begin_phase(self, phase: str, deadline: float) -> None:
+        expected = "inspection" if self._phase is None else "tasks"
+        if (
+            phase != expected
+            or phase in self._sealed
+            or phase in self._sealed_snapshots
+            or not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or time.monotonic() >= deadline
+            or (phase == "tasks" and "inspection" not in self._sealed)
+        ):
+            raise AuditInfrastructureError(
+                "Linux attempt accountant phase is invalid")
+        self._phase = phase
+
+    def prepare_compiler_inspection_launch(self, capability,
+                                           deadline: float) -> str:
+        if (
+            self._phase != "inspection"
+            or self._pending_inspection is not None
+            or time.monotonic() >= deadline
+        ):
+            raise AuditInfrastructureError(
+                "Linux inspection launch preparation is invalid")
+        token = secrets.token_hex(16)
+        self._pending_inspection = (token, capability)
+        return token
+
+    def register_compiler_process_launch(self, event, carrier) -> None:
+        if (
+            self._phase != "inspection"
+            or event.purpose is not CompilerLaunchPurpose.INSPECTION
+            or event.process_start in self._active_carriers
+            or self._pending_inspection is None
+        ):
+            raise AuditInfrastructureError(
+                "Linux inspection launch registration is invalid")
+        self._active_carriers[event.process_start] = carrier
+        self.inspection_probe_invocations += 1
+
+    def complete_compiler_process_launch(self, event, carrier) -> None:
+        if self._active_carriers.pop(event.process_start, None) is not carrier:
+            raise AuditInfrastructureError(
+                "Linux inspection process carrier differs")
+
+    def fail_compiler_process_launch(self, event, carrier) -> None:
+        if self._active_carriers.get(event.process_start) is carrier:
+            self._active_carriers.pop(event.process_start)
+
+    def finish_compiler_inspection_launch_preparation(self, token: str) -> None:
+        if (self._pending_inspection is None
+                or self._pending_inspection[0] != token):
+            raise AuditInfrastructureError(
+                "Linux inspection launch preparation differs")
+        self._pending_inspection = None
+
+    def cancel_compiler_inspection_launch_preparation(self, token: str) -> None:
+        if (self._pending_inspection is not None
+                and self._pending_inspection[0] == token):
+            self._pending_inspection = None
+
+    def _surviving_pids(self) -> set[int]:
+        pids: set[int] = set()
+        try:
+            for path in self._run.rglob("cgroup.procs"):
+                pids.update(int(value) for value in path.read_text(
+                    encoding="ascii").split())
+        except (OSError, ValueError) as error:
+            raise AuditInfrastructureError(
+                "Linux attempt cgroup membership is unavailable") from error
+        pids.discard(os.getpid())
+        return pids
+
+    def memory_measurements(self) -> LinuxRunMemoryMeasurements:
+        run = self._read_events(self._run / "memory.events")
+        service = self._read_events(self._service_root / "memory.events")
+
+        def delta(current, baseline, name):
+            value = current[name] - baseline[name]
+            if value < 0:
+                raise AuditInfrastructureError(
+                    "Linux attempt cgroup event counter regressed")
+            return value
+
+        survivors = len(self._surviving_pids())
+        values = LinuxRunMemoryMeasurements(
+            self._read_integer(self._run / "memory.current"),
+            self._read_integer(self._run / "memory.peak"),
+            self._read_integer(self._run / "memory.max"),
+            self._read_integer(self._run / "memory.high"),
+            delta(run, self._baseline_run, "oom"),
+            delta(run, self._baseline_run, "oom_kill"),
+            delta(run, self._baseline_run, "max"),
+            delta(service, self._baseline_service, "oom"),
+            delta(service, self._baseline_service, "oom_kill"),
+            delta(service, self._baseline_service, "max"),
+            survivors,
+            survivors == 0,
+        )
+        if any((
+            values.cgroup_oom_count_delta,
+            values.cgroup_oom_kill_count_delta,
+            values.cgroup_max_event_count_delta,
+            values.service_root_oom_count_delta,
+            values.service_root_oom_kill_count_delta,
+            values.service_root_max_event_count_delta,
+        )):
+            raise AuditInfrastructureError(
+                "Linux attempt cgroup memory event increased")
+        return values
+
+    def seal_phase(self, phase: str, deadline: float):
+        existing = self._sealed_snapshots.get(phase)
+        if existing is None:
+            if (
+                phase != self._phase
+                or phase in self._sealed
+                or self._active_carriers
+                or self._pending_inspection is not None
+                or time.monotonic() >= deadline
+            ):
+                raise AuditInfrastructureError(
+                    "Linux attempt accountant phase seal is invalid")
+            memory = self.memory_measurements()
+            if not memory.accounting_complete:
+                raise AuditInfrastructureError(
+                    "Linux attempt accountant phase has survivors")
+            existing = LinuxPhaseSnapshot("linux", phase, memory, 0)
+            _attempt_phase_seal_transition(
+                "linux", "snapshot", "before", phase
+            )
+            self._sealed_snapshots[phase] = existing
+            _attempt_phase_seal_transition(
+                "linux", "snapshot", "after", phase
+            )
+        if phase not in self._sealed:
+            _attempt_phase_seal_transition(
+                "linux", "sealed", "before", phase
+            )
+            self._sealed.add(phase)
+            _attempt_phase_seal_transition(
+                "linux", "sealed", "after", phase
+            )
+        return existing
+
+    def seal_phase_from_lifecycle_snapshot(
+        self,
+        phase: str,
+        deadline: float,
+        lifecycle_snapshot: LinuxPhaseSnapshot,
+    ) -> LinuxPhaseSnapshot:
+        existing = self._sealed_snapshots.get(phase)
+        if existing is not None:
+            if (
+                type(lifecycle_snapshot) is not LinuxPhaseSnapshot
+                or existing.memory != lifecycle_snapshot.memory
+            ):
+                raise AuditInfrastructureError(
+                    "Linux lifecycle task phase snapshot differs"
+                )
+            if phase not in self._sealed:
+                _attempt_phase_seal_transition(
+                    "linux", "sealed", "before", phase
+                )
+                self._sealed.add(phase)
+                _attempt_phase_seal_transition(
+                    "linux", "sealed", "after", phase
+                )
+            return existing
+        if (
+            phase != "tasks"
+            or phase != self._phase
+            or phase in self._sealed
+            or self._active_carriers
+            or self._pending_inspection is not None
+            or time.monotonic() >= deadline
+            or type(lifecycle_snapshot) is not LinuxPhaseSnapshot
+            or lifecycle_snapshot.platform_kind != "linux"
+            or lifecycle_snapshot.phase != phase
+            or type(lifecycle_snapshot.memory)
+            is not LinuxRunMemoryMeasurements
+            or not lifecycle_snapshot.memory.accounting_complete
+            or lifecycle_snapshot.memory.surviving_cgroup_process_count != 0
+        ):
+            raise AuditInfrastructureError(
+                "Linux lifecycle task phase snapshot differs"
+            )
+        if self._surviving_pids():
+            raise AuditInfrastructureError(
+                "Linux attempt accountant phase has survivors"
+            )
+        existing = LinuxPhaseSnapshot(
+            "linux", phase, lifecycle_snapshot.memory, 0
+        )
+        _attempt_phase_seal_transition(
+            "linux", "snapshot", "before", phase
+        )
+        self._sealed_snapshots[phase] = existing
+        _attempt_phase_seal_transition(
+            "linux", "snapshot", "after", phase
+        )
+        _attempt_phase_seal_transition(
+            "linux", "sealed", "before", phase
+        )
+        self._sealed.add(phase)
+        _attempt_phase_seal_transition(
+            "linux", "sealed", "after", phase
+        )
+        return existing
+
+
+def _is_unix_attempt_accountant(run_accountant) -> bool:
+    from gpu_capability_process_tree import MacOSCompilerAuditAttemptAccountant
+
+    return isinstance(
+        run_accountant,
+        (LinuxCompilerAuditAttemptAccountant, MacOSCompilerAuditAttemptAccountant),
+    )
+
+
+def _is_windows_native_accountant(run_accountant) -> bool:
+    from gpu_capability_process_tree import WindowsNativeRunAccountant
+
+    return isinstance(run_accountant, WindowsNativeRunAccountant)
+
+
+def _seal_windows_accountant_phase(
+    run_accountant,
+    phase: str,
+    deadline: float,
+    archived_generation_identities: tuple[tuple[int, int], ...],
+) -> WindowsPhaseSnapshot:
+    from gpu_capability_process_tree import WindowsJobAccountingSnapshot
+
+    if not _is_windows_native_accountant(run_accountant):
+        raise AuditInfrastructureError("Windows run accountant differs")
+    archived_generation_identities = _canonical_generation_identities(
+        archived_generation_identities
+    )
+    journals = getattr(run_accountant, "_phase_finalization_journals", None)
+    if journals is None:
+        journals = {}
+        run_accountant._phase_finalization_journals = journals
+    journal = journals.setdefault(phase, {})
+    if journal.get("expected_identities") not in {
+        None, archived_generation_identities
+    }:
+        raise AuditInfrastructureError(
+            f"Windows {phase} phase generation identities differ"
+        )
+    journal["expected_identities"] = archived_generation_identities
+    if not journal.get("native_sealed", False):
+        run_accountant.seal_phase(deadline, _current_process_rss_bytes())
+        journal["native_sealed"] = True
+    if "raw_snapshot" not in journal:
+        captured = run_accountant.snapshot()
+        if type(captured) is not WindowsJobAccountingSnapshot:
+            raise AuditInfrastructureError(
+                "Windows phase accounting snapshot differs"
+            )
+        journal["raw_snapshot"] = captured
+    captured = journal["raw_snapshot"]
+    if "memory" not in journal:
+        memory = captured.memory_measurements()
+        if type(memory) is not WindowsRunMemoryMeasurements:
+            raise AuditInfrastructureError(
+                "Windows phase memory accounting differs"
+            )
+        if (
+            not memory.accounting_complete
+            or memory.surviving_job_process_count != 0
+        ):
+            raise AuditInfrastructureError(
+                f"Windows {phase} phase survivors remain"
+            )
+        _validate_windows_phase_generation_identities(
+            captured.archived_generation_identities,
+            archived_generation_identities,
+            phase,
+        )
+        journal["memory"] = memory
+    if "typed_snapshot" not in journal:
+        journal["typed_snapshot"] = _construct_task_phase_snapshot(
+            "windows",
+            phase,
+            journal["memory"],
+            archived_generation_identities,
+        )
+    return journal["typed_snapshot"]
+
+
+def _canonical_generation_identities(
+    identities,
+) -> tuple[tuple[int, int], ...]:
+    if (
+        not isinstance(identities, tuple)
+        or any(
+            not isinstance(identity, tuple)
+            or len(identity) != 2
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in identity
+            )
+            for identity in identities
+        )
+        or identities != tuple(sorted(set(identities)))
+    ):
+        raise AuditInfrastructureError(
+            "archived generation identities are not canonical"
+        )
+    return identities
+
+
+def _canonical_archived_generation_identities(
+    archived_generations,
+) -> tuple[tuple[int, int], ...]:
+    identities = tuple(sorted(
+        (worker_index, generation)
+        for worker_index, generation, _resident in archived_generations
+    ))
+    return _canonical_generation_identities(identities)
+
+
+def _validate_windows_phase_generation_identities(
+    actual, expected, phase: str
+) -> None:
+    actual = _canonical_generation_identities(actual)
+    expected = _canonical_generation_identities(expected)
+    if (
+        phase not in {"inspection", "tasks"}
+        or (phase == "inspection" and (actual or expected))
+        or (phase == "tasks" and actual != expected)
+    ):
+        raise AuditInfrastructureError(
+            f"Windows {phase} phase generation identities differ"
+        )
+
+
+def _construct_task_phase_snapshot(
+    platform_kind: str, phase: str, memory, archived_generations
+):
+    if platform_kind == "windows" and type(
+        memory
+    ) is WindowsRunMemoryMeasurements:
+        return WindowsPhaseSnapshot(
+            "windows",
+            phase,
+            memory,
+            _canonical_generation_identities(archived_generations),
+        )
+    if platform_kind == "linux" and type(
+        memory
+    ) is LinuxRunMemoryMeasurements:
+        return LinuxPhaseSnapshot(
+            "linux", phase, memory, archived_generations
+        )
+    if platform_kind == "macos" and type(
+        memory
+    ) is MacOSRunMemoryMeasurements:
+        return MacOSPhaseSnapshot(
+            "macos", phase, memory, archived_generations
+        )
+    raise AuditInfrastructureError("native phase memory backend differs")
 
 
 def _phase_snapshot(
     memory, platform_kind: str, phase: str, archived_generation_count: int
 ):
-    if platform_kind == "windows" and isinstance(
-        memory, WindowsRunMemoryMeasurements
-    ):
-        return WindowsPhaseSnapshot(
-            "windows", phase, memory, archived_generation_count
-        )
-    if platform_kind == "linux" and isinstance(memory, LinuxRunMemoryMeasurements):
+    if platform_kind == "linux" and type(memory) is LinuxRunMemoryMeasurements:
         return LinuxPhaseSnapshot(
             "linux", phase, memory, archived_generation_count
         )
-    if platform_kind == "macos" and isinstance(memory, MacOSRunMemoryMeasurements):
+    if platform_kind == "macos" and type(memory) is MacOSRunMemoryMeasurements:
         return MacOSPhaseSnapshot(
             "macos", phase, memory, archived_generation_count
         )
@@ -9389,19 +10832,106 @@ def _accountant_memory(run_accountant):
     raise AuditInfrastructureError("run accountant memory is unavailable")
 
 
+def _validated_unix_phase_snapshot_memory(
+    snapshot, platform_kind: str, phase: str, archived_generation_count
+):
+    if platform_kind == "linux":
+        snapshot_type = LinuxPhaseSnapshot
+        memory_type = LinuxRunMemoryMeasurements
+    elif platform_kind == "macos":
+        snapshot_type = MacOSPhaseSnapshot
+        memory_type = MacOSRunMemoryMeasurements
+    else:
+        raise AuditInfrastructureError("Unix phase snapshot differs")
+    count = getattr(snapshot, "archived_generation_count", None)
+    if (
+        type(snapshot) is not snapshot_type
+        or snapshot.platform_kind != platform_kind
+        or snapshot.phase != phase
+        or type(snapshot.memory) is not memory_type
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+        or (
+            archived_generation_count is not None
+            and count != archived_generation_count
+        )
+    ):
+        raise AuditInfrastructureError("Unix phase snapshot differs")
+    memory = snapshot.memory
+    if type(memory) is LinuxRunMemoryMeasurements:
+        complete = (
+            memory.accounting_complete
+            and memory.surviving_cgroup_process_count == 0
+        )
+    else:
+        complete = (
+            memory.accounting_complete
+            and memory.surviving_registered_process_count == 0
+            and memory.known_unreconciled_descendant_count == 0
+        )
+    if not complete:
+        raise AuditInfrastructureError("Unix phase snapshot survivors remain")
+    return memory
+
+
+def _final_memory_from_sealed_phases(
+    inspection_phase, task_phase, platform_kind: str
+):
+    if platform_kind in {"linux", "macos"}:
+        _validated_unix_phase_snapshot_memory(
+            inspection_phase, platform_kind, "inspection", 0
+        )
+        return _validated_unix_phase_snapshot_memory(
+            task_phase, platform_kind, "tasks", None
+        )
+    if platform_kind == "windows":
+        if (
+            type(inspection_phase) is not WindowsPhaseSnapshot
+            or inspection_phase.platform_kind != "windows"
+            or inspection_phase.phase != "inspection"
+            or inspection_phase.archived_generation_identities
+            or type(task_phase) is not WindowsPhaseSnapshot
+            or task_phase.platform_kind != "windows"
+            or task_phase.phase != "tasks"
+            or type(task_phase.memory) is not WindowsRunMemoryMeasurements
+        ):
+            raise AuditInfrastructureError("Windows phase snapshot differs")
+        return task_phase.memory
+    raise AuditInfrastructureError("native phase snapshot differs")
+
+
 def _seal_accountant_phase(
     run_accountant, phase: str, pipeline_deadline: float, platform_kind: str
 ):
-    seal = getattr(run_accountant, "seal_phase", None)
-    if callable(seal):
-        try:
-            result = seal(phase, pipeline_deadline)
-        except TypeError:
-            result = seal(pipeline_deadline, _current_process_rss_bytes())
-        if isinstance(
-            result, (WindowsPhaseSnapshot, LinuxPhaseSnapshot, MacOSPhaseSnapshot)
-        ):
-            return result
+    if platform_kind == "windows" and _is_windows_native_accountant(
+        run_accountant
+    ):
+        return _seal_windows_accountant_phase(
+            run_accountant, phase, pipeline_deadline, ()
+        )
+    if platform_kind == "windows":
+        return _construct_task_phase_snapshot(
+            "windows",
+            phase,
+            _accountant_memory(run_accountant),
+            (),
+        )
+    if _is_unix_attempt_accountant(run_accountant):
+        result = run_accountant.seal_phase(phase, pipeline_deadline)
+        expected_platform = (
+            "linux"
+            if isinstance(
+                run_accountant, LinuxCompilerAuditAttemptAccountant
+            )
+            else "macos"
+        )
+        if platform_kind != expected_platform:
+            raise AuditInfrastructureError("Unix phase snapshot differs")
+        _validated_unix_phase_snapshot_memory(
+            result, platform_kind, phase, 0
+        )
+        return result
     return _phase_snapshot(
         _accountant_memory(run_accountant), platform_kind, phase, 0
     )
@@ -9410,6 +10940,26 @@ def _seal_accountant_phase(
 def _begin_accountant_phase(
     run_accountant, phase: str, deadline: float, platform_kind: str
 ) -> None:
+    if platform_kind == "windows" and _is_windows_native_accountant(
+        run_accountant
+    ):
+        if (
+            phase not in {"inspection", "tasks"}
+            or not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or time.monotonic() >= deadline
+        ):
+            raise AuditInfrastructureError(
+                "Windows run accountant phase is invalid"
+            )
+        if phase == "inspection":
+            _construct_task_phase_snapshot(
+                "windows",
+                phase,
+                _accountant_memory(run_accountant),
+                (),
+            )
+        return
     begin = getattr(run_accountant, "begin_phase", None)
     if not callable(begin):
         raise AuditInfrastructureError(
@@ -9417,9 +10967,13 @@ def _begin_accountant_phase(
         )
     begin(phase, deadline)
     if phase == "inspection":
-        _phase_snapshot(
-            _accountant_memory(run_accountant), platform_kind, phase, 0
-        )
+        memory = _accountant_memory(run_accountant)
+        if platform_kind == "windows":
+            _construct_task_phase_snapshot(
+                "windows", phase, memory, ()
+            )
+        else:
+            _phase_snapshot(memory, platform_kind, phase, 0)
 
 
 class _BoundedPolicyWorkspace:
@@ -10010,6 +11564,92 @@ def run_compiler_audit_pipeline(
 ) -> CompilerAuditRun:
     """Run the production audit without exposing full views or compact results."""
 
+    return _run_compiler_audit_pipeline_core(
+        source_root,
+        compile_commands,
+        launcher_environment,
+        dependency_roots,
+        capability_registry,
+        cache,
+        inspection_cache,
+        limits,
+        mode,
+        decision_path,
+        operation_deadline,
+        run_accountant,
+        evidence_suballocator,
+        expected_audit_engine_fingerprint,
+        smoke_runtime_contract=None,
+        cleanup_deadline=None,
+    )
+
+
+def run_compiler_audit_smoke_pipeline(
+    source_root: Path,
+    compile_commands: tuple[Path, ...],
+    launcher_environment: Mapping[str, str],
+    dependency_roots: DependencyRootAuthority,
+    capability_registry,
+    cache,
+    inspection_cache,
+    limits: AuditLimits,
+    runtime_contract: WorkerRuntimeContract,
+    operation_deadline: float,
+    cleanup_deadline: float,
+    run_accountant,
+    expected_audit_engine_fingerprint: str | None = None,
+) -> CompilerAuditRun:
+    """Run one native configuration without decision or evidence authority."""
+
+    if (
+        not isinstance(runtime_contract, WorkerRuntimeContract)
+        or runtime_contract.workers != 1
+        or runtime_contract.maximum_tasks_per_worker != 1
+        or time.monotonic() >= runtime_contract.pipeline_deadline
+    ):
+        raise AuditInfrastructureError(
+            "compiler audit smoke runtime contract is invalid")
+    return _run_compiler_audit_pipeline_core(
+        source_root,
+        compile_commands,
+        launcher_environment,
+        dependency_roots,
+        capability_registry,
+        cache,
+        inspection_cache,
+        limits,
+        "cold",
+        None,
+        operation_deadline,
+        run_accountant,
+        None,
+        expected_audit_engine_fingerprint,
+        smoke_runtime_contract=runtime_contract,
+        cleanup_deadline=cleanup_deadline,
+    )
+
+
+def _run_compiler_audit_pipeline_core(
+    source_root: Path,
+    compile_commands: tuple[Path, ...],
+    launcher_environment: Mapping[str, str],
+    dependency_roots: DependencyRootAuthority,
+    capability_registry,
+    cache,
+    inspection_cache,
+    limits: AuditLimits,
+    mode: str,
+    decision_path: Path | None,
+    operation_deadline: float,
+    run_accountant,
+    evidence_suballocator,
+    expected_audit_engine_fingerprint: str | None,
+    *,
+    smoke_runtime_contract: WorkerRuntimeContract | None,
+    cleanup_deadline: float | None,
+) -> CompilerAuditRun:
+    """Shared production orchestration with one explicit authority source."""
+
     pipeline_started_at = time.monotonic()
 
     from gpu_capability_calibration import (
@@ -10026,8 +11666,13 @@ def run_compiler_audit_pipeline(
     )
     from gpu_capability_source_audit import _attest_loaded_audit_engine
 
+    smoke_only = smoke_runtime_contract is not None
     if (
         mode not in {"cold", "warm", "audit"}
+        or (smoke_only and mode != "cold")
+        or (smoke_only and decision_path is not None)
+        or (smoke_only and evidence_suballocator is not None)
+        or (not smoke_only and not isinstance(decision_path, Path))
         or not isinstance(limits, AuditLimits)
         or not isinstance(limits.total_seconds, (int, float))
         or isinstance(limits.total_seconds, bool)
@@ -10044,11 +11689,28 @@ def run_compiler_audit_pipeline(
     effective_deadline = min(
         operation_deadline, pipeline_started_at + total_seconds
     )
+    cleanup_ceiling = (
+        effective_deadline if cleanup_deadline is None else cleanup_deadline
+    )
+    if (
+        not isinstance(cleanup_ceiling, (int, float))
+        or isinstance(cleanup_ceiling, bool)
+        or not math.isfinite(float(cleanup_ceiling))
+        or cleanup_ceiling < effective_deadline
+        or (not smoke_only and cleanup_ceiling != effective_deadline)
+    ):
+        raise AuditInfrastructureError(
+            "compiler audit cleanup deadline is invalid"
+        )
+    cleanup_ceiling = float(cleanup_ceiling)
     if time.monotonic() >= effective_deadline:
         raise AuditInfrastructureError("pipeline deadline expired")
     _validate_pipeline_cache_authorities(cache, inspection_cache)
     engine = _attest_loaded_audit_engine(expected_audit_engine_fingerprint)
     platform_kind = canonical_platform_kind(sys.platform)
+    if smoke_only and platform_kind not in {"linux", "macos"}:
+        raise AuditInfrastructureError(
+            "compiler audit smoke requires Linux or macOS")
     _begin_accountant_phase(
         run_accountant, "inspection", effective_deadline, platform_kind
     )
@@ -10065,20 +11727,24 @@ def run_compiler_audit_pipeline(
     summary_reservation = None
     summary_committed = False
     try:
-        uninspected = bounded_uninspected_configuration_digest(
-            source_root,
-            compile_commands,
-            launcher_environment,
-            dependency_roots,
-            effective_deadline,
-        )
-        prevalidated = prevalidate_platform_worker_decision(
-            decision_path,
-            platform_kind,
-            engine,
-            uninspected,
-            effective_deadline,
-        )
+        if smoke_only:
+            uninspected = None
+            prevalidated = None
+        else:
+            uninspected = bounded_uninspected_configuration_digest(
+                source_root,
+                compile_commands,
+                launcher_environment,
+                dependency_roots,
+                effective_deadline,
+            )
+            prevalidated = prevalidate_platform_worker_decision(
+                decision_path,
+                platform_kind,
+                engine,
+                uninspected,
+                effective_deadline,
+            )
         _production_allocation_event("collect")
         collection = collect_configurations_with_decision_records(
             source_root,
@@ -10106,6 +11772,9 @@ def run_compiler_audit_pipeline(
         ordered = _validated_orchestration_inputs(
             collection.configurations, production_table, cache, limits
         )
+        if smoke_only and len(ordered) != 1:
+            raise AuditInfrastructureError(
+                "compiler audit smoke requires exactly one configuration")
         active, configured_sources = compute_active_sources(
             ordered, production_table
         )
@@ -10117,36 +11786,49 @@ def run_compiler_audit_pipeline(
                     path.as_posix() for path in sorted(missing_commands)
                 )
             )
-        configuration_digest = configuration_set_digest(
-            ordered, collection.decision_records, dependency_roots
-        )
-        compiler_digests = {
-            record.compiler_digest for record in collection.decision_records.values()
-        }
-        if len(compiler_digests) != 1:
-            raise AuditInfrastructureError(
-                "configuration decision compilers differ"
+        if smoke_only:
+            runtime_contract = WorkerRuntimeContract(
+                smoke_runtime_contract.workers,
+                smoke_runtime_contract.maximum_tasks_per_worker,
+                smoke_runtime_contract.recycle_rss_bytes,
+                min(smoke_runtime_contract.pipeline_deadline,
+                    effective_deadline),
             )
-        envelope = {
-            "windows": windows_calibration_envelope,
-            "linux": linux_calibration_envelope,
-            "macos": macos_calibration_envelope,
-        }[platform_kind]()
-        expected_key = platform_worker_decision_key(
-            platform_kind,
-            next(iter(compiler_digests)),
-            configuration_digest,
-            uninspected,
-            engine,
-            effective_worker_capacity(limits),
-            envelope,
-        )
-        decision = finalize_platform_worker_decision(
-            prevalidated, expected_key, effective_deadline
-        )
-        runtime_contract = runtime_contract_from_platform_decision(
-            decision, effective_deadline
-        )
+            if time.monotonic() >= runtime_contract.pipeline_deadline:
+                raise AuditInfrastructureError(
+                    "compiler audit smoke deadline expired")
+        else:
+            configuration_digest = configuration_set_digest(
+                ordered, collection.decision_records, dependency_roots
+            )
+            compiler_digests = {
+                record.compiler_digest
+                for record in collection.decision_records.values()
+            }
+            if len(compiler_digests) != 1:
+                raise AuditInfrastructureError(
+                    "configuration decision compilers differ"
+                )
+            envelope = {
+                "windows": windows_calibration_envelope,
+                "linux": linux_calibration_envelope,
+                "macos": macos_calibration_envelope,
+            }[platform_kind]()
+            expected_key = platform_worker_decision_key(
+                platform_kind,
+                next(iter(compiler_digests)),
+                configuration_digest,
+                uninspected,
+                engine,
+                effective_worker_capacity(limits),
+                envelope,
+            )
+            decision = finalize_platform_worker_decision(
+                prevalidated, expected_key, effective_deadline
+            )
+            runtime_contract = runtime_contract_from_platform_decision(
+                decision, effective_deadline
+            )
         _production_allocation_event("snapshot")
         with snapshot_production_sources(
             production_table,
@@ -10173,6 +11855,7 @@ def run_compiler_audit_pipeline(
                 ),
                 run_accountant=run_accountant,
                 compact_observer=compact_observer,
+                cleanup_deadline=cleanup_ceiling,
             )
             aggregate = session_needing_abort.consume_aggregate()
             if (
@@ -10216,26 +11899,31 @@ def run_compiler_audit_pipeline(
             )
             source_text.close()
             source_text = None
-            reserve_summary = getattr(evidence_suballocator, "reserve_summary", None)
-            commit_summary = getattr(evidence_suballocator, "commit_summary", None)
-            if not callable(reserve_summary) or not callable(commit_summary):
-                raise AuditInfrastructureError(
-                    "evidence summary suballocator is invalid"
+            if not smoke_only:
+                reserve_summary = getattr(
+                    evidence_suballocator, "reserve_summary", None)
+                commit_summary = getattr(
+                    evidence_suballocator, "commit_summary", None)
+                if not callable(reserve_summary) or not callable(commit_summary):
+                    raise AuditInfrastructureError(
+                        "evidence summary suballocator is invalid"
+                    )
+                if getattr(
+                        evidence_suballocator, "maximum_bytes", 524288
+                ) != 524288:
+                    raise AuditInfrastructureError(
+                        "evidence summary suballocator bound differs"
+                    )
+                cancel_summary = getattr(
+                    evidence_suballocator, "cancel_summary", None
                 )
-            if getattr(evidence_suballocator, "maximum_bytes", 524288) != 524288:
-                raise AuditInfrastructureError(
-                    "evidence summary suballocator bound differs"
+                if not callable(cancel_summary):
+                    raise AuditInfrastructureError(
+                        "evidence summary cancellation is invalid"
+                    )
+                summary_reservation = reserve_summary(
+                    len(aggregate.configurations), effective_deadline
                 )
-            cancel_summary = getattr(
-                evidence_suballocator, "cancel_summary", None
-            )
-            if not callable(cancel_summary):
-                raise AuditInfrastructureError(
-                    "evidence summary cancellation is invalid"
-                )
-            summary_reservation = reserve_summary(
-                len(aggregate.configurations), effective_deadline
-            )
             result_budget.prevalidate_aggregate_release(
                 aggregate.budget_ownership
             )
@@ -10243,9 +11931,10 @@ def run_compiler_audit_pipeline(
                 aggregate,
                 summary_builder,
             )
-            commit_summary(summary_reservation, summary)
-            summary_committed = True
-            summary_reservation = None
+            if not smoke_only:
+                commit_summary(summary_reservation, summary)
+                summary_committed = True
+                summary_reservation = None
             summary_builder.release_backing_state()
             summary_builder = None
             result_budget.release_aggregate_after_summary(
@@ -10255,20 +11944,25 @@ def run_compiler_audit_pipeline(
             session_needing_abort.shutdown_reap(effective_deadline)
             completed_session = session_needing_abort
             session_needing_abort = None
+        completed_reactor = getattr(completed_session, "reactor", None)
         task_phase = getattr(
-            getattr(completed_session, "reactor", None),
-            "task_phase_snapshot",
-            None,
+            completed_reactor, "task_phase_snapshot", None
         )
-        if not isinstance(
-            task_phase,
-            (WindowsPhaseSnapshot, LinuxPhaseSnapshot, MacOSPhaseSnapshot),
-        ):
+        if completed_reactor is None:
             task_phase = _seal_accountant_phase(
                 run_accountant, "tasks", effective_deadline, platform_kind
             )
+        elif not isinstance(
+            task_phase,
+            (WindowsPhaseSnapshot, LinuxPhaseSnapshot, MacOSPhaseSnapshot),
+        ):
+            raise AuditInfrastructureError(
+                "scheduled task phase snapshot is unavailable"
+            )
         cache_bytes, cache_entries = cache.measure(effective_deadline)
-        memory = _accountant_memory(run_accountant)
+        memory = _final_memory_from_sealed_phases(
+            inspection_phase, task_phase, platform_kind
+        )
         elapsed = time.monotonic() - pipeline_started_at
         if elapsed >= total_seconds or time.monotonic() >= effective_deadline:
             raise AuditInfrastructureError("pipeline deadline expired")
@@ -10365,7 +12059,7 @@ def run_compiler_audit_pipeline(
         if session_needing_abort is not None:
             try:
                 session_needing_abort.abort_and_reap(
-                    emergency_cleanup_deadline()
+                    emergency_cleanup_deadline(cleanup_ceiling)
                 )
             except BaseException as cleanup_error:
                 primary_error.add_note(

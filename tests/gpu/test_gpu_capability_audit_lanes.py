@@ -4,6 +4,7 @@ import contextlib
 import io
 import inspect
 import os
+import re
 import shutil
 import subprocess
 import struct
@@ -98,14 +99,14 @@ def _reference_audit_pipeline_streaming(sources, compact_results):
 
 
 class AuditEngineFingerprintTests(unittest.TestCase):
-    def test_task7_stage_and_module_roots_are_exact(self):
+    def test_task9_stage_and_module_roots_are_exact(self):
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_GRAPH_SCHEMA_BYTES,
-            b"olr-gpu-capability-live-graph-v7",
+            b"olr-gpu-capability-live-graph-v8",
         )
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-8-stream-findings-coverage",
+            b"task-9-compiled-provenance-scanner",
         )
         self.assertEqual(
             tuple(module.__name__ for module in capability_audit._AUDIT_ENGINE_TARGET_MODULES),
@@ -557,7 +558,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
         self.assertFalse(hasattr(capability_runner, "preprocess_all"))
         self.assertEqual(
             capability_audit.AUDIT_ENGINE_STAGE_BYTES,
-            b"task-8-stream-findings-coverage",
+            b"task-9-compiled-provenance-scanner",
         )
 
     def test_task8_pipeline_measures_cache_before_memory_under_effective_deadline(self):
@@ -568,7 +569,7 @@ class AuditEngineFingerprintTests(unittest.TestCase):
         function = source[source.index("def run_compiler_audit_pipeline("):]
         self.assertLess(
             function.index("cache.measure(effective_deadline)"),
-            function.index("_accountant_memory(run_accountant)"),
+            function.index("_final_memory_from_sealed_phases("),
         )
         self.assertIn(
             "effective_deadline = min(\n"
@@ -751,6 +752,54 @@ class AuditEngineFingerprintTests(unittest.TestCase):
             with self.subTest(name=name), mock.patch.object(owner, name, replacement):
                 self.assertNotEqual(capability_audit.audit_engine_fingerprint(), baseline)
 
+    def test_task9_scanner_stage_schema_and_rebindings_invalidate_both_digests(self):
+        self.assertEqual(
+            capability_audit.AUDIT_ENGINE_GRAPH_SCHEMA_BYTES,
+            b"olr-gpu-capability-live-graph-v8",
+        )
+        self.assertEqual(
+            capability_audit.AUDIT_ENGINE_STAGE_BYTES,
+            b"task-9-compiled-provenance-scanner",
+        )
+        scanner = capability_audit._gpu_capability_provenance
+        self.assertIsInstance(scanner._TOKEN_CANDIDATE, re.Pattern)
+        self.assertEqual(
+            scanner._PUNCTUATOR_PATTERN,
+            b"|".join(re.escape(value) for value in scanner._PUNCTUATORS),
+        )
+        self.assertEqual(
+            scanner._PUNCTUATORS,
+            tuple(sorted(scanner._PUNCTUATORS, key=len, reverse=True)),
+        )
+        baseline_audit = capability_audit.audit_engine_fingerprint()
+        baseline_decision = capability_audit.decision_engine_fingerprint(baseline_audit)
+
+        def mutated_scan_line(self, content):
+            return None
+
+        def mutated_budget_poll(self, content):
+            return None
+
+        mutations = (
+            (scanner, "_TOKEN_CANDIDATE", re.compile(rb"(?P<unknown>[^\r\n])")),
+            (scanner, "_PUNCTUATOR_PATTERN", scanner._PUNCTUATOR_PATTERN + rb"|!"),
+            (scanner, "_PUNCTUATORS", tuple(reversed(scanner._PUNCTUATORS))),
+            (scanner.PreprocessedStreamBuilder, "_scan_line", mutated_scan_line),
+            (
+                scanner.PreprocessedStreamBuilder,
+                "_poll_candidate_scan_budget",
+                mutated_budget_poll,
+            ),
+        )
+        for owner, name, replacement in mutations:
+            with self.subTest(name=name), mock.patch.object(owner, name, replacement):
+                mutated_audit = capability_audit.audit_engine_fingerprint()
+                mutated_decision = capability_audit.decision_engine_fingerprint(
+                    mutated_audit
+                )
+                self.assertNotEqual(mutated_audit, baseline_audit)
+                self.assertNotEqual(mutated_decision, baseline_decision)
+
     def test_task1_policy_globals_are_deeply_immutable(self):
         self.assertIsInstance(capability_audit.SOURCE_SUFFIXES, frozenset)
         tables = (
@@ -931,13 +980,13 @@ print(recomputed)
             self.assertEqual(fingerprint(first), fingerprint(second))
             mutated = (second / "gpu_capability_source_audit.py").read_text(encoding="utf-8")
             self.assertIn(
-                'AUDIT_ENGINE_STAGE_BYTES = b"task-8-stream-findings-coverage"',
+                'AUDIT_ENGINE_STAGE_BYTES = b"task-9-compiled-provenance-scanner"',
                 mutated,
             )
             (second / "gpu_capability_source_audit.py").write_text(
                 mutated.replace(
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-8-stream-findings-coverage"',
-                    'AUDIT_ENGINE_STAGE_BYTES = b"task-8-stream-findings-coverage-mutated"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-9-compiled-provenance-scanner"',
+                    'AUDIT_ENGINE_STAGE_BYTES = b"task-9-compiled-provenance-scanner-mutated"',
                     1,
                 ),
                 encoding="utf-8",

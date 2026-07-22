@@ -52,6 +52,401 @@ from gpu_capability_process_tree import (  # noqa: E402
 
 
 class WindowsProcessTreeAccountingTests(unittest.TestCase):
+    def test_unrelated_aggregate_total_increase_is_not_assignment_evidence(self):
+        class AggregateJob:
+            def __init__(_self):
+                _self.calls = 0
+                _self.total = 0
+
+            def accounting_totals(_self):
+                return _self.total, _self.total, 0
+
+            def process_ids(_self):
+                return (99,) if _self.total else ()
+
+            def contains_process_handle(_self, _handle):
+                return False
+
+            def assign_process_handle(_self, _handle):
+                _self.calls += 1
+                _self.total += 1
+                raise RuntimeError("unrelated aggregate increase")
+
+        class GenerationJob:
+            def __init__(_self): _self.calls = 0
+            def accounting_totals(_self): return 0, 0, 0
+            def process_ids(_self): return ()
+            def contains_process_handle(_self, _handle): return False
+            def assign_process_handle(_self, _handle): _self.calls += 1
+
+        aggregate = AggregateJob()
+        generation_job = GenerationJob()
+        accountant = object.__new__(WindowsNativeRunAccountant)
+        accountant.job = aggregate
+        accountant._generation_jobs = {(2, 5): generation_job}
+        accountant._archived_generation_jobs = {}
+        accountant._aggregate_only_generation_jobs = set()
+        accountant._discarded_generation_jobs = set()
+        accountant._aggregate_assignment_intents = {}
+        accountant._generation_assignment_intents = {}
+        accountant._aggregate_assignment_progress = set()
+        accountant._generation_assignment_progress = set()
+        accountant._assigned_generation_jobs = set()
+        accountant._retain = mock.Mock()
+
+        for _attempt in range(2):
+            with self.assertRaisesRegex(
+                RuntimeError, "unrelated aggregate increase"
+            ):
+                accountant.assign_generation_process(
+                    2, 5, 41, 41, "worker:2:5"
+                )
+        self.assertEqual(aggregate.calls, 2)
+        self.assertEqual(generation_job.calls, 0)
+        self.assertEqual(
+            accountant.generation_job_assignment_state(2, 5), "unassigned"
+        )
+
+    def test_generation_job_terminal_transitions_are_retryable_at_every_boundary(self):
+        class Job:
+            def __init__(_self, total):
+                _self.close_calls = 0
+                _self.total = total
+
+            def drain_notifications(_self): return ()
+            def accounting_totals(_self): return _self.total, 0, _self.total
+            def process_ids(_self): return ()
+            def peak_commit_charge_bytes(_self): return 17
+            def close(_self): _self.close_calls += 1
+
+        for kind in ("aggregate-only", "discard", "archive"):
+            for stage in ("close", "terminal", "remove"):
+                for position in ("before", "after"):
+                    with self.subTest(
+                        kind=kind, stage=stage, position=position
+                    ):
+                        key = (2, 5)
+                        job = Job(1 if kind == "archive" else 0)
+                        accountant = object.__new__(WindowsNativeRunAccountant)
+                        accountant._generation_jobs = {key: job}
+                        accountant._archived_generation_jobs = {}
+                        accountant._discarded_generation_jobs = set()
+                        accountant._aggregate_only_generation_jobs = set()
+                        accountant._aggregate_assignment_progress = (
+                            {key} if kind != "discard" else set()
+                        )
+                        accountant._generation_assignment_progress = (
+                            {key} if kind == "archive" else set()
+                        )
+                        accountant._assigned_generation_jobs = (
+                            {key} if kind == "archive" else set()
+                        )
+                        accountant._aggregate_only_job_close_progress = set()
+                        accountant._generation_terminal_close_progress = set()
+                        accountant._pending_generation_archives = {}
+                        faulted = False
+
+                        def inject(actual_kind, actual_stage, actual_position,
+                                   worker, generation):
+                            nonlocal faulted
+                            if (
+                                (actual_kind, actual_stage, actual_position)
+                                == (kind, stage, position)
+                                and (worker, generation) == key
+                                and not faulted
+                            ):
+                                faulted = True
+                                raise RuntimeError(
+                                    f"{kind} {stage} {position} fault"
+                                )
+
+                        def finalize():
+                            if kind == "aggregate-only":
+                                return accountant.finalize_aggregate_only_generation_job(
+                                    *key
+                                )
+                            if kind == "discard":
+                                return accountant.discard_generation_job(*key)
+                            return accountant.archive_generation_job(
+                                *key, time.monotonic() + 1.0
+                            )
+
+                        with mock.patch(
+                            "gpu_capability_process_tree._windows_generation_terminal_transition",
+                            side_effect=inject,
+                            create=True,
+                        ), self.assertRaisesRegex(
+                            RuntimeError, f"{kind} {stage} {position} fault"
+                        ):
+                            finalize()
+
+                        published = (
+                            key in accountant._aggregate_only_generation_jobs
+                            if kind == "aggregate-only"
+                            else key in accountant._discarded_generation_jobs
+                            if kind == "discard"
+                            else key in accountant._archived_generation_jobs
+                        )
+                        if stage == "close":
+                            self.assertFalse(published)
+                        elif stage == "terminal" and position == "before":
+                            self.assertFalse(published)
+                        else:
+                            self.assertTrue(published)
+                        if stage == "remove" and position == "after":
+                            self.assertNotIn(key, accountant._generation_jobs)
+                        else:
+                            self.assertIn(key, accountant._generation_jobs)
+                        if published and key in accountant._generation_jobs:
+                            self.assertEqual(
+                                accountant.generation_job_assignment_state(*key),
+                                "generation-assigned"
+                                if kind == "archive"
+                                else "aggregate-only"
+                                if kind == "aggregate-only"
+                                else "unassigned",
+                            )
+
+                        with mock.patch(
+                            "gpu_capability_process_tree._windows_generation_terminal_transition",
+                            side_effect=inject,
+                            create=True,
+                        ):
+                            result = finalize()
+                        self.assertEqual(job.close_calls, 1)
+                        self.assertNotIn(key, accountant._generation_jobs)
+                        if kind == "archive":
+                            self.assertEqual(result, (1, 17))
+
+    def test_aggregate_only_assignment_finalizes_without_losing_identity(self):
+        class Job:
+            def __init__(_self, fail_assignment=False):
+                _self.fail_assignment = fail_assignment
+                _self.calls = 0
+                _self.close_calls = 0
+                _self.total = 0
+                _self.members = set()
+
+            def assign_process_handle(_self, handle):
+                _self.calls += 1
+                if _self.fail_assignment:
+                    raise RuntimeError("generation assignment failed")
+                _self.total = 1
+                _self.members.add(handle)
+
+            def process_ids(_self):
+                return tuple(_self.members)
+
+            def contains_process_handle(_self, handle):
+                return handle in _self.members
+
+            def accounting_totals(_self):
+                return _self.total, len(_self.members), 0
+
+            def drain_notifications(_self):
+                return ()
+
+            def peak_commit_charge_bytes(_self):
+                return 19
+
+            def close(_self):
+                _self.close_calls += 1
+
+        for position in ("before", "after"):
+            with self.subTest(position=position):
+                aggregate = Job()
+                generation_job = Job(fail_assignment=True)
+                accountant = object.__new__(WindowsNativeRunAccountant)
+                accountant.job = aggregate
+                accountant._generation_jobs = {(2, 5): generation_job}
+                accountant._archived_generation_jobs = {}
+                accountant._assigned_generation_jobs = set()
+                accountant._discarded_generation_jobs = set()
+                accountant._aggregate_only_generation_jobs = set()
+                accountant._aggregate_only_job_close_progress = set()
+                accountant._aggregate_assignment_intents = {}
+                accountant._generation_assignment_intents = {}
+                accountant._aggregate_assignment_progress = set()
+                accountant._generation_assignment_progress = set()
+                accountant._retain = mock.Mock()
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "generation assignment failed"
+                ):
+                    accountant.assign_generation_process(
+                        2, 5, 41, 41, "worker:2:5"
+                    )
+                self.assertEqual(
+                    accountant.generation_job_assignment_state(2, 5),
+                    "aggregate-only",
+                )
+                faulted = False
+
+                def fail(worker, generation):
+                    nonlocal faulted
+                    if (worker, generation) == (2, 5) and not faulted:
+                        faulted = True
+                        raise RuntimeError(f"{position} partial finalize")
+
+                before = fail if position == "before" else mock.Mock()
+                after = fail if position == "after" else mock.Mock()
+                with mock.patch(
+                    "gpu_capability_process_tree._aggregate_only_before_finalize",
+                    side_effect=before,
+                    create=True,
+                ), mock.patch(
+                    "gpu_capability_process_tree._aggregate_only_finalize",
+                    side_effect=after,
+                    create=True,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, f"{position} partial finalize"
+                    ):
+                        accountant.finalize_aggregate_only_generation_job(2, 5)
+                    self.assertIn((2, 5), accountant._generation_jobs)
+                    self.assertNotIn(
+                        (2, 5), accountant._aggregate_only_generation_jobs
+                    )
+                    accountant.finalize_aggregate_only_generation_job(2, 5)
+
+                self.assertEqual(generation_job.close_calls, 1)
+                self.assertNotIn((2, 5), accountant._generation_jobs)
+                self.assertIn(
+                    (2, 5), accountant._aggregate_only_generation_jobs
+                )
+
+                aggregate.total = 3
+                aggregate.members.clear()
+                accountant._handles = {41: 1, 42: 2, 43: 3}
+                accountant._purposes = {
+                    41: "worker:2:5",
+                    42: "compiler:2:5:0",
+                    43: "compiler:2:5:1",
+                }
+                accountant._peaks = {41: 10, 42: 20, 43: 30}
+                accountant._parent_peak = 0
+                accountant._simultaneous_peak = 0
+                accountant._complete = True
+                raw = accountant.snapshot()
+                self.assertEqual(
+                    raw.archived_generation_identities, ((2, 5),)
+                )
+                self.assertEqual(raw.job_total_process_count, 3)
+                generation = raw.slots[0].generations[0]
+                self.assertEqual(
+                    generation.worker_root_peak_working_set_bytes, 10
+                )
+                self.assertEqual(
+                    tuple(
+                        item.compiler_descendant_peak_tree_bytes
+                        for item in generation.invocations
+                    ),
+                    (20, 30),
+                )
+
+    def test_generation_assignment_lost_replies_are_key_idempotent(self):
+        class Job:
+            def __init__(_self, fault):
+                _self.fault = fault
+                _self.calls = 0
+                _self.total = 0
+                _self.members = set()
+                _self.closed = False
+
+            def assign_process_handle(_self, handle):
+                _self.calls += 1
+                _self.total = 1
+                _self.members.add(handle)
+                if _self.fault and _self.calls == 1:
+                    raise RuntimeError(f"{_self.fault} reply lost")
+
+            def process_ids(_self):
+                return tuple(_self.members)
+
+            def contains_process_handle(_self, handle):
+                return handle in _self.members
+
+            def accounting_totals(_self):
+                return _self.total, len(_self.members), _self.total - len(_self.members)
+
+            def open_member_handle(_self, pid):
+                self.assertIn(pid, _self.members)
+                return 1000 + pid
+
+            def process_identity(_self, _handle, pid):
+                return OwnedProcessIdentity("windows", pid, f"start-{pid}")
+
+            def process_parent_pid(_self, _handle):
+                return os.getpid()
+
+            def close_process_handle(_self, _handle):
+                return None
+
+            def drain_notifications(_self):
+                return ()
+
+            def peak_commit_charge_bytes(_self):
+                return 17
+
+            def close(_self):
+                _self.closed = True
+
+        for target in ("aggregate", "generation"):
+            with self.subTest(target=target):
+                aggregate = Job("aggregate" if target == "aggregate" else None)
+                generation_job = Job(
+                    "generation" if target == "generation" else None
+                )
+                accountant = object.__new__(WindowsNativeRunAccountant)
+                accountant.job = aggregate
+                accountant._generation_jobs = {(2, 5): generation_job}
+                accountant._archived_generation_jobs = {}
+                accountant._assigned_generation_jobs = set()
+                accountant._discarded_generation_jobs = set()
+                accountant._aggregate_only_generation_jobs = set()
+                accountant._aggregate_only_job_close_progress = set()
+                accountant._aggregate_assignment_intents = {}
+                accountant._generation_assignment_intents = {}
+                accountant._aggregate_assignment_progress = set()
+                accountant._generation_assignment_progress = set()
+                accountant._generation_terminal_close_progress = set()
+                accountant._pending_generation_archives = {}
+                accountant._handles = {}
+                accountant._identities = {}
+                accountant._purposes = {}
+                accountant._parent_pids = {}
+                accountant._peaks = {}
+                accountant._parent_peak = 0
+                accountant._simultaneous_peak = 0
+                accountant._complete = True
+
+                accountant.assign_generation_process(
+                    2, 5, 41, 41, "worker:2:5"
+                )
+
+                self.assertEqual(aggregate.calls, 1)
+                self.assertEqual(generation_job.calls, 1)
+                self.assertTrue(
+                    accountant.generation_job_assignment_completed(2, 5)
+                )
+                self.assertEqual(
+                    accountant._identities[41],
+                    OwnedProcessIdentity("windows", 41, "start-41"),
+                )
+                self.assertEqual(accountant._purposes[41], "worker:2:5")
+                aggregate.members.clear()
+                generation_job.members.clear()
+                archived = accountant.archive_generation_job(
+                    2, 5, time.monotonic() + 1.0
+                )
+                self.assertEqual(archived, (1, 17))
+                self.assertTrue(generation_job.closed)
+                memory = accountant.snapshot().memory_measurements()
+                self.assertEqual(memory.job_total_process_count, 1)
+                self.assertEqual(memory.retained_process_identity_count, 1)
+                self.assertEqual(memory.surviving_job_process_count, 0)
+                self.assertTrue(memory.accounting_complete)
+
     @unittest.skipUnless(os.name == "nt", "requires native Windows Job objects")
     def test_native_job_retains_membership_and_kills_on_close(self) -> None:
         process = subprocess.Popen((sys.executable, "-c", "import time; time.sleep(30)"))
@@ -92,6 +487,34 @@ class WindowsProcessTreeAccountingTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows Job objects")
+    def test_unassigned_generation_job_discards_without_archive_identity(self):
+        accountant = WindowsNativeRunAccountant(os.getpid())
+        try:
+            accountant.create_generation_job(3, 4)
+            accountant.discard_generation_job(3, 4)
+            accountant.discard_generation_job(3, 4)
+            self.assertEqual(
+                accountant.snapshot().archived_generation_identities, ()
+            )
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "discarded"
+            ):
+                accountant.create_generation_job(3, 4)
+        finally:
+            accountant.close()
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows Job objects")
+    def test_snapshot_preserves_sticky_incomplete_accounting_state(self):
+        accountant = WindowsNativeRunAccountant(os.getpid())
+        try:
+            accountant._complete = False
+            raw = accountant.snapshot()
+            self.assertFalse(raw.accounting_complete)
+            self.assertFalse(raw.memory_measurements().accounting_complete)
+        finally:
+            accountant.close()
 
     @unittest.skipUnless(os.name == "nt", "requires native Windows Job objects")
     def test_native_accountant_retains_short_lived_inspection_peak_and_seals(self) -> None:
@@ -152,6 +575,7 @@ class WindowsProcessTreeAccountingTests(unittest.TestCase):
             retained_process_identity_count=7,
             retained_inspection_process_identity_count=2,
             surviving_job_process_count=0,
+            archived_generation_identities=((0, 0), (0, 1), (1, 0)),
         )
         memory = snapshot.memory_measurements()
         self.assertEqual(memory.inspection_peak_tree_bytes, 80)
@@ -576,6 +1000,150 @@ client.release_leaf(0, 0, deadline)
 
 
 class MacOSRegisteredAccountingTests(unittest.TestCase):
+    def test_successful_group_reconciliation_is_idempotently_receipted(self):
+        leader = OwnedProcessIdentity("macos", 701, "1:2")
+        accountant = MacOSRegisteredPgidAccountant()
+        accountant.register_group(701, leader, "worker:1:2")
+        accountant.register_group(701, leader, "worker:1:2")
+
+        provider = object.__new__(MacOSLibprocProvider)
+        provider.reconcile_survivors = mock.Mock(return_value=())
+        self.assertTrue(accountant.reconcile_group(701, provider))
+        self.assertTrue(accountant.reconcile_group(701, provider))
+        self.assertEqual(provider.reconcile_survivors.call_count, 1)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "intent differs"
+        ):
+            accountant.register_group(701, leader, "worker:1:3")
+
+    def test_registration_lost_reply_is_completed_from_exact_native_effect(self):
+        class LostReplyMembers(dict):
+            faulted = False
+
+            def __setitem__(_self, key, value):
+                super().__setitem__(key, value)
+                if not _self.faulted:
+                    _self.faulted = True
+                    raise RuntimeError("registration reply lost")
+
+        leader = OwnedProcessIdentity("macos", 711, "3:4")
+        accountant = MacOSRegisteredPgidAccountant()
+        accountant._members = LostReplyMembers()
+        with self.assertRaisesRegex(RuntimeError, "registration reply lost"):
+            accountant.register_group(711, leader, "worker:3:4")
+        accountant.register_group(711, leader, "worker:3:4")
+        self.assertEqual(accountant._leaders[711], leader)
+        self.assertEqual(accountant._members[711], (leader,))
+        with self.assertRaisesRegex(AuditInfrastructureError, "intent differs"):
+            accountant.register_group(711, leader, "worker:3:5")
+
+    def test_exec_permit_lost_replies_are_exactly_idempotent(self):
+        class LostReplyMembers(dict):
+            faulted = False
+
+            def __setitem__(_self, key, value):
+                super().__setitem__(key, value)
+                if not _self.faulted:
+                    _self.faulted = True
+                    raise RuntimeError("registration reply lost")
+
+        class LostReplyIssued(set):
+            faulted = False
+
+            def add(_self, value):
+                super().add(value)
+                if not _self.faulted:
+                    _self.faulted = True
+                    raise RuntimeError("permit reply lost")
+
+        identity = FileIdentity(Path("/toolchain/clang"), None, 1, 2, 0, False)
+        cases = (
+            (
+                "compiler",
+                CompilerPgidReported(
+                    0, 1, 2, CompilerLaunchPurpose.AUDIT_ACCEPTED,
+                    721, 721, "5:6", identity, "a" * 64, "b" * 64,
+                ),
+                lambda authority, report: authority.permit_compiler(report),
+            ),
+            (
+                "inspection",
+                MacOSInspectionPgidReported(
+                    "inspection-721", 721, 721, "5:6", identity, "a" * 64,
+                ),
+                lambda authority, report: authority.permit_inspection(report),
+            ),
+        )
+        for kind, report, issue in cases:
+            for boundary in ("registration", "permit"):
+                with self.subTest(kind=kind, boundary=boundary):
+                    accountant = MacOSRegisteredPgidAccountant()
+                    if boundary == "registration":
+                        accountant._members = LostReplyMembers()
+                    authority = MacOSExecPermitAuthority(
+                        accountant,
+                        ("b" * 64,),
+                        identity_verifier=lambda pid, pgid: OwnedProcessIdentity(
+                            "macos", pid, "5:6"
+                        ),
+                        executable_verifier=lambda _identity, _digest: "b" * 64,
+                    )
+                    if boundary == "permit":
+                        authority._issued = LostReplyIssued()
+                    with self.assertRaisesRegex(RuntimeError, "reply lost"):
+                        issue(authority, report)
+                    permit = issue(authority, report)
+                    self.assertEqual(permit.pgid, 721)
+                    self.assertEqual(accountant._leaders[721].pid, 721)
+
+    def test_inspection_adoption_lost_reply_reuses_exact_permit(self):
+        from gpu_capability_process_tree import MacOSCompilerAuditAttemptAccountant
+
+        class LostReplyPgids(set):
+            faulted = False
+
+            def add(_self, value):
+                super().add(value)
+                if not _self.faulted:
+                    _self.faulted = True
+                    raise RuntimeError("inspection adoption reply lost")
+
+        identity = FileIdentity(Path("/toolchain/clang"), None, 1, 2, 0, False)
+        capability = mock.Mock(
+            executable_identity=identity,
+            executable_sha256="a" * 64,
+            capability_digest="b" * 64,
+        )
+        accountant = object.__new__(MacOSCompilerAuditAttemptAccountant)
+        MacOSRegisteredPgidAccountant.__init__(accountant)
+        authority = MacOSExecPermitAuthority(
+            accountant,
+            ("b" * 64,),
+            identity_verifier=lambda pid, _pgid: OwnedProcessIdentity(
+                "macos", pid, "7:8"
+            ),
+            executable_verifier=lambda _identity, _digest: "b" * 64,
+        )
+        provider = object.__new__(MacOSLibprocProvider)
+        provider.observe = mock.Mock()
+        provider.reconcile_survivors = lambda _accountant, _pgid: ()
+        accountant._provider = provider
+        accountant._pending_inspection = (
+            "inspection-731", capability, authority, time.monotonic() + 10.0
+        )
+        accountant._inspection_pgids = LostReplyPgids()
+        process_start = mock.Mock(
+            platform_kind="macos", pid=731, native_start_token="7:8"
+        )
+        with self.assertRaisesRegex(RuntimeError, "adoption reply lost"):
+            accountant.authorize_macos_compiler_exec(process_start)
+        permit = accountant.authorize_macos_compiler_exec(process_start)
+        self.assertEqual(permit.pgid, 731)
+        self.assertEqual(accountant._inspection_pgids, {731})
+        self.assertTrue(accountant.reconcile_group(731, provider))
+        accountant._inspection_pgids.remove(731)
+        self.assertTrue(accountant.memory_measurements().accounting_complete)
+
     @staticmethod
     def reconciliation_provider(
             survivors: tuple[OwnedProcessIdentity, ...]) -> MacOSLibprocProvider:
@@ -617,8 +1185,8 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
             601, 601, "20:30", identity, "a" * 64, "b" * 64)
         self.assertEqual(authority.permit_compiler(report),
                          CompilerExecPermit(0, 0, 1, 601))
-        with self.assertRaisesRegex(AuditInfrastructureError, "reused"):
-            authority.permit_compiler(report)
+        self.assertEqual(authority.permit_compiler(report),
+                         CompilerExecPermit(0, 0, 1, 601))
         untrusted = dataclasses.replace(report, task_id=2,
                                         driver_fingerprint="c" * 64)
         with self.assertRaisesRegex(AuditInfrastructureError, "untrusted"):
@@ -645,6 +1213,50 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
         self.assertEqual(memory.surviving_registered_process_count, 0)
         self.assertEqual(memory.known_unreconciled_descendant_count, 0)
         self.assertTrue(memory.accounting_complete)
+
+    def test_reconciliation_survivors_are_current_and_retryable(self) -> None:
+        accountant = MacOSRegisteredPgidAccountant()
+        leader = OwnedProcessIdentity("macos", 231, "start-leader")
+        first_child = OwnedProcessIdentity("macos", 232, "start-child-1")
+        second_child = OwnedProcessIdentity("macos", 233, "start-child-2")
+        accountant.register_group(231, leader, "worker")
+        provider = MacOSLibprocProvider.__new__(MacOSLibprocProvider)
+        provider.reconcile_survivors = mock.Mock(
+            side_effect=(
+                (first_child, second_child),
+                (second_child,),
+                (),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "survivors"
+        ):
+            accountant.reconcile_group(231, provider)
+        self.assertIn(231, accountant._leaders)
+        self.assertIn(231, accountant._members)
+        blocked = accountant.memory_measurements()
+        self.assertEqual(blocked.known_unreconciled_descendant_count, 2)
+        self.assertEqual(
+            accountant._members[231], (first_child, second_child)
+        )
+        self.assertFalse(blocked.accounting_complete)
+
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "survivors"
+        ):
+            accountant.reconcile_group(231, provider)
+        narrowed = accountant.memory_measurements()
+        self.assertEqual(narrowed.known_unreconciled_descendant_count, 1)
+        self.assertEqual(accountant._members[231], (second_child,))
+
+        self.assertIs(accountant.reconcile_group(231, provider), True)
+        self.assertNotIn(231, accountant._leaders)
+        self.assertNotIn(231, accountant._members)
+        recovered = accountant.memory_measurements()
+        self.assertEqual(recovered.known_unreconciled_descendant_count, 0)
+        self.assertEqual(recovered.surviving_registered_process_count, 0)
+        self.assertTrue(recovered.accounting_complete)
 
     def test_start_identity_change_fails_closed(self) -> None:
         accountant = MacOSRegisteredPgidAccountant()

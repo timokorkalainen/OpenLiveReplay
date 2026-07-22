@@ -1,8 +1,11 @@
 import ast
 import dataclasses
 import gc
+import hashlib
 import json
 import os
+import statistics
+import subprocess
 import sys
 import tempfile
 import threading
@@ -16,6 +19,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_capability_provenance as provenance  # noqa: E402
+import gpu_capability_runner as capability_runner  # noqa: E402
 
 from gpu_capability_model import (  # noqa: E402
     AuditInfrastructureError,
@@ -317,6 +321,41 @@ class ProvenanceTests(unittest.TestCase):
                 with self.assertRaisesRegex(AuditInfrastructureError, "deadline"):
                     builder.feed(token + b"\n")
                 self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_maximal_candidate_scan_polls_cancellation_without_deadline(self):
+        cancelled = threading.Event()
+        builder = PreprocessedStreamBuilder(
+            self.configuration(),
+            self.production,
+            AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+            lambda: 0,
+            cancel_event=cancelled,
+        )
+        cancelled.set()
+        with self.assertRaisesRegex(AuditInfrastructureError, "cancelled"):
+            builder._poll_candidate_scan_budget(
+                b"identifier" * (provenance._TOKEN_BUDGET_POLL_BYTES // 2)
+            )
+
+    def test_maximal_candidates_poll_with_a_distant_deadline(self):
+        cases = (
+            b"identifier" * (provenance._TOKEN_BUDGET_POLL_BYTES // 2),
+            b"1" * (provenance._TOKEN_BUDGET_POLL_BYTES * 4),
+            b'"' + b"x" * (provenance._TOKEN_BUDGET_POLL_BYTES * 4) + b'"',
+        )
+        builder = PreprocessedStreamBuilder(
+            self.configuration(),
+            self.production,
+            AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+            lambda: 0,
+            deadline=time.monotonic() + 60.0,
+        )
+        for token in cases:
+            with self.subTest(prefix=token[:1]), mock.patch.object(
+                PreprocessedStreamBuilder, "_check_budget", autospec=True
+            ) as check:
+                builder._poll_candidate_scan_budget(token)
+                self.assertGreaterEqual(check.call_count, 4)
 
     def test_retained_accounting_uses_incremental_intern_totals(self):
         slots = set(PreprocessedStreamBuilder.__slots__)
@@ -742,6 +781,877 @@ class ProvenanceTests(unittest.TestCase):
         )
         self.assertIn(b'"hello world"', [token.spelling for token in split.tokens])
         self.assertIn(b"+", [token.spelling for token in split.tokens])
+
+
+@dataclasses.dataclass(frozen=True)
+class _ScannerOutcome:
+    value: object | None = None
+    error: Exception | None = None
+
+    @property
+    def succeeded(self):
+        return self.error is None
+
+
+def _frozen_byte_scan(builder, content: bytes) -> None:
+    """Task-8 byte scanner, frozen solely as the Task-9 differential oracle."""
+
+    def identifier_start(byte):
+        return (
+            byte == ord("_")
+            or ord("A") <= byte <= ord("Z")
+            or ord("a") <= byte <= ord("z")
+            or byte >= 0x80
+        )
+
+    def identifier_continue(byte):
+        return identifier_start(byte) or ord("0") <= byte <= ord("9")
+
+    index = 0
+    while index < len(content):
+        byte = content[index]
+        if builder._in_block_comment:
+            close = content.find(b"*/", index)
+            builder._check_budget()
+            if close < 0:
+                return
+            builder._in_block_comment = False
+            index = close + 2
+            continue
+        if byte in b" \t\r\f\v":
+            index += 1
+            continue
+        if content.startswith(b"//", index):
+            return
+        if content.startswith(b"/*", index):
+            builder._in_block_comment = True
+            index += 2
+            continue
+        start = index
+        if identifier_start(byte):
+            index += 1
+            while index < len(content) and identifier_continue(content[index]):
+                index += 1
+        elif ord("0") <= byte <= ord("9") or (
+            byte == ord(".")
+            and index + 1 < len(content)
+            and content[index + 1 : index + 2].isdigit()
+        ):
+            index += 1
+            while index < len(content):
+                current = content[index]
+                if identifier_continue(current) or current in b".'":
+                    index += 1
+                    continue
+                if current in b"+-" and index > start and content[index - 1] in b"eEpP":
+                    index += 1
+                    continue
+                break
+        elif byte in (ord('"'), ord("'")):
+            quote = byte
+            index += 1
+            escaped = False
+            while index < len(content):
+                current = content[index]
+                index += 1
+                if escaped:
+                    escaped = False
+                elif current == ord("\\"):
+                    escaped = True
+                elif current == quote:
+                    break
+            else:
+                raise AuditInfrastructureError(
+                    "compiler output contains an unterminated literal"
+                )
+        else:
+            punctuator = next(
+                (
+                    value
+                    for value in provenance._PUNCTUATORS
+                    if content.startswith(value, index)
+                ),
+                None,
+            )
+            index += len(punctuator) if punctuator is not None else 1
+        builder._append_token(content[start:index])
+
+
+class _FrozenByteScannerBuilder(PreprocessedStreamBuilder):
+    def _tokenize(self, content: bytes) -> None:
+        _frozen_byte_scan(self, content)
+
+    def _scan_line(self, content: bytes) -> None:
+        _frozen_byte_scan(self, content)
+
+
+class _CountingScannerBuilder(PreprocessedStreamBuilder):
+    __slots__ = ("token_count", "token_bytes")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.token_count = 0
+        self.token_bytes = 0
+
+    def _append_token(self, spelling: bytes) -> None:
+        self.token_count += 1
+        self.token_bytes += len(spelling)
+
+
+class _CountingFrozenScannerBuilder(_CountingScannerBuilder):
+    def _tokenize(self, content: bytes) -> None:
+        _frozen_byte_scan(self, content)
+
+    def _scan_line(self, content: bytes) -> None:
+        _frozen_byte_scan(self, content)
+
+
+class _SpellingScannerBuilder(_CountingScannerBuilder):
+    __slots__ = ("spellings",)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spellings = []
+
+    def _append_token(self, spelling: bytes) -> None:
+        super()._append_token(spelling)
+        self.spellings.append(spelling)
+
+
+class _SpellingFrozenScannerBuilder(_SpellingScannerBuilder):
+    def _tokenize(self, content: bytes) -> None:
+        _frozen_byte_scan(self, content)
+
+    def _scan_line(self, content: bytes) -> None:
+        _frozen_byte_scan(self, content)
+
+
+class ProvenanceScannerParityTests(unittest.TestCase):
+    """Exact Task-8 semantics around the Task-9 candidate scanner."""
+
+    def setUp(self):
+        ProvenanceTests.setUp(self)
+
+    identity = ProvenanceTests.identity
+    configuration = ProvenanceTests.configuration
+
+    def _capture(self, builder_type, stream, splits, family, dependencies):
+        try:
+            builder = builder_type(
+                self.configuration(family),
+                self.production,
+                AuditLimits(retained_token_bytes=128 * 1024 * 1024),
+                lambda: 0,
+            )
+            offset = 0
+            for width in splits:
+                builder.feed(stream[offset : offset + width])
+                offset += width
+            builder.feed(stream[offset:])
+            return _ScannerOutcome(value=builder.finalize(dependencies))
+        except Exception as error:  # The oracle compares exact fail-closed surfaces.
+            return _ScannerOutcome(error=error)
+
+    @staticmethod
+    def _compact_columns(view):
+        return (
+            view.configuration.digest,
+            view.dependencies,
+            tuple(
+                (
+                    token.spelling,
+                    token.location.identity,
+                    token.location.inclusion_instance,
+                    token.location.line,
+                    token.location.configuration_digest,
+                )
+                for token in view.tokens
+            ),
+        )
+
+    @staticmethod
+    def _feasible_differential_matrix(stream):
+        length = len(stream)
+        yielded = set()
+
+        def admit(widths):
+            widths = tuple(widths)
+            if widths not in yielded:
+                yielded.add(widths)
+                return widths
+            return None
+
+        for widths in ((length,), *((offset, length - offset) for offset in range(1, length))):
+            candidate = admit(widths)
+            if candidate is not None:
+                yield candidate
+        candidate = admit((1,) * length)
+        if candidate is not None:
+            yield candidate
+        for index in range(32):
+            seed = hashlib.sha256(
+                b"olr-task-9-three-way\0" + index.to_bytes(2, "big") + stream
+            ).digest()
+            first = int.from_bytes(seed[:8], "big") % (length + 1)
+            second = int.from_bytes(seed[8:16], "big") % (length + 1)
+            first, second = sorted((first, second))
+            candidate = admit((first, second - first, length - second))
+            if candidate is not None:
+                yield candidate
+
+    def assert_scanners_equal(
+        self, stream, *, family=CompilerFamily.GCC, dependencies=None, succeeds=True
+    ):
+        dependencies = dependencies or (self.main_identity,)
+        expected = self._capture(
+            _FrozenByteScannerBuilder,
+            stream,
+            (len(stream),),
+            family,
+            dependencies,
+        )
+        self.assertEqual(expected.succeeded, succeeds)
+        for splits in self._feasible_differential_matrix(stream):
+            actual = self._capture(
+                PreprocessedStreamBuilder, stream, splits, family, dependencies
+            )
+            if expected.succeeded:
+                self.assertTrue(actual.succeeded, (splits, actual.error))
+                self.assertEqual(
+                    self._compact_columns(actual.value),
+                    self._compact_columns(expected.value),
+                    splits,
+                )
+            else:
+                self.assertFalse(actual.succeeded, splits)
+                self.assertIs(type(actual.error), type(expected.error), splits)
+                self.assertEqual(str(actual.error), str(expected.error), splits)
+
+    def test_small_corpus_matches_frozen_tokens_provenance_and_failures(self):
+        # Keep the physical line non-directive-shaped at every feed boundary;
+        # adjacent alternatives still exercise longest-first recognition.
+        punctuators = b"x" + b"".join(provenance._PUNCTUATORS)
+        lexical = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b"alpha /* split\nblock */ beta // line comment\n"
+            b'"escaped\\\"string" \'escaped\\\'character\' '
+            b"1e+2 0x1p-3 7e + 4p - 9 u8\"eight\" u\"short\" "
+            b"U'wide' L\"long\" .5e-1 lease.\xc3\xb1ative()\n"
+            + punctuators
+            + b"\n"
+        )
+        gcc_markers = (
+            b'# 0 "D:/repo/playback/a.cpp"\n'
+            b'# 1 "D:/repo/build//"\n'
+            b'# 0 "<built-in>"\n# 0 "<command-line>"\n'
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b'#pragma GCC visibility push(default)\n'
+            b'# 1 "D:/repo/playback/h.h" 1 3 4\nheader_token\n'
+            b'# 5 "D:/repo/playback/a.cpp" 2\nmain_token\n'
+        )
+        recursive_gcc_markers = (
+            b'# 1 "D:/repo/playback/a.cpp"\nmain_before\n'
+            b'# 1 "D:/repo/playback/h.h" 1\nheader_outer\n'
+            b'# 10 "D:/repo/playback/a.cpp" 1\nmain_recursive\n'
+            b'# 2 "D:/repo/playback/h.h" 1\nheader_inner\n'
+            b'# 11 "D:/repo/playback/a.cpp" 2\nmain_recursive_return\n'
+            b'# 3 "D:/repo/playback/h.h" 2\nheader_outer_return\n'
+            b'# 2 "D:/repo/playback/a.cpp" 2\nmain_after\n'
+        )
+        msvc_markers = (
+            b'#line 1 "D:\\repo\\playback\\a.cpp"\nmain_token\n'
+            b'#line 1 "D:\\repo\\playback\\h.h"\nheader_token\n'
+            b'#line 4 "D:\\repo\\playback\\a.cpp"\nreturn_token\n'
+        )
+        macro_outputs = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b"lease.nativeHandle(); lease.safeX(); lease.safe(); "
+            b'const char* value = "lease.CAT(native,Handle)()"; SELF\n'
+        )
+        cases = (
+            ("lexical", lexical, CompilerFamily.GCC,
+             (self.main_identity,), True),
+            ("gcc-markers", gcc_markers, CompilerFamily.GCC,
+             (self.main_identity, self.header_identity), True),
+            ("recursive-gcc-markers", recursive_gcc_markers,
+             CompilerFamily.GCC,
+             (self.main_identity, self.header_identity), True),
+            ("msvc-markers", msvc_markers, CompilerFamily.MSVC,
+             (self.main_identity, self.header_identity), True),
+            ("macro-outputs", macro_outputs, CompilerFamily.GCC,
+             (self.main_identity,), True),
+            (
+                "multiline-raw-spelling",
+                b'# 1 "D:/repo/playback/a.cpp"\nR"tag(first\nsecond)tag"\n',
+                CompilerFamily.GCC,
+                (self.main_identity,),
+                False,
+            ),
+        )
+        for label, stream, family, dependencies, succeeds in cases:
+            with self.subTest(label=label):
+                self.assert_scanners_equal(
+                    stream,
+                    family=family,
+                    dependencies=dependencies,
+                    succeeds=succeeds,
+                )
+
+    def test_named_lexical_boundaries_match_before_inside_and_after(self):
+        stream = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b'alpha /* block */ beta "escaped\\\"quote" '
+            b"'escaped\\\'character' u8\"eight\" u\"short\" U'wide' "
+            b'L"long" R"tag(raw)tag" 1e+2 0x1p-3 '
+            b'lease.\xc3\xb1ative() '
+            + b" ".join(provenance._PUNCTUATORS)
+            + b' // line comment\n'
+        )
+        features = {
+            "marker": (b'# 1 "',),
+            "block-comment": (b"/* block */",),
+            "line-comment": (b"// line comment",),
+            "escape": (b'\\\"', b"\\\'"),
+            "literal-prefix": (b'u8"', b'u"', b"U'", b'L"'),
+            "literal-terminator": (b'quote"', b"character'"),
+            "raw-delimiters": (b'R"tag(', b')tag"'),
+            "pp-number-sign": (b"e+", b"p-"),
+            "utf8": (b"\xc3\xb1",),
+            "punctuator": provenance._PUNCTUATORS,
+        }
+        expected = self._capture(
+            _FrozenByteScannerBuilder, stream, (len(stream),),
+            CompilerFamily.GCC, (self.main_identity,))
+        self.assertTrue(expected.succeeded, expected.error)
+        exercised = set()
+        for label, needles in features.items():
+            for needle in needles:
+                start = stream.find(needle)
+                self.assertGreaterEqual(start, 0, (label, needle))
+                for boundary in range(max(1, start - 1),
+                                      min(len(stream), start + len(needle) + 2)):
+                    exercised.add(label)
+                    for builder_type in (
+                            PreprocessedStreamBuilder,
+                            _FrozenByteScannerBuilder):
+                        observed = self._capture(
+                            builder_type, stream,
+                            (boundary, len(stream) - boundary),
+                            CompilerFamily.GCC, (self.main_identity,))
+                        self.assertTrue(
+                            observed.succeeded,
+                            (label, needle, boundary, observed.error))
+                        self.assertEqual(
+                            self._compact_columns(observed.value),
+                            self._compact_columns(expected.value),
+                            (label, needle, boundary, builder_type.__name__))
+        self.assertEqual(exercised, set(features))
+
+    def test_frozen_prefixed_literals_and_pp_numbers_keep_exact_boundaries(self):
+        stream = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b'u8"a" u"b" U"c" L"d" 1e+2 0x1p-3\n'
+        )
+        outcome = self._capture(
+            PreprocessedStreamBuilder,
+            stream,
+            (stream.index(b"e+") + 1, 1, len(stream)),
+            CompilerFamily.GCC,
+            (self.main_identity,),
+        )
+        self.assertTrue(outcome.succeeded, outcome.error)
+        self.assertEqual(
+            tuple(token.spelling for token in outcome.value.tokens),
+            (
+                b"u8", b'"a"', b"u", b'"b"', b"U", b'"c"', b"L",
+                b'"d"', b"1e+2", b"0x1p-3",
+            ),
+        )
+
+    def test_compiled_candidate_pattern_and_punctuator_order_are_exact(self):
+        self.assertEqual(
+            provenance._PUNCTUATORS,
+            tuple(sorted(provenance._PUNCTUATORS, key=len, reverse=True)),
+        )
+        self.assertEqual(
+            provenance._PUNCTUATOR_PATTERN,
+            b"|".join(provenance.re.escape(value)
+                       for value in provenance._PUNCTUATORS),
+        )
+        self.assertEqual(
+            provenance._TOKEN_CANDIDATE.pattern,
+            (
+                rb"(?P<whitespace>[ \t\f\v\r]+)"
+                rb"|(?P<line_comment>//[^\r\n]*)"
+                rb"|(?P<block_comment>/\*(?:[^*]|\*(?!/))*\*/)"
+                rb"|(?P<identifier>[_A-Za-z\x80-\xff][_A-Za-z0-9\x80-\xff]*)"
+                rb"|(?P<number>(?:[0-9]|\.[0-9])"
+                rb"(?:[eEpP][+-]|[_A-Za-z0-9.\'\x80-\xff])*)"
+                rb'|(?P<string>"(?:\\.|[^"\\])*")'
+                rb"|(?P<character>\'(?:\\.|[^\'\\])*\')"
+                rb"|(?P<punctuator>" + provenance._PUNCTUATOR_PATTERN + rb")"
+                rb"|(?P<unknown>[^\r\n])"
+            ),
+        )
+
+    def test_authoritative_maximal_match_observes_concurrent_cancellation(self):
+        cancelled = threading.Event()
+        authoritative_entered = threading.Event()
+        builder = _CountingScannerBuilder(
+            self.configuration(),
+            self.production,
+            AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+            lambda: 0,
+            cancel_event=cancelled,
+        )
+        content = b"identifier" * (2 * provenance._TOKEN_BUDGET_POLL_BYTES)
+
+        def cancel_after_authoritative_entry():
+            if authoritative_entered.wait(2.0):
+                cancelled.set()
+
+        def authoritative_chunk_completed(*_args):
+            authoritative_entered.set()
+            self.assertTrue(cancelled.wait(1.0))
+
+        thread = threading.Thread(
+            target=cancel_after_authoritative_entry, daemon=True
+        )
+        thread.start()
+        started = time.monotonic()
+        with mock.patch.object(
+            provenance,
+            "_authoritative_candidate_chunk_completed",
+            side_effect=authoritative_chunk_completed,
+            create=True,
+        ) as completed, self.assertRaisesRegex(
+            AuditInfrastructureError, "cancelled"
+        ):
+            builder._scan_line(content)
+        thread.join(timeout=2.0)
+
+        self.assertTrue(authoritative_entered.is_set())
+        completed.assert_called()
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_authoritative_chunks_preserve_boundary_spanning_maximal_tokens(self):
+        boundary = provenance._TOKEN_BUDGET_POLL_BYTES
+        cases = [
+            ("identifier", b"a" * (boundary + 17), (0,)),
+            ("number", b"1" * (boundary + 17), (0,)),
+            (
+                "number-exponent",
+                b"1" + b"2" * (boundary - 2) + b"e+3",
+                (0,),
+            ),
+            (
+                "literal",
+                b'"' + b"a" * (boundary + 9) + b'\\"z"',
+                (0,),
+            ),
+        ]
+        for punctuator in provenance._PUNCTUATORS:
+            cases.append(
+                (
+                    f"punctuator-{punctuator!r}",
+                    punctuator + b" tail",
+                    range(1, len(punctuator)),
+                )
+            )
+        cases.extend((
+            ("line-comment", b"//comment tail", (1,)),
+            ("block-comment", b"/*comment*/ tail", (1,)),
+        ))
+        for name, candidate, splits in cases:
+            for split in splits:
+                for offset in (-1, 0, 1):
+                    prefix = b" " * max(0, boundary - split + offset)
+                    content = prefix + candidate
+                    actual = _SpellingScannerBuilder(
+                        self.configuration(), self.production,
+                        AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+                        lambda: 0,
+                    )
+                    frozen = _SpellingFrozenScannerBuilder(
+                        self.configuration(), self.production,
+                        AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+                        lambda: 0,
+                    )
+                    with self.subTest(
+                        name=name, split=split, offset=offset
+                    ):
+                        actual._scan_line(content)
+                        frozen._scan_line(content)
+                        self.assertEqual(
+                            tuple(actual.spellings), tuple(frozen.spellings)
+                        )
+                        self.assertEqual(
+                            (actual.token_count, actual.token_bytes),
+                            (frozen.token_count, frozen.token_bytes),
+                        )
+
+    def test_continued_block_comment_observes_concurrent_cancellation(self):
+        cancelled = threading.Event()
+        continuation_entered = threading.Event()
+        builder = _SpellingScannerBuilder(
+            self.configuration(), self.production,
+            AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+            lambda: 0,
+            cancel_event=cancelled,
+        )
+        builder._in_block_comment = True
+
+        def cancel_during_continuation():
+            if continuation_entered.wait(2.0):
+                cancelled.set()
+
+        def continuation_chunk_completed(*_args):
+            continuation_entered.set()
+            self.assertTrue(cancelled.wait(1.0))
+
+        thread = threading.Thread(
+            target=cancel_during_continuation, daemon=True
+        )
+        thread.start()
+        try:
+            with mock.patch.object(
+                provenance,
+                "_authoritative_candidate_chunk_completed",
+                side_effect=continuation_chunk_completed,
+            ) as completed, self.assertRaisesRegex(
+                AuditInfrastructureError, "cancelled"
+            ):
+                builder._scan_line(
+                    b"x" * (2 * provenance._TOKEN_BUDGET_POLL_BYTES + 17)
+                )
+        finally:
+            thread.join(timeout=2.0)
+        self.assertTrue(continuation_entered.is_set())
+        completed.assert_called()
+
+    def test_continued_block_comment_observes_deadline_between_chunks(self):
+        builder = _SpellingScannerBuilder(
+            self.configuration(), self.production,
+            AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+            lambda: 0,
+            deadline=time.monotonic() + 60.0,
+        )
+        builder._in_block_comment = True
+
+        def expire_deadline(*_args):
+            builder._deadline = time.monotonic() - 1.0
+
+        with mock.patch.object(
+            provenance,
+            "_authoritative_candidate_chunk_completed",
+            side_effect=expire_deadline,
+        ) as completed, self.assertRaisesRegex(
+            AuditInfrastructureError, "deadline"
+        ):
+            builder._scan_line(
+                b"x" * (2 * provenance._TOKEN_BUDGET_POLL_BYTES + 17)
+            )
+        completed.assert_called()
+
+    def test_continued_block_comment_boundaries_match_frozen_oracle(self):
+        boundary = provenance._TOKEN_BUDGET_POLL_BYTES
+        cases = [
+            (f"close-{offset:+d}", b"x" * (boundary + offset) + b"*/tail")
+            for offset in (-1, 0, 1)
+        ]
+        cases.extend(
+            (f"no-close-{size}", b"x" * size)
+            for size in (
+                boundary - 1,
+                boundary,
+                boundary + 1,
+                2 * boundary + 1,
+            )
+        )
+        for name, content in cases:
+            with self.subTest(name=name):
+                actual = _SpellingScannerBuilder(
+                    self.configuration(), self.production,
+                    AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+                    lambda: 0,
+                )
+                frozen = _SpellingFrozenScannerBuilder(
+                    self.configuration(), self.production,
+                    AuditLimits(retained_token_bytes=64 * 1024 * 1024),
+                    lambda: 0,
+                )
+                actual._in_block_comment = True
+                frozen._in_block_comment = True
+                actual._scan_line(content)
+                frozen._scan_line(content)
+                self.assertEqual(
+                    tuple(actual.spellings), tuple(frozen.spellings)
+                )
+                self.assertEqual(
+                    (actual.token_count, actual.token_bytes),
+                    (frozen.token_count, frozen.token_bytes),
+                )
+                self.assertEqual(
+                    actual._in_block_comment, frozen._in_block_comment
+                )
+
+    def _count_scan(self, builder_type, content):
+        builder = builder_type(
+            self.configuration(), self.production, AuditLimits(), lambda: 0
+        )
+        scanner = getattr(builder, "_scan_line", None)
+        if scanner is None:
+            scanner = builder._tokenize
+        scanner(content)
+        return builder.token_count, builder.token_bytes
+
+    @staticmethod
+    def _regenerate_required_mingw_capture(manifest, compiler, source_bytes):
+        source_relative = PurePosixPath(manifest["source"]["relative_path"])
+        output_relative = PurePosixPath(manifest["capture"]["relative_path"])
+        if (
+            source_relative.is_absolute()
+            or output_relative.is_absolute()
+            or ".." in source_relative.parts
+            or ".." in output_relative.parts
+        ):
+            raise AssertionError("MinGW capture paths are not controlled")
+        with tempfile.TemporaryDirectory(prefix="olr-task9-mingw-regenerate-") as name:
+            root = Path(name).resolve()
+            source = root.joinpath(*source_relative.parts)
+            output = root.joinpath(*output_relative.parts)
+            source.parent.mkdir(parents=True)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(source_bytes)
+            command = (str(compiler), *manifest["command"][1:])
+            environment = {
+                key: os.environ[key]
+                for key in ("SystemRoot", "WINDIR", "TEMP", "TMP")
+                if key in os.environ
+            }
+            environment["PATH"] = str(compiler.parent)
+            completed = subprocess.run(
+                command,
+                cwd=root,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30.0,
+            )
+            if completed.returncode != 0:
+                raise AssertionError(
+                    "required MinGW capture regeneration failed: "
+                    + completed.stderr[-4096:].decode("utf-8", errors="replace"))
+            size = output.stat().st_size
+            if size != manifest["capture"]["byte_count"]:
+                raise AssertionError(
+                    f"regenerated MinGW capture byte count differs: {size}")
+            return output.read_bytes()
+
+    def test_one_million_dense_tokens_match_reference_scanner(self):
+        content = b"x " * 1_000_000
+        self.assertEqual(
+            self._count_scan(_CountingScannerBuilder, content),
+            self._count_scan(_CountingFrozenScannerBuilder, content),
+        )
+
+    def test_one_million_dense_tokens_match_at_locked_feed_widths(self):
+        token_count = 1_000_000
+        stream = (b'# 1 "D:/repo/playback/a.cpp"\n'
+                  + b"x " * token_count + b"\n")
+        expected = self._count_scan(
+            _CountingFrozenScannerBuilder, b"x " * token_count)
+        self.assertEqual(expected, (token_count, token_count))
+        for width in (1, 2, 3, 7, 4096):
+            with self.subTest(width=width):
+                builder = _CountingScannerBuilder(
+                    self.configuration(), self.production, AuditLimits(),
+                    lambda: 0)
+                for offset in range(0, len(stream), width):
+                    builder.feed(stream[offset:offset + width])
+                self.assertEqual(
+                    (builder.token_count, builder.token_bytes), expected)
+
+    def test_compiled_scanner_is_at_least_twice_reference_throughput(self):
+        fixture_root = Path(__file__).resolve().parent / "fixtures"
+        manifest = json.loads(
+            (fixture_root / "task9_mingw_preprocessed.json").read_text(
+                encoding="utf-8"))
+        source = fixture_root / "task9_mingw_capture.cpp"
+        capture = fixture_root / "task9_mingw_preprocessed.ii"
+        source_bytes = source.read_bytes()
+        real_output = capture.read_bytes()
+        self.assertEqual(manifest["schema"], "olr-task9-mingw-preprocessed-v1")
+        self.assertEqual(
+            manifest["toolchain"]["distribution"], "tools_mingw1310_64")
+        self.assertEqual(
+            manifest["command"],
+            [
+                "g++", "-std=c++20", "-E", "-ftrack-macro-expansion=0",
+                "-fno-working-directory",
+                "tests/gpu/fixtures/task9_mingw_capture.cpp", "-o",
+                "tests/gpu/fixtures/task9_mingw_preprocessed.ii",
+            ],
+        )
+        self.assertEqual(
+            hashlib.sha256(source_bytes).hexdigest(), manifest["source"]["sha256"])
+        self.assertEqual(
+            source_bytes.count(b"\n"), manifest["source"]["line_count"])
+        self.assertEqual(len(real_output), manifest["capture"]["byte_count"])
+        self.assertGreaterEqual(len(real_output), 256 * 1024)
+        self.assertLessEqual(len(real_output), 4 * 1024 * 1024)
+        self.assertEqual(
+            hashlib.sha256(real_output).hexdigest(), manifest["capture"]["sha256"])
+        self.assertEqual(
+            manifest["accepted_oracle"]["dependency_schema"],
+            "one-production-source-v1")
+        self.assertEqual(
+            manifest["accepted_oracle"]["line_schema"], "gcc-line-marker-v1")
+
+        required_compiler = os.environ.get("OLR_TASK9_REFERENCE_COMPILER")
+        if required_compiler is not None:
+            regenerate = getattr(self, "_regenerate_required_mingw_capture", None)
+            self.assertTrue(callable(regenerate),
+                            "required MinGW capture regeneration is unavailable")
+            compiler = Path(required_compiler)
+            self.assertTrue(compiler.is_absolute() and compiler.is_file())
+            self.assertEqual(os.environ.get("OLR_TASK9_REQUIRED_FAMILY"), "GNU")
+            self.assertEqual(
+                hashlib.sha256(compiler.read_bytes()).hexdigest(),
+                manifest["toolchain"]["compiler_executable_sha256"])
+            version = subprocess.run(
+                (str(compiler), "--version"), check=True, capture_output=True,
+                text=True).stdout.splitlines()[0]
+            target = subprocess.run(
+                (str(compiler), "-dumpmachine"), check=True, capture_output=True,
+                text=True).stdout.strip()
+            self.assertIn(manifest["toolchain"]["compiler_version"], version)
+            self.assertEqual(target, manifest["toolchain"]["target"])
+            regenerated = regenerate(manifest, compiler, source_bytes)
+            self.assertEqual(regenerated, real_output)
+            self.assertEqual(
+                hashlib.sha256(regenerated).hexdigest(),
+                manifest["capture"]["sha256"])
+
+        metadata = source.stat()
+        identity = FileIdentity(
+            source.resolve(),
+            PurePosixPath(manifest["source"]["relative_path"]),
+            int(metadata.st_dev),
+            int(metadata.st_ino) if int(metadata.st_ino) else None,
+            manifest["source"]["line_count"],
+            True,
+        )
+        configuration = dataclasses.replace(
+            self.configuration(),
+            working_directory=Path(__file__).resolve().parents[2],
+            source=identity,
+            arguments=(manifest["source"]["relative_path"],),
+        )
+        production = {identity.relative: identity}
+        dependencies = (identity,)
+        chunk_bytes = manifest["replay"]["chunk_bytes"]
+        self.assertEqual(chunk_bytes, capability_runner._IO_CHUNK_BYTES)
+        self.assertEqual(manifest["replay"]["warmups_per_builder"], 1)
+        self.assertEqual(
+            manifest["replay"]["balanced_order"], ["AB", "BA", "AB", "BA"])
+
+        def compact_oracle(view):
+            digest = hashlib.sha256(b"olr-task9-compact-oracle-v1\0")
+            digest.update(view.configuration.digest.encode("utf-8") + b"\0")
+            digest.update(len(view.dependencies).to_bytes(4, "big"))
+            for dependency in view.dependencies:
+                digest.update(dependency.relative.as_posix().encode("utf-8") + b"\0")
+            count = 0
+            for token in view.tokens:
+                count += 1
+                for value in (
+                    token.spelling,
+                    token.location.identity.relative.as_posix().encode("utf-8"),
+                    str(token.location.inclusion_instance).encode("ascii"),
+                    str(token.location.line).encode("ascii"),
+                    token.location.configuration_digest.encode("utf-8"),
+                ):
+                    digest.update(len(value).to_bytes(4, "big"))
+                    digest.update(value)
+            return count, digest.hexdigest()
+
+        def replay(builder_type):
+            builder = builder_type(
+                configuration,
+                production,
+                AuditLimits(retained_token_bytes=128 * 1024 * 1024),
+                lambda: 0,
+            )
+            gc.collect()
+            gc.disable()
+            try:
+                started = time.perf_counter()
+                for offset in range(0, len(real_output), chunk_bytes):
+                    builder.feed(real_output[offset:offset + chunk_bytes])
+                view = builder.finalize(dependencies)
+                elapsed = time.perf_counter() - started
+            finally:
+                gc.enable()
+            return elapsed, view
+
+        expected_columns = None
+        expected_oracle = None
+        for builder_type in (_FrozenByteScannerBuilder, PreprocessedStreamBuilder):
+            _elapsed, view = replay(builder_type)
+            columns = self._compact_columns(view)
+            oracle = compact_oracle(view)
+            expected_columns = columns if expected_columns is None else expected_columns
+            expected_oracle = oracle if expected_oracle is None else expected_oracle
+            self.assertEqual(columns, expected_columns)
+            self.assertEqual(oracle, expected_oracle)
+            del view, columns
+            gc.collect()
+        self.assertEqual(expected_oracle[0], manifest["accepted_oracle"]["token_count"])
+        self.assertEqual(
+            expected_oracle[1], manifest["accepted_oracle"]["compact_sha256"])
+
+        samples = {"A": [], "B": []}
+        builders = {"A": PreprocessedStreamBuilder, "B": _FrozenByteScannerBuilder}
+        for pair in manifest["replay"]["balanced_order"]:
+            for label in pair:
+                elapsed, view = replay(builders[label])
+                self.assertEqual(self._compact_columns(view), expected_columns)
+                self.assertEqual(compact_oracle(view), expected_oracle)
+                samples[label].append(elapsed)
+                del view
+                gc.collect()
+
+        native_seconds = statistics.median(samples["A"])
+        reference_seconds = statistics.median(samples["B"])
+        speedup = reference_seconds / native_seconds
+        evidence = {
+            "compiler_executable_sha256": manifest["toolchain"][
+                "compiler_executable_sha256"],
+            "compiler_version": manifest["toolchain"]["compiler_version"],
+            "target": manifest["toolchain"]["target"],
+            "raw_byte_count": len(real_output),
+            "raw_sha256": manifest["capture"]["sha256"],
+            "token_count": expected_oracle[0],
+            "compact_oracle_sha256": expected_oracle[1],
+            "chunk_bytes": chunk_bytes,
+            "warmups_per_builder": manifest["replay"]["warmups_per_builder"],
+            "balanced_order": manifest["replay"]["balanced_order"],
+            "native_samples": samples["A"],
+            "reference_samples": samples["B"],
+            "native_median": native_seconds,
+            "reference_median": reference_seconds,
+            "speedup": speedup,
+        }
+        print(json.dumps(evidence, sort_keys=True))
+        self.assertGreaterEqual(
+            speedup,
+            2.0,
+            f"compiled scanner throughput is {speedup:.3f}x reference "
+            f"({reference_seconds:.6f}s/{native_seconds:.6f}s); "
+            f"evidence={json.dumps(evidence, sort_keys=True)}",
+        )
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ from gpu_capability_model import (
     LinuxRunMemoryMeasurements,
     LinuxWorkerContainment,
     MacOSRunMemoryMeasurements,
+    MacOSPhaseSnapshot,
     MacOSInspectionExecPermit,
     MacOSInspectionPgidReported,
     WindowsRunMemoryMeasurements,
@@ -260,6 +261,10 @@ class WindowsNativeJob:
         self._kernel32.OpenProcess.restype = wintypes.HANDLE
         self._kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
         self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32.IsProcessInJob.argtypes = (
+            wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)
+        )
+        self._kernel32.IsProcessInJob.restype = wintypes.BOOL
         self._handle = self._kernel32.CreateJobObjectW(None, name)
         if not self._handle:
             raise AuditInfrastructureError("Windows Job creation failed")
@@ -293,6 +298,20 @@ class WindowsNativeJob:
             raise AuditInfrastructureError("Windows Job process handle is invalid")
         if not self._kernel32.AssignProcessToJobObject(self._handle, process_handle):
             raise AuditInfrastructureError("Windows Job process assignment failed")
+
+    def contains_process_handle(self, process_handle: int) -> bool:
+        if not self._handle or not isinstance(process_handle, int) or process_handle <= 0:
+            raise AuditInfrastructureError("Windows Job process handle is invalid")
+        from ctypes import wintypes
+
+        contained = wintypes.BOOL()
+        if not self._kernel32.IsProcessInJob(
+            process_handle, self._handle, self._ctypes.byref(contained)
+        ):
+            raise AuditInfrastructureError(
+                "Windows Job exact membership query failed"
+            )
+        return bool(contained.value)
 
     def process_ids(self) -> tuple[int, ...]:
         ctypes = self._ctypes
@@ -483,6 +502,28 @@ class WindowsNativeJob:
         self.close()
 
 
+def _aggregate_only_before_finalize(
+    _worker_index: int, _generation: int
+) -> None:
+    return None
+
+
+def _aggregate_only_finalize(
+    _worker_index: int, _generation: int
+) -> None:
+    return None
+
+
+def _windows_generation_terminal_transition(
+    _kind: str,
+    _stage: str,
+    _position: str,
+    _worker_index: int,
+    _generation: int,
+) -> None:
+    return None
+
+
 class WindowsNativeRunAccountant:
     """Retain every Job PID/start handle and seal only after stable equality."""
 
@@ -505,6 +546,61 @@ class WindowsNativeRunAccountant:
         self._complete = True
         self._generation_jobs: dict[tuple[int, int], WindowsNativeJob] = {}
         self._archived_generation_jobs: dict[tuple[int, int], tuple[int, int]] = {}
+        self._assigned_generation_jobs: set[tuple[int, int]] = set()
+        self._discarded_generation_jobs: set[tuple[int, int]] = set()
+        self._aggregate_only_generation_jobs: set[tuple[int, int]] = set()
+        self._aggregate_only_job_close_progress: set[
+            tuple[int, int]
+        ] = set()
+        self._generation_terminal_close_progress: set[
+            tuple[str, int, int]
+        ] = set()
+        self._pending_generation_archives: dict[
+            tuple[int, int], tuple[int, int]
+        ] = {}
+        self._aggregate_assignment_intents: dict[
+            tuple[int, int], tuple[int, int, str, int]
+        ] = {}
+        self._generation_assignment_intents: dict[
+            tuple[int, int], tuple[int, int, str, int]
+        ] = {}
+        self._aggregate_assignment_progress: set[tuple[int, int]] = set()
+        self._generation_assignment_progress: set[tuple[int, int]] = set()
+        self.inspection_probe_invocations = 0
+        self._active_inspection_carriers: dict[object, object] = {}
+
+    def register_compiler_process_launch(self, event, carrier) -> None:
+        _require_contract(
+            event.purpose is CompilerLaunchPurpose.INSPECTION
+            and event.process_start.platform_kind == "windows"
+            and event.process_start not in self._active_inspection_carriers,
+            "Windows inspection launch registration is invalid",
+        )
+        process_handle = getattr(carrier, "windows_process_handle", None)
+        _require_contract(
+            isinstance(process_handle, int)
+            and not isinstance(process_handle, bool)
+            and process_handle != 0,
+            "Windows inspection process handle is unavailable",
+        )
+        purpose = f"inspection:{self.inspection_probe_invocations}"
+        self.assign_process_handle(
+            process_handle, event.process_start.pid, purpose
+        )
+        self._active_inspection_carriers[event.process_start] = carrier
+        self.inspection_probe_invocations += 1
+
+    def complete_compiler_process_launch(self, event, carrier) -> None:
+        _require_contract(
+            self._active_inspection_carriers.pop(
+                event.process_start, None
+            ) is carrier,
+            "Windows inspection process carrier differs",
+        )
+
+    def fail_compiler_process_launch(self, event, carrier) -> None:
+        if self._active_inspection_carriers.get(event.process_start) is carrier:
+            self._active_inspection_carriers.pop(event.process_start)
 
     def create_generation_job(self, worker_index: int,
                               generation: int) -> None:
@@ -516,6 +612,10 @@ class WindowsNativeRunAccountant:
         _require_contract(key not in self._generation_jobs
                           and key not in self._archived_generation_jobs,
                           "Windows generation Job already exists")
+        _require_contract(key not in self._discarded_generation_jobs,
+                          "Windows generation Job was discarded")
+        _require_contract(key not in self._aggregate_only_generation_jobs,
+                          "Windows generation Job was partially finalized")
         job = WindowsNativeJob()
         if job.process_ids() or job.accounting_totals()[:2] != (0, 0):
             job.close()
@@ -525,35 +625,276 @@ class WindowsNativeRunAccountant:
     def assign_generation_process(self, worker_index: int, generation: int,
                                   process_handle: int, pid: int,
                                   purpose: str) -> None:
-        job = self._generation_jobs.get((worker_index, generation))
+        key = (worker_index, generation)
+        job = self._generation_jobs.get(key)
         _require_contract(job is not None, "Windows generation Job is unavailable")
-        self.assign_process_handle(process_handle, pid, purpose)
-        job.assign_process_handle(process_handle)
+        metadata = (process_handle, pid, purpose)
+
+        def prepare_intent(intents, target_job):
+            existing = intents.get(key)
+            if existing is not None:
+                _require_contract(
+                    existing[:3] == metadata,
+                    "Windows generation Job assignment intent differs",
+                )
+                return existing
+            baseline_total = target_job.accounting_totals()[0]
+            intent = (*metadata, baseline_total)
+            intents[key] = intent
+            return intent
+
+        def effect_observed(target_job, intent) -> bool:
+            del intent
+            return target_job.contains_process_handle(process_handle)
+
+        aggregate_intent = prepare_intent(
+            self._aggregate_assignment_intents, self.job
+        )
+        if key not in self._aggregate_assignment_progress:
+            if effect_observed(self.job, aggregate_intent):
+                self._aggregate_assignment_progress.add(key)
+            else:
+                try:
+                    self.job.assign_process_handle(process_handle)
+                except BaseException:
+                    if not effect_observed(self.job, aggregate_intent):
+                        raise
+                    self._aggregate_assignment_progress.add(key)
+                self._aggregate_assignment_progress.add(key)
+        self._retain(pid, purpose)
+
+        generation_intent = prepare_intent(
+            self._generation_assignment_intents, job
+        )
+        if key not in self._generation_assignment_progress:
+            if effect_observed(job, generation_intent):
+                self._generation_assignment_progress.add(key)
+            else:
+                try:
+                    job.assign_process_handle(process_handle)
+                except BaseException:
+                    if not effect_observed(job, generation_intent):
+                        raise
+                    self._generation_assignment_progress.add(key)
+                    self._assigned_generation_jobs.add(key)
+                self._generation_assignment_progress.add(key)
+            self._assigned_generation_jobs.add(key)
+
+    def generation_job_assignment_completed(
+        self, worker_index: int, generation: int
+    ) -> bool:
+        return self.generation_job_assignment_state(
+            worker_index, generation
+        ) == "generation-assigned"
+
+    def generation_job_assignment_state(
+        self, worker_index: int, generation: int
+    ) -> str:
+        key = (worker_index, generation)
+        if key in self._archived_generation_jobs:
+            return "generation-assigned"
+        if key in self._aggregate_only_generation_jobs:
+            return "aggregate-only"
+        if key in self._discarded_generation_jobs:
+            return "unassigned"
+        _require_contract(
+            key in self._generation_jobs,
+            "Windows generation Job is unavailable",
+        )
+        aggregate = key in self._aggregate_assignment_progress
+        generation_assigned = key in self._generation_assignment_progress
+        _require_contract(
+            not generation_assigned or aggregate,
+            "Windows generation Job assignment progress differs",
+        )
+        if generation_assigned:
+            return "generation-assigned"
+        if aggregate:
+            return "aggregate-only"
+        return "unassigned"
+
+    def finalize_aggregate_only_generation_job(
+        self, worker_index: int, generation: int
+    ) -> None:
+        key = (worker_index, generation)
+        if (
+            key in self._aggregate_only_generation_jobs
+            and key not in self._generation_jobs
+        ):
+            return
+        job = self._generation_jobs.get(key)
+        _require_contract(
+            job is not None
+            and (
+                key in self._aggregate_only_generation_jobs
+                or (
+                    key in self._aggregate_assignment_progress
+                    and key not in self._generation_assignment_progress
+                )
+            ),
+            "Windows aggregate-only generation Job is invalid",
+        )
+        progress = self._terminal_close_progress()
+        token = ("aggregate-only", *key)
+        if token not in progress:
+            _aggregate_only_before_finalize(worker_index, generation)
+            job.drain_notifications()
+            total, active, _terminated = job.accounting_totals()
+            _require_contract(
+                total == 0 and active == 0 and not job.process_ids(),
+                "Windows aggregate-only generation Job is not empty",
+            )
+        self._complete_generation_terminal_transition(
+            "aggregate-only",
+            key,
+            job.close,
+            lambda: key in self._aggregate_only_generation_jobs,
+            lambda: self._aggregate_only_generation_jobs.add(key),
+            lambda: _aggregate_only_finalize(worker_index, generation),
+        )
+        self._aggregate_only_job_close_progress.add(key)
+
+    def discard_generation_job(self, worker_index: int,
+                               generation: int) -> None:
+        key = (worker_index, generation)
+        if (
+            key in self._discarded_generation_jobs
+            and key not in self._generation_jobs
+        ):
+            return
+        job = self._generation_jobs.get(key)
+        _require_contract(
+            job is not None
+            and key not in self._aggregate_assignment_progress
+            and key not in self._generation_assignment_progress
+            and key not in self._archived_generation_jobs,
+            "Windows generation Job discard is invalid",
+        )
+        progress = self._terminal_close_progress()
+        if ("discard", *key) not in progress:
+            job.drain_notifications()
+            total, active, _terminated = job.accounting_totals()
+            _require_contract(
+                total == 0 and active == 0 and not job.process_ids(),
+                "Windows unassigned generation Job is not empty",
+            )
+        self._complete_generation_terminal_transition(
+            "discard",
+            key,
+            job.close,
+            lambda: key in self._discarded_generation_jobs,
+            lambda: self._discarded_generation_jobs.add(key),
+        )
 
     def archive_generation_job(self, worker_index: int, generation: int,
                                deadline: float) -> tuple[int, int]:
         key = (worker_index, generation)
         job = self._generation_jobs.get(key)
-        _require_contract(job is not None and isinstance(deadline, (int, float))
+        archived = self._archived_generation_jobs.get(key)
+        if archived is not None and key not in self._generation_jobs:
+            self._finish_archived_generation_progress(key)
+            return archived
+        _require_contract(job is not None
+                          and key in self._generation_assignment_progress
+                          and isinstance(deadline, (int, float))
                           and not isinstance(deadline, bool),
                           "Windows generation Job archive is invalid")
-        stable = False
-        while time.monotonic() < deadline:
-            job.drain_notifications()
-            total, active, _terminated = job.accounting_totals()
-            empty = not job.process_ids()
-            if active == 0 and empty:
-                if stable:
-                    archive = (total, job.peak_commit_charge_bytes())
-                    job.close()
-                    del self._generation_jobs[key]
-                    self._archived_generation_jobs[key] = archive
-                    return archive
-                stable = True
-            else:
-                stable = False
-            time.sleep(0.005)
-        raise AuditInfrastructureError("Windows generation Job did not become empty")
+        pending = self._pending_archives()
+        archive = archived or pending.get(key)
+        if archive is None:
+            stable = False
+            while time.monotonic() < deadline:
+                job.drain_notifications()
+                total, active, _terminated = job.accounting_totals()
+                empty = not job.process_ids()
+                if active == 0 and empty:
+                    if stable:
+                        archive = (total, job.peak_commit_charge_bytes())
+                        pending[key] = archive
+                        break
+                    stable = True
+                else:
+                    stable = False
+                time.sleep(0.005)
+        if archive is None:
+            raise AuditInfrastructureError(
+                "Windows generation Job did not become empty"
+            )
+        self._complete_generation_terminal_transition(
+            "archive",
+            key,
+            job.close,
+            lambda: key in self._archived_generation_jobs,
+            lambda: self._archived_generation_jobs.__setitem__(key, archive),
+        )
+        self._finish_archived_generation_progress(key)
+        return archive
+
+    def _terminal_close_progress(self) -> set[tuple[str, int, int]]:
+        progress = getattr(self, "_generation_terminal_close_progress", None)
+        if progress is None:
+            progress = set()
+            self._generation_terminal_close_progress = progress
+        return progress
+
+    def _pending_archives(self) -> dict[tuple[int, int], tuple[int, int]]:
+        pending = getattr(self, "_pending_generation_archives", None)
+        if pending is None:
+            pending = {}
+            self._pending_generation_archives = pending
+        return pending
+
+    def _complete_generation_terminal_transition(
+        self,
+        kind: str,
+        key: tuple[int, int],
+        close_action,
+        is_published,
+        publish_action,
+        after_close=None,
+    ) -> None:
+        worker_index, generation = key
+        progress = self._terminal_close_progress()
+        token = (kind, worker_index, generation)
+        if token not in progress:
+            _windows_generation_terminal_transition(
+                kind, "close", "before", worker_index, generation
+            )
+            close_action()
+            progress.add(token)
+            _windows_generation_terminal_transition(
+                kind, "close", "after", worker_index, generation
+            )
+        if callable(after_close):
+            after_close()
+        if not is_published():
+            _windows_generation_terminal_transition(
+                kind, "terminal", "before", worker_index, generation
+            )
+            publish_action()
+            _windows_generation_terminal_transition(
+                kind, "terminal", "after", worker_index, generation
+            )
+        if key in self._generation_jobs:
+            _windows_generation_terminal_transition(
+                kind, "remove", "before", worker_index, generation
+            )
+            del self._generation_jobs[key]
+            _windows_generation_terminal_transition(
+                kind, "remove", "after", worker_index, generation
+            )
+        _require_contract(
+            is_published() and key not in self._generation_jobs,
+            "Windows generation Job terminal transition is incomplete",
+        )
+
+    def _finish_archived_generation_progress(
+        self, key: tuple[int, int]
+    ) -> None:
+        self._assigned_generation_jobs.discard(key)
+        self._aggregate_assignment_progress.discard(key)
+        self._generation_assignment_progress.discard(key)
+        self._pending_archives().pop(key, None)
 
     def begin_process_scope(self, purpose: str) -> None:
         _require_contract(isinstance(purpose, str) and bool(purpose)
@@ -645,6 +986,10 @@ class WindowsNativeRunAccountant:
         _require_contract(isinstance(deadline, (int, float))
                           and not isinstance(deadline, bool),
                           "Windows Job seal deadline is invalid")
+        _require_contract(
+            not self._active_inspection_carriers,
+            "Windows inspection process carriers remain active",
+        )
         stable: tuple[int, int] | None = None
         while time.monotonic() < deadline:
             totals = self.observe(parent_current_resident_bytes)
@@ -698,13 +1043,23 @@ class WindowsNativeRunAccountant:
             self._complete = False
             raise AuditInfrastructureError(
                 "Windows generation Job is not archived")
+        aggregate_only = getattr(
+            self, "_aggregate_only_generation_jobs", set()
+        )
+        archived_generation_keys = (
+            set(self._archived_generation_jobs) | set(aggregate_only)
+        )
         if (set(worker_roots) != set(generation_process_counts)
-                or set(self._archived_generation_jobs) != set(worker_roots)):
+                or archived_generation_keys != set(worker_roots)
+                or set(self._archived_generation_jobs) & set(aggregate_only)):
             self._complete = False
             raise AuditInfrastructureError(
                 "Windows generation accounting is incomplete")
         for key, process_count in generation_process_counts.items():
-            if self._archived_generation_jobs[key][0] != process_count:
+            if (
+                key in self._archived_generation_jobs
+                and self._archived_generation_jobs[key][0] != process_count
+            ):
                 self._complete = False
                 raise AuditInfrastructureError(
                     "Windows generation process accounting differs")
@@ -730,7 +1085,12 @@ class WindowsNativeRunAccountant:
             job_total_process_count=total,
             retained_process_identity_count=len(self._handles),
             retained_inspection_process_identity_count=retained_inspection,
-            surviving_job_process_count=active)
+            surviving_job_process_count=active,
+            archived_generation_identities=tuple(
+                sorted(archived_generation_keys)
+            ),
+            accounting_complete=self._complete,
+        )
 
     def close(self) -> None:
         for job in self._generation_jobs.values():
@@ -834,6 +1194,8 @@ class WindowsJobAccountingSnapshot:
     retained_process_identity_count: int
     retained_inspection_process_identity_count: int
     surviving_job_process_count: int
+    archived_generation_identities: tuple[tuple[int, int], ...] = ()
+    accounting_complete: bool = True
 
     def __post_init__(self) -> None:
         for label in (
@@ -853,6 +1215,29 @@ class WindowsJobAccountingSnapshot:
                           and all(isinstance(slot, WindowsSlotPeak)
                                   for slot in self.slots),
                           "Windows slot peaks are invalid")
+        _require_contract(
+            isinstance(self.archived_generation_identities, tuple)
+            and self.archived_generation_identities
+            == tuple(sorted(set(self.archived_generation_identities)))
+            and all(
+                isinstance(identity, tuple)
+                and len(identity) == 2
+                and all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                    for value in identity
+                )
+                for identity in self.archived_generation_identities
+            )
+            and len(self.archived_generation_identities)
+            == sum(len(slot.generations) for slot in self.slots),
+            "Windows archived generation identities are invalid",
+        )
+        _require_contract(
+            isinstance(self.accounting_complete, bool),
+            "Windows accounting completeness is invalid",
+        )
 
     def memory_measurements(self) -> WindowsRunMemoryMeasurements:
         if self.job_total_process_count != self.retained_process_identity_count:
@@ -878,7 +1263,7 @@ class WindowsJobAccountingSnapshot:
             retained_inspection_process_identity_count=(
                 self.retained_inspection_process_identity_count),
             surviving_job_process_count=self.surviving_job_process_count,
-            accounting_complete=True,
+            accounting_complete=self.accounting_complete,
         )
 
 
@@ -1280,7 +1665,8 @@ class LinuxDelegatedCgroupSupervisor:
 
     def release_worker_leaf(self, worker_index: int, generation: int) -> None:
         current = self._worker_leaves.get((worker_index, generation))
-        _require_contract(current is not None, "Linux worker leaf is not owned")
+        if current is None:
+            return
         leaf, _token = current
         _require_contract(not _cgroup_pids(leaf / "cgroup.procs"),
                           "Linux worker leaf is occupied")
@@ -1589,6 +1975,22 @@ class LinuxRendezvousClient:
         _require_contract(reply["kind"] == "hello-accepted",
                           "Linux rendezvous hello was rejected")
 
+    def coordinator_accounting_paths(self) -> tuple[Path, Path, Path]:
+        """Return the delegated coordinator, run, and service cgroups."""
+
+        coordinator = _current_linux_cgroup_path()
+        run = coordinator.parent
+        service_root = run.parent
+        _require_contract(
+            coordinator.name == "coordinator"
+            and run.name == self._run_id
+            and coordinator.is_dir()
+            and run.is_dir()
+            and service_root.is_dir(),
+            "Linux rendezvous coordinator cgroup differs",
+        )
+        return coordinator, run, service_root
+
     def create_leaf(self, worker_index: int, generation: int,
                     deadline: float) -> LinuxWorkerContainment:
         reply = self._request(
@@ -1743,7 +2145,14 @@ class MacOSRegisteredPgidAccountant:
         self._maximum_owned = 0
         self._maximum_parent = 0
         self._maximum_aggregate = 0
-        self._unreconciled = 0
+        self._unreconciled: dict[
+            int, tuple[OwnedProcessIdentity, ...]
+        ] = {}
+        self._reconciled_pgids: set[int] = set()
+        self._registration_intents: dict[
+            int, tuple[OwnedProcessIdentity, str]
+        ] = {}
+        self._registration_receipts: set[int] = set()
         self._complete = True
 
     def register_group(self, pgid: int, leader: OwnedProcessIdentity,
@@ -1754,10 +2163,35 @@ class MacOSRegisteredPgidAccountant:
                           "macOS registered PGID is invalid")
         _require_contract(isinstance(purpose, str) and bool(purpose),
                           "macOS registered PGID purpose is invalid")
-        _require_contract(pgid not in self._leaders,
-                          "macOS PGID was registered twice")
-        self._leaders[pgid] = leader
-        self._members[pgid] = (leader,)
+        intent = (leader, purpose)
+        existing_intent = self._registration_intents.get(pgid)
+        if existing_intent is None:
+            _require_contract(
+                pgid not in self._leaders
+                and pgid not in self._members
+                and pgid not in self._reconciled_pgids,
+                "macOS PGID was registered twice",
+            )
+            self._registration_intents[pgid] = intent
+        else:
+            _require_contract(
+                existing_intent == intent,
+                "macOS registered PGID intent differs",
+            )
+        if pgid in self._registration_receipts:
+            return
+        existing_leader = self._leaders.get(pgid)
+        existing_members = self._members.get(pgid)
+        _require_contract(
+            existing_leader in (None, leader)
+            and existing_members in (None, (leader,)),
+            "macOS registered PGID effect differs",
+        )
+        if existing_leader is None:
+            self._leaders[pgid] = leader
+        if existing_members is None:
+            self._members[pgid] = (leader,)
+        self._registration_receipts.add(pgid)
 
     def observe_group(self, pgid: int,
                       resident_by_identity: Mapping[OwnedProcessIdentity, int]) -> None:
@@ -1799,9 +2233,19 @@ class MacOSRegisteredPgidAccountant:
         self._maximum_aggregate = max(self._maximum_aggregate, parent + owned)
 
     def reconcile_group(self, pgid: int,
-                        provider: "MacOSLibprocProvider") -> None:
-        _require_contract(pgid in self._leaders
-                          and isinstance(provider, MacOSLibprocProvider),
+                        provider: "MacOSLibprocProvider") -> bool:
+        reconciled = getattr(self, "_reconciled_pgids", None)
+        if reconciled is None:
+            reconciled = set()
+            self._reconciled_pgids = reconciled
+        _require_contract(isinstance(provider, MacOSLibprocProvider),
+                          "macOS reconciliation native provider is invalid")
+        if pgid in reconciled:
+            self._leaders.pop(pgid, None)
+            self._members.pop(pgid, None)
+            self._unreconciled.pop(pgid, None)
+            return True
+        _require_contract(pgid in self._leaders,
                           "macOS reconciliation native provider is invalid")
         surviving_identities = provider.reconcile_survivors(self, pgid)
         _require_contract(isinstance(surviving_identities, tuple)
@@ -1810,11 +2254,16 @@ class MacOSRegisteredPgidAccountant:
                                   for identity in surviving_identities),
                           "macOS native reconciliation result is invalid")
         if surviving_identities:
-            self._unreconciled += len(surviving_identities)
-            self._complete = False
-            return
-        del self._leaders[pgid]
-        del self._members[pgid]
+            self._unreconciled[pgid] = surviving_identities
+            self._members[pgid] = surviving_identities
+            raise AuditInfrastructureError(
+                "macOS registered PGID survivors remain"
+            )
+        self._unreconciled.pop(pgid, None)
+        reconciled.add(pgid)
+        self._leaders.pop(pgid, None)
+        self._members.pop(pgid, None)
+        return True
 
     def memory_measurements(self) -> MacOSRunMemoryMeasurements:
         survivors = sum(max(1, len(members))
@@ -1824,10 +2273,13 @@ class MacOSRegisteredPgidAccountant:
             maximum_observed_parent_resident_bytes=self._maximum_parent,
             maximum_observed_owned_group_resident_bytes=self._maximum_owned,
             surviving_registered_process_count=survivors,
-            known_unreconciled_descendant_count=self._unreconciled,
+            known_unreconciled_descendant_count=sum(
+                len(identities)
+                for identities in self._unreconciled.values()
+            ),
             accounting_complete=(self._complete and not self._leaders
                                  and survivors == 0
-                                 and self._unreconciled == 0),
+                                 and not self._unreconciled),
         )
 
 
@@ -1850,6 +2302,7 @@ class MacOSExecPermitAuthority:
         self._verifier = identity_verifier
         self._executable_verifier = executable_verifier
         self._issued: set[tuple[object, ...]] = set()
+        self._permit_intents: dict[tuple[object, ...], object] = {}
 
     def _verify(self, pid: int, pgid: int, start_identity: str) -> None:
         _require_contract(pid == pgid and isinstance(start_identity, str)
@@ -1877,15 +2330,24 @@ class MacOSExecPermitAuthority:
                           "unregistered or untrusted macOS compiler exec")
         key = ("compiler", report.worker_index, report.generation,
                report.task_id, report.pgid)
-        _require_contract(key not in self._issued,
-                          "macOS compiler exec permit was reused")
+        existing_intent = self._permit_intents.get(key)
+        if existing_intent is None:
+            self._permit_intents[key] = report
+        else:
+            _require_contract(
+                existing_intent == report,
+                "macOS compiler exec permit intent differs",
+            )
+        permit = CompilerExecPermit(
+            report.worker_index, report.generation, report.task_id, report.pgid)
+        if key in self._issued:
+            return permit
         self._verify(report.pid, report.pgid, report.bsd_start_identity)
         leader = OwnedProcessIdentity(
             "macos", report.pid, report.bsd_start_identity)
         self._accountant.register_group(report.pgid, leader, "compiler")
         self._issued.add(key)
-        return CompilerExecPermit(
-            report.worker_index, report.generation, report.task_id, report.pgid)
+        return permit
 
     def permit_inspection(
         self, report: MacOSInspectionPgidReported,
@@ -1897,15 +2359,24 @@ class MacOSExecPermitAuthority:
         _require_contract(driver_fingerprint in self._trusted,
                           "unregistered or untrusted macOS inspection exec")
         key = ("inspection", report.inspection_id, report.pgid)
-        _require_contract(key not in self._issued,
-                          "macOS inspection exec permit was reused")
+        existing_intent = self._permit_intents.get(key)
+        if existing_intent is None:
+            self._permit_intents[key] = report
+        else:
+            _require_contract(
+                existing_intent == report,
+                "macOS inspection exec permit intent differs",
+            )
+        permit = MacOSInspectionExecPermit(
+            report.inspection_id, report.pid, report.pgid, driver_fingerprint)
+        if key in self._issued:
+            return permit
         self._verify(report.pid, report.pgid, report.bsd_start_identity)
         leader = OwnedProcessIdentity(
             "macos", report.pid, report.bsd_start_identity)
         self._accountant.register_group(report.pgid, leader, "inspection")
         self._issued.add(key)
-        return MacOSInspectionExecPermit(
-            report.inspection_id, report.pid, report.pgid, driver_fingerprint)
+        return permit
 
 
 class MacOSLibprocProvider:
@@ -2096,6 +2567,181 @@ class MacOSLibprocProvider:
                          for pid in stable_pids)
         return tuple(sorted(observed, key=lambda identity: (
             identity.pid, identity.native_start_identity)))
+
+
+def _attempt_phase_seal_transition(
+    _platform: str, _stage: str, _position: str, _phase: str
+) -> None:
+    return None
+
+
+class MacOSCompilerAuditAttemptAccountant(MacOSRegisteredPgidAccountant):
+    """Phase-aware native authority for one production calibration attempt."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        _require_contract(sys.platform == "darwin",
+                          "macOS attempt accountant requires macOS")
+        self.inspection_probe_invocations = 0
+        self._provider = MacOSLibprocProvider()
+        self._phase: str | None = None
+        self._sealed: set[str] = set()
+        self._sealed_snapshots: dict[str, MacOSPhaseSnapshot] = {}
+        self._active_carriers: dict[object, object] = {}
+        self._inspection_pgids: set[int] = set()
+        self._pending_inspection: tuple[
+            str, object, MacOSExecPermitAuthority, float
+        ] | None = None
+
+    def begin_phase(self, phase: str, deadline: float) -> None:
+        expected = "inspection" if self._phase is None else "tasks"
+        _require_contract(
+            phase == expected
+            and phase not in self._sealed
+            and phase not in self._sealed_snapshots
+            and isinstance(deadline, (int, float))
+            and not isinstance(deadline, bool)
+            and time.monotonic() < deadline,
+            "macOS attempt accountant phase is invalid",
+        )
+        if phase == "tasks":
+            _require_contract("inspection" in self._sealed,
+                              "macOS inspection phase is not sealed")
+        self._phase = phase
+
+    def prepare_compiler_inspection_launch(self, capability, deadline: float) -> str:
+        _require_contract(
+            self._phase == "inspection"
+            and self._pending_inspection is None
+            and isinstance(deadline, (int, float))
+            and not isinstance(deadline, bool)
+            and time.monotonic() < deadline,
+            "macOS inspection launch preparation is invalid",
+        )
+        inspection_id = secrets.token_hex(16)
+
+        def verify_executable(identity, digest):
+            _require_contract(
+                identity == capability.executable_identity
+                and digest == capability.executable_sha256,
+                "macOS inspection executable authority differs",
+            )
+            return capability.capability_digest
+
+        permit_authority = MacOSExecPermitAuthority(
+            self,
+            (capability.capability_digest,),
+            executable_verifier=verify_executable,
+        )
+        self._pending_inspection = (
+            inspection_id, capability, permit_authority, float(deadline))
+        return inspection_id
+
+    @property
+    def macos_launch_deadline(self) -> float:
+        _require_contract(self._pending_inspection is not None,
+                          "macOS inspection launch deadline is unavailable")
+        return self._pending_inspection[3]
+
+    @property
+    def macos_launch_cancel_event(self):
+        return None
+
+    def authorize_macos_compiler_exec(self, process_start):
+        _require_contract(
+            self._pending_inspection is not None
+            and process_start.platform_kind == "macos",
+            "macOS inspection exec authority is unavailable",
+        )
+        inspection_id, capability, authority, _deadline = self._pending_inspection
+        report = MacOSInspectionPgidReported(
+            inspection_id,
+            process_start.pid,
+            process_start.pid,
+            process_start.native_start_token,
+            capability.executable_identity,
+            capability.executable_sha256,
+        )
+        permit = authority.permit_inspection(report)
+        self._inspection_pgids.add(process_start.pid)
+        self._provider.observe(self, native_process_resident_bytes(os.getpid()))
+        return permit
+
+    def register_compiler_process_launch(self, event, carrier) -> None:
+        _require_contract(
+            self._phase == "inspection"
+            and event.purpose is CompilerLaunchPurpose.INSPECTION
+            and event.process_start not in self._active_carriers
+            and self._pending_inspection is not None,
+            "macOS inspection launch registration is invalid",
+        )
+        self._active_carriers[event.process_start] = carrier
+        self.inspection_probe_invocations += 1
+
+    def complete_compiler_process_launch(self, event, carrier) -> None:
+        _require_contract(
+            self._active_carriers.pop(event.process_start, None) is carrier,
+            "macOS inspection process carrier differs",
+        )
+
+    def fail_compiler_process_launch(self, event, carrier) -> None:
+        if self._active_carriers.get(event.process_start) is carrier:
+            self._active_carriers.pop(event.process_start)
+
+    def finish_compiler_inspection_launch_preparation(self, token: str) -> None:
+        _require_contract(
+            self._pending_inspection is not None
+            and self._pending_inspection[0] == token,
+            "macOS inspection launch preparation differs",
+        )
+        self._pending_inspection = None
+
+    def cancel_compiler_inspection_launch_preparation(self, token: str) -> None:
+        if self._pending_inspection is not None and self._pending_inspection[0] == token:
+            self._pending_inspection = None
+
+    def seal_phase(self, phase: str, deadline: float):
+        existing = self._sealed_snapshots.get(phase)
+        if existing is None:
+            _require_contract(
+                phase == self._phase
+                and phase not in self._sealed
+                and not self._active_carriers
+                and self._pending_inspection is None
+                and time.monotonic() < deadline,
+                "macOS attempt accountant phase seal is invalid",
+            )
+            if phase == "inspection":
+                for pgid in tuple(self._inspection_pgids):
+                    _require_contract(
+                        self.reconcile_group(pgid, self._provider) is True,
+                        "macOS inspection reconciliation did not complete",
+                    )
+                    self._inspection_pgids.remove(pgid)
+            memory = self.memory_measurements()
+            _require_contract(
+                memory.accounting_complete
+                and memory.surviving_registered_process_count == 0
+                and memory.known_unreconciled_descendant_count == 0,
+                "macOS attempt accountant phase survivors remain",
+            )
+            existing = MacOSPhaseSnapshot("macos", phase, memory, 0)
+            _attempt_phase_seal_transition(
+                "macos", "snapshot", "before", phase
+            )
+            self._sealed_snapshots[phase] = existing
+            _attempt_phase_seal_transition(
+                "macos", "snapshot", "after", phase
+            )
+        if phase not in self._sealed:
+            _attempt_phase_seal_transition(
+                "macos", "sealed", "before", phase
+            )
+            self._sealed.add(phase)
+            _attempt_phase_seal_transition(
+                "macos", "sealed", "after", phase
+            )
+        return existing
 
 
 def _current_linux_cgroup_path() -> Path:

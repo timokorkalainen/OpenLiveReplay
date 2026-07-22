@@ -839,10 +839,33 @@ class WindowsPhaseSnapshot:
     platform_kind: str
     phase: str
     memory: WindowsRunMemoryMeasurements
-    archived_generation_count: int
+    archived_generation_identities: tuple[tuple[int, int], ...]
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.archived_generation_identities, tuple)
+            or any(
+                not isinstance(identity, tuple)
+                or len(identity) != 2
+                or any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in identity
+                )
+                for identity in self.archived_generation_identities
+            )
+            or self.archived_generation_identities
+            != tuple(sorted(set(self.archived_generation_identities)))
+        ):
+            raise AuditInfrastructureError(
+                "Windows phase generation identities are invalid"
+            )
         _validate_phase_snapshot(self, "windows", WindowsRunMemoryMeasurements)
+
+    @property
+    def archived_generation_count(self) -> int:
+        return len(self.archived_generation_identities)
 
 
 @dataclass(frozen=True, slots=True)

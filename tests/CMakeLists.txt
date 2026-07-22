@@ -280,6 +280,30 @@ add_test(NAME gpu_capability_source_audit_perf
         --performance-only)
 set_tests_properties(gpu_capability_source_audit_perf PROPERTIES
     LABELS "gpu-capability;ci" RUN_SERIAL TRUE TIMEOUT 180)
+if(WIN32 AND MINGW AND OLR_GPU_PIPELINE
+        AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_test(NAME gpu_capability_mingw_provenance_perf
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "OLR_TASK9_REFERENCE_COMPILER=${CMAKE_CXX_COMPILER}"
+            "OLR_TASK9_REQUIRED_FAMILY=GNU"
+            "${Python3_EXECUTABLE}" -m unittest
+            tests.gpu.test_gpu_capability_provenance.ProvenanceScannerParityTests.test_compiled_scanner_is_at_least_twice_reference_throughput)
+    set_tests_properties(gpu_capability_mingw_provenance_perf PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        LABELS "gpu-capability;ci"
+        RUN_SERIAL TRUE
+        TIMEOUT 180)
+endif()
+if(UNIX AND NOT WIN32)
+    add_test(NAME gpu_capability_calibration_smoke
+        COMMAND "${Python3_EXECUTABLE}" -m unittest
+            tests.gpu.test_gpu_capability_runner.ProcessCoordinatorTests.test_task9_native_calibration_smoke_one_configuration)
+    set_tests_properties(gpu_capability_calibration_smoke PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        LABELS "gpu-capability-smoke"
+        RUN_SERIAL TRUE
+        TIMEOUT 175)
+endif()
 add_executable(gpu_lease_release_probe
     "${CMAKE_SOURCE_DIR}/tests/gpu/gpu_lease_release_probe.cpp")
 target_include_directories(gpu_lease_release_probe PRIVATE "${CMAKE_SOURCE_DIR}")

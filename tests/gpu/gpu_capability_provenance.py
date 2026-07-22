@@ -144,6 +144,24 @@ _PUNCTUATORS = tuple(
         reverse=True,
     )
 )
+_PUNCTUATOR_PATTERN = b"|".join(re.escape(value) for value in _PUNCTUATORS)
+_TOKEN_CANDIDATE = re.compile(
+    rb"(?P<whitespace>[ \t\f\v\r]+)"
+    rb"|(?P<line_comment>//[^\r\n]*)"
+    rb"|(?P<block_comment>/\*(?:[^*]|\*(?!/))*\*/)"
+    rb"|(?P<identifier>[_A-Za-z\x80-\xff][_A-Za-z0-9\x80-\xff]*)"
+    rb"|(?P<number>(?:[0-9]|\.[0-9])"
+    rb"(?:[eEpP][+-]|[_A-Za-z0-9.\'\x80-\xff])*)"
+    rb'|(?P<string>"(?:\\.|[^"\\])*")'
+    rb"|(?P<character>\'(?:\\.|[^\'\\])*\')"
+    rb"|(?P<punctuator>" + _PUNCTUATOR_PATTERN + rb")"
+    rb"|(?P<unknown>[^\r\n])"
+)
+_TOKEN_IDENTIFIER_CONTINUATION = re.compile(
+    rb"[_A-Za-z0-9\x80-\xff]*"
+)
+_TOKEN_WHITESPACE_CONTINUATION = re.compile(rb"[ \t\f\v\r]*")
+_TOKEN_BOUNDARY_LOOKAHEAD = max(len(value) for value in _PUNCTUATORS) - 1
 _BLOCK_SIZE = 4096
 _ARRAY_SLACK = 4096
 _TUPLE_SLOT_BYTES = sys.getsizeof((None,)) - sys.getsizeof(())
@@ -151,6 +169,10 @@ _TUPLE_SLOT_BYTES = sys.getsizeof((None,)) - sys.getsizeof(())
 
 def _fail(message: str) -> AuditInfrastructureError:
     return AuditInfrastructureError(message)
+
+
+def _authoritative_candidate_chunk_completed(_stop: int) -> None:
+    return None
 
 
 def _is_windows_path(value: str) -> bool:
@@ -841,14 +863,6 @@ class PreprocessedStreamBuilder:
             self._apply_msvc_marker(line, path, relative)
         return True
 
-    @staticmethod
-    def _identifier_start(byte: int) -> bool:
-        return byte == ord("_") or ord("A") <= byte <= ord("Z") or ord("a") <= byte <= ord("z") or byte >= 0x80
-
-    @staticmethod
-    def _identifier_continue(byte: int) -> bool:
-        return PreprocessedStreamBuilder._identifier_start(byte) or ord("0") <= byte <= ord("9")
-
     def _append_token(self, spelling: bytes) -> None:
         if not self._stack:
             raise _fail("compiler output contains code without a real-file marker")
@@ -875,87 +889,253 @@ class PreprocessedStreamBuilder:
         self._original_lines.append(self._current_line)
         self._seen_real_code = True
 
-    def _tokenize(self, content: bytes) -> None:
-        index = 0
+    def _poll_candidate_scan_budget(self, content: bytes) -> None:
+        if len(content) < _TOKEN_BUDGET_POLL_BYTES:
+            return
+        # Python's regex engine cannot call back while one maximal candidate is
+        # matching. Bounded regex probes preserve responsive cancellation and
+        # deadlines without reverting candidate recognition to Python bytes.
+        for start in range(0, len(content), _TOKEN_BUDGET_POLL_BYTES):
+            _TOKEN_CANDIDATE.match(
+                content,
+                start,
+                min(start + _TOKEN_BUDGET_POLL_BYTES, len(content)),
+            )
+            self._check_budget()
+
+    def _authoritative_chunk_completed(self, stop: int) -> None:
+        _authoritative_candidate_chunk_completed(stop)
+        self._check_budget()
+
+    def _extend_simple_candidate(
+        self, content: bytes, start: int, continuation
+    ) -> int:
+        index = start
         while index < len(content):
-            byte = content[index]
-            if self._in_block_comment:
-                close = content.find(b"*/", index)
-                self._check_budget()
-                if close < 0:
-                    return
-                self._in_block_comment = False
-                index = close + 2
-                continue
-            if byte in b" \t\r\f\v":
-                index += 1
-                continue
-            if content.startswith(b"//", index):
-                return
-            if content.startswith(b"/*", index):
-                self._in_block_comment = True
-                index += 2
-                continue
-            start = index
-            if self._identifier_start(byte):
-                index += 1
-                next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
-                while index < len(content) and self._identifier_continue(content[index]):
+            end = min(index + _TOKEN_BUDGET_POLL_BYTES, len(content))
+            match = continuation.match(content, index, end)
+            if match is None:
+                raise _fail("compiler token continuation scanner failed")
+            stop = match.end()
+            self._authoritative_chunk_completed(stop)
+            if stop < end:
+                return stop
+            index = stop
+        return index
+
+    def _extend_number_candidate(self, content: bytes, start: int) -> int:
+        index = start
+        if (
+            index > 0
+            and index < len(content)
+            and content[index - 1] in b"eEpP"
+            and content[index] in b"+-"
+        ):
+            index += 1
+        while index < len(content):
+            end = min(index + _TOKEN_BUDGET_POLL_BYTES, len(content))
+            while index < end:
+                value = content[index]
+                if (
+                    value in b"eEpP"
+                    and index + 1 < len(content)
+                    and content[index + 1] in b"+-"
+                ):
+                    index += 2
+                    continue
+                if (
+                    value == ord("_")
+                    or value == ord(".")
+                    or value == ord("'")
+                    or ord("0") <= value <= ord("9")
+                    or ord("A") <= value <= ord("Z")
+                    or ord("a") <= value <= ord("z")
+                    or value >= 0x80
+                ):
                     index += 1
-                    if index >= next_budget_poll:
-                        self._check_budget()
-                        next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
-            elif ord("0") <= byte <= ord("9") or (
-                byte == ord(".") and index + 1 < len(content) and content[index + 1 : index + 2].isdigit()
+                    continue
+                break
+            self._authoritative_chunk_completed(index)
+            if index < end:
+                return index
+        return index
+
+    def _extend_line_comment(self, content: bytes, start: int) -> int:
+        index = start
+        while index < len(content):
+            end = min(index + _TOKEN_BUDGET_POLL_BYTES, len(content))
+            carriage_return = content.find(b"\r", index, end)
+            stop = carriage_return if carriage_return >= 0 else end
+            self._authoritative_chunk_completed(stop)
+            if stop < end:
+                return stop
+            index = stop
+        return index
+
+    def _find_block_comment_close(
+        self, content: bytes, search_start: int
+    ) -> int | None:
+        index = search_start
+        while index < len(content):
+            end = min(index + _TOKEN_BUDGET_POLL_BYTES, len(content))
+            close = content.find(b"*/", index, end)
+            stop = close + 2 if close >= 0 else end
+            self._authoritative_chunk_completed(stop)
+            if close >= 0:
+                return stop
+            if end == len(content):
+                return None
+            index = end - 1
+        return None
+
+    def _find_literal_stop(
+        self, content: bytes, start: int, quote: int
+    ) -> int | None:
+        index = start + 1
+        escaped = False
+        while index < len(content):
+            end = min(index + _TOKEN_BUDGET_POLL_BYTES, len(content))
+            while index < end:
+                value = content[index]
+                index += 1
+                if escaped:
+                    escaped = False
+                elif value == ord("\\"):
+                    escaped = True
+                elif value == quote:
+                    self._authoritative_chunk_completed(index)
+                    return index
+            self._authoritative_chunk_completed(index)
+        return None
+
+    def _authoritative_candidates(self, content: bytes, start_index: int):
+        index = start_index
+        while index < len(content):
+            end = min(index + _TOKEN_BUDGET_POLL_BYTES, len(content))
+            recognition_end = min(
+                end + _TOKEN_BOUNDARY_LOOKAHEAD, len(content)
+            )
+            restart = False
+            for candidate in _TOKEN_CANDIDATE.finditer(
+                content, index, recognition_end
             ):
-                index += 1
-                next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
-                while index < len(content):
-                    current = content[index]
-                    if self._identifier_continue(current) or current in b".'":
-                        index += 1
-                        if index >= next_budget_poll:
-                            self._check_budget()
-                            next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
-                        continue
-                    if current in b"+-" and index > start and content[index - 1] in b"eEpP":
-                        index += 1
-                        if index >= next_budget_poll:
-                            self._check_budget()
-                            next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
-                        continue
+                start, stop = candidate.span()
+                if start >= end:
                     break
-            elif byte in (ord('"'), ord("'")):
-                quote = byte
-                index += 1
-                escaped = False
-                next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
-                while index < len(content):
-                    current = content[index]
-                    index += 1
-                    if index >= next_budget_poll:
-                        self._check_budget()
-                        next_budget_poll = index + _TOKEN_BUDGET_POLL_BYTES
-                    if escaped:
-                        escaped = False
-                    elif current == ord("\\"):
-                        escaped = True
-                    elif current == quote:
-                        break
-                else:
+                if start != index:
+                    raise _fail("compiler token candidate scanner skipped input")
+                kind = candidate.lastgroup
+                if kind == "unknown" and content.startswith(b"/*", start):
+                    self._authoritative_chunk_completed(stop)
+                    completed = self._find_block_comment_close(
+                        content, start + 2
+                    )
+                    if completed is None:
+                        yield "incomplete_block_comment", start, len(content)
+                        return
+                    yield "block_comment", start, completed
+                    index = completed
+                    restart = True
+                    break
+                if kind == "unknown" and content[start] in (ord('"'), ord("'")):
+                    self._authoritative_chunk_completed(stop)
+                    completed = self._find_literal_stop(
+                        content, start, content[start]
+                    )
+                    if completed is None:
+                        yield kind, start, stop
+                        index = stop
+                    else:
+                        yield (
+                            "string" if content[start] == ord('"') else "character",
+                            start,
+                            completed,
+                        )
+                        index = completed
+                    restart = True
+                    break
+                if (
+                    stop == recognition_end
+                    and recognition_end < len(content)
+                    and kind in {
+                    "whitespace", "line_comment", "identifier", "number"
+                    }
+                ):
+                    self._authoritative_chunk_completed(stop)
+                    if kind == "whitespace":
+                        stop = self._extend_simple_candidate(
+                            content, stop, _TOKEN_WHITESPACE_CONTINUATION
+                        )
+                    elif kind == "identifier":
+                        stop = self._extend_simple_candidate(
+                            content, stop, _TOKEN_IDENTIFIER_CONTINUATION
+                        )
+                    elif kind == "number":
+                        stop = self._extend_number_candidate(content, stop)
+                    else:
+                        stop = self._extend_line_comment(content, stop)
+                    yield kind, start, stop
+                    index = stop
+                    restart = True
+                    break
+                yield kind, start, stop
+                index = stop
+                if stop >= end:
+                    self._authoritative_chunk_completed(stop)
+                    restart = True
+                    break
+            if restart:
+                continue
+            self._authoritative_chunk_completed(index)
+            if index != end:
+                raise _fail("compiler token candidate scanner did not consume the line")
+
+    def _scan_line(self, content: bytes) -> None:
+        index = 0
+        if self._in_block_comment:
+            close = self._find_block_comment_close(content, 0)
+            if close is None:
+                return
+            self._in_block_comment = False
+            index = close
+
+        for kind, start, stop in self._authoritative_candidates(content, index):
+            if start != index:
+                raise _fail("compiler token candidate scanner skipped input")
+            if kind == "block_comment":
+                pass
+            elif kind == "whitespace":
+                pass
+            elif kind == "line_comment":
+                self._check_budget()
+                return
+            elif kind == "incomplete_block_comment":
+                # The compiled candidate recognizes only complete block comments;
+                # retain the explicit cross-line comment state for an incomplete one.
+                self._in_block_comment = True
+                self._check_budget()
+                return
+            elif kind in (
+                "string",
+                "character",
+                "identifier",
+                "number",
+                "punctuator",
+                "unknown",
+            ):
+                if kind == "unknown" and content[start] in (ord('"'), ord("'")):
                     raise _fail("compiler output contains an unterminated literal")
+                self._append_token(content[start:stop])
             else:
-                punctuator = next(
-                    (value for value in _PUNCTUATORS if content.startswith(value, index)),
-                    None,
-                )
-                index += len(punctuator) if punctuator is not None else 1
-            self._append_token(content[start:index])
+                raise _fail("compiler token candidate scanner returned an unknown kind")
+            index = stop
+        if index != len(content):
+            raise _fail("compiler token candidate scanner did not consume the line")
 
     def _process_line(self, content: bytes) -> None:
         if not self._in_block_comment and self._parse_marker(content):
             return
-        self._tokenize(content)
+        self._scan_line(content)
         if self._stack:
             if self._current_line == UINT32_MAX:
                 raise _fail("source line exceeds unsigned 32-bit range")
@@ -991,7 +1171,7 @@ class PreprocessedStreamBuilder:
                     if split >= 0:
                         prefix = bytes(self._line_buffer[: split + 1])
                         del self._line_buffer[: split + 1]
-                        self._tokenize(prefix)
+                        self._scan_line(prefix)
                 self._check_retained()
                 return
             self._check_retained(newline - offset)

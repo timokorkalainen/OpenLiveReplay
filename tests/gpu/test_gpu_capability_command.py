@@ -2947,6 +2947,92 @@ class ConfigurationTests(unittest.TestCase):
                 from gpu_capability_command import _probe_compiler_version
                 _probe_compiler_version(capability, CompilerFamily.GCC, self.build, self.environment)
 
+    def test_probe_post_launch_preparation_failure_cleans_once_and_preserves_primary(self):
+        capability = open_compiler_executable_capability(
+            self.compiler,
+            self.dependency_roots,
+            time.monotonic() + 60.0,
+            compiler_family=CompilerFamily.GCC,
+        )
+        self.addCleanup(capability.native_owner.close)
+
+        class FatalPreparation(BaseException):
+            pass
+
+        for primary in (RuntimeError("finish failed"), FatalPreparation("fatal")):
+            with self.subTest(primary=type(primary).__name__):
+                events = []
+
+                class Containment:
+                    requires_handshake = False
+
+                    def prepare_command(_self, command): return command
+                    def terminate(_self): events.append("terminate")
+                    def close(_self): events.append("close")
+
+                class Process:
+                    def poll(_self): return None
+                    def kill(_self): events.append("kill")
+                    def wait(_self, timeout=None):
+                        events.append(("wait", timeout))
+                        return -9
+
+                class Carrier:
+                    completed = False
+
+                    def complete_after_exit(_self):
+                        _self.completed = True
+                        events.append("carrier-complete")
+
+                class Observer:
+                    def prepare_compiler_inspection_launch(_self, *_args):
+                        return "preparation"
+
+                    def finish_compiler_inspection_launch_preparation(
+                        _self, preparation
+                    ):
+                        self.assertEqual(preparation, "preparation")
+                        raise primary
+
+                    def cancel_compiler_inspection_launch_preparation(
+                        _self, preparation
+                    ):
+                        self.assertEqual(preparation, "preparation")
+                        events.append("cancel-preparation")
+
+                containment = Containment()
+                process = Process()
+                carrier = Carrier()
+                with mock.patch.object(
+                    capability_command,
+                    "_ProbeContainment",
+                    return_value=containment,
+                ), mock.patch.object(
+                    capability_command,
+                    "launch_compiler_process",
+                    return_value=(process, carrier),
+                ), self.assertRaises(type(primary)) as raised:
+                    capability_command._run_probe_command(
+                        capability,
+                        ("--version",),
+                        self.build,
+                        self.environment,
+                        time.monotonic() + 10.0,
+                        launch_observer=Observer(),
+                    )
+                self.assertIs(raised.exception, primary)
+                self.assertEqual(
+                    events,
+                    [
+                        "cancel-preparation",
+                        "terminate",
+                        "kill",
+                        ("wait", 1.0),
+                        "carrier-complete",
+                        "close",
+                    ],
+                )
+
     def test_probe_uses_owned_generation_guards_without_rehashing_full_closure(self):
         capability = open_compiler_executable_capability(
             self.compiler, self.dependency_roots, time.monotonic() + 10.0
@@ -3327,6 +3413,20 @@ class MacOSCompilerExecGateTests(unittest.TestCase):
                 task_id="audit-5-0123456789abcdef",
                 generation=7,
             )
+
+    def test_inspection_permit_is_bound_to_ungenerated_launch_identity(self):
+        start = capability_command.ProcessStartIdentity(
+            "macos", 71, "1:2", "d" * 64)
+        permit = capability_command.MacOSInspectionExecPermit(
+            "inspection-1", 71, 71, "e" * 64)
+        capability_command._validate_macos_compiler_exec_permit(
+            permit, start, worker_index=None, task_id=None, generation=None)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "inspection exec permit"
+        ):
+            capability_command._validate_macos_compiler_exec_permit(
+                dataclasses.replace(permit, pgid=72), start,
+                worker_index=None, task_id=None, generation=None)
 
 
 class CommandRewriteTests(unittest.TestCase):

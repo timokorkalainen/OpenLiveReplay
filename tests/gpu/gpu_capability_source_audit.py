@@ -8434,8 +8434,8 @@ def run_correctness_only_cli(args: argparse.Namespace) -> None:
         "correctness-only native decision preparation belongs to Task 10")
 
 
-AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v7"
-AUDIT_ENGINE_STAGE_BYTES = b"task-8-stream-findings-coverage"
+AUDIT_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-live-graph-v8"
+AUDIT_ENGINE_STAGE_BYTES = b"task-9-compiled-provenance-scanner"
 DECISION_ENGINE_GRAPH_SCHEMA_BYTES = b"olr-gpu-capability-decision-live-graph-v1"
 _PREPROCESS_CONFIGURATION_CONSTRUCTOR_INVENTORY = MappingProxyType({
     "gpu_capability_command.py": 1,

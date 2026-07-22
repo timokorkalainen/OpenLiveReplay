@@ -31,7 +31,12 @@ from gpu_capability_provenance import (  # noqa: E402
     parse_gcc_dependencies,
     validate_dependency_identities,
 )
+import gpu_capability_runner as production_runner  # noqa: E402
+import gpu_capability_provenance as provenance  # noqa: E402
 import gpu_capability_source_audit as capability_audit  # noqa: E402
+from test_gpu_capability_provenance import (  # noqa: E402
+    _FrozenByteScannerBuilder,
+)
 from gpu_capability_source_audit import (  # noqa: E402
     AggregatedFinding,
     Finding,
@@ -992,6 +997,118 @@ FORWARD(lease.safe)();
                 ))
 
 
+_NATIVE_LIVE_BUILDER = production_runner.PreprocessedStreamBuilder
+
+
+def _live_lexical_boundary_offsets(raw_output):
+    needles = {
+        "markers": (b"# ", b"#line "),
+        "comments": (b"//", b"/*", b"*/"),
+        "escapes": (b"\\",),
+        "prefixes": (b'u8"', b'u"', b'U"', b'L"', b"u'", b"U'", b"L'"),
+        "terminators": (b'"', b"'"),
+        "raw-delimiters": (b'R"', b")"),
+        "pp-signs": (b"e+", b"e-", b"E+", b"E-",
+                     b"p+", b"p-", b"P+", b"P-"),
+        "punctuators": provenance._PUNCTUATORS,
+    }
+    boundaries = {label: set() for label in needles}
+    boundaries["utf8"] = set()
+    for label, values in needles.items():
+        for value in values:
+            start = 0
+            while True:
+                start = raw_output.find(value, start)
+                if start < 0:
+                    break
+                for offset in range(max(1, start - 1),
+                                    min(len(raw_output), start + len(value) + 2)):
+                    boundaries[label].add(offset)
+                start += max(1, len(value))
+    for index, value in enumerate(raw_output):
+        if value >= 0x80:
+            for offset in range(max(1, index - 1),
+                                min(len(raw_output), index + 3)):
+                boundaries["utf8"].add(offset)
+    return {label: tuple(sorted(offsets))
+            for label, offsets in boundaries.items() if offsets}
+
+
+class _DifferentialLiveBuilder:
+    """Feed exact live compiler bytes to native and frozen Task-8 scanners."""
+
+    def __init__(self, *args, **kwargs):
+        self._builder_args = args
+        self._builder_kwargs = dict(kwargs)
+        self._raw_chunks = []
+        self._native = _NATIVE_LIVE_BUILDER(*args, **kwargs)
+        self._reference = _FrozenByteScannerBuilder(*args, **kwargs)
+
+    def feed(self, chunk):
+        self._raw_chunks.append(chunk)
+        self._native.feed(chunk)
+        self._reference.feed(chunk)
+
+    @staticmethod
+    def _compact(view):
+        return (
+            view.configuration.digest,
+            view.dependencies,
+            tuple(
+                (
+                    token.spelling,
+                    token.location.identity,
+                    token.location.inclusion_instance,
+                    token.location.line,
+                    token.location.configuration_digest,
+                )
+                for token in view.tokens
+            ),
+        )
+
+    def finalize(self, dependencies):
+        native = self._native.finalize(dependencies)
+        reference = self._reference.finalize(dependencies)
+        expected = self._compact(reference)
+        if self._compact(native) != expected:
+            raise AssertionError(
+                "live compiler native scanner differs from frozen Task-8 oracle"
+            )
+        raw_output = b"".join(self._raw_chunks)
+        replay_kwargs = dict(self._builder_kwargs)
+        replay_kwargs["deadline"] = None
+        replay_kwargs["cancel_event"] = None
+        for width in (1, 2, 3, 7, 4096):
+            for builder_type in (_NATIVE_LIVE_BUILDER, _FrozenByteScannerBuilder):
+                replay = builder_type(*self._builder_args, **replay_kwargs)
+                for offset in range(0, len(raw_output), width):
+                    replay.feed(raw_output[offset : offset + width])
+                observed = replay.finalize(dependencies)
+                if self._compact(observed) != expected:
+                    raise AssertionError(
+                        "live compiler scanner chunk-width replay differs: "
+                        f"builder={builder_type.__name__} width={width}"
+                    )
+        named_boundaries = sorted({
+            offset
+            for offsets in _live_lexical_boundary_offsets(raw_output).values()
+            for offset in offsets
+        })
+        for builder_type in (_NATIVE_LIVE_BUILDER, _FrozenByteScannerBuilder):
+            replay = builder_type(*self._builder_args, **replay_kwargs)
+            previous = 0
+            for offset in (*named_boundaries, len(raw_output)):
+                replay.feed(raw_output[previous:offset])
+                previous = offset
+            observed = replay.finalize(dependencies)
+            if self._compact(observed) != expected:
+                raise AssertionError(
+                    "live compiler named lexical-boundary replay differs: "
+                    f"builder={builder_type.__name__}"
+                )
+        return native
+
+
 class LiveCompilerParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1007,36 +1124,87 @@ class LiveCompilerParityTests(unittest.TestCase):
             self.skipTest("optional live compiler absent: no supported executable found")
         runner = globals().get("run_live_fixture")
         self.assertTrue(callable(runner))
-        for family, compiler in self.compilers:
-            for name, source in FORBIDDEN_FIXTURES.items():
-                with self.subTest(family=family.value, name=name):
-                    _view, findings = runner(
-                        compiler,
-                        family,
-                        source,
-                        FORBIDDEN_OUTPUT_ORACLES[name],
-                        budget=self.budget,
-                    )
-                    _require_forbidden_finding(name, source, _view, findings)
+        with mock.patch.object(
+            production_runner,
+            "PreprocessedStreamBuilder",
+            _DifferentialLiveBuilder,
+        ):
+            for family, compiler in self.compilers:
+                for name, source in FORBIDDEN_FIXTURES.items():
+                    with self.subTest(family=family.value, name=name):
+                        _view, findings = runner(
+                            compiler,
+                            family,
+                            source,
+                            FORBIDDEN_OUTPUT_ORACLES[name],
+                            budget=self.budget,
+                        )
+                        _require_forbidden_finding(name, source, _view, findings)
 
     def test_safe_expansions_emit_expected_tokens_without_findings(self):
         if not self.compilers:
             self.skipTest("optional live compiler absent: no supported executable found")
         runner = globals().get("run_live_fixture")
         self.assertTrue(callable(runner))
-        for family, compiler in self.compilers:
-            for name, (source, expected) in SAFE_FIXTURES.items():
-                with self.subTest(family=family.value, name=name):
-                    view, findings = runner(
-                        compiler,
-                        family,
-                        source,
-                        expected,
-                        budget=self.budget,
-                    )
-                    _require_safe_output_oracle(name, view)
+        with mock.patch.object(
+            production_runner,
+            "PreprocessedStreamBuilder",
+            _DifferentialLiveBuilder,
+        ):
+            for family, compiler in self.compilers:
+                for name, (source, expected) in SAFE_FIXTURES.items():
+                    with self.subTest(family=family.value, name=name):
+                        view, findings = runner(
+                            compiler,
+                            family,
+                            source,
+                            expected,
+                            budget=self.budget,
+                        )
+                        _require_safe_output_oracle(name, view)
+                        self.assertEqual(findings, [])
+                        self.assertFalse(view.configuration.source.canonical.exists())
+
+    def test_live_recursive_include_corpus_matches_frozen_scanner(self):
+        selected = tuple(
+            item for item in self.compilers
+            if item[0] in {CompilerFamily.GCC, CompilerFamily.CLANG})
+        if not selected:
+            self.skipTest("recursive live corpus requires GCC or Clang")
+        source = """\
+#if __INCLUDE_LEVEL__ < 2
+#include "live_fixture.cpp"
+#endif
+int recursive_depth = __INCLUDE_LEVEL__;
+lease.safe();
+"""
+        with mock.patch.object(
+            production_runner, "PreprocessedStreamBuilder",
+            _DifferentialLiveBuilder,
+        ):
+            for family, compiler in selected:
+                with self.subTest(family=family.value):
+                    view, findings = run_live_fixture(
+                        compiler, family, source, b"recursive_depth",
+                        budget=self.budget)
+                    self.assertGreaterEqual(
+                        sum(token.spelling == b"recursive_depth"
+                            for token in view.tokens), 3)
                     self.assertEqual(findings, [])
-                    self.assertFalse(view.configuration.source.canonical.exists())
+
+    def test_live_named_boundary_selector_covers_locked_classes(self):
+        raw = (
+            b'# 1 "a.cpp"\n/*c*/ u8"x\\\"" R"tag(raw)tag" '
+            b'1e+2 0x1p-3 \xc3\xb1 :: ->* // tail\n')
+        observed = _live_lexical_boundary_offsets(raw)
+        self.assertEqual(
+            set(observed),
+            {"markers", "comments", "escapes", "prefixes", "terminators",
+             "raw-delimiters", "pp-signs", "punctuators", "utf8"})
+        for label, offsets in observed.items():
+            self.assertTrue(offsets, label)
+            self.assertTrue(all(0 < offset < len(raw) for offset in offsets),
+                            label)
 
 
 if __name__ == "__main__":
