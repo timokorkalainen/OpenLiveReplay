@@ -12,6 +12,7 @@ import math
 import multiprocessing
 import os
 import queue
+import re
 import secrets
 import selectors
 import shutil
@@ -3935,6 +3936,10 @@ class GenerationReactor:
         ).counting_pass_peak_bytes
         self.context = multiprocessing.get_context("spawn")
         self.cancel_event = self.context.Event()
+        if isinstance(
+            self.run_accountant, LinuxCompilerAuditAttemptAccountant
+        ):
+            self.run_accountant.register_spawn_resource_tracker()
         self.states: list[_GenerationState | None] = [None] * worker_count
         self.next_generations = [0] * worker_count
         self.publication_requests: collections.deque[
@@ -10384,6 +10389,171 @@ def _attempt_phase_seal_transition(
     return None
 
 
+@dataclass(frozen=True)
+class _LinuxCoordinatorProcessSnapshot:
+    pid: int
+    parent_pid: int
+    start_identity: str
+    cgroup_path: Path
+    executable_path: Path
+    argv: tuple[bytes, ...]
+
+
+def _read_linux_coordinator_process_snapshot(
+    pid: int,
+) -> _LinuxCoordinatorProcessSnapshot:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise AuditInfrastructureError(
+            "Linux coordinator process identity is invalid"
+        )
+    proc = Path("/proc") / str(pid)
+    try:
+        stat_text = (proc / "stat").read_text(encoding="ascii")
+        close = stat_text.rindex(")")
+        fields = stat_text[close + 2 :].split()
+        parent_pid = int(fields[1])
+        start_ticks = fields[19]
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii"
+        ).strip()
+        cgroup_path = None
+        for line in (proc / "cgroup").read_text(
+            encoding="ascii"
+        ).splitlines():
+            hierarchy, controllers, relative = line.split(":", 2)
+            if hierarchy == "0" and controllers == "":
+                cgroup_path = (
+                    Path("/sys/fs/cgroup") / relative.lstrip("/")
+                ).resolve(strict=True)
+                break
+        executable_path = (proc / "exe").resolve(strict=True)
+        argv = tuple((proc / "cmdline").read_bytes().split(b"\0"))
+        if argv and argv[-1] == b"":
+            argv = argv[:-1]
+    except (OSError, ValueError, IndexError) as error:
+        raise AuditInfrastructureError(
+            "Linux coordinator process identity is unavailable"
+        ) from error
+    if (
+        parent_pid <= 0
+        or not boot_id
+        or not start_ticks.isdigit()
+        or cgroup_path is None
+        or not argv
+        or any(not value for value in argv)
+    ):
+        raise AuditInfrastructureError(
+            "Linux coordinator process identity is invalid"
+        )
+    return _LinuxCoordinatorProcessSnapshot(
+        pid,
+        parent_pid,
+        f"linux-proc:{boot_id}:{start_ticks}",
+        cgroup_path,
+        executable_path,
+        argv,
+    )
+
+
+class _LinuxCoordinatorProcessCarrier:
+    _RESOURCE_TRACKER_COMMAND = re.compile(
+        br"from multiprocessing\.resource_tracker import main;"
+        br"main\((?:0|[1-9][0-9]*)\)"
+    )
+
+    def __init__(self, pid: int, coordinator: Path) -> None:
+        before = _read_linux_coordinator_process_snapshot(pid)
+        self._validate_snapshot(before, coordinator)
+        pidfd_open = getattr(os, "pidfd_open", None)
+        if not callable(pidfd_open):
+            raise AuditInfrastructureError(
+                "Linux coordinator process pidfd authority is unavailable"
+            )
+        try:
+            pidfd = pidfd_open(pid)
+        except OSError as error:
+            raise AuditInfrastructureError(
+                "Linux coordinator process pidfd retention failed"
+            ) from error
+        try:
+            after = _read_linux_coordinator_process_snapshot(pid)
+            self._validate_snapshot(after, coordinator)
+            if after != before:
+                raise AuditInfrastructureError(
+                    "Linux coordinator process identity changed during retention"
+                )
+            self.pid = pid
+            self._snapshot = after
+            self._pidfd: int | None = pidfd
+        except BaseException as primary:
+            try:
+                os.close(pidfd)
+            except BaseException as cleanup_error:
+                primary.add_note(
+                    "Linux coordinator pidfd cleanup failed: "
+                    f"{cleanup_error}"
+                )
+            raise
+
+    @classmethod
+    def _validate_snapshot(cls, snapshot, coordinator: Path) -> None:
+        from multiprocessing import util as multiprocessing_util
+
+        expected_executable = Path(sys.executable).resolve(strict=True)
+        argv = snapshot.argv
+        interpreter_flags = tuple(
+            os.fsencode(argument)
+            for argument in multiprocessing_util._args_from_interpreter_flags()
+        )
+        command_index = 1 + len(interpreter_flags)
+        try:
+            invoked_executable = Path(os.fsdecode(argv[0])).resolve(strict=True)
+        except (OSError, TypeError, ValueError) as error:
+            raise AuditInfrastructureError(
+                "Linux spawn resource tracker identity is invalid"
+            ) from error
+        if (
+            snapshot.pid <= 0
+            or snapshot.parent_pid != os.getpid()
+            or snapshot.cgroup_path != coordinator.resolve(strict=True)
+            or snapshot.executable_path != expected_executable
+            or invoked_executable != expected_executable
+            or len(argv) != command_index + 2
+            or argv[1:command_index] != interpreter_flags
+            or argv[command_index] != b"-c"
+            or cls._RESOURCE_TRACKER_COMMAND.fullmatch(
+                argv[command_index + 1]
+            ) is None
+        ):
+            raise AuditInfrastructureError(
+                "Linux spawn resource tracker identity is invalid"
+            )
+
+    def validate(self, coordinator: Path) -> None:
+        if self._pidfd is None:
+            raise AuditInfrastructureError(
+                "Linux coordinator process carrier is closed"
+            )
+        try:
+            os.fstat(self._pidfd)
+        except OSError as error:
+            raise AuditInfrastructureError(
+                "Linux coordinator process pidfd identity is unavailable"
+            ) from error
+        current = _read_linux_coordinator_process_snapshot(self.pid)
+        self._validate_snapshot(current, coordinator)
+        if current != self._snapshot:
+            raise AuditInfrastructureError(
+                "Linux coordinator process identity changed"
+            )
+
+    def close(self) -> None:
+        if self._pidfd is not None:
+            pidfd = self._pidfd
+            self._pidfd = None
+            os.close(pidfd)
+
+
 class LinuxCompilerAuditAttemptAccountant:
     """Account inspection and task phases in one delegated native cgroup run."""
 
@@ -10415,6 +10585,9 @@ class LinuxCompilerAuditAttemptAccountant:
         self._sealed_snapshots: dict[str, LinuxPhaseSnapshot] = {}
         self._active_carriers: dict[ProcessStartIdentity, object] = {}
         self._pending_inspection: tuple[str, object] | None = None
+        self._coordinator_process_carriers: dict[
+            int, _LinuxCoordinatorProcessCarrier
+        ] = {}
 
     @staticmethod
     def _read_events(path: Path) -> dict[str, int]:
@@ -10504,6 +10677,86 @@ class LinuxCompilerAuditAttemptAccountant:
                 and self._pending_inspection[0] == token):
             self._pending_inspection = None
 
+    def _retain_spawn_resource_tracker(self, *, required: bool) -> None:
+        from multiprocessing import resource_tracker
+
+        pid = getattr(resource_tracker._resource_tracker, "_pid", None)
+        if pid is None and not required:
+            return
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+        ):
+            raise AuditInfrastructureError(
+                "Linux spawn resource tracker registration is invalid"
+            )
+        existing = self._coordinator_process_carriers.get(pid)
+        if existing is not None:
+            if len(self._coordinator_process_carriers) != 1:
+                raise AuditInfrastructureError(
+                    "Linux spawn resource tracker registration differs"
+                )
+            existing.validate(self._coordinator)
+            return
+        if self._coordinator_process_carriers:
+            raise AuditInfrastructureError(
+                "Linux spawn resource tracker registration differs"
+            )
+        carrier = _LinuxCoordinatorProcessCarrier(pid, self._coordinator)
+        try:
+            self._coordinator_process_carriers[pid] = carrier
+        except BaseException as primary:
+            try:
+                carrier.close()
+            except BaseException as cleanup_error:
+                primary.add_note(
+                    "Linux coordinator carrier cleanup failed: "
+                    f"{cleanup_error}"
+                )
+            raise
+
+    def adopt_existing_spawn_resource_tracker(self) -> None:
+        if (
+            self._phase is not None
+            or self._sealed
+            or self._sealed_snapshots
+            or self._coordinator_process_carriers
+        ):
+            raise AuditInfrastructureError(
+                "Linux existing resource tracker adoption is invalid"
+            )
+        self._retain_spawn_resource_tracker(required=False)
+
+    def register_spawn_resource_tracker(self) -> None:
+        if (
+            self._phase != "tasks"
+            or "inspection" not in self._sealed
+        ):
+            raise AuditInfrastructureError(
+                "Linux spawn resource tracker registration is invalid"
+            )
+        self._retain_spawn_resource_tracker(required=True)
+
+    def close(self) -> None:
+        carriers = getattr(self, "_coordinator_process_carriers", None)
+        if carriers is None:
+            return
+        failures = []
+        for carrier in tuple(carriers.values()):
+            try:
+                carrier.close()
+            except BaseException as error:
+                failures.append(error)
+        carriers.clear()
+        if failures:
+            error = AuditInfrastructureError(
+                "Linux coordinator process carrier cleanup failed"
+            )
+            for failure in failures:
+                error.add_note(str(failure))
+            raise error
+
     def _surviving_pids(self) -> set[int]:
         pids: set[int] = set()
         try:
@@ -10514,6 +10767,13 @@ class LinuxCompilerAuditAttemptAccountant:
             raise AuditInfrastructureError(
                 "Linux attempt cgroup membership is unavailable") from error
         pids.discard(os.getpid())
+        for pid, carrier in self._coordinator_process_carriers.items():
+            carrier.validate(self._coordinator)
+            if pid not in pids:
+                raise AuditInfrastructureError(
+                    "Linux coordinator process carrier is unavailable"
+                )
+            pids.discard(pid)
         return pids
 
     def memory_measurements(self) -> LinuxRunMemoryMeasurements:
@@ -11716,6 +11976,13 @@ def _run_compiler_audit_pipeline_core(
     if smoke_only and platform_kind not in {"linux", "macos"}:
         raise AuditInfrastructureError(
             "compiler audit smoke requires Linux or macOS")
+    if (
+        platform_kind == "linux"
+        and isinstance(
+            run_accountant, LinuxCompilerAuditAttemptAccountant
+        )
+    ):
+        run_accountant.adopt_existing_spawn_resource_tracker()
     _begin_accountant_phase(
         run_accountant, "inspection", effective_deadline, platform_kind
     )

@@ -1960,6 +1960,389 @@ class OrchestrationTests(unittest.TestCase):
         ):
             accountant.seal_phase("inspection", deadline)
 
+    def test_task9_linux_attempt_excludes_only_registered_spawn_tracker(self):
+        run = self.root / "registered-helper" / "run"
+        coordinator = run / "coordinator"
+        coordinator.mkdir(parents=True)
+        tracker_pid = 31337
+        foreign_pid = 424242
+        (coordinator / "cgroup.procs").write_text(
+            f"{os.getpid()}\n{tracker_pid}\n{foreign_pid}\n",
+            encoding="ascii",
+        )
+        accountant = object.__new__(
+            capability_runner.LinuxCompilerAuditAttemptAccountant
+        )
+        accountant._phase = "tasks"
+        accountant._sealed = {"inspection"}
+        accountant._coordinator = coordinator
+        accountant._run = run
+        accountant._coordinator_process_carriers = {}
+        carrier = mock.Mock(pid=tracker_pid)
+
+        with mock.patch(
+            "multiprocessing.resource_tracker._resource_tracker",
+            SimpleNamespace(_pid=tracker_pid),
+        ), mock.patch.object(
+            capability_runner,
+            "_LinuxCoordinatorProcessCarrier",
+            return_value=carrier,
+        ) as retain:
+            accountant.register_spawn_resource_tracker()
+
+        retain.assert_called_once_with(tracker_pid, coordinator)
+        self.assertEqual(accountant._surviving_pids(), {foreign_pid})
+        carrier.validate.assert_called_once_with(coordinator)
+        accountant.close()
+        carrier.close.assert_called_once_with()
+        self.assertEqual(accountant._coordinator_process_carriers, {})
+
+    def test_task9_linux_attempt_adopts_existing_tracker_before_inspection(self):
+        coordinator = self.root / "existing-helper" / "run" / "coordinator"
+        coordinator.mkdir(parents=True)
+        tracker_pid = 31337
+        accountant = object.__new__(
+            capability_runner.LinuxCompilerAuditAttemptAccountant
+        )
+        accountant._phase = None
+        accountant._sealed = set()
+        accountant._sealed_snapshots = {}
+        accountant._coordinator = coordinator
+        accountant._coordinator_process_carriers = {}
+        carrier = mock.Mock(pid=tracker_pid)
+        deadline = time.monotonic() + 10.0
+
+        with mock.patch.object(
+            capability_runner.sys, "platform", "linux"
+        ), mock.patch(
+            "multiprocessing.resource_tracker._resource_tracker",
+            SimpleNamespace(_pid=tracker_pid),
+        ), mock.patch.object(
+            capability_runner,
+            "_LinuxCoordinatorProcessCarrier",
+            return_value=carrier,
+        ) as retain:
+            accountant.adopt_existing_spawn_resource_tracker()
+            accountant.begin_phase("inspection", deadline)
+            accountant._sealed.add("inspection")
+            accountant.begin_phase("tasks", deadline)
+            accountant.register_spawn_resource_tracker()
+
+        retain.assert_called_once_with(tracker_pid, coordinator)
+        self.assertIs(
+            accountant._coordinator_process_carriers[tracker_pid], carrier
+        )
+        carrier.validate.assert_called_once_with(coordinator)
+
+    def test_task9_linux_spawn_tracker_carrier_revalidates_exact_identity(self):
+        coordinator = (self.root / "exact-helper" / "run" / "coordinator")
+        coordinator.mkdir(parents=True)
+        pid = 31337
+        snapshot = SimpleNamespace(
+            pid=pid,
+            parent_pid=os.getpid(),
+            start_identity="linux-proc:boot:99",
+            cgroup_path=coordinator.resolve(),
+            executable_path=Path(sys.executable).resolve(),
+            argv=(
+                os.fsencode(sys.executable),
+                b"-c",
+                b"from multiprocessing.resource_tracker import main;main(7)",
+            ),
+        )
+
+        with mock.patch.object(
+            capability_runner,
+            "_read_linux_coordinator_process_snapshot",
+            side_effect=(snapshot, snapshot, snapshot),
+        ) as read_snapshot, mock.patch.object(
+            os, "pidfd_open", return_value=91, create=True
+        ) as pidfd_open, mock.patch.object(
+            os, "fstat", return_value=SimpleNamespace()
+        ) as fstat, mock.patch.object(os, "close") as close:
+            carrier = capability_runner._LinuxCoordinatorProcessCarrier(
+                pid, coordinator
+            )
+            carrier.validate(coordinator)
+            carrier.close()
+
+        self.assertEqual(read_snapshot.call_count, 3)
+        pidfd_open.assert_called_once_with(pid)
+        fstat.assert_called_once_with(91)
+        close.assert_called_once_with(91)
+
+    def test_task9_linux_spawn_tracker_carrier_rejects_wrong_command(self):
+        coordinator = (self.root / "wrong-helper" / "run" / "coordinator")
+        coordinator.mkdir(parents=True)
+        snapshot = SimpleNamespace(
+            pid=31337,
+            parent_pid=os.getpid(),
+            start_identity="linux-proc:boot:99",
+            cgroup_path=coordinator.resolve(),
+            executable_path=Path(sys.executable).resolve(),
+            argv=(os.fsencode(sys.executable), b"-c", b"print('foreign')"),
+        )
+        with mock.patch.object(
+            capability_runner,
+            "_read_linux_coordinator_process_snapshot",
+            return_value=snapshot,
+        ), mock.patch.object(
+            os, "pidfd_open", create=True
+        ) as pidfd_open, self.assertRaisesRegex(
+            AuditInfrastructureError, "resource tracker identity"
+        ):
+            capability_runner._LinuxCoordinatorProcessCarrier(
+                snapshot.pid, coordinator
+            )
+        pidfd_open.assert_not_called()
+
+    def test_task9_linux_spawn_tracker_accepts_interpreter_flags(self):
+        coordinator = (self.root / "flagged-helper" / "run" / "coordinator")
+        coordinator.mkdir(parents=True)
+        snapshot = SimpleNamespace(
+            pid=31337,
+            parent_pid=os.getpid(),
+            start_identity="linux-proc:boot:99",
+            cgroup_path=coordinator.resolve(),
+            executable_path=Path(sys.executable).resolve(),
+            argv=(
+                os.fsencode(sys.executable),
+                b"-I",
+                b"-W",
+                b"default",
+                b"-X",
+                b"dev",
+                b"-c",
+                b"from multiprocessing.resource_tracker import main;main(7)",
+            ),
+        )
+
+        with mock.patch(
+            "multiprocessing.util._args_from_interpreter_flags",
+            return_value=["-I", "-W", "default", "-X", "dev"],
+        ), mock.patch.object(
+            capability_runner,
+            "_read_linux_coordinator_process_snapshot",
+            side_effect=(snapshot, snapshot),
+        ), mock.patch.object(
+            os, "pidfd_open", return_value=91, create=True
+        ), mock.patch.object(os, "close"):
+            carrier = capability_runner._LinuxCoordinatorProcessCarrier(
+                snapshot.pid, coordinator
+            )
+            carrier.close()
+
+    def test_task9_linux_spawn_tracker_accepts_zero_pipe_fd(self):
+        coordinator = (self.root / "fd-zero-helper" / "run" / "coordinator")
+        coordinator.mkdir(parents=True)
+        snapshot = SimpleNamespace(
+            pid=31337,
+            parent_pid=os.getpid(),
+            start_identity="linux-proc:boot:99",
+            cgroup_path=coordinator.resolve(),
+            executable_path=Path(sys.executable).resolve(),
+            argv=(
+                os.fsencode(sys.executable),
+                b"-c",
+                b"from multiprocessing.resource_tracker import main;main(0)",
+            ),
+        )
+
+        with mock.patch.object(
+            capability_runner,
+            "_read_linux_coordinator_process_snapshot",
+            side_effect=(snapshot, snapshot),
+        ), mock.patch.object(
+            os, "pidfd_open", return_value=91, create=True
+        ), mock.patch.object(os, "close"):
+            carrier = capability_runner._LinuxCoordinatorProcessCarrier(
+                snapshot.pid, coordinator
+            )
+            carrier.close()
+
+    def test_task9_linux_spawn_tracker_rejects_noncanonical_pipe_fd(self):
+        coordinator = (
+            self.root / "noncanonical-fd-helper" / "run" / "coordinator"
+        )
+        coordinator.mkdir(parents=True)
+        snapshot = SimpleNamespace(
+            pid=31337,
+            parent_pid=os.getpid(),
+            start_identity="linux-proc:boot:99",
+            cgroup_path=coordinator.resolve(),
+            executable_path=Path(sys.executable).resolve(),
+            argv=(
+                os.fsencode(sys.executable),
+                b"-c",
+                b"from multiprocessing.resource_tracker import main;main(00)",
+            ),
+        )
+
+        with mock.patch.object(
+            capability_runner,
+            "_read_linux_coordinator_process_snapshot",
+            return_value=snapshot,
+        ), mock.patch.object(
+            os, "pidfd_open", create=True
+        ) as pidfd_open, self.assertRaisesRegex(
+            AuditInfrastructureError, "resource tracker identity"
+        ):
+            capability_runner._LinuxCoordinatorProcessCarrier(
+                snapshot.pid, coordinator
+            )
+
+        pidfd_open.assert_not_called()
+
+    def test_task9_linux_spawn_tracker_closes_pidfd_when_assignment_fails(self):
+        coordinator = (
+            self.root / "assignment-failure" / "run" / "coordinator"
+        )
+        coordinator.mkdir(parents=True)
+        snapshot = SimpleNamespace(
+            pid=31337,
+            parent_pid=os.getpid(),
+            start_identity="linux-proc:boot:99",
+            cgroup_path=coordinator.resolve(),
+            executable_path=Path(sys.executable).resolve(),
+            argv=(
+                os.fsencode(sys.executable),
+                b"-c",
+                b"from multiprocessing.resource_tracker import main;main(7)",
+            ),
+        )
+
+        class AssignmentFailingCarrier(
+            capability_runner._LinuxCoordinatorProcessCarrier
+        ):
+            def __setattr__(self, name, value):
+                if name == "pid":
+                    raise MemoryError("assignment failed")
+                super().__setattr__(name, value)
+
+        with mock.patch.object(
+            capability_runner,
+            "_read_linux_coordinator_process_snapshot",
+            side_effect=(snapshot, snapshot),
+        ), mock.patch.object(
+            os, "pidfd_open", return_value=91, create=True
+        ), mock.patch.object(os, "close") as close, self.assertRaisesRegex(
+            MemoryError, "assignment failed"
+        ):
+            AssignmentFailingCarrier(snapshot.pid, coordinator)
+
+        close.assert_called_once_with(91)
+
+    def test_task9_linux_spawn_tracker_preserves_identity_error_when_close_fails(self):
+        coordinator = (self.root / "close-failure" / "run" / "coordinator")
+        coordinator.mkdir(parents=True)
+        valid = SimpleNamespace(
+            pid=31337,
+            parent_pid=os.getpid(),
+            start_identity="linux-proc:boot:99",
+            cgroup_path=coordinator.resolve(),
+            executable_path=Path(sys.executable).resolve(),
+            argv=(
+                os.fsencode(sys.executable),
+                b"-c",
+                b"from multiprocessing.resource_tracker import main;main(7)",
+            ),
+        )
+        changed = SimpleNamespace(**{**vars(valid), "parent_pid": os.getpid() + 1})
+
+        with mock.patch.object(
+            capability_runner,
+            "_read_linux_coordinator_process_snapshot",
+            side_effect=(valid, changed),
+        ), mock.patch.object(
+            os, "pidfd_open", return_value=91, create=True
+        ), mock.patch.object(
+            os, "close", side_effect=OSError("close failed")
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError, "resource tracker identity"
+        ) as raised:
+            capability_runner._LinuxCoordinatorProcessCarrier(
+                valid.pid, coordinator
+            )
+
+        self.assertTrue(
+            any("close failed" in note for note in raised.exception.__notes__)
+        )
+
+    def test_task9_linux_spawn_tracker_closes_carrier_when_registration_fails(self):
+        coordinator = (self.root / "registration-failure" / "run" / "coordinator")
+        coordinator.mkdir(parents=True)
+        tracker_pid = 31337
+        accountant = object.__new__(
+            capability_runner.LinuxCompilerAuditAttemptAccountant
+        )
+        accountant._coordinator = coordinator
+        carriers = mock.MagicMock()
+        carriers.get.return_value = None
+        carriers.__bool__.return_value = False
+        carriers.__setitem__.side_effect = RuntimeError("registration failed")
+        accountant._coordinator_process_carriers = carriers
+        carrier = mock.Mock(pid=tracker_pid)
+
+        with mock.patch(
+            "multiprocessing.resource_tracker._resource_tracker",
+            SimpleNamespace(_pid=tracker_pid),
+        ), mock.patch.object(
+            capability_runner,
+            "_LinuxCoordinatorProcessCarrier",
+            return_value=carrier,
+        ), self.assertRaisesRegex(RuntimeError, "registration failed"):
+            accountant._retain_spawn_resource_tracker(required=True)
+
+        carrier.close.assert_called_once_with()
+
+    def test_task9_linux_reactor_registers_spawn_tracker_after_event_creation(self):
+        backend = SimpleNamespace(
+            hello=mock.Mock(),
+            create_leaf=mock.Mock(),
+            acknowledge_leaf=mock.Mock(),
+            release_leaf=mock.Mock(),
+        )
+        accountant = object.__new__(
+            capability_runner.LinuxCompilerAuditAttemptAccountant
+        )
+        accountant._client = backend
+        order = []
+        accountant.register_spawn_resource_tracker = mock.Mock(
+            side_effect=lambda: order.append("register")
+        )
+        context = SimpleNamespace(Event=mock.Mock(
+            side_effect=lambda: (
+                order.append("event"), threading.Event()
+            )[1]
+        ))
+        runtime = capability_model.WorkerRuntimeContract(
+            1, 1, 1 << 30, time.monotonic() + 10.0
+        )
+
+        with mock.patch.object(
+            capability_runner.multiprocessing,
+            "get_context",
+            return_value=context,
+        ), mock.patch.object(capability_runner.sys, "platform", "linux"):
+            capability_runner.GenerationReactor(
+                configurations=(),
+                dependency_roots=object(),
+                production_snapshot={},
+                cache_root=self.root / "reactor-register-helper",
+                limits=AuditLimits(),
+                engine="e" * 64,
+                runtime_contract=runtime,
+                run_accountant=accountant,
+                capability_registry=object(),
+                result_budget=SimpleNamespace(observer=object()),
+                worker_count=0,
+                cleanup_deadline=runtime.pipeline_deadline,
+            )
+
+        context.Event.assert_called_once_with()
+        accountant.register_spawn_resource_tracker.assert_called_once_with()
+        self.assertEqual(order, ["event", "register"])
+
     def test_task8_public_run_and_production_limits_are_exact(self):
         self.assertEqual(
             tuple(field.name for field in dataclasses.fields(CompilerAuditRun)),
@@ -7219,14 +7602,29 @@ class ProcessCoordinatorTests(unittest.TestCase):
                 primary_error = error
                 raise
             finally:
-                try:
-                    registry.close()
-                except BaseException as cleanup_error:
-                    if primary_error is not None:
+                cleanup_errors = []
+                for label, close in (
+                    ("attempt accountant", getattr(run_accountant, "close", None)),
+                    ("registry", registry.close),
+                ):
+                    if not callable(close):
+                        continue
+                    try:
+                        close()
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append((label, cleanup_error))
+                if primary_error is not None:
+                    for label, cleanup_error in cleanup_errors:
                         primary_error.add_note(
-                            f"registry cleanup also failed: {cleanup_error!r}")
-                    else:
-                        raise
+                            f"{label} cleanup also failed: {cleanup_error!r}"
+                        )
+                elif cleanup_errors:
+                    label, cleanup_error = cleanup_errors[0]
+                    for extra_label, extra_error in cleanup_errors[1:]:
+                        cleanup_error.add_note(
+                            f"{extra_label} cleanup also failed: {extra_error!r}"
+                        )
+                    raise cleanup_error
 
         runner = capability_calibration.RealCalibrationRunner(
             "linux" if sys.platform.startswith("linux") else "macos",
