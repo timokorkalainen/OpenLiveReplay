@@ -23,6 +23,7 @@ from gpu_capability_model import (  # noqa: E402
     CompilerPgidReported, FileIdentity, MacOSInspectionPgidReported,
 )
 from gpu_capability_process_tree import (  # noqa: E402
+    MacOSRegisteredLeaderMissingError,
     MacOSRegisteredPgidAccountant,
     MacOSExecPermitAuthority,
     MacOSLibprocProvider,
@@ -1349,9 +1350,12 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
         accountant = MacOSRegisteredPgidAccountant()
         leader = OwnedProcessIdentity("macos", 211, "bsd-start-1")
         accountant.register_group(211, leader, "compiler")
-        with self.assertRaisesRegex(AuditInfrastructureError,
-                                    "registered leader"):
+        with self.assertRaisesRegex(
+            MacOSRegisteredLeaderMissingError,
+            "registered leader",
+        ) as raised:
             accountant.observe_group(211, {})
+        self.assertEqual(raised.exception.pgid, 211)
         memory = accountant.memory_measurements()
         self.assertEqual(memory.surviving_registered_process_count, 1)
         self.assertFalse(memory.accounting_complete)

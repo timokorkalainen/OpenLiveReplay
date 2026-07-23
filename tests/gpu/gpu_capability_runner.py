@@ -3772,6 +3772,10 @@ class _MacOSGenerationLifecycle:
         self._release_reconciliation_progress: set[
             tuple[int, int, int]
         ] = set()
+        self._native_reconciled_groups: set[
+            tuple[int, int, int]
+        ] = set()
+        self._force_signal_attempted_groups: set[tuple[int, int, int]] = set()
         self._sealed_task_phase_snapshot: MacOSPhaseSnapshot | None = None
 
     def accept_worker_session(self, report: MacOSWorkerSessionReported) -> None:
@@ -3842,15 +3846,86 @@ class _MacOSGenerationLifecycle:
         groups = self.compiler_groups.get(key, [])
         while groups:
             pgid = groups[0]
-            if self.accountant.reconcile_group(pgid, self.provider) is not True:
-                raise AuditInfrastructureError(
-                    "macOS compiler PGID reconciliation did not complete"
-                )
+            progress_key = (worker_index, generation, pgid)
+            self._reconcile_native_group_once(progress_key, pgid)
             _macos_reconciliation_completed(
                 "reconcile-task", worker_index, generation, pgid
             )
             del groups[0]
+            self._native_reconciled_groups.discard(progress_key)
+            getattr(
+                self,
+                "_force_signal_attempted_groups",
+                set(),
+            ).discard(progress_key)
         self.compiler_groups.pop(key, None)
+
+    def _force_empty_native_group_once(
+        self,
+        progress_key: tuple[int, int, int],
+        pgid: int,
+        deadline: float,
+    ) -> None:
+        attempted = getattr(self, "_force_signal_attempted_groups", None)
+        if attempted is None:
+            attempted = set()
+            self._force_signal_attempted_groups = attempted
+        if progress_key in attempted:
+            return
+        # Reserve before attempting killpg.  Once the syscall is attempted,
+        # every outcome consumes the one-shot signal permission: the original
+        # group can exit and its numeric PGID can be reused even after an error.
+        attempted.add(progress_key)
+
+        self._kill_and_wait_empty(pgid, deadline)
+
+    def _reconcile_native_group_once(
+        self,
+        progress_key: tuple[int, int, int],
+        pgid: int,
+    ) -> None:
+        reconciled = getattr(self, "_native_reconciled_groups", None)
+        if reconciled is None:
+            reconciled = set()
+            self._native_reconciled_groups = reconciled
+        if progress_key in reconciled:
+            return
+        # Reserve the retry marker before native ownership can be removed.
+        # A failed reconciliation discards it; successful reconciliation keeps
+        # it across completion-hook and progress-recording failures.
+        reconciled.add(progress_key)
+        try:
+            if self.accountant.reconcile_group(
+                pgid,
+                self.provider,
+            ) is not True:
+                raise AuditInfrastructureError(
+                    "macOS PGID reconciliation did not complete"
+                )
+        except BaseException:
+            reconciled.discard(progress_key)
+            raise
+
+    def reconcile_exited_compiler_for_observation(self, pgid: int) -> bool:
+        """Retire an empty native PGID without authenticating task completion."""
+        matching_keys = [
+            key for key, groups in self.compiler_groups.items()
+            if pgid in groups
+        ]
+        if not matching_keys:
+            return False
+        if len(matching_keys) != 1:
+            raise AuditInfrastructureError(
+                "macOS compiler PGID ownership is ambiguous"
+            )
+        worker_index, generation, _task_id = matching_keys[0]
+        self._reconcile_native_group_once(
+            (worker_index, generation, pgid),
+            pgid,
+        )
+        # Keep compiler_groups intact.  WorkerPayloadReady remains the only
+        # event that authenticates the task and removes its logical groups.
+        return True
 
     def observe(self) -> None:
         self.provider.observe(self.accountant, _current_process_rss_bytes())
@@ -3882,6 +3957,10 @@ class _MacOSGenerationLifecycle:
         if progress is None:
             progress = set()
             self._release_reconciliation_progress = progress
+        native_reconciled = getattr(self, "_native_reconciled_groups", None)
+        if native_reconciled is None:
+            native_reconciled = set()
+            self._native_reconciled_groups = native_reconciled
         remaining = [key for key in self.compiler_groups
                      if key[:2] == (worker_index, generation)]
         for key in remaining:
@@ -3889,14 +3968,14 @@ class _MacOSGenerationLifecycle:
                 progress_key = (worker_index, generation, pgid)
                 if progress_key in progress:
                     continue
-                if force:
-                    self._kill_and_wait_empty(pgid, deadline)
-                if self.accountant.reconcile_group(
-                    pgid, self.provider
-                ) is not True:
-                    raise AuditInfrastructureError(
-                        "macOS compiler PGID reconciliation did not complete"
-                    )
+                if progress_key not in native_reconciled:
+                    if force:
+                        self._force_empty_native_group_once(
+                            progress_key,
+                            pgid,
+                            deadline,
+                        )
+                    self._reconcile_native_group_once(progress_key, pgid)
                 _macos_reconciliation_completed(
                     "release-compiler", worker_index, generation, pgid
                 )
@@ -3906,16 +3985,18 @@ class _MacOSGenerationLifecycle:
             raise AuditInfrastructureError("macOS worker PGID is unavailable")
         worker_progress = (worker_index, generation, pgid)
         if pgid is not None and worker_progress not in progress:
-            if force:
-                self._kill_and_wait_empty(pgid, deadline)
-            if time.monotonic() >= deadline:
-                raise AuditInfrastructureError(
-                    "macOS PGID reconciliation deadline exceeded"
-                )
-            if self.accountant.reconcile_group(pgid, self.provider) is not True:
-                raise AuditInfrastructureError(
-                    "macOS worker PGID reconciliation did not complete"
-                )
+            if worker_progress not in native_reconciled:
+                if time.monotonic() >= deadline:
+                    raise AuditInfrastructureError(
+                        "macOS PGID reconciliation deadline exceeded"
+                    )
+                if force:
+                    self._force_empty_native_group_once(
+                        worker_progress,
+                        pgid,
+                        deadline,
+                    )
+                self._reconcile_native_group_once(worker_progress, pgid)
             _macos_reconciliation_completed(
                 "release-worker", worker_index, generation, pgid
             )
@@ -3938,6 +4019,25 @@ class _MacOSGenerationLifecycle:
             for key in tuple(self.compiler_groups):
                 if key[:2] == worker_key:
                     self.compiler_groups.pop(key)
+            native_reconciled.difference_update(
+                {
+                    progress_key
+                    for progress_key in native_reconciled
+                    if progress_key[:2] == worker_key
+                }
+            )
+            force_attempted = getattr(
+                self,
+                "_force_signal_attempted_groups",
+                set(),
+            )
+            force_attempted.difference_update(
+                {
+                    progress_key
+                    for progress_key in force_attempted
+                    if progress_key[:2] == worker_key
+                }
+            )
             _generation_release_transition(
                 "macos", "remove", "after", *worker_key
             )
@@ -4733,6 +4833,58 @@ class GenerationReactor:
             return self.deferred_events.popleft()
         return self._next_event_raw()
 
+    def _macos_missing_worker_transition_pending(self, pgid: int) -> bool:
+        if not isinstance(self.native_lifecycle, _MacOSGenerationLifecycle):
+            return False
+        worker_key = next(
+            (
+                key
+                for key, worker_pgid
+                in self.native_lifecycle.worker_groups.items()
+                if worker_pgid == pgid
+            ),
+            None,
+        )
+        if worker_key is None:
+            return False
+        for state in self.states:
+            if state is not None and (
+                state.worker_index,
+                state.generation,
+            ) == worker_key:
+                return (
+                    state.event_receiver.poll(0)
+                    or not state.process.is_alive()
+                )
+        return False
+
+    def _sample_owned_forest_or_defer_macos_transition(
+        self,
+    ) -> _OwnedForestSample | None:
+        if not isinstance(self.native_lifecycle, _MacOSGenerationLifecycle):
+            return self._sample_owned_forest()
+        from gpu_capability_process_tree import (
+            MacOSRegisteredLeaderMissingError,
+        )
+
+        while True:
+            try:
+                return self._sample_owned_forest()
+            except MacOSRegisteredLeaderMissingError as error:
+                # Reconcile an exited compiler immediately so another live
+                # compiler in the same task remains observable.  Its logical
+                # task registration stays until WorkerPayloadReady.
+                if self.native_lifecycle.reconcile_exited_compiler_for_observation(
+                    error.pgid
+                ):
+                    continue
+                # A worker PGID may defer only for that same worker's queued
+                # control transition or observed exit.  Unknown or live,
+                # unexplained leader loss remains fail-closed.
+                if self._macos_missing_worker_transition_pending(error.pgid):
+                    return None
+                raise
+
     def _next_event_raw(self) -> tuple[_GenerationState, object]:
         while True:
             if time.monotonic() >= self.runtime_contract.pipeline_deadline:
@@ -4797,18 +4949,8 @@ class GenerationReactor:
                             )
                         permit = self.native_lifecycle.permit_compiler(event)
                         self._send_command(state, permit)
-                    if isinstance(
-                        event,
-                        (
-                            MacOSWorkerSessionReported,
-                            WorkerFailure,
-                            WorkerStopped,
-                        ),
-                    ):
-                        # These events can race with an immediate worker exit.
-                        # Dispatch them before sampling the registered native
-                        # process group so a queued bounded failure diagnostic
-                        # or normal stop cannot be masked by a missing leader.
+                    if isinstance(event, WorkerFailure):
+                        # Preserve the worker's bounded root-cause diagnostic.
                         return state, event
                     if isinstance(event, WorkerPayloadReady):
                         if state.pending is None:
@@ -4826,10 +4968,13 @@ class GenerationReactor:
                                 state.generation,
                                 state.pending.ordinal,
                             )
-                    sample = self._sample_owned_forest()
-                    _enforce_platform_memory_contract(
-                        sample, self.result_budget
+                    sample = (
+                        self._sample_owned_forest_or_defer_macos_transition()
                     )
+                    if sample is not None:
+                        _enforce_platform_memory_contract(
+                            sample, self.result_budget
+                        )
                     return state, event
                 if not state.process.is_alive() and state.process.exitcode is not None:
                     raise AuditInfrastructureError(
@@ -4837,7 +4982,17 @@ class GenerationReactor:
                     )
             if self.cancel_event.is_set():
                 raise AuditInfrastructureError("worker audit was cancelled")
-            sample = self._sample_owned_forest()
+            sample = self._sample_owned_forest_or_defer_macos_transition()
+            if sample is None:
+                time.sleep(min(
+                    0.01,
+                    max(
+                        0.0,
+                        self.runtime_contract.pipeline_deadline
+                        - time.monotonic(),
+                    ),
+                ))
+                continue
             _enforce_platform_memory_contract(sample, self.result_budget)
             time.sleep(min(
                 0.01,

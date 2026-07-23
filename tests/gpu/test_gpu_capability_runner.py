@@ -32,6 +32,7 @@ import gpu_capability_command as capability_command  # noqa: E402
 import gpu_capability_cache as capability_cache  # noqa: E402
 import gpu_capability_calibration as capability_calibration  # noqa: E402
 import gpu_capability_model as capability_model  # noqa: E402
+import gpu_capability_process_tree as capability_process_tree  # noqa: E402
 import gpu_capability_runner as capability_runner  # noqa: E402
 import gpu_capability_source_audit as capability_audit  # noqa: E402
 from gpu_capability_command import (  # noqa: E402
@@ -11199,11 +11200,13 @@ class ProcessCoordinatorTests(unittest.TestCase):
         receiver.receive_bytes_before.return_value = (
             capability_runner.encode_control_message(failure)
         )
+        process = mock.Mock(pid=1234)
+        process.is_alive.return_value = False
         state = SimpleNamespace(
             worker_index=0,
             generation=1,
             event_receiver=receiver,
-            process=mock.Mock(pid=1234),
+            process=process,
             pending=None,
             contained=True,
         )
@@ -11211,12 +11214,13 @@ class ProcessCoordinatorTests(unittest.TestCase):
             pipeline_deadline=time.monotonic() + 10.0
         )
         reactor.states = [state]
-        reactor.native_lifecycle = mock.Mock()
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
         reactor.cancel_event = threading.Event()
+        missing = capability_process_tree.MacOSRegisteredLeaderMissingError(1234)
         reactor._sample_owned_forest = mock.Mock(
-            side_effect=AuditInfrastructureError(
-                "native lifecycle masked worker failure"
-            )
+            side_effect=missing
         )
 
         observed_state, observed_event = reactor._next_event_raw()
@@ -11261,12 +11265,11 @@ class ProcessCoordinatorTests(unittest.TestCase):
         reactor.native_lifecycle = object.__new__(
             capability_runner._MacOSGenerationLifecycle
         )
+        reactor.native_lifecycle.worker_groups = {(0, 1): 1234}
+        reactor.native_lifecycle.compiler_groups = {}
         reactor.cancel_event = threading.Event()
-        reactor._sample_owned_forest = mock.Mock(
-            side_effect=AuditInfrastructureError(
-                "native lifecycle masked worker failure"
-            )
-        )
+        missing = capability_process_tree.MacOSRegisteredLeaderMissingError(1234)
+        reactor._sample_owned_forest = mock.Mock(side_effect=missing)
 
         with mock.patch.object(
             capability_runner._MacOSGenerationLifecycle,
@@ -11282,7 +11285,7 @@ class ProcessCoordinatorTests(unittest.TestCase):
         accept_session.assert_called_once_with(session)
         self.assertTrue(state.contained)
         self.assertTrue(state.native_generation_acquired)
-        reactor._sample_owned_forest.assert_not_called()
+        reactor._sample_owned_forest.assert_called_once_with()
 
     def test_worker_stopped_preempts_native_lifecycle_sampling(self):
         reactor = object.__new__(capability_runner.GenerationReactor)
@@ -11292,11 +11295,13 @@ class ProcessCoordinatorTests(unittest.TestCase):
         receiver.receive_bytes_before.return_value = (
             capability_runner.encode_control_message(stopped)
         )
+        process = mock.Mock(pid=1234)
+        process.is_alive.return_value = False
         state = SimpleNamespace(
             worker_index=0,
             generation=1,
             event_receiver=receiver,
-            process=mock.Mock(pid=1234),
+            process=process,
             pending=None,
             contained=True,
         )
@@ -11304,19 +11309,253 @@ class ProcessCoordinatorTests(unittest.TestCase):
             pipeline_deadline=time.monotonic() + 10.0
         )
         reactor.states = [state]
-        reactor.native_lifecycle = mock.Mock()
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        reactor.native_lifecycle.worker_groups = {(0, 1): 1234}
+        reactor.native_lifecycle.compiler_groups = {}
         reactor.cancel_event = threading.Event()
+        missing = capability_process_tree.MacOSRegisteredLeaderMissingError(1234)
         reactor._sample_owned_forest = mock.Mock(
-            side_effect=AuditInfrastructureError(
-                "native lifecycle masked worker stop"
-            )
+            side_effect=missing
         )
 
         observed_state, observed_event = reactor._next_event_raw()
 
         self.assertIs(observed_state, state)
         self.assertEqual(observed_event, stopped)
-        reactor._sample_owned_forest.assert_not_called()
+        reactor._sample_owned_forest.assert_called_once_with()
+
+    def test_nonterminal_event_then_failure_preempts_macos_sampling(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        accepted = capability_model.WorkerCapabilitiesAccepted(
+            0,
+            1,
+            ("a" * 64,),
+        )
+        failure = capability_model.WorkerFailure(
+            0,
+            1,
+            None,
+            "worker post-event diagnostic",
+        )
+        receiver = mock.Mock()
+        receiver.poll.return_value = True
+        receiver.receive_bytes_before.side_effect = (
+            capability_runner.encode_control_message(accepted),
+            capability_runner.encode_control_message(failure),
+        )
+        process = mock.Mock(pid=1234)
+        process.is_alive.return_value = False
+        state = SimpleNamespace(
+            worker_index=0,
+            generation=1,
+            event_receiver=receiver,
+            process=process,
+            pending=None,
+            contained=True,
+        )
+        reactor.runtime_contract = SimpleNamespace(
+            pipeline_deadline=time.monotonic() + 10.0
+        )
+        reactor.states = [state]
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        reactor.native_lifecycle.worker_groups = {(0, 1): 1234}
+        reactor.native_lifecycle.compiler_groups = {}
+        reactor.cancel_event = threading.Event()
+        missing = capability_process_tree.MacOSRegisteredLeaderMissingError(1234)
+        reactor._sample_owned_forest = mock.Mock(side_effect=missing)
+
+        first_state, first_event = reactor._next_event_raw()
+        second_state, second_event = reactor._next_event_raw()
+
+        self.assertIs(first_state, state)
+        self.assertEqual(first_event, accepted)
+        self.assertIs(second_state, state)
+        self.assertEqual(second_event, failure)
+        reactor._sample_owned_forest.assert_called_once_with()
+
+    def test_macos_missing_leader_race_defers_for_queued_transition(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        receiver = mock.Mock()
+        receiver.poll.return_value = True
+        process = mock.Mock()
+        process.is_alive.return_value = True
+        state = SimpleNamespace(
+            worker_index=0,
+            generation=1,
+            event_receiver=receiver,
+            process=process,
+        )
+        reactor.states = [state]
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        reactor.native_lifecycle.worker_groups = {(0, 1): 1234}
+        reactor.native_lifecycle.compiler_groups = {}
+        missing = capability_process_tree.MacOSRegisteredLeaderMissingError(1234)
+        reactor._sample_owned_forest = mock.Mock(side_effect=missing)
+
+        self.assertIsNone(
+            reactor._sample_owned_forest_or_defer_macos_transition()
+        )
+        reactor._sample_owned_forest.assert_called_once_with()
+
+    def test_macos_missing_leader_without_transition_fails_closed(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        receiver = mock.Mock()
+        receiver.poll.return_value = False
+        process = mock.Mock()
+        process.is_alive.return_value = True
+        state = SimpleNamespace(
+            worker_index=0,
+            generation=1,
+            event_receiver=receiver,
+            process=process,
+        )
+        reactor.states = [state]
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        reactor.native_lifecycle.worker_groups = {(0, 1): 1234}
+        reactor.native_lifecycle.compiler_groups = {}
+        missing = capability_process_tree.MacOSRegisteredLeaderMissingError(1234)
+        reactor._sample_owned_forest = mock.Mock(side_effect=missing)
+
+        with self.assertRaises(
+            capability_process_tree.MacOSRegisteredLeaderMissingError
+        ):
+            reactor._sample_owned_forest_or_defer_macos_transition()
+
+    def test_macos_exited_compiler_reconciles_then_samples_next_compiler(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle,
+        )
+        lifecycle.accountant = mock.Mock()
+        lifecycle.accountant.reconcile_group.return_value = True
+        lifecycle.provider = mock.Mock()
+        lifecycle.worker_groups = {(0, 1): 1234}
+        lifecycle.compiler_groups = {(0, 1, 7): [9000, 9001]}
+        reactor.native_lifecycle = lifecycle
+        missing = capability_process_tree.MacOSRegisteredLeaderMissingError(9000)
+        second_compiler_sample = object()
+        reactor._sample_owned_forest = mock.Mock(
+            side_effect=(missing, second_compiler_sample),
+        )
+
+        self.assertIs(
+            reactor._sample_owned_forest_or_defer_macos_transition(),
+            second_compiler_sample,
+        )
+        lifecycle.accountant.reconcile_group.assert_called_once_with(
+            9000,
+            lifecycle.provider,
+        )
+        self.assertEqual(lifecycle.compiler_groups, {(0, 1, 7): [9000, 9001]})
+        self.assertEqual(reactor._sample_owned_forest.call_count, 2)
+
+    def test_macos_unrelated_worker_transition_does_not_hide_missing_leader(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        missing_receiver = mock.Mock()
+        missing_receiver.poll.return_value = False
+        missing_process = mock.Mock()
+        missing_process.is_alive.return_value = True
+        unrelated_receiver = mock.Mock()
+        unrelated_receiver.poll.return_value = True
+        unrelated_process = mock.Mock()
+        unrelated_process.is_alive.return_value = False
+        reactor.states = [
+            SimpleNamespace(
+                worker_index=0,
+                generation=1,
+                event_receiver=missing_receiver,
+                process=missing_process,
+            ),
+            SimpleNamespace(
+                worker_index=1,
+                generation=1,
+                event_receiver=unrelated_receiver,
+                process=unrelated_process,
+            ),
+        ]
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        reactor.native_lifecycle.worker_groups = {
+            (0, 1): 1234,
+            (1, 1): 5678,
+        }
+        reactor.native_lifecycle.compiler_groups = {}
+        missing = capability_process_tree.MacOSRegisteredLeaderMissingError(1234)
+        reactor._sample_owned_forest = mock.Mock(side_effect=missing)
+
+        with self.assertRaises(
+            capability_process_tree.MacOSRegisteredLeaderMissingError
+        ):
+            reactor._sample_owned_forest_or_defer_macos_transition()
+        missing_receiver.poll.assert_called_once_with(0)
+        missing_process.is_alive.assert_called_once_with()
+        unrelated_receiver.poll.assert_not_called()
+        unrelated_process.is_alive.assert_not_called()
+
+    def test_macos_transition_in_another_worker_does_not_suppress_sampling(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        first_receiver = mock.Mock()
+        first_receiver.poll.return_value = False
+        first_process = mock.Mock()
+        first_process.is_alive.return_value = True
+        second_receiver = mock.Mock()
+        second_receiver.poll.return_value = True
+        second_process = mock.Mock()
+        second_process.is_alive.return_value = False
+        reactor.states = [
+            SimpleNamespace(
+                event_receiver=first_receiver,
+                process=first_process,
+            ),
+            SimpleNamespace(
+                event_receiver=second_receiver,
+                process=second_process,
+            ),
+        ]
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        sample = object()
+        reactor._sample_owned_forest = mock.Mock(return_value=sample)
+
+        self.assertIs(
+            reactor._sample_owned_forest_or_defer_macos_transition(),
+            sample,
+        )
+        reactor._sample_owned_forest.assert_called_once_with()
+
+    def test_macos_quiescent_live_worker_samples_owned_forest(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        receiver = mock.Mock()
+        receiver.poll.return_value = False
+        process = mock.Mock()
+        process.is_alive.return_value = True
+        reactor.states = [
+            SimpleNamespace(
+                event_receiver=receiver,
+                process=process,
+            )
+        ]
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        sample = object()
+        reactor._sample_owned_forest = mock.Mock(return_value=sample)
+
+        self.assertIs(
+            reactor._sample_owned_forest_or_defer_macos_transition(),
+            sample,
+        )
+        reactor._sample_owned_forest.assert_called_once_with()
 
     @unittest.skipIf(os.name == "nt", "POSIX descriptor transfer")
     def test_posix_capability_socketpair_transfers_multiple_chunks(self):
@@ -12459,6 +12698,267 @@ class NativeGenerationLifecycleAdapterTests(unittest.TestCase):
                 ("observe", mock.ANY),
             ],
         )
+
+    def test_macos_early_compiler_reconcile_survives_forced_release_retry(self):
+        deadline = time.monotonic() + 10.0
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle,
+        )
+        lifecycle.accountant = mock.Mock()
+        lifecycle.accountant.reconcile_group.return_value = True
+        lifecycle.provider = mock.Mock()
+        lifecycle.worker_groups = {(2, 4): 701}
+        lifecycle.compiler_groups = {(2, 4, 5): [811]}
+        lifecycle.released_generations = set()
+        lifecycle._release_reconciliation_progress = set()
+
+        self.assertTrue(
+            lifecycle.reconcile_exited_compiler_for_observation(811)
+        )
+        hook_calls = []
+
+        def reconciliation_hook(scope, worker, generation, pgid):
+            hook_calls.append((scope, worker, generation, pgid))
+            if hook_calls == [("release-compiler", 2, 4, 811)]:
+                raise AuditInfrastructureError("injected completion-hook failure")
+
+        with (
+            mock.patch.object(lifecycle, "_kill_and_wait_empty") as kill,
+            mock.patch.object(
+                capability_runner,
+                "_macos_reconciliation_completed",
+                side_effect=reconciliation_hook,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "completion-hook failure",
+            ):
+                lifecycle.release_generation(2, 4, None, deadline, force=True)
+            lifecycle.release_generation(2, 4, None, deadline, force=True)
+
+        self.assertEqual(kill.call_count, 1)
+        self.assertEqual(kill.call_args.args[:2], (701, deadline))
+        self.assertEqual(
+            lifecycle.accountant.reconcile_group.call_args_list,
+            [
+                mock.call(811, lifecycle.provider),
+                mock.call(701, lifecycle.provider),
+            ],
+        )
+        self.assertEqual(lifecycle.worker_groups, {})
+        self.assertEqual(lifecycle.compiler_groups, {})
+        self.assertIn((2, 4), lifecycle.released_generations)
+
+    def test_macos_forced_compiler_release_does_not_rekill_after_hook_failure(self):
+        deadline = time.monotonic() + 10.0
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle,
+        )
+        lifecycle.accountant = mock.Mock()
+        lifecycle.accountant.reconcile_group.return_value = True
+        lifecycle.provider = mock.Mock()
+        lifecycle.worker_groups = {(2, 4): 701}
+        lifecycle.compiler_groups = {(2, 4, 5): [811]}
+        lifecycle.released_generations = set()
+        lifecycle._release_reconciliation_progress = set()
+        lifecycle._native_reconciled_groups = set()
+        failed = False
+
+        def reconciliation_hook(scope, _worker, _generation, _pgid):
+            nonlocal failed
+            if scope == "release-compiler" and not failed:
+                failed = True
+                raise AuditInfrastructureError("injected compiler-hook failure")
+
+        with (
+            mock.patch.object(lifecycle, "_kill_and_wait_empty") as kill,
+            mock.patch.object(
+                capability_runner,
+                "_macos_reconciliation_completed",
+                side_effect=reconciliation_hook,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "compiler-hook failure",
+            ):
+                lifecycle.release_generation(2, 4, None, deadline, force=True)
+            lifecycle.release_generation(2, 4, None, deadline, force=True)
+
+        self.assertEqual(
+            [call.args[:2] for call in kill.call_args_list],
+            [(811, deadline), (701, deadline)],
+        )
+        self.assertEqual(
+            lifecycle.accountant.reconcile_group.call_args_list,
+            [
+                mock.call(811, lifecycle.provider),
+                mock.call(701, lifecycle.provider),
+            ],
+        )
+
+    def test_macos_forced_worker_release_does_not_rekill_after_hook_failure(self):
+        deadline = time.monotonic() + 10.0
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle,
+        )
+        lifecycle.accountant = mock.Mock()
+        lifecycle.accountant.reconcile_group.return_value = True
+        lifecycle.provider = mock.Mock()
+        lifecycle.worker_groups = {(2, 4): 701}
+        lifecycle.compiler_groups = {}
+        lifecycle.released_generations = set()
+        lifecycle._release_reconciliation_progress = set()
+        lifecycle._native_reconciled_groups = set()
+        failed = False
+
+        def reconciliation_hook(scope, _worker, _generation, _pgid):
+            nonlocal failed
+            if scope == "release-worker" and not failed:
+                failed = True
+                raise AuditInfrastructureError("injected worker-hook failure")
+
+        with (
+            mock.patch.object(lifecycle, "_kill_and_wait_empty") as kill,
+            mock.patch.object(
+                capability_runner,
+                "_macos_reconciliation_completed",
+                side_effect=reconciliation_hook,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "worker-hook failure",
+            ):
+                lifecycle.release_generation(2, 4, None, deadline, force=True)
+            lifecycle.release_generation(2, 4, None, deadline, force=True)
+
+        self.assertEqual(kill.call_count, 1)
+        self.assertEqual(kill.call_args.args[:2], (701, deadline))
+        lifecycle.accountant.reconcile_group.assert_called_once_with(
+            701,
+            lifecycle.provider,
+        )
+
+    def test_macos_forced_compiler_does_not_resignal_after_wait_failure(self):
+        deadline = time.monotonic() + 10.0
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle,
+        )
+        lifecycle.accountant = mock.Mock()
+        lifecycle.accountant.reconcile_group.return_value = True
+        lifecycle.provider = mock.Mock()
+        lifecycle.worker_groups = {(2, 4): 701}
+        lifecycle.compiler_groups = {(2, 4, 5): [811]}
+        lifecycle.released_generations = set()
+        lifecycle._release_reconciliation_progress = set()
+        lifecycle._native_reconciled_groups = set()
+        kill_calls = []
+
+        def kill_then_fail(pgid, _deadline, **kwargs):
+            kill_calls.append(pgid)
+            if pgid == 811:
+                # The combined helper has signaled, then its wait fails.
+                raise AuditInfrastructureError("post-signal compiler wait failure")
+
+        with mock.patch.object(
+            lifecycle,
+            "_kill_and_wait_empty",
+            side_effect=kill_then_fail,
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "compiler wait failure",
+            ):
+                lifecycle.release_generation(2, 4, None, deadline, force=True)
+            lifecycle.release_generation(2, 4, None, deadline, force=True)
+
+        self.assertEqual(kill_calls, [811, 701])
+        self.assertEqual(lifecycle.worker_groups, {})
+        self.assertEqual(lifecycle.compiler_groups, {})
+
+    def test_macos_forced_worker_does_not_resignal_after_wait_failure(self):
+        deadline = time.monotonic() + 10.0
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle,
+        )
+        lifecycle.accountant = mock.Mock()
+        lifecycle.accountant.reconcile_group.return_value = True
+        lifecycle.provider = mock.Mock()
+        lifecycle.worker_groups = {(2, 4): 701}
+        lifecycle.compiler_groups = {}
+        lifecycle.released_generations = set()
+        lifecycle._release_reconciliation_progress = set()
+        lifecycle._native_reconciled_groups = set()
+        kill_calls = []
+
+        def kill_then_fail(pgid, _deadline, **kwargs):
+            kill_calls.append(pgid)
+            # The combined helper has signaled, then its wait fails.
+            raise AuditInfrastructureError("post-signal worker wait failure")
+
+        with mock.patch.object(
+            lifecycle,
+            "_kill_and_wait_empty",
+            side_effect=kill_then_fail,
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "worker wait failure",
+            ):
+                lifecycle.release_generation(2, 4, None, deadline, force=True)
+            lifecycle.accountant.reconcile_group.side_effect = None
+            lifecycle.release_generation(2, 4, None, deadline, force=True)
+
+        self.assertEqual(kill_calls, [701])
+        self.assertEqual(lifecycle.worker_groups, {})
+
+    def _assert_macos_failed_signal_attempt_is_not_retried(
+        self,
+        *,
+        compiler: bool,
+    ) -> None:
+        deadline = time.monotonic() + 10.0
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle,
+        )
+        lifecycle.accountant = mock.Mock()
+        lifecycle.accountant.reconcile_group.return_value = True
+        lifecycle.provider = mock.Mock()
+        lifecycle.worker_groups = {(2, 4): 701}
+        lifecycle.compiler_groups = (
+            {(2, 4, 5): [811]} if compiler else {}
+        )
+        lifecycle.released_generations = set()
+        lifecycle._release_reconciliation_progress = set()
+        lifecycle._native_reconciled_groups = set()
+        kill_calls = []
+
+        def fail_first_signal_attempt(pgid, _deadline, **kwargs):
+            kill_calls.append(pgid)
+            if len(kill_calls) == 1:
+                # Simulate killpg itself raising on the one allowed attempt.
+                raise OSError("injected killpg failure")
+
+        with mock.patch.object(
+            lifecycle,
+            "_kill_and_wait_empty",
+            side_effect=fail_first_signal_attempt,
+        ):
+            with self.assertRaisesRegex(OSError, "killpg failure"):
+                lifecycle.release_generation(2, 4, None, deadline, force=True)
+            lifecycle.release_generation(2, 4, None, deadline, force=True)
+
+        self.assertEqual(kill_calls, [811, 701] if compiler else [701])
+        self.assertEqual(lifecycle.worker_groups, {})
+        self.assertEqual(lifecycle.compiler_groups, {})
+
+    def test_macos_failed_compiler_signal_attempt_is_not_retried(self):
+        self._assert_macos_failed_signal_attempt_is_not_retried(compiler=True)
+
+    def test_macos_failed_worker_signal_attempt_is_not_retried(self):
+        self._assert_macos_failed_signal_attempt_is_not_retried(compiler=False)
 
     def test_macos_worker_registration_and_adoption_lost_replies_are_retryable(self):
         from gpu_capability_process_tree import (

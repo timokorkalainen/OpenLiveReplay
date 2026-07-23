@@ -49,6 +49,14 @@ LINUX_MEMORY_MAX_BYTES = 512 << 20
 LINUX_MEMORY_HIGH_BYTES = 448 << 20
 
 
+class MacOSRegisteredLeaderMissingError(AuditInfrastructureError):
+    """A registered macOS process-group leader exited before observation."""
+
+    def __init__(self, pgid: int) -> None:
+        self.pgid = pgid
+        super().__init__("macOS registered leader is missing")
+
+
 def _require_contract(condition: bool, message: str) -> None:
     if not condition:
         raise AuditInfrastructureError(message)
@@ -2248,8 +2256,8 @@ class MacOSRegisteredPgidAccountant:
                               "foreign process in macOS registered group")
             members.append(identity)
             _nonnegative_integer(resident, "macOS observed residency")
-        _require_contract(leader in resident_by_identity,
-                          "macOS registered leader is missing")
+        if leader not in resident_by_identity:
+            raise MacOSRegisteredLeaderMissingError(pgid)
         self._members[pgid] = tuple(members)
 
     def observe_snapshot(
@@ -2539,7 +2547,7 @@ class MacOSLibprocProvider:
             parents = {identity.pid: ppid for identity, _resident, ppid in observed}
             leader = accountant._leaders[pgid]
             if leader not in entries:
-                raise AuditInfrastructureError("macOS registered leader is missing")
+                raise MacOSRegisteredLeaderMissingError(pgid)
             member_pids = set(parents)
             for pid in member_pids - {pgid}:
                 current = pid
