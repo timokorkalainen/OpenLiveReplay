@@ -57,6 +57,15 @@ class MacOSRegisteredLeaderMissingError(AuditInfrastructureError):
         super().__init__("macOS registered leader is missing")
 
 
+class MacOSProcessQueryUnavailableError(AuditInfrastructureError):
+    """A macOS libproc identity or residency record became unavailable."""
+
+    def __init__(self, pid: int, stage: str) -> None:
+        self.pid = pid
+        self.stage = stage
+        super().__init__(f"macOS process {stage} query failed")
+
+
 def _require_contract(condition: bool, message: str) -> None:
     if not condition:
         raise AuditInfrastructureError(message)
@@ -2497,16 +2506,54 @@ class MacOSLibprocProvider:
         bsd = BsdInfo()
         if self._libproc.proc_pidinfo(
                 pid, 3, 0, ctypes.byref(bsd), ctypes.sizeof(bsd)) != ctypes.sizeof(bsd):
-            raise AuditInfrastructureError("macOS process identity query failed")
+            raise MacOSProcessQueryUnavailableError(pid, "identity")
         _require_contract(int(bsd.pid) == pid and int(bsd.pgid) == expected_pgid,
                           "foreign process in macOS registered group")
         task = _MacOSTaskInfo()
         if self._libproc.proc_pidinfo(
                 pid, 4, 0, ctypes.byref(task), ctypes.sizeof(task)) != ctypes.sizeof(task):
-            raise AuditInfrastructureError("macOS process residency query failed")
+            raise MacOSProcessQueryUnavailableError(pid, "residency")
         identity = OwnedProcessIdentity(
             "macos", pid, f"{int(bsd.start_tvsec)}:{int(bsd.start_tvusec)}")
         return identity, int(task.resident_size), int(bsd.ppid)
+
+    def _query_process_if_live(
+        self,
+        pid: int,
+        pgid: int,
+    ) -> tuple[OwnedProcessIdentity, int, int] | None:
+        try:
+            return self._identity_and_residency(pid, pgid)
+        except MacOSProcessQueryUnavailableError:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return None
+            except PermissionError:
+                pass
+            raise
+
+    def _query_stable_group(
+        self,
+        pgid: int,
+    ) -> tuple[tuple[OwnedProcessIdentity, int, int], ...]:
+        for _attempt in range(8):
+            stable_pids = self._stable_list_pids(pgid)
+            observed: list[tuple[OwnedProcessIdentity, int, int]] = []
+            restart = False
+            for pid in stable_pids:
+                entry = self._query_process_if_live(pid, pgid)
+                if entry is None:
+                    restart = True
+                    break
+                observed.append(entry)
+            if restart or self._stable_list_pids(pgid) != stable_pids:
+                time.sleep(0.001)
+                continue
+            return tuple(observed)
+        raise AuditInfrastructureError(
+            "macOS PGID membership changed during query"
+        )
 
     def observe(self, accountant: MacOSRegisteredPgidAccountant,
                 parent_resident_bytes: int) -> None:
@@ -2516,23 +2563,19 @@ class MacOSLibprocProvider:
         for pgid in tuple(accountant._leaders):
             live_prior_pids: set[int] = set()
             for prior in accountant._members[pgid]:
-                try:
-                    actual, _resident, _parent = self._identity_and_residency(
-                        prior.pid, pgid)
-                except AuditInfrastructureError:
-                    try:
-                        os.kill(prior.pid, 0)
-                    except ProcessLookupError:
-                        continue
-                    except PermissionError:
-                        pass
-                    raise
+                queried = self._query_process_if_live(prior.pid, pgid)
+                if queried is None:
+                    continue
+                actual, _resident, _parent = queried
                 if actual != prior:
                     raise AuditInfrastructureError(
                         "macOS process start identity changed")
                 live_prior_pids.add(prior.pid)
-            stable_pids = self._stable_list_pids(pgid)
-            for pid in live_prior_pids - set(stable_pids):
+            observed = self._query_stable_group(pgid)
+            observed_pids = {
+                identity.pid for identity, _resident, _ppid in observed
+            }
+            for pid in live_prior_pids - observed_pids:
                 try:
                     os.kill(pid, 0)
                 except ProcessLookupError:
@@ -2541,8 +2584,6 @@ class MacOSLibprocProvider:
                     pass
                 raise AuditInfrastructureError(
                     "macOS stable PGID enumeration omitted a live member")
-            observed = tuple(self._identity_and_residency(pid, pgid)
-                             for pid in stable_pids)
             entries = {identity: resident for identity, resident, _ppid in observed}
             parents = {identity.pid: ppid for identity, _resident, ppid in observed}
             leader = accountant._leaders[pgid]
@@ -2569,23 +2610,19 @@ class MacOSLibprocProvider:
                           "macOS native reconciliation input is invalid")
         live_prior_pids: set[int] = set()
         for prior in accountant._members[pgid]:
-            try:
-                actual, _resident, _parent = self._identity_and_residency(
-                    prior.pid, pgid)
-            except AuditInfrastructureError:
-                try:
-                    os.kill(prior.pid, 0)
-                except ProcessLookupError:
-                    continue
-                except PermissionError:
-                    pass
-                raise
+            queried = self._query_process_if_live(prior.pid, pgid)
+            if queried is None:
+                continue
+            actual, _resident, _parent = queried
             if actual != prior:
                 raise AuditInfrastructureError(
                     "macOS process start identity changed")
             live_prior_pids.add(prior.pid)
-        stable_pids = self._stable_list_pids(pgid)
-        missing_live = live_prior_pids - set(stable_pids)
+        observed_entries = self._query_stable_group(pgid)
+        observed_pids = {
+            identity.pid for identity, _resident, _ppid in observed_entries
+        }
+        missing_live = live_prior_pids - observed_pids
         for pid in missing_live:
             try:
                 os.kill(pid, 0)
@@ -2595,8 +2632,10 @@ class MacOSLibprocProvider:
                 pass
             raise AuditInfrastructureError(
                 "macOS stable PGID enumeration omitted a live member")
-        observed = tuple(self._identity_and_residency(pid, pgid)[0]
-                         for pid in stable_pids)
+        observed = tuple(
+            identity
+            for identity, _resident, _parent in observed_entries
+        )
         return tuple(sorted(observed, key=lambda identity: (
             identity.pid, identity.native_start_identity)))
 

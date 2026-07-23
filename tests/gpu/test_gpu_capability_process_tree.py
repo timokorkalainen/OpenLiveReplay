@@ -23,6 +23,7 @@ from gpu_capability_model import (  # noqa: E402
     CompilerPgidReported, FileIdentity, MacOSInspectionPgidReported,
 )
 from gpu_capability_process_tree import (  # noqa: E402
+    MacOSProcessQueryUnavailableError,
     MacOSRegisteredLeaderMissingError,
     MacOSRegisteredPgidAccountant,
     MacOSExecPermitAuthority,
@@ -1402,16 +1403,164 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
 
         provider._identity_and_residency = identity_and_residency
         provider._list_pids = lambda _pgid: (leader.pid,)
-        with mock.patch("gpu_capability_process_tree.os.kill", return_value=None):
+        with mock.patch(
+            "gpu_capability_process_tree.os.kill",
+            side_effect=ProcessLookupError,
+        ) as probe:
             with self.assertRaisesRegex(AuditInfrastructureError,
                                         "foreign process"):
                 provider.observe(accountant, 1)
+        probe.assert_not_called()
 
     def test_provider_requires_repeated_stable_pgid_enumeration(self) -> None:
         provider = MacOSLibprocProvider.__new__(MacOSLibprocProvider)
         observations = iter(((), (901,), (901,), (901,)))
         provider._list_pids = lambda _pgid: next(observations)
         self.assertEqual(provider._stable_list_pids(901), (901,))
+
+    def test_provider_skips_enumerated_process_that_exits_before_query(self):
+        accountant = MacOSRegisteredPgidAccountant()
+        leader = OwnedProcessIdentity("macos", 901, "start-leader")
+        accountant.register_group(901, leader, "worker")
+        provider = MacOSLibprocProvider.__new__(MacOSLibprocProvider)
+
+        def identity_and_residency(pid, _pgid):
+            if pid == leader.pid:
+                return leader, 2, 1
+            raise MacOSProcessQueryUnavailableError(pid, "identity")
+
+        provider._identity_and_residency = identity_and_residency
+        stable_groups = iter((
+            (leader.pid, 902),
+            (leader.pid,),
+            (leader.pid,),
+        ))
+        provider._stable_list_pids = lambda _pgid: next(stable_groups)
+        with mock.patch(
+            "gpu_capability_process_tree.os.kill",
+            side_effect=ProcessLookupError,
+        ) as probe:
+            provider.observe(accountant, 1)
+
+        probe.assert_called_once_with(902, 0)
+        self.assertEqual(accountant._members[901], (leader,))
+
+    def test_provider_fails_closed_when_unqueryable_enumerated_process_is_live(self):
+        accountant = MacOSRegisteredPgidAccountant()
+        leader = OwnedProcessIdentity("macos", 901, "start-leader")
+        accountant.register_group(901, leader, "worker")
+        provider = MacOSLibprocProvider.__new__(MacOSLibprocProvider)
+
+        def identity_and_residency(pid, _pgid):
+            if pid == leader.pid:
+                return leader, 2, 1
+            raise MacOSProcessQueryUnavailableError(pid, "identity")
+
+        provider._identity_and_residency = identity_and_residency
+        provider._stable_list_pids = lambda _pgid: (leader.pid, 902)
+        with mock.patch(
+            "gpu_capability_process_tree.os.kill",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "identity query failed",
+            ):
+                provider.observe(accountant, 1)
+
+    def test_provider_fails_closed_when_query_liveness_is_ambiguous(self):
+        accountant = MacOSRegisteredPgidAccountant()
+        leader = OwnedProcessIdentity("macos", 901, "start-leader")
+        accountant.register_group(901, leader, "worker")
+        provider = MacOSLibprocProvider.__new__(MacOSLibprocProvider)
+
+        def identity_and_residency(pid, _pgid):
+            if pid == leader.pid:
+                return leader, 2, 1
+            raise MacOSProcessQueryUnavailableError(pid, "residency")
+
+        provider._identity_and_residency = identity_and_residency
+        provider._stable_list_pids = lambda _pgid: (leader.pid, 902)
+        with mock.patch(
+            "gpu_capability_process_tree.os.kill",
+            side_effect=PermissionError,
+        ):
+            with self.assertRaisesRegex(
+                MacOSProcessQueryUnavailableError,
+                "residency query failed",
+            ):
+                provider.observe(accountant, 1)
+
+    def test_provider_promotes_leader_exit_during_query_to_typed_transition(self):
+        accountant = MacOSRegisteredPgidAccountant()
+        leader = OwnedProcessIdentity("macos", 901, "start-leader")
+        accountant.register_group(901, leader, "worker")
+        provider = MacOSLibprocProvider.__new__(MacOSLibprocProvider)
+        query_count = 0
+
+        def identity_and_residency(pid, _pgid):
+            nonlocal query_count
+            query_count += 1
+            if query_count == 1:
+                return leader, 2, 1
+            raise MacOSProcessQueryUnavailableError(pid, "identity")
+
+        provider._identity_and_residency = identity_and_residency
+        stable_groups = iter(((leader.pid,), (), ()))
+        provider._stable_list_pids = lambda _pgid: next(stable_groups)
+        with mock.patch(
+            "gpu_capability_process_tree.os.kill",
+            side_effect=ProcessLookupError,
+        ):
+            with self.assertRaises(
+                MacOSRegisteredLeaderMissingError,
+            ) as raised:
+                provider.observe(accountant, 1)
+        self.assertEqual(raised.exception.pgid, leader.pid)
+
+    def test_reconciliation_restarts_after_enumerated_process_exit(self):
+        accountant = MacOSRegisteredPgidAccountant()
+        leader = OwnedProcessIdentity("macos", 901, "start-leader")
+        accountant.register_group(901, leader, "worker")
+        provider = MacOSLibprocProvider.__new__(MacOSLibprocProvider)
+
+        def identity_and_residency(pid, _pgid):
+            if pid == leader.pid:
+                return leader, 2, 1
+            raise MacOSProcessQueryUnavailableError(pid, "identity")
+
+        provider._identity_and_residency = identity_and_residency
+        stable_groups = iter((
+            (leader.pid, 902),
+            (leader.pid,),
+            (leader.pid,),
+        ))
+        provider._stable_list_pids = lambda _pgid: next(stable_groups)
+        with mock.patch(
+            "gpu_capability_process_tree.os.kill",
+            side_effect=ProcessLookupError,
+        ):
+            survivors = provider.reconcile_survivors(accountant, leader.pid)
+        self.assertEqual(survivors, (leader,))
+
+    def test_provider_bounds_membership_churn_without_partial_commit(self):
+        provider = MacOSLibprocProvider.__new__(MacOSLibprocProvider)
+        leader = OwnedProcessIdentity("macos", 901, "start-leader")
+        child = OwnedProcessIdentity("macos", 902, "start-child")
+        provider._identity_and_residency = lambda pid, _pgid: (
+            leader if pid == leader.pid else child,
+            2,
+            1,
+        )
+        stable_groups = iter(
+            ((leader.pid,), (leader.pid, child.pid)) * 8
+        )
+        provider._stable_list_pids = lambda _pgid: next(stable_groups)
+        with self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "membership changed during query",
+        ):
+            provider._query_stable_group(leader.pid)
 
     def test_reconciliation_rejects_stable_enumeration_missing_live_member(self):
         accountant = MacOSRegisteredPgidAccountant()
