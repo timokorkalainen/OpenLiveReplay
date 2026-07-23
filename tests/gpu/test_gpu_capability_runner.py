@@ -11429,6 +11429,178 @@ class ProcessCoordinatorTests(unittest.TestCase):
         ):
             reactor._sample_owned_forest_or_defer_macos_transition()
 
+    def test_macos_last_compiler_query_defers_until_next_protocol_event(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        receiver = mock.Mock()
+        receiver.poll.return_value = False
+        process = mock.Mock()
+        process.is_alive.return_value = True
+        reactor.states = [
+            SimpleNamespace(
+                worker_index=0,
+                generation=1,
+                event_receiver=receiver,
+                process=process,
+            )
+        ]
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        reactor.native_lifecycle.worker_groups = {(0, 1): 1234}
+        reactor.native_lifecycle.compiler_groups = {(0, 1, 7): [9000]}
+        unavailable = (
+            capability_process_tree.MacOSProcessQueryUnavailableError(
+                9000,
+                9000,
+                "identity",
+            )
+        )
+        reactor._sample_owned_forest = mock.Mock(side_effect=unavailable)
+
+        self.assertIsNone(
+            reactor._sample_owned_forest_or_defer_macos_transition()
+        )
+        receiver.poll.assert_not_called()
+
+    def test_macos_nonlast_compiler_query_without_transition_fails_closed(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        receiver = mock.Mock()
+        receiver.poll.return_value = False
+        process = mock.Mock()
+        process.is_alive.return_value = True
+        reactor.states = [
+            SimpleNamespace(
+                worker_index=0,
+                generation=1,
+                event_receiver=receiver,
+                process=process,
+            )
+        ]
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        reactor.native_lifecycle.worker_groups = {(0, 1): 1234}
+        reactor.native_lifecycle.compiler_groups = {(0, 1, 7): [9000, 9001]}
+        unavailable = (
+            capability_process_tree.MacOSProcessQueryUnavailableError(
+                9000,
+                9000,
+                "residency",
+            )
+        )
+        reactor._sample_owned_forest = mock.Mock(side_effect=unavailable)
+
+        with self.assertRaises(
+            capability_process_tree.MacOSProcessQueryUnavailableError
+        ):
+            reactor._sample_owned_forest_or_defer_macos_transition()
+        receiver.poll.assert_called_once_with(0)
+        process.is_alive.assert_called_once_with()
+
+    def test_macos_next_compiler_reconciles_prior_before_permit(self):
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        lifecycle.accountant = mock.Mock()
+        lifecycle.accountant.reconcile_group.return_value = True
+        lifecycle.provider = mock.Mock()
+        lifecycle.compiler_groups = {(0, 1, 7): [9000]}
+        lifecycle._native_reconciled_groups = set()
+        lifecycle._compiler_admission_receipts = {(0, 1, 9000)}
+        event = SimpleNamespace(
+            worker_index=0, generation=1, task_id=7, pgid=9001
+        )
+
+        lifecycle.prepare_compiler_admission(event)
+
+        lifecycle.accountant.reconcile_group.assert_called_once_with(
+            9000,
+            lifecycle.provider,
+        )
+        self.assertEqual(lifecycle.compiler_groups, {(0, 1, 7): [9000]})
+        self.assertIn((0, 1, 9000), lifecycle._native_reconciled_groups)
+
+    def test_macos_duplicate_compiler_report_does_not_reconcile_current(self):
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        lifecycle.accountant = mock.Mock()
+        lifecycle.compiler_groups = {(0, 1, 7): [9000]}
+        lifecycle._compiler_admission_receipts = {(0, 1, 9000)}
+        event = SimpleNamespace(
+            worker_index=0, generation=1, task_id=7, pgid=9000
+        )
+
+        lifecycle.prepare_compiler_admission(event)
+
+        lifecycle.accountant.reconcile_group.assert_not_called()
+
+    def test_macos_unsampled_prior_compiler_blocks_next_admission(self):
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        lifecycle.compiler_groups = {(0, 1, 7): [9000]}
+        lifecycle._compiler_admission_receipts = set()
+        event = SimpleNamespace(
+            worker_index=0, generation=1, task_id=7, pgid=9001
+        )
+
+        with self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "admission sample",
+        ):
+            lifecycle.prepare_compiler_admission(event)
+
+    def test_macos_missing_current_gate_cannot_receive_admission(self):
+        lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        lifecycle.accountant = SimpleNamespace(_leaders={})
+        lifecycle.compiler_groups = {(0, 1, 7): [9000]}
+        lifecycle._native_reconciled_groups = {(0, 1, 9000)}
+        lifecycle._compiler_admission_receipts = set()
+        event = SimpleNamespace(
+            worker_index=0, generation=1, task_id=7, pgid=9000
+        )
+
+        with self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "admission is unregistered",
+        ):
+            lifecycle.record_compiler_admission(event)
+        self.assertEqual(lifecycle._compiler_admission_receipts, set())
+
+    def test_macos_pending_admission_retries_after_other_worker_transition(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        state = SimpleNamespace()
+        event = SimpleNamespace(pgid=9000)
+        permit = SimpleNamespace(pgid=9000)
+        reactor._pending_macos_admissions = capability_runner.collections.deque([
+            (state, event, permit)
+        ])
+        reactor.deferred_events = capability_runner.collections.deque()
+        sample = object()
+        reactor.result_budget = object()
+        reactor._sample_owned_forest_or_defer_macos_transition = mock.Mock(
+            side_effect=(None, sample)
+        )
+        reactor.native_lifecycle = mock.Mock()
+        reactor._send_command = mock.Mock()
+
+        self.assertIsNone(reactor._complete_pending_macos_admissions())
+        with mock.patch.object(
+            capability_runner,
+            "_enforce_platform_memory_contract",
+        ) as enforce:
+            completed = reactor._complete_pending_macos_admissions()
+
+        self.assertEqual(completed, (state, event))
+        enforce.assert_called_once_with(sample, reactor.result_budget)
+        reactor.native_lifecycle.record_compiler_admission.assert_called_once_with(
+            event
+        )
+        reactor._send_command.assert_called_once_with(state, permit)
+
     def test_macos_exited_compiler_reconciles_then_samples_next_compiler(self):
         reactor = object.__new__(capability_runner.GenerationReactor)
         lifecycle = object.__new__(

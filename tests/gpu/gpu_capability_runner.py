@@ -3776,6 +3776,7 @@ class _MacOSGenerationLifecycle:
             tuple[int, int, int]
         ] = set()
         self._force_signal_attempted_groups: set[tuple[int, int, int]] = set()
+        self._compiler_admission_receipts: set[tuple[int, int, int]] = set()
         self._sealed_task_phase_snapshot: MacOSPhaseSnapshot | None = None
 
     def accept_worker_session(self, report: MacOSWorkerSessionReported) -> None:
@@ -3853,6 +3854,9 @@ class _MacOSGenerationLifecycle:
             )
             del groups[0]
             self._native_reconciled_groups.discard(progress_key)
+            getattr(self, "_compiler_admission_receipts", set()).discard(
+                progress_key
+            )
             getattr(
                 self,
                 "_force_signal_attempted_groups",
@@ -3926,6 +3930,57 @@ class _MacOSGenerationLifecycle:
         # Keep compiler_groups intact.  WorkerPayloadReady remains the only
         # event that authenticates the task and removes its logical groups.
         return True
+
+    def prepare_compiler_admission(
+        self,
+        report: CompilerPgidReported,
+    ) -> None:
+        key = (report.worker_index, report.generation, report.task_id)
+        groups = self.compiler_groups.get(key, ())
+        if report.pgid in groups:
+            return
+        for pgid in groups:
+            progress_key = (report.worker_index, report.generation, pgid)
+            if progress_key not in self._compiler_admission_receipts:
+                raise AuditInfrastructureError(
+                    "macOS compiler admission sample is unavailable"
+                )
+            self._reconcile_native_group_once(
+                progress_key,
+                pgid,
+            )
+
+    def record_compiler_admission(self, report: CompilerPgidReported) -> None:
+        key = (report.worker_index, report.generation, report.task_id)
+        progress_key = (report.worker_index, report.generation, report.pgid)
+        leaders = getattr(self.accountant, "_leaders", {})
+        if (
+            report.pgid not in self.compiler_groups.get(key, ())
+            or report.pgid not in leaders
+            or progress_key in self._native_reconciled_groups
+        ):
+            raise AuditInfrastructureError("macOS compiler admission is unregistered")
+        self._compiler_admission_receipts.add(progress_key)
+
+    def compiler_admission_recorded(self, report: CompilerPgidReported) -> bool:
+        return (
+            report.worker_index,
+            report.generation,
+            report.pgid,
+        ) in self._compiler_admission_receipts
+
+    def require_task_compiler_admissions(
+        self, worker_index: int, generation: int, task_id: int,
+    ) -> None:
+        groups = self.compiler_groups.get((worker_index, generation, task_id), ())
+        if any(
+            (worker_index, generation, pgid)
+            not in self._compiler_admission_receipts
+            for pgid in groups
+        ):
+            raise AuditInfrastructureError(
+                "macOS compiler admission sample is unavailable"
+            )
 
     def observe(self) -> None:
         self.provider.observe(self.accountant, _current_process_rss_bytes())
@@ -4038,6 +4093,14 @@ class _MacOSGenerationLifecycle:
                     if progress_key[:2] == worker_key
                 }
             )
+            admissions = getattr(self, "_compiler_admission_receipts", set())
+            admissions.difference_update(
+                {
+                    progress_key
+                    for progress_key in admissions
+                    if progress_key[:2] == worker_key
+                }
+            )
             _generation_release_transition(
                 "macos", "remove", "after", *worker_key
             )
@@ -4142,6 +4205,9 @@ class GenerationReactor:
         ] = {}
         self.deferred_events: collections.deque[
             tuple[_GenerationState, object]
+        ] = collections.deque()
+        self._pending_macos_admissions: collections.deque[
+            tuple[_GenerationState, CompilerPgidReported, CompilerExecPermit]
         ] = collections.deque()
         self.task_phase_snapshot = None
         self._lifecycle_task_phase_snapshot = None
@@ -4847,6 +4913,12 @@ class GenerationReactor:
         )
         if worker_key is None:
             return False
+        return self._macos_worker_transition_pending(worker_key)
+
+    def _macos_worker_transition_pending(
+        self,
+        worker_key: tuple[int, int],
+    ) -> bool:
         for state in self.states:
             if state is not None and (
                 state.worker_index,
@@ -4858,12 +4930,38 @@ class GenerationReactor:
                 )
         return False
 
+    def _macos_process_query_transition_pending(
+        self,
+        pgid: int,
+    ) -> bool:
+        if not isinstance(self.native_lifecycle, _MacOSGenerationLifecycle):
+            return False
+        compiler_entry = next(
+            (
+                (key[:2], groups)
+                for key, groups
+                in self.native_lifecycle.compiler_groups.items()
+                if pgid in groups
+            ),
+            None,
+        )
+        if compiler_entry is not None:
+            compiler_owner, groups = compiler_entry
+            # Worker launch order is serial.  The last registered compiler is
+            # the only one that may be between exit and the next protocol
+            # event; no later compiler has been permitted behind it.
+            if groups and groups[-1] == pgid:
+                return True
+            return self._macos_worker_transition_pending(compiler_owner)
+        return self._macos_missing_worker_transition_pending(pgid)
+
     def _sample_owned_forest_or_defer_macos_transition(
         self,
     ) -> _OwnedForestSample | None:
         if not isinstance(self.native_lifecycle, _MacOSGenerationLifecycle):
             return self._sample_owned_forest()
         from gpu_capability_process_tree import (
+            MacOSProcessQueryUnavailableError,
             MacOSRegisteredLeaderMissingError,
         )
 
@@ -4884,11 +4982,42 @@ class GenerationReactor:
                 if self._macos_missing_worker_transition_pending(error.pgid):
                     return None
                 raise
+            except MacOSProcessQueryUnavailableError as error:
+                # proc_pidinfo can become temporarily unavailable while an
+                # owned compiler or worker is exiting but still has a numeric
+                # PID.  Retry only for the exact registered PGID transition;
+                # observation remains all-or-nothing and deadline-bounded.
+                if self._macos_process_query_transition_pending(error.pgid):
+                    return None
+                raise
+
+    def _complete_pending_macos_admissions(
+        self,
+    ) -> tuple[_GenerationState, object] | None:
+        pending = getattr(self, "_pending_macos_admissions", None)
+        if not pending:
+            return None
+        sample = self._sample_owned_forest_or_defer_macos_transition()
+        if sample is None:
+            return None
+        _enforce_platform_memory_contract(sample, self.result_budget)
+        completed = tuple(pending)
+        pending.clear()
+        for state, event, permit in completed:
+            self.native_lifecycle.record_compiler_admission(event)
+            self._send_command(state, permit)
+        for state, event, _permit in completed[1:]:
+            self.deferred_events.append((state, event))
+        state, event, _permit = completed[0]
+        return state, event
 
     def _next_event_raw(self) -> tuple[_GenerationState, object]:
         while True:
             if time.monotonic() >= self.runtime_contract.pipeline_deadline:
                 raise AuditInfrastructureError("pipeline deadline exceeded")
+            completed_admission = self._complete_pending_macos_admissions()
+            if completed_admission is not None:
+                return completed_admission
             for state in self.states:
                 if state is None:
                     continue
@@ -4947,7 +5076,42 @@ class GenerationReactor:
                             raise AuditInfrastructureError(
                                 "macOS compiler PGID task differs"
                             )
+                        # The worker launches compilers serially.  Receiving
+                        # the next report proves every prior compiler for this
+                        # task completed; reconcile them before permitting the
+                        # next exec so no compiler runs behind sampling debt.
+                        self.native_lifecycle.prepare_compiler_admission(event)
                         permit = self.native_lifecycle.permit_compiler(event)
+                        if not self.native_lifecycle.compiler_admission_recorded(
+                            event
+                        ):
+                            admission = (
+                                self._sample_owned_forest_or_defer_macos_transition()
+                            )
+                            if admission is None:
+                                pending = getattr(
+                                    self,
+                                    "_pending_macos_admissions",
+                                    None,
+                                )
+                                if pending is None:
+                                    pending = collections.deque()
+                                    self._pending_macos_admissions = pending
+                                existing = next(
+                                    (item for item in pending if item[0] is state),
+                                    None,
+                                )
+                                if existing is None:
+                                    pending.append((state, event, permit))
+                                elif existing[1:] != (event, permit):
+                                    raise AuditInfrastructureError(
+                                        "macOS pending compiler admission differs"
+                                    )
+                                continue
+                            _enforce_platform_memory_contract(
+                                admission, self.result_budget
+                            )
+                            self.native_lifecycle.record_compiler_admission(event)
                         self._send_command(state, permit)
                     if isinstance(event, WorkerFailure):
                         # Preserve the worker's bounded root-cause diagnostic.
@@ -4963,6 +5127,11 @@ class GenerationReactor:
                         if isinstance(
                             self.native_lifecycle, _MacOSGenerationLifecycle
                         ):
+                            self.native_lifecycle.require_task_compiler_admissions(
+                                state.worker_index,
+                                state.generation,
+                                state.pending.ordinal,
+                            )
                             self.native_lifecycle.reconcile_task(
                                 state.worker_index,
                                 state.generation,
@@ -5526,6 +5695,18 @@ class GenerationReactor:
             state, "deferred-events-remove", remove_deferred_events
         )
 
+        def remove_pending_admissions():
+            pending = getattr(self, "_pending_macos_admissions", None)
+            if pending is None:
+                return
+            self._pending_macos_admissions = collections.deque(
+                item for item in pending if item[0] is not state
+            )
+
+        self._complete_generation_transition(
+            state, "pending-admissions-remove", remove_pending_admissions
+        )
+
         def remove_worker_pid():
             process = getattr(state, "process", None)
             pid = getattr(process, "pid", None)
@@ -5623,6 +5804,7 @@ class GenerationReactor:
                 or getattr(self, "publication_requests", ())
                 or getattr(self, "active_publication", None) is not None
                 or getattr(self, "deferred_events", ())
+                or getattr(self, "_pending_macos_admissions", ())
             ):
                 raise AuditInfrastructureError(
                     "generation shutdown queues are not empty"

@@ -60,8 +60,9 @@ class MacOSRegisteredLeaderMissingError(AuditInfrastructureError):
 class MacOSProcessQueryUnavailableError(AuditInfrastructureError):
     """A macOS libproc identity or residency record became unavailable."""
 
-    def __init__(self, pid: int, stage: str) -> None:
+    def __init__(self, pid: int, pgid: int, stage: str) -> None:
         self.pid = pid
+        self.pgid = pgid
         self.stage = stage
         super().__init__(f"macOS process {stage} query failed")
 
@@ -2506,13 +2507,21 @@ class MacOSLibprocProvider:
         bsd = BsdInfo()
         if self._libproc.proc_pidinfo(
                 pid, 3, 0, ctypes.byref(bsd), ctypes.sizeof(bsd)) != ctypes.sizeof(bsd):
-            raise MacOSProcessQueryUnavailableError(pid, "identity")
+            raise MacOSProcessQueryUnavailableError(
+                pid,
+                expected_pgid,
+                "identity",
+            )
         _require_contract(int(bsd.pid) == pid and int(bsd.pgid) == expected_pgid,
                           "foreign process in macOS registered group")
         task = _MacOSTaskInfo()
         if self._libproc.proc_pidinfo(
                 pid, 4, 0, ctypes.byref(task), ctypes.sizeof(task)) != ctypes.sizeof(task):
-            raise MacOSProcessQueryUnavailableError(pid, "residency")
+            raise MacOSProcessQueryUnavailableError(
+                pid,
+                expected_pgid,
+                "residency",
+            )
         identity = OwnedProcessIdentity(
             "macos", pid, f"{int(bsd.start_tvsec)}:{int(bsd.start_tvusec)}")
         return identity, int(task.resident_size), int(bsd.ppid)
@@ -2522,16 +2531,20 @@ class MacOSLibprocProvider:
         pid: int,
         pgid: int,
     ) -> tuple[OwnedProcessIdentity, int, int] | None:
-        try:
-            return self._identity_and_residency(pid, pgid)
-        except MacOSProcessQueryUnavailableError:
+        for attempt in range(8):
             try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return None
-            except PermissionError:
-                pass
-            raise
+                return self._identity_and_residency(pid, pgid)
+            except MacOSProcessQueryUnavailableError as error:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return None
+                except PermissionError:
+                    raise error
+                if attempt == 7:
+                    raise
+                time.sleep(0.001)
+        raise AssertionError("unreachable macOS process query retry")
 
     def _query_stable_group(
         self,

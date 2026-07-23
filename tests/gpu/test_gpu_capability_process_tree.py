@@ -1427,7 +1427,7 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
         def identity_and_residency(pid, _pgid):
             if pid == leader.pid:
                 return leader, 2, 1
-            raise MacOSProcessQueryUnavailableError(pid, "identity")
+            raise MacOSProcessQueryUnavailableError(pid, 901, "identity")
 
         provider._identity_and_residency = identity_and_residency
         stable_groups = iter((
@@ -1445,6 +1445,42 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
         probe.assert_called_once_with(902, 0)
         self.assertEqual(accountant._members[901], (leader,))
 
+    def test_provider_retries_live_short_query_before_committing_snapshot(self):
+        accountant = MacOSRegisteredPgidAccountant()
+        leader = OwnedProcessIdentity("macos", 901, "start-leader")
+        child = OwnedProcessIdentity("macos", 902, "start-child")
+        accountant.register_group(901, leader, "worker")
+        provider = MacOSLibprocProvider.__new__(MacOSLibprocProvider)
+        child_queries = 0
+
+        def identity_and_residency(pid, _pgid):
+            nonlocal child_queries
+            if pid == leader.pid:
+                return leader, 2, 1
+            child_queries += 1
+            if child_queries < 4:
+                raise MacOSProcessQueryUnavailableError(
+                    pid,
+                    901,
+                    "identity",
+                )
+            return child, 5, leader.pid
+
+        provider._identity_and_residency = identity_and_residency
+        provider._stable_list_pids = lambda _pgid: (leader.pid, child.pid)
+        with mock.patch(
+            "gpu_capability_process_tree.os.kill",
+            return_value=None,
+        ) as probe:
+            provider.observe(accountant, 1)
+
+        self.assertEqual(child_queries, 4)
+        self.assertEqual(probe.call_count, 3)
+        self.assertEqual(
+            accountant.memory_measurements().maximum_observed_owned_group_resident_bytes,
+            7,
+        )
+
     def test_provider_fails_closed_when_unqueryable_enumerated_process_is_live(self):
         accountant = MacOSRegisteredPgidAccountant()
         leader = OwnedProcessIdentity("macos", 901, "start-leader")
@@ -1454,7 +1490,7 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
         def identity_and_residency(pid, _pgid):
             if pid == leader.pid:
                 return leader, 2, 1
-            raise MacOSProcessQueryUnavailableError(pid, "identity")
+            raise MacOSProcessQueryUnavailableError(pid, 901, "identity")
 
         provider._identity_and_residency = identity_and_residency
         provider._stable_list_pids = lambda _pgid: (leader.pid, 902)
@@ -1477,7 +1513,7 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
         def identity_and_residency(pid, _pgid):
             if pid == leader.pid:
                 return leader, 2, 1
-            raise MacOSProcessQueryUnavailableError(pid, "residency")
+            raise MacOSProcessQueryUnavailableError(pid, 901, "residency")
 
         provider._identity_and_residency = identity_and_residency
         provider._stable_list_pids = lambda _pgid: (leader.pid, 902)
@@ -1503,7 +1539,7 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
             query_count += 1
             if query_count == 1:
                 return leader, 2, 1
-            raise MacOSProcessQueryUnavailableError(pid, "identity")
+            raise MacOSProcessQueryUnavailableError(pid, 901, "identity")
 
         provider._identity_and_residency = identity_and_residency
         stable_groups = iter(((leader.pid,), (), ()))
@@ -1527,7 +1563,7 @@ class MacOSRegisteredAccountingTests(unittest.TestCase):
         def identity_and_residency(pid, _pgid):
             if pid == leader.pid:
                 return leader, 2, 1
-            raise MacOSProcessQueryUnavailableError(pid, "identity")
+            raise MacOSProcessQueryUnavailableError(pid, 901, "identity")
 
         provider._identity_and_residency = identity_and_residency
         stable_groups = iter((
