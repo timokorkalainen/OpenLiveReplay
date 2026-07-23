@@ -1465,6 +1465,29 @@ _CAPABILITY_FD_CHUNK = 64
 _CAPABILITY_FD_HEADER_FORMAT = "!32sIII"
 
 
+def _posix_capability_socket_type() -> socket.SocketKind:
+    if sys.platform == "darwin":
+        return socket.SOCK_DGRAM
+    if sys.platform.startswith("linux"):
+        return socket.SOCK_SEQPACKET
+    raise AuditInfrastructureError(
+        "worker compiler capability transfer platform is unsupported"
+    )
+
+
+def _validate_posix_capability_socket(endpoint: socket.socket) -> None:
+    try:
+        socket_type = endpoint.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+    except OSError as error:
+        raise AuditInfrastructureError(
+            "worker compiler capability transfer endpoint is invalid"
+        ) from error
+    if socket_type not in {socket.SOCK_DGRAM, socket.SOCK_SEQPACKET}:
+        raise AuditInfrastructureError(
+            "worker compiler capability transfer endpoint is not record-oriented"
+        )
+
+
 def _send_posix_capability_streams(
     endpoint: socket.socket,
     streams: tuple[object, ...],
@@ -1476,6 +1499,7 @@ def _send_posix_capability_streams(
         raise AuditInfrastructureError(
             "worker compiler capability transfer endpoint is invalid"
         )
+    _validate_posix_capability_socket(endpoint)
     chunks = max(1, math.ceil(len(streams) / _CAPABILITY_FD_CHUNK))
     endpoint.setblocking(False)
     selector = selectors.DefaultSelector()
@@ -1541,6 +1565,8 @@ def _receive_posix_capability_streams(
         1, math.ceil(expected_count / _CAPABILITY_FD_CHUNK)
     )
     received_fds: list[int] = []
+    streams: list[object] = []
+    _validate_posix_capability_socket(endpoint)
     endpoint.setblocking(False)
     selector = selectors.DefaultSelector()
     selector.register(endpoint, selectors.EVENT_READ)
@@ -1566,52 +1592,95 @@ def _receive_posix_capability_streams(
                 except BlockingIOError:
                     continue
                 break
-            if flags & getattr(socket, "MSG_CTRUNC", 0):
-                raise AuditInfrastructureError(
-                    "worker compiler capability receive was truncated"
-                )
-            if len(header) != struct.calcsize(_CAPABILITY_FD_HEADER_FORMAT):
-                raise AuditInfrastructureError(
-                    "worker compiler capability receive header differs"
-                )
-            raw_cookie, observed_index, observed_chunks, observed_count = (
-                struct.unpack(_CAPABILITY_FD_HEADER_FORMAT, header)
-            )
-            if (
-                raw_cookie.hex() != cookie
-                or observed_index != chunk_index
-                or observed_chunks != expected_chunks
-                or observed_count <= 0
-                or observed_count > _CAPABILITY_FD_CHUNK
-            ):
-                raise AuditInfrastructureError(
-                    "worker compiler capability receive generation differs"
-                )
             chunk_fds = array("i")
+            ancillary_valid = True
+            rights_messages = 0
             for level, kind, payload in ancillary:
                 if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                    usable = len(payload) - (len(payload) % chunk_fds.itemsize)
-                    chunk_fds.frombytes(payload[:usable])
-            if len(chunk_fds) != observed_count:
-                raise AuditInfrastructureError(
-                    "worker compiler capability receive count differs"
+                    rights_messages += 1
+                    if len(payload) % chunk_fds.itemsize != 0:
+                        ancillary_valid = False
+                    else:
+                        chunk_fds.frombytes(payload)
+                else:
+                    ancillary_valid = False
+            chunk_descriptors = list(chunk_fds)
+            try:
+                if flags & (
+                    getattr(socket, "MSG_TRUNC", 0)
+                    | getattr(socket, "MSG_CTRUNC", 0)
+                ):
+                    raise AuditInfrastructureError(
+                        "worker compiler capability receive was truncated"
+                    )
+                if len(header) != struct.calcsize(_CAPABILITY_FD_HEADER_FORMAT):
+                    raise AuditInfrastructureError(
+                        "worker compiler capability receive header differs"
+                    )
+                raw_cookie, observed_index, observed_chunks, observed_count = (
+                    struct.unpack(_CAPABILITY_FD_HEADER_FORMAT, header)
                 )
-            for descriptor in chunk_fds:
-                os.set_inheritable(descriptor, False)
-                received_fds.append(descriptor)
+                expected_chunk_count = min(
+                    _CAPABILITY_FD_CHUNK,
+                    expected_count - chunk_index * _CAPABILITY_FD_CHUNK,
+                )
+                if (
+                    raw_cookie.hex() != cookie
+                    or observed_index != chunk_index
+                    or observed_chunks != expected_chunks
+                    or observed_count != expected_chunk_count
+                ):
+                    raise AuditInfrastructureError(
+                        "worker compiler capability receive generation differs"
+                    )
+                if (
+                    not ancillary_valid
+                    or rights_messages != 1
+                    or len(chunk_descriptors) != observed_count
+                ):
+                    raise AuditInfrastructureError(
+                        "worker compiler capability receive count differs"
+                    )
+                for descriptor in chunk_descriptors:
+                    os.set_inheritable(descriptor, False)
+                received_fds.extend(chunk_descriptors)
+                chunk_descriptors.clear()
+            finally:
+                for descriptor in chunk_descriptors:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
         if len(received_fds) != expected_count:
             raise AuditInfrastructureError(
                 "worker compiler capability receive total differs"
             )
-        streams = tuple(os.fdopen(descriptor, "rb", closefd=True) for descriptor in received_fds)
-        received_fds.clear()
-        return streams
+        pending_fds = received_fds
+        received_fds = []
+        for index, descriptor in enumerate(pending_fds):
+            try:
+                streams.append(os.fdopen(descriptor, "rb", closefd=True))
+            except BaseException:
+                for pending_descriptor in pending_fds[index:]:
+                    try:
+                        os.close(pending_descriptor)
+                    except OSError:
+                        pass
+                raise
+        result = tuple(streams)
+        streams.clear()
+        return result
     except (OSError, ValueError) as error:
         raise AuditInfrastructureError(
             "worker compiler capability receive failed"
         ) from error
     finally:
         selector.close()
+        for stream in reversed(streams):
+            try:
+                stream.close()
+            except BaseException:
+                pass
         for descriptor in received_fds:
             try:
                 os.close(descriptor)
@@ -4141,7 +4210,10 @@ class GenerationReactor:
             capability_transfer_child = None
             if os.name != "nt":
                 capability_transfer_parent, capability_transfer_child = own_pair(
-                    socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET),
+                    socket.socketpair(
+                        socket.AF_UNIX,
+                        _posix_capability_socket_type(),
+                    ),
                     "capability socket setup cleanup",
                 )
                 state.capability_transfer_parent = capability_transfer_parent

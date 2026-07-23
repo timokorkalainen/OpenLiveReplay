@@ -10,6 +10,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import socket
 import subprocess
 import struct
 import sys
@@ -11151,6 +11152,272 @@ class ProcessCoordinatorTests(unittest.TestCase):
         document["platform_kind"] = platform_kind
         document["resolved_runtime_closure_digest"] = closure_digest
         document["digest"] = capability_digest
+
+    def test_posix_capability_socket_type_is_supported_per_platform(self):
+        with mock.patch.object(capability_runner.sys, "platform", "darwin"):
+            self.assertEqual(
+                capability_runner._posix_capability_socket_type(),
+                socket.SOCK_DGRAM,
+            )
+        with mock.patch.object(capability_runner.sys, "platform", "linux"):
+            self.assertEqual(
+                capability_runner._posix_capability_socket_type(),
+                socket.SOCK_SEQPACKET,
+            )
+        with mock.patch.object(
+            capability_runner.sys,
+            "platform",
+            "freebsd",
+        ), self.assertRaisesRegex(
+            AuditInfrastructureError,
+            "platform is unsupported",
+        ):
+            capability_runner._posix_capability_socket_type()
+
+    def test_posix_capability_transfer_rejects_stream_socket(self):
+        first, second = socket.socketpair()
+        try:
+            with self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "not record-oriented",
+            ):
+                capability_runner._validate_posix_capability_socket(first)
+        finally:
+            first.close()
+            second.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor transfer")
+    def test_posix_capability_socketpair_transfers_multiple_chunks(self):
+        paths = []
+        for index in range(65):
+            path = self.root / f"capability-transfer-{index}"
+            path.write_bytes(f"stream-{index}".encode("ascii"))
+            paths.append(path)
+        socket_types = tuple(dict.fromkeys((
+            capability_runner._posix_capability_socket_type(),
+            socket.SOCK_DGRAM,
+        )))
+        for socket_type in socket_types:
+            with self.subTest(socket_type=socket_type):
+                parent, child = socket.socketpair(socket.AF_UNIX, socket_type)
+                sources = tuple(path.open("rb") for path in paths)
+                expected_identities = tuple(os.fstat(stream.fileno()) for stream in sources)
+                received = ()
+                cookie = "a" * 64
+                deadline = time.monotonic() + 10.0
+                try:
+                    capability_runner._send_posix_capability_streams(
+                        parent,
+                        sources,
+                        cookie,
+                        deadline,
+                        threading.Event(),
+                    )
+                    received = capability_runner._receive_posix_capability_streams(
+                        child,
+                        len(sources),
+                        cookie,
+                        deadline,
+                        threading.Event(),
+                    )
+                    self.assertEqual(len(received), len(sources))
+                    for index, (stream, expected) in enumerate(
+                        zip(received, expected_identities)
+                    ):
+                        observed = os.fstat(stream.fileno())
+                        self.assertEqual(
+                            (observed.st_dev, observed.st_ino),
+                            (expected.st_dev, expected.st_ino),
+                        )
+                        self.assertFalse(os.get_inheritable(stream.fileno()))
+                        self.assertEqual(
+                            stream.read(),
+                            f"stream-{index}".encode("ascii"),
+                        )
+                finally:
+                    for stream in received:
+                        stream.close()
+                    for stream in sources:
+                        stream.close()
+                    parent.close()
+                    child.close()
+
+    @staticmethod
+    def _open_posix_descriptor_numbers():
+        root = Path("/dev/fd" if sys.platform == "darwin" else "/proc/self/fd")
+        descriptors = set()
+        for entry in root.iterdir():
+            try:
+                descriptor = int(entry.name)
+                os.fstat(descriptor)
+            except (OSError, ValueError):
+                continue
+            descriptors.add(descriptor)
+        return descriptors
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor transfer")
+    def test_posix_capability_receive_rejects_truncation_without_fd_leak(self):
+        cookie = "b" * 64
+        header = struct.pack(
+            capability_runner._CAPABILITY_FD_HEADER_FORMAT,
+            bytes.fromhex(cookie),
+            0,
+            1,
+            1,
+        )
+        for case, descriptor_count, payload in (
+            ("payload", 1, header + b"trailing-byte"),
+            ("ancillary", 65, header),
+        ):
+            with self.subTest(case=case):
+                parent, child = socket.socketpair(
+                    socket.AF_UNIX,
+                    capability_runner._posix_capability_socket_type(),
+                )
+                baseline = self._open_posix_descriptor_numbers()
+                sources = tuple(self.compiler.open("rb") for _ in range(descriptor_count))
+                try:
+                    try:
+                        sent = parent.sendmsg(
+                            [payload],
+                            [(
+                                socket.SOL_SOCKET,
+                                socket.SCM_RIGHTS,
+                                array("i", (stream.fileno() for stream in sources)),
+                            )],
+                        )
+                        self.assertEqual(sent, len(payload))
+                        with self.assertRaisesRegex(
+                            AuditInfrastructureError,
+                            "truncated",
+                        ):
+                            capability_runner._receive_posix_capability_streams(
+                                child,
+                                1,
+                                cookie,
+                                time.monotonic() + 10.0,
+                                threading.Event(),
+                            )
+                    finally:
+                        for stream in sources:
+                            stream.close()
+                    self.assertEqual(self._open_posix_descriptor_numbers(), baseline)
+                finally:
+                    parent.close()
+                    child.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor transfer")
+    def test_posix_capability_receive_rejects_wrong_generation_without_fd_leak(self):
+        cookie = "c" * 64
+        cases = (
+            ("cookie", "d" * 64, 0, 1, 1),
+            ("index", cookie, 1, 1, 1),
+            ("chunks", cookie, 0, 2, 1),
+            ("count", cookie, 0, 1, 2),
+        )
+        for case, sent_cookie, chunk_index, chunks, descriptor_count in cases:
+            with self.subTest(case=case):
+                parent, child = socket.socketpair(
+                    socket.AF_UNIX,
+                    capability_runner._posix_capability_socket_type(),
+                )
+                baseline = self._open_posix_descriptor_numbers()
+                source = self.compiler.open("rb")
+                try:
+                    try:
+                        header = struct.pack(
+                            capability_runner._CAPABILITY_FD_HEADER_FORMAT,
+                            bytes.fromhex(sent_cookie),
+                            chunk_index,
+                            chunks,
+                            descriptor_count,
+                        )
+                        sent = parent.sendmsg(
+                            [header],
+                            [(
+                                socket.SOL_SOCKET,
+                                socket.SCM_RIGHTS,
+                                array("i", (source.fileno(),)),
+                            )],
+                        )
+                        self.assertEqual(sent, len(header))
+                        with self.assertRaisesRegex(
+                            AuditInfrastructureError,
+                            "generation differs",
+                        ):
+                            capability_runner._receive_posix_capability_streams(
+                                child,
+                                1,
+                                cookie,
+                                time.monotonic() + 10.0,
+                                threading.Event(),
+                            )
+                    finally:
+                        source.close()
+                    self.assertEqual(self._open_posix_descriptor_numbers(), baseline)
+                finally:
+                    parent.close()
+                    child.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor transfer")
+    def test_posix_capability_receive_unwinds_partial_fdopen_without_leak(self):
+        parent, child = socket.socketpair(
+            socket.AF_UNIX,
+            capability_runner._posix_capability_socket_type(),
+        )
+        baseline = self._open_posix_descriptor_numbers()
+        sources = tuple(self.compiler.open("rb") for _ in range(2))
+        cookie = "e" * 64
+        header = struct.pack(
+            capability_runner._CAPABILITY_FD_HEADER_FORMAT,
+            bytes.fromhex(cookie),
+            0,
+            1,
+            2,
+        )
+        real_fdopen = os.fdopen
+        calls = 0
+
+        def fail_second_fdopen(descriptor, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected fdopen failure")
+            return real_fdopen(descriptor, *args, **kwargs)
+
+        try:
+            try:
+                sent = parent.sendmsg(
+                    [header],
+                    [(
+                        socket.SOL_SOCKET,
+                        socket.SCM_RIGHTS,
+                        array("i", (stream.fileno() for stream in sources)),
+                    )],
+                )
+                self.assertEqual(sent, len(header))
+                with mock.patch.object(
+                    capability_runner.os,
+                    "fdopen",
+                    side_effect=fail_second_fdopen,
+                ), self.assertRaisesRegex(
+                    AuditInfrastructureError,
+                    "receive failed",
+                ):
+                    capability_runner._receive_posix_capability_streams(
+                        child,
+                        2,
+                        cookie,
+                        time.monotonic() + 10.0,
+                        threading.Event(),
+                    )
+            finally:
+                for stream in sources:
+                    stream.close()
+            self.assertEqual(self._open_posix_descriptor_numbers(), baseline)
+        finally:
+            parent.close()
+            child.close()
 
     def test_child_bootstrap_linux_uses_only_transferred_handles_without_path_or_watcher(self):
         streams = tuple(
