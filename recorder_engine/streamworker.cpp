@@ -358,7 +358,6 @@ void StreamWorker::enqueueDecodedVideoFrameForSession(DecodedVideoFrame decoded,
     qf.timecodeEvidence = decoded.timecodeEvidence;
 #if defined(OLR_GPU_PIPELINE_BUILD)
     qf.gpuFrame = std::move(decoded.gpuFrame);
-    qf.gpuFenceValue = decoded.gpuFenceValue;
     const uint64_t gpuCarrierSessionIdentity = decoded.gpuCarrierSessionIdentity;
     const uint64_t gpuCarrierEpoch = decoded.gpuCarrierEpoch;
 #endif
@@ -548,9 +547,8 @@ bool StreamWorker::ensureGpuEncodePumpStarted() {
     if (!gpuPipelineEnabled() || !m_nativeEncoder) return false;
     if (m_gpuEncodePump) return true;
 
-    m_gpuEncodeFence = GpuFence::create();
-    m_gpuEncodePump = std::make_unique<GpuEncodePump>(m_nativeEncoder.get(), m_gpuEncodeFence, 4,
-                                                      &m_nativeEncodeMutex);
+    m_gpuEncodePump =
+        std::make_unique<GpuEncodePump>(m_nativeEncoder.get(), 4, &m_nativeEncodeMutex);
     m_gpuEncodePump->start();
     return true;
 }
@@ -608,7 +606,6 @@ StreamWorker::importGpuVideoFrameForEncode(void* nativeDecodedImage, const Frame
     const qint64 bytes = gpuSurfaceBytes(*surface);
     imported.frame = makeGpuFrameHandle(std::move(surface), nullptr, metadata, nullptr,
                                         GpuBudgetCharge(bytes, GpuBudgetTag::RecorderWrap));
-    imported.fenceValue = 0;
 #elif defined(_WIN32)
     if (!m_gpuEncodeImportEdge || m_gpuEncodeImportEdge->deviceLost()) {
         QString error;
@@ -635,12 +632,9 @@ StreamWorker::importGpuVideoFrameForEncode(void* nativeDecodedImage, const Frame
         if (latchFallbackOnFailure) latchGpuEncodeCpuFallback();
         return imported;
     }
-    uint64_t fenceValue = 0;
     const qint64 bytes = gpuSurfaceBytes(*surface);
     imported.frame = WinGpuImportEdge::makeGpuFrameHandleForTest(
-        std::move(surface), metadata, fence, GpuBudgetCharge(bytes, GpuBudgetTag::RecorderWrap),
-        &fenceValue);
-    imported.fenceValue = fenceValue;
+        std::move(surface), metadata, fence, GpuBudgetCharge(bytes, GpuBudgetTag::RecorderWrap));
 #else
     Q_UNUSED(nativeDecodedImage);
     Q_UNUSED(metadata);
@@ -1453,7 +1447,6 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     bool pulledAnyFrame = false;
 #ifdef OLR_GPU_PIPELINE_BUILD
     FrameHandle pulledGpuFrame;
-    uint64_t pulledGpuFenceValue = 0;
 #endif
     const bool paintBlue = m_paintBlue.fetchAndStoreRelaxed(0) != 0;
 
@@ -1497,7 +1490,6 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             pulledAnyFrame = true;
 #ifdef OLR_GPU_PIPELINE_BUILD
             pulledGpuFrame = top.gpuFrame;
-            pulledGpuFenceValue = top.gpuFenceValue;
 #endif
         }
     }
@@ -1520,7 +1512,6 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         m_latestFrameCarrierToken.reset();
 #ifdef OLR_GPU_PIPELINE_BUILD
         m_latestGpuFrame = FrameHandle{};
-        m_latestGpuFenceValue = 0;
         m_latestGpuFrameTimecode100ns.store(-1, std::memory_order_release);
         std::atomic_store_explicit(&m_latestGpuFrameTimecodeEvidence,
                                    std::shared_ptr<const TimecodeEvidence>{},
@@ -1540,7 +1531,6 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         if (pulled) av_frame_free(&pulled);
 #ifdef OLR_GPU_PIPELINE_BUILD
         m_latestGpuFrame = std::move(pulledGpuFrame);
-        m_latestGpuFenceValue = pulledGpuFenceValue;
         m_latestGpuFrameTimecode100ns.store(m_latestGpuFrame.isNull() ? -1 : pulledTimecode100ns,
                                             std::memory_order_release);
         m_latestGpuFrameCarrierToken = m_latestGpuFrame.isNull()
@@ -1626,10 +1616,10 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                         // must not disable GPU encode for the replacement carrier.
                         if (submissionToken) tryLatchGpuEncodeCpuFallback(*submissionToken);
                     } else {
-                        submittedGpuEncode = m_gpuEncodePump->submit(
-                            m_latestGpuFrame, m_latestGpuFenceValue, m_internalFrameCount,
-                            m_latestGpuFrame.metadata().color,
-                            gpuCallbacksForSubmission(submissionId));
+                        submittedGpuEncode =
+                            m_gpuEncodePump->submit(m_latestGpuFrame, m_internalFrameCount,
+                                                    m_latestGpuFrame.metadata().color,
+                                                    gpuCallbacksForSubmission(submissionId));
                         if (submittedGpuEncode && selectedGpuEvidence) {
                             if (m_latestFrameTimecodeEvidence &&
                                 sameTimecodeEvidence(*m_latestFrameTimecodeEvidence,

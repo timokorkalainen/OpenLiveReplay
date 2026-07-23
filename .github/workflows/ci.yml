@@ -299,7 +299,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-test-macos:
     name: Build + Test (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     needs: changes
     if: ${{ needs.changes.outputs.app == 'true' }}
     steps:
@@ -380,6 +380,12 @@ jobs:
         # local pre-push hook and are excluded defensively; the playback e2e gate
         # below adds worker-level coverage on top of the unit label.
         run: ctest --output-on-failure --repeat until-pass:2 -L ci -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
+
+      - name: Run native GPU calibration smoke
+        working-directory: build
+        run: >
+          ctest --output-on-failure --no-tests=error
+          -R '^gpu_capability_calibration_smoke$'
 
       - name: Run GPU async-readback, budget, seek-prefetch, and device-loss e2e gates
         working-directory: build
@@ -465,11 +471,16 @@ jobs:
   # ---------------------------------------------------------------------------
   build-test-windows:
     name: Build + Test (Windows, MinGW)
-    runs-on: windows-latest
+    runs-on: windows-2022
     needs: changes
     if: ${{ needs.changes.outputs.app == 'true' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
 
       # Qt reorganised the Windows online-repository layout in 6.11, and the current
       # aqtinstall (3.3.0, used by install-qt-action) cannot locate the 6.11.x Windows
@@ -510,14 +521,15 @@ jobs:
         run: |
           set -euo pipefail
           export OLR_QT_ROOT="${QT_ROOT_DIR//\\//}"
-          # Discover the newest MinGW kit + Ninja the same way the build scripts do.
-          # shellcheck disable=SC2012
-          newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1 || true; }
+          # Task 9's reference lane is the exact Qt tools_mingw1310 kit.
           QT_TOOLS_DIR="$(cd "$OLR_QT_ROOT/../.." && pwd)/Tools"
-          : "${OLR_MINGW_ROOT:=$(newest "$QT_TOOLS_DIR"/mingw*_64)}"
-          [ -n "${OLR_MINGW_ROOT:-}" ] || OLR_MINGW_ROOT="$(newest C:/Qt/Tools/mingw*_64)"
+          OLR_MINGW_ROOT="$QT_TOOLS_DIR/mingw1310_64"
+          [ -x "$OLR_MINGW_ROOT/bin/g++.exe" ] || {
+            echo "::error::exact tools_mingw1310_64 compiler is unavailable"
+            exit 1
+          }
           NINJA_BIN="$(command -v ninja || true)"
-          [ -n "$NINJA_BIN" ] || NINJA_BIN="$(newest "$QT_TOOLS_DIR"/Ninja/ninja.exe)"
+          [ -n "$NINJA_BIN" ] || NINJA_BIN="$(find "$QT_TOOLS_DIR/Ninja" -maxdepth 1 -type f -name ninja.exe -print | sort -V | tail -1)"
           NINJA_DIR="$(dirname "$NINJA_BIN")"
           HOST_PYTHON="$(command -v python)"
           export PATH="$OLR_MINGW_ROOT/bin:$NINJA_DIR:$PATH"
@@ -542,7 +554,14 @@ jobs:
             -DOLR_PYTHON3_EXECUTABLE="$HOST_PYTHON" \
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
-          cmake --build build-tests --target OpenLiveReplay qt_core_media_smoke tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge rhi_d3d_probe
+          cmake --build build-tests --target OpenLiveReplay qt_core_media_smoke tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge tst_gpusurfaceallocator tst_streamworker_gpuencode tst_gpurhicontext tst_gpuretireregistry_perf tst_gpuretireregistry_production_perf rhi_d3d_probe
+
+      - name: Run real GPU capability source audit
+        shell: bash
+        run: |
+          test -s build-tests/compile_commands.json
+          ctest --test-dir build-tests --output-on-failure --no-tests=error \
+            -R '^gpu_capability_source_audit$'
 
       - name: Run Windows GPU import probe (diagnostic)
         shell: bash
@@ -580,15 +599,23 @@ jobs:
             esac
             printf '%s' "$p"
           }
-          newest() { find "$@" -maxdepth 0 -type d 2>/dev/null | sort -V | tail -1 || true; }
           qt_root="$(to_msys "$QT_ROOT_DIR")"
           qt_tools_dir="$(cd "$qt_root/../.." && pwd)/Tools"
-          mingw_root="$(to_msys "$(newest "$qt_tools_dir"/mingw*_64)")"
+          mingw_root="$qt_tools_dir/mingw1310_64"
+          [ -x "$mingw_root/bin/g++.exe" ] || {
+            echo "::error::exact tools_mingw1310_64 compiler is unavailable"
+            exit 1
+          }
           ffmpeg_root="$(cd windows_build/dist/ffmpeg && pwd)"
           srt_root="$(cd windows_build/dist/srt && pwd)"
+          mkdir -p "$RUNNER_TEMP/gpu-perf"
+          OLR_GPU_PERF_EVIDENCE_DIR="$(to_msys "$RUNNER_TEMP/gpu-perf")"
+          export OLR_GPU_PERF_EVIDENCE_DIR
           export PATH="$mingw_root/bin:$qt_root/bin:$ffmpeg_root/bin:$ffmpeg_root/lib:$srt_root/bin:$srt_root/lib:$PATH"
+          ctest --test-dir build-tests --output-on-failure --no-tests=error \
+            -R '^gpu_capability_mingw_provenance_perf$'
           ctest --test-dir build-tests --output-on-failure \
-            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_wingpuimportedge)$'
+            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_wingpuimportedge|tst_gpusurfaceallocator|tst_streamworker_gpuencode|tst_gpurhicontext|tst_gpuretireregistry_perf|tst_gpuretireregistry_production_perf)$'
           gpu_test="$(find build-tests -type f \( -name tst_gpucompositor -o -name tst_gpucompositor.exe \) -print -quit)"
           if [ ! -x "$gpu_test" ]; then
             echo "::error::tst_gpucompositor executable not found"
@@ -608,6 +635,14 @@ jobs:
             echo "::warning::tst_gpucompositor produced no QtTest log at $gpu_log"
           fi
           exit "$gpu_rc"
+
+      - name: Upload Windows GPU performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-performance-evidence-windows
+          path: ${{ runner.temp }}/gpu-perf/*.json
+          if-no-files-found: warn
 
       - name: Run static media/package smoke tests
         shell: bash
@@ -646,7 +681,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-test-linux:
     name: Build + Test (Linux, GCC)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: ${{ needs.changes.outputs.app == 'true' }}
     steps:
@@ -742,6 +777,12 @@ jobs:
           done
           echo "Shader toolchain OK: pass-through .qsb baked multi-target."
 
+      - name: Run real GPU capability source audit
+        run: |
+          test -s build-gpu/compile_commands.json
+          ctest --test-dir build-gpu --output-on-failure --no-tests=error \
+            -R '^gpu_capability_source_audit$'
+
       - name: ccache stats
         if: always()
         run: ccache --show-stats
@@ -757,7 +798,31 @@ jobs:
 
       - name: Run static media/package smoke tests
         working-directory: build
-        run: ctest --output-on-failure --no-tests=error -L smoke
+        # CTest label matching is regex-based, so `-L smoke` also selects the
+        # delegated-cgroup `gpu-capability-smoke` test.  That test has its own
+        # supervised systemd-run gate below and must never run unsupervised.
+        run: >
+          ctest --output-on-failure --no-tests=error -L smoke
+          -E '^gpu_capability_calibration_smoke$'
+
+      - name: Run delegated-cgroup GPU calibration smoke
+        run: |
+          set -euo pipefail
+          unit="olr-gpu-calibration-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo systemd-run \
+            --unit="$unit" --wait --collect --pipe \
+            --property=Type=exec \
+            --property=Delegate=yes \
+            --property=MemoryAccounting=yes \
+            --property=MemoryMax=1073741824 \
+            --property=MemoryHigh=939524096 \
+            --property=RuntimeMaxSec=180 \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --working-directory="$PWD" \
+            python3 tests/gpu/gpu_capability_process_tree.py \
+              prepare-linux-cgroup -- \
+              python3 -m unittest \
+                tests.gpu.test_gpu_capability_runner.ProcessCoordinatorTests.test_task9_native_calibration_smoke_one_configuration
 
       - name: Assemble and exercise controlled Linux package
         run: |

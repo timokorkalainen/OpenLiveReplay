@@ -167,15 +167,11 @@ OutputBusFrame cpuFrame(qint64 index, uint64_t gpuGeneration = 0) {
 
 class CountingSurface final : public GpuSurface {
 public:
-    explicit CountingSurface(uint64_t pendingFence = 0) : m_pendingFence(pendingFence) {}
+    explicit CountingSurface(uint64_t pendingFence = 0) { retainUntilFenceRetired(pendingFence); }
 
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Yuv420p, 16, 16}; }
     bool isValid() const override { return true; }
     void* nativeHandle() const override { return nullptr; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
-
-private:
-    uint64_t m_pendingFence = 0;
 };
 
 class ReadyFence final : public GpuFence {
@@ -203,6 +199,11 @@ public:
     }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_producerFence; }
+    GpuFrameSynchronization gpuSynchronization() const override {
+        return {m_producerFence,
+                m_surface->pendingFenceValue() == 0 ? uint64_t(1) : m_surface->pendingFenceValue(),
+                true};
+    }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Yuv420p; }
     int readCount() const { return m_readCount.load(std::memory_order_acquire); }
 
@@ -219,6 +220,9 @@ public:
     CpuPlanes readToCpu(FramePixelFormat) const override { return CpuPlanes{}; }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_producerFence; }
+    GpuFrameSynchronization gpuSynchronization() const override {
+        return {m_producerFence, 1, true};
+    }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Yuv420p; }
 
 private:
@@ -238,6 +242,9 @@ public:
     }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_producerFence; }
+    GpuFrameSynchronization gpuSynchronization() const override {
+        return {m_producerFence, 1, true};
+    }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Yuv420p; }
     bool waitForReadStart(int timeoutMs) const { return m_readStarted.tryAcquire(1, timeoutMs); }
     void releaseReadback(int count = 1) const { m_releaseReadback.release(count); }

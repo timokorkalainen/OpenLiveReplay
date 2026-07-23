@@ -9,6 +9,7 @@
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
 
+#include <array>
 #include <utility>
 
 namespace {
@@ -101,9 +102,12 @@ GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface,
             if (s && renderFence) {
                 GpuRetireRegistry registry;
                 GpuOpScope operation(renderFence, registry);
-                operation.track(s);
-                if (!operation.submit([] { return GpuSubmitOutcome::Submitted; }))
-                    return FrameHandle{};
+                auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+                const auto result = operation.submitRetained(
+                    adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{s}));
+                if (!result.succeeded()) return FrameHandle{};
+                return makeGpuFrameHandle(std::move(s), std::move(rhi), m, result.producerFence,
+                                          result.fenceValue, std::move(charge));
             }
             return makeGpuFrameHandle(std::move(s), std::move(rhi), m, std::move(renderFence),
                                       std::move(charge));

@@ -2,11 +2,15 @@
 // interface is uniform; concrete backends use MTLSharedEvent on Apple,
 // ID3D11Fence on Windows, and a deterministic timeline stub elsewhere.
 #include <QtTest>
+#include <QScopeGuard>
 
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpusubmission.h"
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -17,6 +21,19 @@ using Microsoft::WRL::ComPtr;
 #endif
 
 namespace {
+
+class IdentityFence final : public GpuFence {
+public:
+    IdentityFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
+
+    uint64_t signal() override { return ++m_value; }
+    bool wait(uint64_t value, int) override { return m_value >= value; }
+    uint64_t completedValue() const override { return m_value; }
+
+private:
+    uint64_t m_value = 0;
+};
 
 bool gpuFenceRequiredForTest() {
     return qEnvironmentVariableIntValue("OLR_REQUIRE_GPU_FENCE") != 0;
@@ -32,7 +49,8 @@ std::shared_ptr<GpuFence> createTestFence() {
                                  D3D11_SDK_VERSION, &device, &level, &context))) {
         return nullptr;
     }
-    return makeD3D11GpuFence(device.Get());
+    return makeD3D11GpuFence(device.Get(),
+                             GpuDeviceLossMonitor::instance().currentDeviceAuthorityForTest());
 #else
     return GpuFence::create();
 #endif
@@ -48,6 +66,11 @@ private slots:
     void waitTimesOutBeforeSignal();
     void waitForeverReturnsAfterSignal();
     void concurrentSignalsProduceUniqueMonotonicValues();
+    void identityIsStableAndUniquePerFenceInstance();
+    void instanceIdExhaustionFailsClosedPermanently();
+#ifdef __APPLE__
+    void defaultFactoryTracksDeviceAuthorityAcrossRebuild();
+#endif
 };
 
 void TestGpuFence::createIsNullOrValidNeverPartial() {
@@ -67,7 +90,9 @@ void TestGpuFence::signalWaitRoundTrips() {
     }
     const uint64_t value = fence->signal();
     QVERIFY(value >= 1);
-    QVERIFY(fence->wait(value, 1000));
+    // Metal command submission is intentionally real here. TSan and shared CI
+    // runners can delay the first command buffer well beyond one second.
+    QVERIFY(fence->wait(value, 5000));
     QVERIFY(fence->completedValue() >= value);
 }
 
@@ -130,6 +155,54 @@ void TestGpuFence::concurrentSignalsProduceUniqueMonotonicValues() {
         QCOMPARE(values[i], uint64_t(i + 1));
     QVERIFY(fence->wait(values.back(), 2000));
 }
+
+void TestGpuFence::identityIsStableAndUniquePerFenceInstance() {
+    auto first = std::make_shared<IdentityFence>(0xA11CE, 7);
+    auto second = std::make_shared<IdentityFence>(0xA11CE, 7);
+    auto otherDomain = std::make_shared<IdentityFence>(0xB0B, 7);
+
+    const GpuFenceIdentity firstIdentity = first->identity();
+    QVERIFY(first->identity() == firstIdentity);
+    QVERIFY(firstIdentity.instanceId != 0);
+    QCOMPARE(firstIdentity.deviceDomainId, uintptr_t(0xA11CE));
+    QCOMPARE(firstIdentity.authorityEpoch, uint64_t(7));
+    QVERIFY(firstIdentity != second->identity());
+    QVERIFY(firstIdentity != otherDomain->identity());
+}
+
+void TestGpuFence::instanceIdExhaustionFailsClosedPermanently() {
+    std::atomic<uint64_t> next{std::numeric_limits<uint64_t>::max() - 1};
+
+    QCOMPARE(gpuSubmissionDetail::takeMonotonicInstanceId(next),
+             std::numeric_limits<uint64_t>::max() - 1);
+    QCOMPARE(gpuSubmissionDetail::takeMonotonicInstanceId(next),
+             std::numeric_limits<uint64_t>::max());
+    QCOMPARE(gpuSubmissionDetail::takeMonotonicInstanceId(next), uint64_t(0));
+    QCOMPARE(gpuSubmissionDetail::takeMonotonicInstanceId(next), uint64_t(0));
+    QCOMPARE(next.load(std::memory_order_relaxed), uint64_t(0));
+}
+
+#ifdef __APPLE__
+void TestGpuFence::defaultFactoryTracksDeviceAuthorityAcrossRebuild() {
+    GpuDeviceLossMonitor& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto resetMonitor = qScopeGuard([&monitor] { monitor.reset(); });
+
+    const uint64_t initialAuthority = monitor.currentDeviceAuthorityForTest();
+    auto initialFence = GpuFence::create();
+    if (!initialFence) QSKIP("default Metal fence unavailable on this host");
+    QCOMPARE(initialFence->identity().authorityEpoch, initialAuthority);
+
+    monitor.recordLoss();
+    monitor.beginRebuild();
+    const uint64_t replacementAuthority = monitor.currentDeviceAuthorityForTest();
+    QVERIFY(replacementAuthority != initialAuthority);
+    auto replacementFence = GpuFence::create();
+    QVERIFY2(replacementFence, "replacement-authority Metal fence creation failed");
+    QCOMPARE(replacementFence->identity().authorityEpoch, replacementAuthority);
+    QCOMPARE(initialFence->identity().authorityEpoch, initialAuthority);
+}
+#endif
 
 QTEST_GUILESS_MAIN(TestGpuFence)
 #include "tst_gpufence.moc"

@@ -32,29 +32,28 @@ namespace {
 
 class StressGpuSurface final : public GpuSurface {
 public:
-    explicit StressGpuSurface(uint64_t pendingFence) : m_pendingFence(pendingFence) {}
+    explicit StressGpuSurface(uint64_t pendingFence) { retainUntilFenceRetired(pendingFence); }
 
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 4, 4}; }
     bool isValid() const override { return true; }
     void* nativeHandle() const override { return nullptr; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
-
-private:
-    uint64_t m_pendingFence = 0;
 };
 
 class StressGpuFrameData final : public IFrameData {
 public:
-    explicit StressGpuFrameData(std::shared_ptr<StressGpuSurface> surface)
-        : m_surface(std::move(surface)) {}
+    StressGpuFrameData(std::shared_ptr<StressGpuSurface> surface, std::shared_ptr<GpuFence> fence,
+                       uint64_t value)
+        : m_surface(std::move(surface)), m_synchronization{std::move(fence), value, true} {}
 
     bool isGpuBacked() const override { return true; }
     CpuPlanes readToCpu(FramePixelFormat) const override { return {}; }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
+    GpuFrameSynchronization gpuSynchronization() const override { return m_synchronization; }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
 
 private:
     std::shared_ptr<StressGpuSurface> m_surface;
+    GpuFrameSynchronization m_synchronization;
 };
 
 class StressFence final : public GpuFence {
@@ -75,9 +74,10 @@ private:
 };
 
 FrameHandle makeStressGpuFrame(int feed, qint64 ptsMs, uint64_t pendingFence,
+                               const std::shared_ptr<GpuFence>& fence,
                                std::weak_ptr<const IFrameData>* weakData = nullptr) {
-    auto data = std::static_pointer_cast<const IFrameData>(
-        std::make_shared<StressGpuFrameData>(std::make_shared<StressGpuSurface>(pendingFence)));
+    auto data = std::static_pointer_cast<const IFrameData>(std::make_shared<StressGpuFrameData>(
+        std::make_shared<StressGpuSurface>(pendingFence), fence, pendingFence));
     if (weakData) *weakData = data;
     FrameMetadata meta;
     meta.key.feedIndex = feed;
@@ -106,7 +106,7 @@ void TestGpuSyncStress::concurrentEvictWhileRenderNeverFreesInUse() {
     for (int feed = 0; feed < kFeeds; ++feed) {
         producers.emplace_back([&, feed] {
             for (int i = 0; i < kIters; ++i) {
-                auto surface = makeAppleNv12Surface(64, 48);
+                auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
                 if (!surface) continue;
                 FrameMetadata meta;
                 meta.key.feedIndex = feed;
@@ -174,18 +174,19 @@ void TestGpuSyncStress::capEvictionRetireQueueHoldsGpuFramesUntilFenceCompletes(
     for (int feed = 0; feed < kFeeds; ++feed) {
         TrackBuffer buffer;
         std::weak_ptr<const IFrameData> weak;
-        QVERIFY(buffer.insert(0, makeStressGpuFrame(feed, 0, kFenceValue, &weak), /*capFrames*/ 2,
+        QVERIFY(buffer.insert(0, makeStressGpuFrame(feed, 0, kFenceValue, fence, &weak),
+                              /*capFrames*/ 2,
                               /*keepNearMs*/ 0, /*protectToMs*/ 40));
-        QVERIFY(buffer.insert(40, makeStressGpuFrame(feed, 40, kFenceValue), /*capFrames*/ 2,
+        QVERIFY(buffer.insert(40, makeStressGpuFrame(feed, 40, kFenceValue, fence), /*capFrames*/ 2,
                               /*keepNearMs*/ 0, /*protectToMs*/ 40));
 
         TrackBuffer::EvictedFrames evicted;
-        QVERIFY(buffer.insert(80, makeStressGpuFrame(feed, 80, kFenceValue), /*capFrames*/ 2,
+        QVERIFY(buffer.insert(80, makeStressGpuFrame(feed, 80, kFenceValue, fence), /*capFrames*/ 2,
                               /*keepNearMs*/ 80, /*protectToMs*/ 120, &evicted));
         QCOMPARE(evicted.size(), 1);
         evictedData.append(weak);
         for (const TrackBuffer::Frame& frame : evicted)
-            retireQueue.collect(frame.frame, fence);
+            retireQueue.collect(frame.frame);
     }
 
     int stalls = 0;

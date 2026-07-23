@@ -4,6 +4,18 @@
 # modules linked.
 find_package(Qt6 REQUIRED COMPONENTS QuickTest Qml Quick Gui Test QuickControls2)
 
+set(olr_qmlstyle_test_environment
+    "QT_QPA_PLATFORM=offscreen"
+    "QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml"
+    "QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+if(WIN32)
+    list(REMOVE_ITEM olr_qmlstyle_test_environment
+        "QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    list(APPEND olr_qmlstyle_test_environment
+        "QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins"
+        "QML2_IMPORT_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../qml")
+endif()
+
 qt_add_executable(tst_olrstyle tst_olrstyle_main.cpp)
 target_link_libraries(tst_olrstyle PRIVATE
     Qt6::QuickTest Qt6::Qml Qt6::Quick Qt6::Gui Qt6::Test Qt6::QuickControls2
@@ -14,7 +26,7 @@ olr_add_ctest(NAME tst_olrstyle
 set_tests_properties(tst_olrstyle PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "${olr_qmlstyle_test_environment}")
 
 qt_add_executable(tst_statusstrip_onair tst_statusstrip_onair_main.cpp)
 target_link_libraries(tst_statusstrip_onair PRIVATE
@@ -26,7 +38,7 @@ olr_add_ctest(NAME tst_statusstrip_onair
 set_tests_properties(tst_statusstrip_onair PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "${olr_qmlstyle_test_environment}")
 
 qt_add_executable(tst_pgmstage_mapping
     tst_pgmstage_mapping_main.cpp
@@ -41,7 +53,7 @@ olr_add_ctest(NAME tst_pgmstage_mapping
 set_tests_properties(tst_pgmstage_mapping PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "${olr_qmlstyle_test_environment}")
 
 qt_add_executable(tst_rundownrail_drag tst_rundownrail_drag_main.cpp)
 target_link_libraries(tst_rundownrail_drag PRIVATE
@@ -53,7 +65,7 @@ olr_add_ctest(NAME tst_rundownrail_drag
 set_tests_properties(tst_rundownrail_drag PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "${olr_qmlstyle_test_environment}")
 
 qt_add_executable(tst_scrubtimeline tst_scrubtimeline_main.cpp)
 target_link_libraries(tst_scrubtimeline PRIVATE
@@ -65,7 +77,7 @@ olr_add_ctest(NAME tst_scrubtimeline
 set_tests_properties(tst_scrubtimeline PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "${olr_qmlstyle_test_environment}")
 
 qt_add_executable(tst_transportdock_layout tst_transportdock_layout_main.cpp)
 target_link_libraries(tst_transportdock_layout PRIVATE
@@ -77,7 +89,7 @@ olr_add_ctest(NAME tst_transportdock_layout
 set_tests_properties(tst_transportdock_layout PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "${olr_qmlstyle_test_environment}")
 
 qt_add_executable(tst_sourcelistpanel_layout tst_sourcelistpanel_layout_main.cpp)
 target_link_libraries(tst_sourcelistpanel_layout PRIVATE
@@ -89,7 +101,7 @@ olr_add_ctest(NAME tst_sourcelistpanel_layout
 set_tests_properties(tst_sourcelistpanel_layout PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "${olr_qmlstyle_test_environment}")
 
 # These tests select the dynamic OlrStyle QQC2 style at runtime. Linking the
 # backing QML module does not make its generated MODULE_LIBRARY a build
@@ -133,3 +145,6 @@ if(UNIX AND NOT APPLE)
     target_link_options(tst_sourcelistpanel_layout PRIVATE "LINKER:--no-as-needed")
     target_link_options(uipreview PRIVATE "LINKER:--no-as-needed")
 endif()
+
+get_property(_olr_qmlstyle_tests DIRECTORY PROPERTY TESTS)
+olr_apply_windows_test_runtime(${_olr_qmlstyle_tests})

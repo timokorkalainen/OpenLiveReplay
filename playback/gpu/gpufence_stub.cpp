@@ -1,4 +1,6 @@
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
+#include "playback/gpu/gpugeneration.h"
 
 #if !defined(__APPLE__) && !defined(_WIN32)
 
@@ -6,12 +8,16 @@
 #include <chrono>
 #include <thread>
 
-GpuFence::~GpuFence() = default;
-
 namespace {
+
+std::atomic<uint64_t> nextFenceInstanceId{1};
+const int stubDeviceDomain = 0;
 
 class StubGpuFence final : public GpuFence {
 public:
+    StubGpuFence()
+        : GpuFence(reinterpret_cast<uintptr_t>(&stubDeviceDomain),
+                   GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()) {}
     uint64_t signal() override { return m_value.fetch_add(1, std::memory_order_acq_rel) + 1; }
 
     bool wait(uint64_t value, int timeoutMs) override {
@@ -32,6 +38,25 @@ private:
 };
 
 } // namespace
+
+GpuFence::GpuFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+    : m_identity{gpuSubmissionDetail::takeMonotonicInstanceId(nextFenceInstanceId), deviceDomainId,
+                 authorityEpoch != 0
+                     ? authorityEpoch
+                     : GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()},
+      m_ticketAuthorityKey(makeTicketAuthorityKey(m_identity, this)) {}
+
+GpuFence::~GpuFence() = default;
+
+uint64_t GpuFence::currentGpuGeneration() noexcept {
+    return GpuGenerationCounter::instance().current();
+}
+
+bool GpuFence::validatesRetirement(const GpuRetirementTicket& ticket,
+                                   const GpuSurfaceCompatibility& surface) const noexcept {
+    return validatesIssuedRetirement(ticket, surface) &&
+           ticket.m_gpuGeneration == currentGpuGeneration();
+}
 
 std::shared_ptr<GpuFence> GpuFence::create() {
     return std::make_shared<StubGpuFence>();

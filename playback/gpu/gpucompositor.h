@@ -3,6 +3,10 @@
 
 #include "playback/output/framehandle.h"
 
+#ifdef OLR_UNIT_TEST
+#include "playback/gpu/gpusubmission.h"
+#endif
+
 #include <QList>
 #include <QVector>
 
@@ -24,6 +28,16 @@ public:
     static std::shared_ptr<GpuSurface>
     uploadFrameToNv12SurfaceForTest(const FrameHandle& frame,
                                     const std::shared_ptr<GpuRhiContext>& rhi);
+#ifdef OLR_UNIT_TEST
+    static GpuSubmitOutcome renderExceptionOutcomeForTest(bool submissionAttempted) noexcept;
+    static GpuSubmitOutcome renderDispatchOutcomeForTest(bool submissionAttempted, bool invoked,
+                                                         bool rendered) noexcept;
+    static void injectRenderPassFailureForTest() noexcept;
+    static void injectBeginFrameFailureForTest() noexcept;
+    static void injectFrameOpFailureForTest() noexcept;
+    static int recoveredRenderPassesForTest() noexcept;
+    static int recoveredOffscreenFramesForTest() noexcept;
+#endif
 
     ~GpuCompositor();
 
@@ -49,9 +63,9 @@ public:
                                                  uint64_t generation) const;
     CpuPlanes composeGridToCpu(const QList<FrameHandle>& frames, int width, int height,
                                ColorMetadata color, ScaleQuality quality) const;
-    CpuPlanes composeGridToCpuForGeneration(const QList<FrameHandle>& frames, int width,
-                                            int height, ColorMetadata color,
-                                            ScaleQuality quality, uint64_t generation) const;
+    CpuPlanes composeGridToCpuForGeneration(const QList<FrameHandle>& frames, int width, int height,
+                                            ColorMetadata color, ScaleQuality quality,
+                                            uint64_t generation) const;
     FrameHandle composePgm(const FrameHandle& source, int width, int height, ColorMetadata color,
                            ScaleQuality quality) const;
     FrameHandle composePgmForGeneration(const FrameHandle& source, int width, int height,

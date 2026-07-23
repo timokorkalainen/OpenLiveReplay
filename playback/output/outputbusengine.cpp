@@ -339,11 +339,9 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
             sourceKeys.append(int(sourceMeta.color.range));
 
             const IFrameData* sourceData = out.video.data();
-            const GpuSurface* sourceSurface = sourceData ? sourceData->gpuSurface() : nullptr;
-            const uint64_t pendingFenceValue =
-                sourceSurface ? sourceSurface->pendingFenceValue() : uint64_t(0);
-            const bool sourceOrderingKnown =
-                pendingFenceValue == 0 || (sourceData && sourceData->gpuFence());
+            const GpuFrameSynchronization sourceSynchronization =
+                sourceData ? sourceData->gpuSynchronization() : GpuFrameSynchronization{};
+            const bool sourceOrderingKnown = sourceSynchronization.isExact();
             const bool canReuseSource = out.video.isGpuBacked() && out.video.isPresentable() &&
                                         sourceMeta.gpuGeneration == state.gpuGeneration &&
                                         !sourceMeta.key.isPlaceholder &&

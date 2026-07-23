@@ -143,16 +143,11 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
         return ok;
     }
 
-    uint64_t fenceValue = 0;
-    std::shared_ptr<GpuFence> producerFence = m_renderFence;
-    bool hasExplicitProducerFence = false;
-    if (const IFrameData* data = frame.video.data()) {
-        if (GpuSurface* surface = data->gpuSurface()) fenceValue = surface->pendingFenceValue();
-        if (std::shared_ptr<GpuFence> frameFence = data->gpuFence()) {
-            producerFence = std::move(frameFence);
-            hasExplicitProducerFence = true;
-        }
-    }
+    const GpuFrameSynchronization synchronization =
+        frame.video.data() ? frame.video.data()->gpuSynchronization() : GpuFrameSynchronization{};
+    const uint64_t fenceValue = synchronization.value;
+    std::shared_ptr<GpuFence> producerFence = synchronization.fence;
+    const bool hasExplicitProducerFence = synchronization.isExact();
 
     OutputBusFrame cadenceFrame;
     bool submitCadenceFrame = false;
@@ -187,7 +182,6 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
                 return true;
             }
         } else {
-            if (fenceValue == 0 && producerFence) fenceValue = producerFence->completedValue();
             ready =
                 m_ring.pushAndTakeReady(frame, fenceValue, std::move(producerFence), m_cpuFormat);
         }
@@ -298,17 +292,11 @@ bool AsyncGpuReadbackSink::submitGpuFrameAndFlush(const OutputBusFrame& frame, i
     timer.start();
     const int boundedTimeoutMs = qMax(0, timeoutMs);
 
-    uint64_t fenceValue = 0;
-    std::shared_ptr<GpuFence> producerFence = m_renderFence;
-    bool hasExplicitProducerFence = false;
-    if (const IFrameData* data = frame.video.data()) {
-        if (GpuSurface* surface = data->gpuSurface()) fenceValue = surface->pendingFenceValue();
-        if (std::shared_ptr<GpuFence> frameFence = data->gpuFence()) {
-            producerFence = std::move(frameFence);
-            hasExplicitProducerFence = true;
-        }
-    }
-    if (fenceValue == 0 && producerFence) fenceValue = producerFence->completedValue();
+    const GpuFrameSynchronization synchronization =
+        frame.video.data() ? frame.video.data()->gpuSynchronization() : GpuFrameSynchronization{};
+    const uint64_t fenceValue = synchronization.value;
+    std::shared_ptr<GpuFence> producerFence = synchronization.fence;
+    const bool hasExplicitProducerFence = synchronization.isExact();
 
     OutputBusFrame frameToDeliver;
     bool deliverCadenceFrame = false;
@@ -454,17 +442,11 @@ bool AsyncGpuReadbackSink::prewarmReadback(const OutputBusFrame& frame) {
     CpuPlanes cached;
     if (m_sharedReadbacks->find(frame, m_cpuFormat, &cached)) return cached.isValid();
 
-    uint64_t fenceValue = 0;
-    std::shared_ptr<GpuFence> producerFence = m_renderFence;
-    bool hasExplicitProducerFence = false;
-    if (const IFrameData* data = frame.video.data()) {
-        if (GpuSurface* surface = data->gpuSurface()) fenceValue = surface->pendingFenceValue();
-        if (std::shared_ptr<GpuFence> frameFence = data->gpuFence()) {
-            producerFence = std::move(frameFence);
-            hasExplicitProducerFence = true;
-        }
-    }
-    if (fenceValue == 0 && producerFence) fenceValue = producerFence->completedValue();
+    const GpuFrameSynchronization synchronization =
+        frame.video.data() ? frame.video.data()->gpuSynchronization() : GpuFrameSynchronization{};
+    const uint64_t fenceValue = synchronization.value;
+    const std::shared_ptr<GpuFence> producerFence = synchronization.fence;
+    const bool hasExplicitProducerFence = synchronization.isExact();
     if (fenceValue == 0 && !hasExplicitProducerFence) return false;
     if (producerFence && fenceValue != 0 && producerFence->completedValue() < fenceValue)
         return false;

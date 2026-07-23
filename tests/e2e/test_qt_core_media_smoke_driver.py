@@ -637,6 +637,29 @@ class DriverPolicyTests(unittest.TestCase):
         self.assertNotIn("-L smoke", macos_commands)
         self.assertIn("-L smoke", windows_commands)
         self.assertIn("-L smoke", linux_commands)
+        self.assertIn("-E '^gpu_capability_calibration_smoke$'", linux_commands)
+        self.assertIn("prepare-linux-cgroup", linux_commands)
+        direct_calibration = (
+            "tests.gpu.test_gpu_capability_runner.ProcessCoordinatorTests."
+            "test_task9_native_calibration_smoke_one_configuration"
+        )
+        self.assertIn(direct_calibration, linux_commands)
+        self.assertEqual(linux_commands.count("gpu_capability_calibration_smoke"), 1)
+        self.assertEqual(linux_commands.count(direct_calibration), 1)
+        self.assertLess(
+            linux_commands.index("-E '^gpu_capability_calibration_smoke$'"),
+            linux_commands.index("prepare-linux-cgroup"),
+        )
+        self.assertLess(
+            linux_commands.index("prepare-linux-cgroup"),
+            linux_commands.index(direct_calibration),
+        )
+        delegated_prefix = linux_commands[
+            linux_commands.index("prepare-linux-cgroup"):
+            linux_commands.index(direct_calibration)
+        ]
+        self.assertNotIn("ctest", delegated_prefix)
+        self.assertIn("--property=RuntimeMaxSec=180", linux_commands)
         expected = {
             "macos": (macos_commands, "build-scripts/build_macos_app.sh", "build/OpenLiveReplay.app"),
             "windows": (windows_commands, "build-scripts/build_windows_app.sh", "windows_build/dist/OpenLiveReplay"),

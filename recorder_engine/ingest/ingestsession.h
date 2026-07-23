@@ -51,7 +51,6 @@ struct DecodedVideoFrame {
     std::optional<TimecodeEvidence> timecodeEvidence;
 #if defined(OLR_GPU_PIPELINE_BUILD)
     FrameHandle gpuFrame;
-    uint64_t gpuFenceValue = 0;
     uint64_t gpuCarrierSessionIdentity = 0;
     uint64_t gpuCarrierEpoch = 0;
 #endif
@@ -69,7 +68,6 @@ struct DecodedAudioChunk {
 #if defined(OLR_GPU_PIPELINE_BUILD)
 struct ImportedGpuVideoFrame {
     FrameHandle frame;
-    uint64_t fenceValue = 0;
     uint64_t carrierSessionIdentity = 0;
     uint64_t carrierEpoch = 0;
 };

@@ -103,6 +103,7 @@ private slots:
     void gpuPressureWarningShrinksWindowWithoutLatch();
     void gpuPressureBelowLevel1LatchesCpuBeforeJetsam();
     void gpuPressureLevel2LatchesCpuWithoutDeviceLoss();
+    void gpuPressureLevel2UnregistersRecoveryParticipantBeforeFutureEpoch();
     void gpuPressureRecoveryReanchorsCommittedPlayheadDuringPendingSeek();
     void gpuPressureRecoveryHonorsSelectedFeedMode();
     void countersExposeGpuFallbackOutputGateState();
@@ -3021,6 +3022,43 @@ void TestPlaybackWorker::gpuPressureLevel2LatchesCpuWithoutDeviceLoss() {
     QVERIFY(!GpuDeviceLossMonitor::instance().isLost());
     QCOMPARE(worker.counters().gpuMemoryPressureLevel1, qint64(1));
     QCOMPARE(worker.counters().gpuMemoryPressureLevel2, qint64(1));
+}
+
+void TestPlaybackWorker::gpuPressureLevel2UnregistersRecoveryParticipantBeforeFutureEpoch() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.initializeOutputGraph(1, 64, 48);
+    monitor.reset();
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    worker.m_gpuPendingRecoveryGeneration = 17;
+    worker.m_gpuRebuildDeferredForSuspend.store(true, std::memory_order_release);
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+
+    worker.evaluateGpuMemoryPressureForTest(64 * 1024 * 1024, false, 1000);
+
+    const uint64_t futureParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t futureGeneration = monitor.recordLoss();
+    const bool futureCleanupAcknowledged =
+        monitor.acknowledgeRecoveryCleanup(futureParticipant, futureGeneration);
+    const GpuRecoveryTicket futureTicket = monitor.beginRebuild(futureParticipant);
+    const bool futureEpochAdvanced =
+        futureTicket.isValid() && monitor.clearForRebuild(futureTicket);
+    monitor.unregisterRecoveryParticipant(futureParticipant);
+    monitor.reset();
+
+    QVERIFY(futureCleanupAcknowledged);
+    QVERIFY2(futureEpochAdvanced,
+             "level-2 CPU fallback must not leave a participant blocking a future recovery epoch");
+    QCOMPARE(worker.m_gpuRecoveryParticipantId, uint64_t(0));
+    QCOMPARE(worker.m_gpuPendingRecoveryGeneration, uint64_t(0));
+    QVERIFY(!worker.m_gpuRebuildDeferredForSuspend.load(std::memory_order_acquire));
 }
 
 void TestPlaybackWorker::gpuPressureRecoveryReanchorsCommittedPlayheadDuringPendingSeek() {

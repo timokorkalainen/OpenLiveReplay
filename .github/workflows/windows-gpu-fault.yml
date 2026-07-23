@@ -1,0 +1,55 @@
+name: Windows GPU fault lane
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type RUN REAL GPU FAULT to authorize a display-driver reset'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-real-gpu-fault
+  cancel-in-progress: false
+
+jobs:
+  real-gpu-removal:
+    if: inputs.confirmation == 'RUN REAL GPU FAULT'
+    runs-on: [self-hosted, Windows, gpu-fault]
+    timeout-minutes: 20
+    env:
+      OLR_GPU_FAULT_LANE: '1'
+      OLR_GPU_FAULT_DEDICATED_RUNNER: '1'
+      OLR_GPU_FAULT_EVIDENCE: '${{ github.workspace }}\windows-gpu-fault-evidence.jsonl'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure fault harness
+        shell: pwsh
+        run: >-
+          cmake -S . -B build/gpu-fault -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_PREFIX_PATH="$env:OLR_QT_ROOT"
+          -DOLR_GPU_PIPELINE=ON -DOLR_BUILD_TESTS=ON
+          -DOLR_FFMPEG_ROOT="$env:OLR_FFMPEG_ROOT"
+          -DOLR_SRT_ROOT="$env:OLR_SRT_ROOT"
+
+      - name: Build isolated parent and child
+        run: cmake --build build/gpu-fault --target win_gpu_fault_parent win_gpu_fault_child
+
+      - name: Trigger real removal and validate recovery evidence
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests/e2e/run_gpu_fault_recovery.ps1 build/gpu-fault
+
+      - name: Upload fault evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-gpu-fault-evidence-${{ github.run_id }}
+          path: |
+            windows-gpu-fault-evidence.jsonl
+            build/gpu-fault/Testing/Temporary/LastTest.log
+          if-no-files-found: warn

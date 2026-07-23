@@ -13,6 +13,10 @@ std::shared_ptr<GpuFence> IFrameData::gpuFence() const {
     return nullptr;
 }
 
+GpuFrameSynchronization IFrameData::gpuSynchronization() const {
+    return {};
+}
+
 namespace {
 
 qsizetype planeBytes(int stride, int rows) {

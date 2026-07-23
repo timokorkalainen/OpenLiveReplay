@@ -7,12 +7,24 @@ target_link_libraries(tst_qml_codecsettings PRIVATE
 
 olr_add_ctest(NAME tst_qml_codecsettings
     COMMAND $<TARGET_FILE:tst_qml_codecsettings> -input "${CMAKE_CURRENT_SOURCE_DIR}")
-set(qt_test_path_modifications
-    "QML_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}"
-    "QML2_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}")
+set(olr_qml_test_environment
+    "QT_QPA_PLATFORM=offscreen"
+    "QML_IMPORT_PATH=${CMAKE_SOURCE_DIR}")
+if(WIN32)
+    list(APPEND olr_qml_test_environment
+        "QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins"
+        "QML2_IMPORT_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../qml")
+endif()
 set_tests_properties(tst_qml_codecsettings PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_SOURCE_DIR}")
+    ENVIRONMENT "${olr_qml_test_environment}")
+
+set(qt_test_path_modifications
+    "QML_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}"
+    "QML2_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}")
 set_property(TEST tst_qml_codecsettings APPEND PROPERTY
     ENVIRONMENT_MODIFICATION "${qt_test_path_modifications}")
+
+get_property(_olr_qml_tests DIRECTORY PROPERTY TESTS)
+olr_apply_windows_test_runtime(${_olr_qml_tests})

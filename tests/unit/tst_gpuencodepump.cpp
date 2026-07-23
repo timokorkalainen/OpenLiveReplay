@@ -93,15 +93,20 @@ public:
 
 class FakeGpuFrameData final : public IFrameData {
 public:
+    explicit FakeGpuFrameData(GpuFrameSynchronization synchronization = {nullptr, 0, true})
+        : m_synchronization(std::move(synchronization)) {}
     bool isGpuBacked() const override { return true; }
     CpuPlanes readToCpu(FramePixelFormat target) const override {
         return solidYuv420pHandle(16, 16, 70, 128, 128).readToCpu(target);
     }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
+    std::shared_ptr<GpuFence> gpuFence() const override { return m_synchronization.fence; }
+    GpuFrameSynchronization gpuSynchronization() const override { return m_synchronization; }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
 
 private:
     std::shared_ptr<FakeSurface> m_surface = std::make_shared<FakeSurface>();
+    GpuFrameSynchronization m_synchronization;
 };
 
 class UnreadableGpuFrameData final : public IFrameData {
@@ -112,6 +117,7 @@ public:
         return CpuPlanes{};
     }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
+    GpuFrameSynchronization gpuSynchronization() const override { return {nullptr, 0, true}; }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
     int readCount() const { return m_readCount.load(std::memory_order_acquire); }
 
@@ -188,12 +194,12 @@ struct PumpProbe {
     }
 };
 
-FrameHandle makeGpuHandle() {
+FrameHandle makeGpuHandle(GpuFrameSynchronization synchronization = {nullptr, 0, true}) {
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 16;
     meta.key.height = 16;
-    return FrameHandle(std::make_shared<FakeGpuFrameData>(), meta);
+    return FrameHandle(std::make_shared<FakeGpuFrameData>(std::move(synchronization)), meta);
 }
 
 FrameHandle makeUnreadableGpuHandle(const std::shared_ptr<UnreadableGpuFrameData>& data =
@@ -211,6 +217,7 @@ class TestGpuEncodePump : public QObject {
     Q_OBJECT
 private slots:
     void encodeWaitsForFenceThenForwardsPacket();
+    void exactFrameSynchronizationDoesNotMixTimelines();
     void encodeSurfaceFailureReportsDroppedJob();
     void encodeSurfaceFailureDropsJobWithoutCpuFallback();
     void unreadableGpuHandleDropsWithoutCpuReadback();
@@ -220,17 +227,39 @@ private slots:
     void packetOverflowFailsWithoutPartialPackets();
     void submitBackpressuresOnOverflowUntilQueueSpace();
     void cancelPendingReleasesQueuedJobCallbacks();
+    void idleStopCannotLoseWakeup();
 };
+
+void TestGpuEncodePump::exactFrameSynchronizationDoesNotMixTimelines() {
+    FakeEncoder enc;
+    auto unrelatedFence = std::make_shared<FakeFence>();
+    auto frameFence = std::make_shared<FakeFence>();
+    unrelatedFence->signal();
+    frameFence->signal();
+    QCOMPARE(unrelatedFence->completedValue(), uint64_t(1));
+
+    GpuEncodePump pump(&enc, 4);
+    pump.start();
+    PumpProbe probe;
+    QVERIFY(
+        pump.submit(makeGpuHandle({frameFence, 2, true}), 100, ColorMetadata{}, probe.callbacks()));
+
+    QTest::qWait(60);
+    QCOMPARE(enc.calls.load(std::memory_order_acquire), 0);
+    frameFence->signal();
+    QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 1, 2000);
+    pump.stop();
+}
 
 void TestGpuEncodePump::encodeWaitsForFenceThenForwardsPacket() {
     FakeEncoder enc;
     auto fence = std::make_shared<FakeFence>();
 
-    GpuEncodePump pump(&enc, fence, 4);
+    GpuEncodePump pump(&enc, 4);
     pump.start();
 
     PumpProbe probe;
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QVERIFY(pump.submit(makeGpuHandle({fence, 1, true}), 100, ColorMetadata{}, probe.callbacks()));
 
     QTest::qWait(60);
     QCOMPARE(enc.calls.load(std::memory_order_acquire), 0);
@@ -247,14 +276,12 @@ void TestGpuEncodePump::encodeWaitsForFenceThenForwardsPacket() {
 void TestGpuEncodePump::encodeSurfaceFailureReportsDroppedJob() {
     FakeEncoder enc;
     enc.failSurfaceEncode.store(true, std::memory_order_release);
-    auto fence = std::make_shared<FakeFence>();
-    fence->signal();
 
-    GpuEncodePump pump(&enc, fence, 4);
+    GpuEncodePump pump(&enc, 4);
     pump.start();
 
     PumpProbe probe;
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QVERIFY(pump.submit(makeGpuHandle(), 100, ColorMetadata{}, probe.callbacks()));
 
     QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 1, 2000);
     QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
@@ -270,15 +297,12 @@ void TestGpuEncodePump::encodeSurfaceFailureDropsJobWithoutCpuFallback() {
     FakeEncoder enc;
     enc.failSurfaceEncode.store(true, std::memory_order_release);
     enc.cpuEncodeSucceeds.store(true, std::memory_order_release);
-    auto fence = std::make_shared<FakeFence>();
-    fence->signal();
-    const auto data = std::make_shared<UnreadableGpuFrameData>();
 
-    GpuEncodePump pump(&enc, fence, 4);
+    GpuEncodePump pump(&enc, 4);
     pump.start();
 
     PumpProbe probe;
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QVERIFY(pump.submit(makeGpuHandle(), 100, ColorMetadata{}, probe.callbacks()));
 
     QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 1, 2000);
     QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
@@ -294,15 +318,13 @@ void TestGpuEncodePump::unreadableGpuHandleDropsWithoutCpuReadback() {
     FakeEncoder enc;
     enc.failSurfaceEncode.store(true, std::memory_order_release);
     enc.cpuEncodeSucceeds.store(true, std::memory_order_release);
-    auto fence = std::make_shared<FakeFence>();
-    fence->signal();
     const auto data = std::make_shared<UnreadableGpuFrameData>();
 
-    GpuEncodePump pump(&enc, fence, 4);
+    GpuEncodePump pump(&enc, 4);
     pump.start();
 
     PumpProbe probe;
-    QVERIFY(pump.submit(makeUnreadableGpuHandle(data), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QVERIFY(pump.submit(makeUnreadableGpuHandle(data), 100, ColorMetadata{}, probe.callbacks()));
 
     QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 1, 2000);
     QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
@@ -317,17 +339,15 @@ void TestGpuEncodePump::unreadableGpuHandleDropsWithoutCpuReadback() {
 
 void TestGpuEncodePump::packetCallbackRunsAfterEncoderMutexReleased() {
     FakeEncoder enc;
-    auto fence = std::make_shared<FakeFence>();
-    fence->signal();
     std::mutex encoderMutex;
     enc.expectedEncoderMutex = &encoderMutex;
 
-    GpuEncodePump pump(&enc, fence, 4, &encoderMutex);
+    GpuEncodePump pump(&enc, 4, &encoderMutex);
     pump.start();
 
     PumpProbe probe;
     probe.encoderMutex = &encoderMutex;
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QVERIFY(pump.submit(makeGpuHandle(), 100, ColorMetadata{}, probe.callbacks()));
 
     QTRY_COMPARE_WITH_TIMEOUT(probe.packets.load(std::memory_order_acquire), 1, 2000);
     QVERIFY(enc.sawEncoderMutexHeld.load(std::memory_order_acquire));
@@ -339,13 +359,11 @@ void TestGpuEncodePump::packetCallbackRunsAfterEncoderMutexReleased() {
 void TestGpuEncodePump::multiplePacketsForwardedAndFinishedOnce() {
     FakeEncoder enc;
     enc.packetsPerSurfaceEncode.store(2, std::memory_order_release);
-    auto fence = std::make_shared<FakeFence>();
-    fence->signal();
-    GpuEncodePump pump(&enc, fence, 4);
+    GpuEncodePump pump(&enc, 4);
     pump.start();
 
     PumpProbe probe;
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QVERIFY(pump.submit(makeGpuHandle(), 100, ColorMetadata{}, probe.callbacks()));
     QTRY_COMPARE_WITH_TIMEOUT(probe.packets.load(std::memory_order_acquire), 2, 2000);
     QTRY_COMPARE_WITH_TIMEOUT(probe.finished.load(std::memory_order_acquire), 1, 2000);
     QCOMPARE(probe.failures.load(std::memory_order_acquire), 0);
@@ -356,13 +374,11 @@ void TestGpuEncodePump::multiplePacketsForwardedAndFinishedOnce() {
 void TestGpuEncodePump::failureAfterPacketDiscardsBufferedPackets() {
     FakeEncoder enc;
     enc.packetsBeforeFailure.store(1, std::memory_order_release);
-    auto fence = std::make_shared<FakeFence>();
-    fence->signal();
-    GpuEncodePump pump(&enc, fence, 4);
+    GpuEncodePump pump(&enc, 4);
     pump.start();
 
     PumpProbe probe;
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QVERIFY(pump.submit(makeGpuHandle(), 100, ColorMetadata{}, probe.callbacks()));
     QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
     QTRY_COMPARE_WITH_TIMEOUT(probe.finished.load(std::memory_order_acquire), 1, 2000);
     QCOMPARE(probe.packets.load(std::memory_order_acquire), 0);
@@ -374,13 +390,11 @@ void TestGpuEncodePump::packetOverflowFailsWithoutPartialPackets() {
     FakeEncoder enc;
     enc.packetsPerSurfaceEncode.store(GpuEncodePump::kMaxPacketsPerJob + 1,
                                       std::memory_order_release);
-    auto fence = std::make_shared<FakeFence>();
-    fence->signal();
-    GpuEncodePump pump(&enc, fence, 4);
+    GpuEncodePump pump(&enc, 4);
     pump.start();
 
     PumpProbe probe;
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 100, ColorMetadata{}, probe.callbacks()));
+    QVERIFY(pump.submit(makeGpuHandle(), 100, ColorMetadata{}, probe.callbacks()));
     QTRY_COMPARE_WITH_TIMEOUT(probe.failures.load(std::memory_order_acquire), 1, 2000);
     QTRY_COMPARE_WITH_TIMEOUT(probe.finished.load(std::memory_order_acquire), 1, 2000);
     QCOMPARE(probe.packets.load(std::memory_order_acquire), 0);
@@ -391,23 +405,21 @@ void TestGpuEncodePump::packetOverflowFailsWithoutPartialPackets() {
 void TestGpuEncodePump::submitBackpressuresOnOverflowUntilQueueSpace() {
     FakeEncoder enc;
     enc.blockSurfaceEncode.store(true, std::memory_order_release);
-    auto fence = std::make_shared<FakeFence>();
-    fence->signal();
 
-    GpuEncodePump pump(&enc, fence, 1);
+    GpuEncodePump pump(&enc, 1);
     pump.start();
 
     PumpProbe probe;
 
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 1, ColorMetadata{}, probe.callbacks(1)));
+    QVERIFY(pump.submit(makeGpuHandle(), 1, ColorMetadata{}, probe.callbacks(1)));
     QTRY_COMPARE_WITH_TIMEOUT(enc.blockedSurfaceEncodeEntries.load(std::memory_order_acquire), 1,
                               2000);
-    QVERIFY(pump.submit(makeGpuHandle(), 1, 2, ColorMetadata{}, probe.callbacks(2)));
+    QVERIFY(pump.submit(makeGpuHandle(), 2, ColorMetadata{}, probe.callbacks(2)));
 
     std::atomic<bool> returned{false};
     bool thirdSubmit = false;
     std::thread submitter([&] {
-        thirdSubmit = pump.submit(makeGpuHandle(), 1, 3, ColorMetadata{}, probe.callbacks(3));
+        thirdSubmit = pump.submit(makeGpuHandle(), 3, ColorMetadata{}, probe.callbacks(3));
         returned.store(true, std::memory_order_release);
     });
 
@@ -434,13 +446,12 @@ void TestGpuEncodePump::submitBackpressuresOnOverflowUntilQueueSpace() {
 
 void TestGpuEncodePump::cancelPendingReleasesQueuedJobCallbacks() {
     FakeEncoder enc;
-    auto fence = std::make_shared<FakeFence>();
-    GpuEncodePump pump(&enc, fence, 4);
+    GpuEncodePump pump(&enc, 4);
 
     PumpProbe probe;
 
-    QVERIFY(pump.submit(makeGpuHandle(), 9, 1, ColorMetadata{}, probe.callbacks(1)));
-    QVERIFY(pump.submit(makeGpuHandle(), 9, 2, ColorMetadata{}, probe.callbacks(2)));
+    QVERIFY(pump.submit(makeGpuHandle(), 1, ColorMetadata{}, probe.callbacks(1)));
+    QVERIFY(pump.submit(makeGpuHandle(), 2, ColorMetadata{}, probe.callbacks(2)));
 
     pump.cancelPending();
 
@@ -448,6 +459,15 @@ void TestGpuEncodePump::cancelPendingReleasesQueuedJobCallbacks() {
     QCOMPARE(probe.packets.load(std::memory_order_acquire), 0);
     QCOMPARE(probe.failures.load(std::memory_order_acquire), 2);
     QCOMPARE(probe.finished.load(std::memory_order_acquire), 2);
+}
+
+void TestGpuEncodePump::idleStopCannotLoseWakeup() {
+    FakeEncoder enc;
+    for (int iteration = 0; iteration < 200; ++iteration) {
+        GpuEncodePump pump(&enc, 4);
+        pump.start();
+        pump.stop();
+    }
 }
 
 QTEST_GUILESS_MAIN(TestGpuEncodePump)

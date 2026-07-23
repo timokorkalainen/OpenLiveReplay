@@ -22,20 +22,26 @@
 #include <QHash>
 #include <QMutex>
 #include <QMutexLocker>
+#ifdef OLR_UNIT_TEST
+#include <QSemaphore>
+#endif
 #include <QStringList>
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <d3d10.h>
 #include <d3d11.h>
 #include <functional>
+#include <future>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfobjects.h>
 #include <mftransform.h>
 #include <objbase.h>
+#include <thread>
 #include <utility>
 #include <wrl/client.h>
 
@@ -47,8 +53,33 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+#ifdef OLR_UNIT_TEST
+std::atomic<int> winDeviceLossPollCallsForTest{0};
+#endif
+
 constexpr const char* kMfHardwareDecoderEnv = "OLR_MF_VIDEO_ENABLE_HARDWARE";
 constexpr int kD3DReadbackFenceTimeoutMs = 2000;
+
+class ScopedComApartment {
+public:
+    ScopedComApartment() noexcept : m_result(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+    ~ScopedComApartment() {
+        if (SUCCEEDED(m_result)) CoUninitialize();
+    }
+
+    bool usable() const noexcept { return SUCCEEDED(m_result) || m_result == RPC_E_CHANGED_MODE; }
+    HRESULT result() const noexcept { return m_result; }
+
+private:
+    HRESULT m_result = E_FAIL;
+};
+
+uintptr_t deviceDomainId(ID3D11Device* device) {
+    ComPtr<IUnknown> identity;
+    return device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&identity)))
+               ? reinterpret_cast<uintptr_t>(identity.Get())
+               : 0;
+}
 
 class ScopedHardwareDecoderProbeFlag {
 public:
@@ -164,13 +195,15 @@ class D3D11IGpuFrameData final : public IFrameData {
 public:
 #ifdef OLR_GPU_PIPELINE_BUILD
     D3D11IGpuFrameData(std::shared_ptr<D3D11GpuSurface> surface,
-                       std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge budgetCharge)
+                       std::shared_ptr<GpuFence> renderFence, uint64_t renderFenceValue,
+                       GpuBudgetCharge budgetCharge)
         : m_surface(std::move(surface)), m_renderFence(std::move(renderFence)),
-          m_budgetCharge(std::move(budgetCharge)) {}
+          m_renderFenceValue(renderFenceValue), m_budgetCharge(std::move(budgetCharge)) {}
 #else
     D3D11IGpuFrameData(std::shared_ptr<D3D11GpuSurface> surface,
-                       std::shared_ptr<GpuFence> renderFence)
-        : m_surface(std::move(surface)), m_renderFence(std::move(renderFence)) {}
+                       std::shared_ptr<GpuFence> renderFence, uint64_t renderFenceValue)
+        : m_surface(std::move(surface)), m_renderFence(std::move(renderFence)),
+          m_renderFenceValue(renderFenceValue) {}
 #endif
 
     bool isGpuBacked() const override { return true; }
@@ -178,11 +211,21 @@ public:
     CpuPlanes cachedCpuPlanes(FramePixelFormat target) const override;
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_renderFence; }
+    GpuFrameSynchronization gpuSynchronization() const override {
+        if (m_renderFenceValue == 0) return {nullptr, 0, true};
+        return {m_renderFence, m_renderFenceValue, true};
+    }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
+    void seedCpuCacheForTest(CpuPlanes planes) const {
+        if (!planes.isValid()) return;
+        QMutexLocker locker(&m_cacheMutex);
+        m_cpuCache.insert(int(planes.format), std::move(planes));
+    }
 
 private:
     std::shared_ptr<D3D11GpuSurface> m_surface;
     std::shared_ptr<GpuFence> m_renderFence;
+    uint64_t m_renderFenceValue = 0;
 #ifdef OLR_GPU_PIPELINE_BUILD
     GpuBudgetCharge m_budgetCharge;
 #endif
@@ -254,14 +297,29 @@ bool winGpuImportProbeForcesHardwareDecoderForTest() {
 #endif
 
 struct WinGpuImportEdge::Impl {
+    struct DeviceLossPollState {
+        std::atomic<bool> deviceLost{false};
+        std::atomic<bool> pollPending{false};
+#ifdef OLR_UNIT_TEST
+        std::atomic<QSemaphore*> blockEntered{nullptr};
+        std::atomic<QSemaphore*> blockRelease{nullptr};
+#endif
+    };
+
     ComPtr<ID3D11Device> device;
     ComPtr<IMFDXGIDeviceManager> manager;
     UINT resetToken = 0;
-    bool coOwned = false;
     bool mfStarted = false;
     uint64_t deviceAuthorityEpoch = 0;
-    mutable std::atomic<bool> deviceLost{false};
+    std::shared_ptr<DeviceLossPollState> deviceLossState = std::make_shared<DeviceLossPollState>();
     std::function<void(const FrameHandle&)> importTap;
+
+    ~Impl() {
+        ScopedComApartment apartment;
+        if (mfStarted) MFShutdown();
+        manager.Reset();
+        device.Reset();
+    }
 
     bool ownsDevice(ID3D11Device* candidate) const {
         if (!candidate || !device) return false;
@@ -271,30 +329,34 @@ struct WinGpuImportEdge::Impl {
                SUCCEEDED(device.As(&edgeIdentity)) && candidateIdentity.Get() == edgeIdentity.Get();
     }
 
-    bool noteDeviceLostIfRemoved() const {
-        if (!device) return false;
-        const HRESULT reason = device->GetDeviceRemovedReason();
+    bool noteDeviceLostReason(HRESULT reason, uintptr_t domainId) const {
         if (FAILED(reason)) {
-            WinGpuImportEdge::publishDeviceRemovedForMonitor(reason, deviceAuthorityEpoch);
-            deviceLost.store(true, std::memory_order_release);
+            const uint64_t generation = WinGpuImportEdge::publishDeviceRemovedForMonitor(
+                reason, deviceAuthorityEpoch, domainId);
+            if (generation != 0) deviceLossState->deviceLost.store(true, std::memory_order_release);
             return true;
         }
         return false;
+    }
+
+    bool noteDeviceLostIfRemoved() const {
+        return device &&
+               noteDeviceLostReason(device->GetDeviceRemovedReason(), deviceDomainId(device.Get()));
     }
 };
 
 WinGpuImportEdge::WinGpuImportEdge() : m_impl(std::make_unique<Impl>()) {}
 
 uint64_t WinGpuImportEdge::publishDeviceRemovedForMonitor(HRESULT reason,
-                                                          uint64_t deviceAuthorityEpoch) {
+                                                          uint64_t deviceAuthorityEpoch,
+                                                          uintptr_t domainId) {
     if (SUCCEEDED(reason)) return 0;
     return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-        DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
+        DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch, domainId);
 }
 
 WinGpuImportEdge::~WinGpuImportEdge() {
-    if (m_impl && m_impl->mfStarted) MFShutdown();
-    if (m_impl && m_impl->coOwned) CoUninitialize();
+    m_impl.reset();
 }
 
 std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::create(QString* error) {
@@ -305,12 +367,11 @@ std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::create(QString* error) {
     }
 
     auto edge = std::unique_ptr<WinGpuImportEdge>(new WinGpuImportEdge());
-    const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(coHr) && coHr != RPC_E_CHANGED_MODE) {
-        if (error) *error = hresultString("CoInitializeEx", coHr);
+    ScopedComApartment apartment;
+    if (!apartment.usable()) {
+        if (error) *error = hresultString("CoInitializeEx", apartment.result());
         return nullptr;
     }
-    edge->m_impl->coOwned = SUCCEEDED(coHr);
 
     const HRESULT mfHr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
     if (FAILED(mfHr)) {
@@ -331,14 +392,107 @@ std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::create(QString* error) {
 }
 
 bool WinGpuImportEdge::isAvailable() const {
-    return m_impl && m_impl->device && !m_impl->deviceLost.load(std::memory_order_acquire);
+    return m_impl && m_impl->device &&
+           !m_impl->deviceLossState->deviceLost.load(std::memory_order_acquire);
 }
 
 bool WinGpuImportEdge::deviceLost() const {
+#ifdef OLR_UNIT_TEST
+    winDeviceLossPollCallsForTest.fetch_add(1, std::memory_order_acq_rel);
+#endif
     if (!m_impl) return false;
-    if (m_impl->deviceLost.load(std::memory_order_acquire)) return true;
+    if (m_impl->deviceLossState->deviceLost.load(std::memory_order_acquire)) return true;
     return m_impl->noteDeviceLostIfRemoved();
 }
+
+bool WinGpuImportEdge::pollDeviceLossFor(int timeoutMs) const {
+#ifdef OLR_UNIT_TEST
+    winDeviceLossPollCallsForTest.fetch_add(1, std::memory_order_acq_rel);
+#endif
+    if (!m_impl) return false;
+    const auto state = m_impl->deviceLossState;
+    if (state->deviceLost.load(std::memory_order_acquire)) return true;
+
+#ifdef OLR_UNIT_TEST
+    QSemaphore* const blockEntered = state->blockEntered.exchange(nullptr);
+    QSemaphore* const blockRelease = state->blockRelease.exchange(nullptr);
+#else
+    constexpr void* blockEntered = nullptr;
+    constexpr void* blockRelease = nullptr;
+#endif
+    const ComPtr<ID3D11Device> device = m_impl->device;
+    if (!device && !blockEntered) return false;
+    bool expected = false;
+    if (!state->pollPending.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire))
+        return state->deviceLost.load(std::memory_order_acquire);
+
+    const uint64_t authority = m_impl->deviceAuthorityEpoch;
+    auto completion = std::make_shared<std::promise<void>>();
+    std::future<void> completed = completion->get_future();
+    try {
+        std::thread([state, device, authority, completion, blockEntered, blockRelease] {
+            ScopedComApartment apartment;
+#ifdef OLR_UNIT_TEST
+            if (blockEntered) blockEntered->release();
+            if (blockRelease) blockRelease->acquire();
+#endif
+            if (device) {
+                const HRESULT reason = device->GetDeviceRemovedReason();
+                if (FAILED(reason)) {
+                    const uint64_t generation = WinGpuImportEdge::publishDeviceRemovedForMonitor(
+                        reason, authority, deviceDomainId(device.Get()));
+                    if (generation != 0) state->deviceLost.store(true, std::memory_order_release);
+                }
+            }
+            state->pollPending.store(false, std::memory_order_release);
+            try {
+                completion->set_value();
+            } catch (...) {
+                static_cast<void>(0);
+            }
+        }).detach();
+    } catch (...) {
+        state->pollPending.store(false, std::memory_order_release);
+        return state->deviceLost.load(std::memory_order_acquire);
+    }
+    const int boundedTimeoutMs = timeoutMs < 0 ? 0 : timeoutMs;
+    (void) completed.wait_for(std::chrono::milliseconds(boundedTimeoutMs));
+    return state->deviceLost.load(std::memory_order_acquire);
+}
+
+#ifdef OLR_UNIT_TEST
+std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::createUnavailableForTest() {
+    return std::unique_ptr<WinGpuImportEdge>(new WinGpuImportEdge);
+}
+
+void WinGpuImportEdge::resetDeviceLossPollCountForTest() noexcept {
+    winDeviceLossPollCallsForTest.store(0, std::memory_order_release);
+}
+
+int WinGpuImportEdge::deviceLossPollCountForTest() noexcept {
+    return winDeviceLossPollCallsForTest.load(std::memory_order_acquire);
+}
+
+bool WinGpuImportEdge::observeDeviceRemovedForTest(HRESULT reason, uint64_t deviceAuthorityEpoch,
+                                                   uintptr_t deviceDomainId) {
+    if (!m_impl) return false;
+    if (m_impl->deviceLossState->deviceLost.load(std::memory_order_acquire)) return true;
+    m_impl->deviceAuthorityEpoch = deviceAuthorityEpoch;
+    return m_impl->noteDeviceLostReason(reason, deviceDomainId);
+}
+
+bool WinGpuImportEdge::deviceLostStickyForTest() const noexcept {
+    return m_impl && m_impl->deviceLossState->deviceLost.load(std::memory_order_acquire);
+}
+
+void WinGpuImportEdge::blockNextDeviceLossPollForTest(QSemaphore* entered,
+                                                      QSemaphore* release) noexcept {
+    if (!m_impl) return;
+    m_impl->deviceLossState->blockRelease.store(release, std::memory_order_release);
+    m_impl->deviceLossState->blockEntered.store(entered, std::memory_order_release);
+}
+#endif
 
 std::optional<FrameHandle> WinGpuImportEdge::tryImport(void* mfSampleOpaque, int feedIndex,
                                                        qint64 ptsMs, int width, int height,
@@ -384,7 +538,8 @@ std::shared_ptr<D3D11GpuSurface> WinGpuImportEdge::tryImportSurface(void* mfSamp
     ComPtr<ID3D11Device> textureDevice;
     texture->GetDevice(&textureDevice);
     if (!m_impl->ownsDevice(textureDevice.Get())) return nullptr;
-    auto surface = D3D11GpuSurface::createKept(textureDevice, texture, subresource, width, height);
+    auto surface = D3D11GpuSurface::createKept(textureDevice, texture, subresource, width, height,
+                                               m_impl->deviceAuthorityEpoch);
     if (!surface && m_impl) m_impl->noteDeviceLostIfRemoved();
     return surface;
 }
@@ -392,51 +547,75 @@ std::shared_ptr<D3D11GpuSurface> WinGpuImportEdge::tryImportSurface(void* mfSamp
 std::shared_ptr<GpuFence>
 WinGpuImportEdge::createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& surface) {
     if (!surface) return nullptr;
+    const uint64_t authorityEpoch = surface->compatibility().authorityEpoch;
+    std::shared_ptr<GpuFence> result;
     GpuSyncReadScope scope;
-    const GpuReadLease lease = scope.read(surface);
-    const std::shared_ptr<void> retained = lease.retainNativeHandle();
-    auto* texture = static_cast<ID3D11Texture2D*>(retained.get());
-    ComPtr<ID3D11Device> device;
-    if (texture) texture->GetDevice(&device);
-    return makeD3D11GpuFence(device.Get());
+    scope.withRead(surface, [authorityEpoch, &result](const GpuReadLease& lease) {
+        auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
+        ComPtr<ID3D11Device> device;
+        if (texture) texture->GetDevice(&device);
+        result = makeD3D11GpuFence(device.Get(), authorityEpoch);
+    });
+    return result;
 }
 
 std::shared_ptr<GpuFence> WinGpuImportEdge::createFence() const {
-    return (m_impl && m_impl->device) ? makeD3D11GpuFence(m_impl->device.Get()) : nullptr;
+    return (m_impl && m_impl->device)
+               ? makeD3D11GpuFence(m_impl->device.Get(), m_impl->deviceAuthorityEpoch)
+               : nullptr;
 }
 
+FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
+                                                        FrameMetadata meta,
+                                                        std::shared_ptr<GpuFence> renderFence,
 #ifdef OLR_GPU_PIPELINE_BUILD
-FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
-                                                        FrameMetadata meta,
-                                                        std::shared_ptr<GpuFence> renderFence,
                                                         GpuBudgetCharge charge,
-                                                        uint64_t* submittedFenceValue) {
 #else
-FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
-                                                        FrameMetadata meta,
-                                                        std::shared_ptr<GpuFence> renderFence,
-                                                        uint64_t* submittedFenceValue) {
+                                                        std::nullptr_t charge,
 #endif
+                                                        uint64_t* submittedFenceValue) {
     if (!surface) return FrameHandle();
-    if (renderFence && !renderFence->isCompatibleWith(*surface)) return FrameHandle();
+    if (renderFence && !renderFence->sharesDeviceAuthorityWith(surface)) return FrameHandle();
     if (meta.key.width <= 0) meta.key.width = surface->desc().width;
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;
+    uint64_t exactFenceValue = 0;
+    std::shared_ptr<GpuFence> exactFence;
     if (renderFence) {
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
-        operation.track(surface);
-        if (!operation.submit([] { return GpuSubmitOutcome::Submitted; })) return FrameHandle{};
-        if (submittedFenceValue) *submittedFenceValue = operation.fenceValue();
+        auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+        const auto result = operation.submitRetained(
+            adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+        if (!result.succeeded()) return FrameHandle{};
+        exactFence = result.producerFence;
+        exactFenceValue = result.fenceValue;
+        if (submittedFenceValue) *submittedFenceValue = exactFenceValue;
     }
 #ifdef OLR_GPU_PIPELINE_BUILD
-    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence),
-                                                     std::move(charge));
+    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(exactFence),
+                                                     exactFenceValue, std::move(charge));
 #else
-    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence));
+    (void) charge;
+    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(exactFence),
+                                                     exactFenceValue);
 #endif
     return FrameHandle(std::move(data), meta);
 }
+
+#if defined(OLR_GPU_PIPELINE_BUILD) && defined(OLR_UNIT_TEST)
+FrameHandle WinGpuImportEdge::makeGpuFrameHandleWithCachedCpuForTest(
+    std::shared_ptr<D3D11GpuSurface> surface, FrameMetadata meta,
+    std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge charge, uint64_t* submittedFenceValue,
+    CpuPlanes cachedCpu) {
+    FrameHandle handle =
+        makeGpuFrameHandleForTest(std::move(surface), std::move(meta), std::move(renderFence),
+                                  std::move(charge), submittedFenceValue);
+    const auto data = std::dynamic_pointer_cast<const D3D11IGpuFrameData>(handle.dataPtr());
+    if (data) data->seedCpuCacheForTest(std::move(cachedCpu));
+    return handle;
+}
+#endif
 
 void WinGpuImportEdge::setImportTapForTest(std::function<void(const FrameHandle&)> tap) {
     if (!m_impl) return;
@@ -449,8 +628,11 @@ bool WinGpuImportEdge::acceptsD3D11DeviceForTest(void* device) const {
 
 bool WinGpuImportEdge::decodeOneForTest(ComPtr<ID3D11Device> device, ComPtr<ID3D11Texture2D> nv12,
                                         int width, int height) {
-    auto surface =
-        D3D11GpuSurface::createKept(std::move(device), std::move(nv12), 0, width, height);
+    const uint64_t authorityEpoch =
+        m_impl ? m_impl->deviceAuthorityEpoch
+               : GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch();
+    auto surface = D3D11GpuSurface::createKept(std::move(device), std::move(nv12), 0, width, height,
+                                               authorityEpoch);
     if (!surface) return false;
 
     FrameMetadata meta;
@@ -470,27 +652,25 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     const auto cached = m_cpuCache.constFind(int(target));
     if (cached != m_cpuCache.cend()) return cached.value();
 
+    bool nativeReadComplete = false;
     GpuSyncReadScope readScope;
-    const GpuReadLease lease = readScope.read(m_surface);
-    {
-        const std::shared_ptr<void> retained = lease.retainNativeHandle();
-        auto* src = static_cast<ID3D11Texture2D*>(retained.get());
+    readScope.withRead(m_surface, [&](const GpuReadLease& lease) {
+        auto* src = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
         ComPtr<ID3D11Device> retainedDevice;
         if (src) src->GetDevice(&retainedDevice);
         ID3D11Device* device = retainedDevice.Get();
-        if (!device || !src) return out;
+        if (!device || !src) return;
 
-        const uint64_t pendingFenceValue = m_surface->pendingFenceValue();
-        if (pendingFenceValue != 0) {
+        if (m_renderFenceValue != 0) {
             if (!m_renderFence ||
-                !m_renderFence->wait(pendingFenceValue, kD3DReadbackFenceTimeoutMs)) {
-                return out;
+                !m_renderFence->wait(m_renderFenceValue, kD3DReadbackFenceTimeoutMs)) {
+                return;
             }
         }
 
         ComPtr<ID3D11DeviceContext> ctx;
         device->GetImmediateContext(&ctx);
-        if (!ctx) return out;
+        if (!ctx) return;
 
         D3D11_TEXTURE2D_DESC desc{};
         src->GetDesc(&desc);
@@ -503,12 +683,12 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
         staging.MipLevels = 1;
 
         ComPtr<ID3D11Texture2D> readable;
-        if (FAILED(device->CreateTexture2D(&staging, nullptr, &readable))) return out;
+        if (FAILED(device->CreateTexture2D(&staging, nullptr, &readable))) return;
         ctx->CopySubresourceRegion(readable.Get(), 0, 0, 0, 0, src, lease.nativeSubresource(),
                                    nullptr);
 
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (FAILED(ctx->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return out;
+        if (FAILED(ctx->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
 
         const int w = m_surface->desc().width;
         const int h = m_surface->desc().height;
@@ -546,18 +726,22 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
         }
 
         ctx->Unmap(readable.Get(), 0);
-        if (out.isValid()) {
-            gpuRecordFrameReadToCpuReadback();
-            if (m_renderFence && m_surface) {
-                GpuRetireRegistry registry;
-                GpuOpScope operation(m_renderFence, registry);
-                operation.track(m_surface);
-                (void) operation.submit([] { return GpuSubmitOutcome::Submitted; });
-            }
-            m_cpuCache.insert(int(target), out);
+        nativeReadComplete = true;
+    });
+    if (!nativeReadComplete) return out;
+
+    if (out.isValid()) {
+        gpuRecordFrameReadToCpuReadback();
+        if (m_renderFence && m_surface) {
+            GpuRetireRegistry registry;
+            GpuOpScope operation(m_renderFence, registry);
+            auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+            (void) operation.submitRetained(
+                adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{m_surface}));
         }
-        return out;
+        m_cpuCache.insert(int(target), out);
     }
+    return out;
 }
 
 CpuPlanes D3D11IGpuFrameData::cachedCpuPlanes(FramePixelFormat target) const {

@@ -4,6 +4,7 @@
 #include <QtTest>
 
 #include <QFile>
+#include <QScopeGuard>
 #include <rhi/qshader.h>
 
 #include "framepsnr.h"
@@ -12,6 +13,8 @@
 #include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpucompositor.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/formatcanon.h"
@@ -42,11 +45,23 @@ private slots:
     void bilinearDiffersFromNearestOracle();
     void memoHitReusesSameGpuSurface();
     void memoMissRendersFresh();
+    void renderExceptionBeforeSubmissionIsNotSubmitted();
+    void renderExceptionAfterSubmissionIsSubmittedWithError();
+    void swallowedRenderExceptionAfterSubmissionIsSubmittedWithError();
+    void renderPassExceptionClosesPassAndFrame();
+#ifdef _WIN32
+    void submittedRenderExceptionPollsAuthoritativeLossOnce();
+    void beginFrameFailurePollsAuthoritativeLossOnce();
+    void zeroOwnerFrameOpFailurePublishesAuthoritativeLoss();
+    void successfulFrameDoesNotPollDeviceLoss();
+#endif
 #ifdef __APPLE__
+    void nativeOwnerRenderExceptionRetainsOwner();
     void cpuHandleUploadsToNv12Surface();
     void gpuNv12HandleAliasesExistingSurface();
     void gpuNv12AliasUsesBoundedFenceWait();
     void memoHitReusesSameLocalGpuSurface();
+    void composeGridFiveSourcesReturnsGpuBackedFrame();
 #endif
 };
 
@@ -312,14 +327,24 @@ void compareRgbaWithinOneLsb(const CpuPlanes& actual, const CpuPlanes& expected)
 #ifdef __APPLE__
 class PendingNv12Surface final : public GpuSurface {
 public:
+    explicit PendingNv12Surface(GpuSurfaceCompatibility compatibility)
+        : m_compatibility(compatibility) {
+        retainUntilFenceRetired(1);
+    }
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 8}; }
     bool isValid() const override { return true; }
-    void* nativeHandle() const override { return nullptr; }
-    uint64_t pendingFenceValue() const override { return 1; }
+    GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
+    void* nativeHandle() const override { return const_cast<PendingNv12Surface*>(this); }
+
+private:
+    GpuSurfaceCompatibility m_compatibility;
 };
 
 class NeverRetiredFence final : public GpuFence {
 public:
+    explicit NeverRetiredFence(GpuSurfaceCompatibility compatibility)
+        : GpuFence(compatibility.deviceDomainId, compatibility.authorityEpoch) {}
+
     uint64_t signal() override { return 1; }
     bool wait(uint64_t, int timeoutMs) override {
         waits.fetch_add(1, std::memory_order_acq_rel);
@@ -544,6 +569,29 @@ void TestGpuCompositor::composeGridChargesGpuBudgetOnLocalGpu() {
 #endif
 }
 
+#ifdef __APPLE__
+void TestGpuCompositor::composeGridFiveSourcesReturnsGpuBackedFrame() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 32, 80, 176),   solidYuv420pHandle(4, 4, 64, 88, 168),
+        solidYuv420pHandle(4, 4, 96, 96, 160),   solidYuv420pHandle(4, 4, 128, 104, 152),
+        solidYuv420pHandle(4, 4, 160, 112, 144),
+    };
+    const FrameHandle composed = comp->composeGrid(frames, 12, 8, ColorMetadata{},
+                                                   GpuCompositor::ScaleQuality::NearestCompat);
+
+    QVERIFY(!composed.isNull());
+    QVERIFY(composed.isPresentable());
+    QVERIFY(composed.isGpuBacked());
+    QCOMPARE(composed.metadata().key.format, FramePixelFormat::Rgba8);
+}
+#endif
+
 void TestGpuCompositor::swappedQuadrantsDifferFromOracle() {
     auto rhi = GpuRhiContext::createNullForTest();
     if (!rhi) QSKIP("QRhi Null backend unavailable on this host");
@@ -700,7 +748,190 @@ void TestGpuCompositor::memoMissRendersFresh() {
     QVERIFY(a.dataPtr() != b.dataPtr());
 }
 
+void TestGpuCompositor::renderExceptionBeforeSubmissionIsNotSubmitted() {
+    QCOMPARE(GpuCompositor::renderExceptionOutcomeForTest(false), GpuSubmitOutcome::NotSubmitted);
+}
+
+void TestGpuCompositor::renderExceptionAfterSubmissionIsSubmittedWithError() {
+    QCOMPARE(GpuCompositor::renderExceptionOutcomeForTest(true),
+             GpuSubmitOutcome::SubmittedWithError);
+}
+
+void TestGpuCompositor::swallowedRenderExceptionAfterSubmissionIsSubmittedWithError() {
+    QCOMPARE(GpuCompositor::renderDispatchOutcomeForTest(true, false, false),
+             GpuSubmitOutcome::SubmittedWithError);
+}
+
+void TestGpuCompositor::renderPassExceptionClosesPassAndFrame() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const auto resetMonitor = qScopeGuard([&monitor] { monitor.reset(); });
 #ifdef __APPLE__
+    auto rhi = GpuRhiContext::create();
+#else
+    auto rhi = GpuRhiContext::createWarpForTest();
+#endif
+    if (!rhi) QSKIP("required native QRhi backend unavailable");
+    auto comp = GpuCompositor::create(rhi);
+    QVERIFY(comp != nullptr);
+    const QList<FrameHandle> frames{patternedYuv420pHandle(8, 8)};
+    ColorMetadata color;
+
+    GpuCompositor::injectRenderPassFailureForTest();
+    const CpuPlanes failed =
+        comp->composeGridToCpu(frames, 16, 16, color, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY(!failed.isValid());
+    QCOMPARE(GpuCompositor::recoveredRenderPassesForTest(), 1);
+    QCOMPARE(GpuCompositor::recoveredOffscreenFramesForTest(), 1);
+#ifdef __APPLE__
+    // SubmittedWithError deliberately rotates device authority. Apple offscreen
+    // frames submit synchronously, so tokenless recovery can drain and clear
+    // before this call returns; continue on a context from the new authority.
+    QVERIFY(!monitor.isLost());
+    comp.reset();
+    rhi.reset();
+    rhi = GpuRhiContext::create();
+    QVERIFY2(rhi != nullptr, "native QRhi backend must rebuild after tokenless recovery");
+    comp = GpuCompositor::create(rhi);
+    QVERIFY2(comp != nullptr, "compositor must rebuild after tokenless recovery");
+#elif defined(_WIN32)
+    QVERIFY(!monitor.isLost());
+    QCOMPARE(rhi->deviceLossPollCountForTest(), 1);
+#endif
+
+    const CpuPlanes recovered =
+        comp->composeGridToCpu(frames, 16, 16, color, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY2(recovered.isValid(), "cleanup must leave the backend usable after recovery");
+#ifdef _WIN32
+    QVERIFY(!monitor.isLost());
+    QCOMPARE(rhi->deviceLossPollCountForTest(), 1);
+#endif
+}
+
+#ifdef _WIN32
+void TestGpuCompositor::submittedRenderExceptionPollsAuthoritativeLossOnce() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi) QSKIP("WARP QRhi backend unavailable");
+    auto comp = GpuCompositor::create(rhi);
+    QVERIFY(comp != nullptr);
+
+    rhi->injectPollOnlyDeviceLostForTest();
+    GpuCompositor::injectRenderPassFailureForTest();
+    const CpuPlanes failed = comp->composeGridToCpu({patternedYuv420pHandle(8, 8)}, 16, 16, {},
+                                                    GpuCompositor::ScaleQuality::NearestCompat);
+
+    QVERIFY(!failed.isValid());
+    QVERIFY(monitor.isLost());
+    QCOMPARE(monitor.realLossTokens().size(), size_t(1));
+    QCOMPARE(rhi->deviceLossPollCountForTest(), 1);
+    monitor.reset();
+}
+
+void TestGpuCompositor::beginFrameFailurePollsAuthoritativeLossOnce() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi) QSKIP("WARP QRhi backend unavailable");
+    auto comp = GpuCompositor::create(rhi);
+    QVERIFY(comp != nullptr);
+
+    rhi->injectPollOnlyDeviceLostForTest();
+    GpuCompositor::injectBeginFrameFailureForTest();
+    const CpuPlanes failed = comp->composeGridToCpu({patternedYuv420pHandle(8, 8)}, 16, 16, {},
+                                                    GpuCompositor::ScaleQuality::NearestCompat);
+
+    QVERIFY(!failed.isValid());
+    QVERIFY(monitor.isLost());
+    QCOMPARE(monitor.realLossTokens().size(), size_t(1));
+    QCOMPARE(rhi->deviceLossPollCountForTest(), 1);
+    monitor.reset();
+}
+
+void TestGpuCompositor::zeroOwnerFrameOpFailurePublishesAuthoritativeLoss() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi) QSKIP("WARP QRhi backend unavailable");
+    auto comp = GpuCompositor::create(rhi);
+    QVERIFY(comp != nullptr);
+
+    rhi->injectPollOnlyDeviceLostForTest();
+    GpuCompositor::injectFrameOpFailureForTest();
+    const CpuPlanes failed = comp->composeGridToCpu({patternedYuv420pHandle(8, 8)}, 16, 16, {},
+                                                    GpuCompositor::ScaleQuality::NearestCompat);
+
+    QVERIFY(!failed.isValid());
+    QVERIFY(monitor.isLost());
+    QCOMPARE(monitor.realLossTokens().size(), size_t(1));
+    QCOMPARE(rhi->deviceLossPollCountForTest(), 1);
+    monitor.reset();
+}
+
+void TestGpuCompositor::successfulFrameDoesNotPollDeviceLoss() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi) QSKIP("WARP QRhi backend unavailable");
+    auto comp = GpuCompositor::create(rhi);
+    QVERIFY(comp != nullptr);
+
+    rhi->injectPollOnlyDeviceLostForTest();
+    const CpuPlanes rendered = comp->composeGridToCpu({patternedYuv420pHandle(8, 8)}, 16, 16, {},
+                                                      GpuCompositor::ScaleQuality::NearestCompat);
+
+    QVERIFY(rendered.isValid());
+    QVERIFY(!monitor.isLost());
+    QCOMPARE(rhi->deviceLossPollCountForTest(), 0);
+    monitor.reset();
+}
+#endif
+
+#ifdef __APPLE__
+void TestGpuCompositor::nativeOwnerRenderExceptionRetainsOwner() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const auto resetMonitor = qScopeGuard([&monitor] { monitor.reset(); });
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no native RHI backend");
+    auto comp = GpuCompositor::create(rhi);
+    QVERIFY(comp != nullptr);
+    auto surface =
+        GpuCompositor::uploadFrameToNv12SurfaceForTest(patternedYuv420pHandle(16, 8), rhi);
+    if (!surface) QSKIP("native NV12 upload unavailable");
+    FrameMetadata metadata;
+    FrameHandle gpuFrame = makeGpuFrameHandle(surface, rhi, metadata);
+    const std::weak_ptr<GpuSurface> retainedOwner = surface;
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(0));
+
+    GpuCompositor::injectRenderPassFailureForTest();
+    const CpuPlanes failed =
+        comp->composeGridToCpu({gpuFrame}, 32, 16, {}, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY(!failed.isValid());
+    QVERIFY(monitor.isLost());
+    QVERIFY2(surface->pendingFenceValue() != 0,
+             "submitted exception path must retain the exact native owner");
+    QCOMPARE(GpuCompositor::recoveredRenderPassesForTest(), 1);
+    QCOMPARE(GpuCompositor::recoveredOffscreenFramesForTest(), 1);
+
+    surface.reset();
+    gpuFrame = {};
+    QVERIFY2(!retainedOwner.expired(),
+             "the retire registry must remain the durable owner after callers release theirs");
+
+    GpuRetireRegistry registry;
+    QVERIFY2(registry.drainWithBoundedWait(2000) > 0,
+             "the submitted native owner must retire through its real compositor fence");
+    QVERIFY2(retainedOwner.expired(),
+             "the durable owner must be released after its compositor fence retires");
+}
+
 void TestGpuCompositor::cpuHandleUploadsToNv12Surface() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
@@ -752,13 +983,14 @@ void TestGpuCompositor::gpuNv12AliasUsesBoundedFenceWait() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
 
-    auto fence = std::make_shared<NeverRetiredFence>();
+    const GpuSurfaceCompatibility compatibility = rhi->surfaceCompatibility();
+    auto fence = std::make_shared<NeverRetiredFence>(compatibility);
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 16;
     meta.key.height = 8;
-    FrameHandle gpuFrame =
-        makeGpuFrameHandle(std::make_shared<PendingNv12Surface>(), rhi, meta, fence);
+    FrameHandle gpuFrame = makeGpuFrameHandle(std::make_shared<PendingNv12Surface>(compatibility),
+                                              rhi, meta, fence, 1, GpuBudgetCharge{});
 
     auto aliased = GpuCompositor::uploadFrameToNv12SurfaceForTest(gpuFrame, rhi);
 

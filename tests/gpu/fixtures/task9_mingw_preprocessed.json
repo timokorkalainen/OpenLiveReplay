@@ -1,0 +1,40 @@
+{
+  "schema": "olr-task9-mingw-preprocessed-v1",
+  "toolchain": {
+    "distribution": "tools_mingw1310_64",
+    "compiler_version": "13.1.0",
+    "target": "x86_64-w64-mingw32",
+    "compiler_executable_sha256": "cd65c087ad69a877e5a105c607cc910abfabcc52ba7e9448572f36567b51698c"
+  },
+  "command": [
+    "g++",
+    "-std=c++20",
+    "-E",
+    "-ftrack-macro-expansion=0",
+    "-fno-working-directory",
+    "tests/gpu/fixtures/task9_mingw_capture.cpp",
+    "-o",
+    "tests/gpu/fixtures/task9_mingw_preprocessed.ii"
+  ],
+  "source": {
+    "relative_path": "tests/gpu/fixtures/task9_mingw_capture.cpp",
+    "line_count": 17,
+    "sha256": "ed6b1bf410afcd0337d4b0e70e21c2d73699f08bcb7ad00d2a6a367523e37ebb"
+  },
+  "capture": {
+    "relative_path": "tests/gpu/fixtures/task9_mingw_preprocessed.ii",
+    "byte_count": 2670784,
+    "sha256": "d5bc6afc49a7dadaa16bd1165b3ac3eb905315b62e39e7bb1ec2ba04e8f3a1ae"
+  },
+  "accepted_oracle": {
+    "dependency_schema": "one-production-source-v1",
+    "line_schema": "gcc-line-marker-v1",
+    "token_count": 16384,
+    "compact_sha256": "d18690309eb477d9daf02a7bf8f20a2bcf29122b42dccb515e8523a83ebc6c56"
+  },
+  "replay": {
+    "chunk_bytes": 262144,
+    "warmups_per_builder": 1,
+    "balanced_order": ["AB", "BA", "AB", "BA"]
+  }
+}

@@ -194,6 +194,28 @@ if(OLR_PYTHON3_EXECUTABLE)
         LABELS "unit;ci"
         TIMEOUT 30)
 
+    add_test(NAME tst_gpu_scope_completion_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_scope_completion_static.py"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_videotoolbox.mm"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_mediafoundation.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/applegpusurface_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurfaceallocator.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/vtkeepsurfaceimporter_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/asyncgpureadbacksink.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/iotargets/decklinksink.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/outputbusengine.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/gpuencodepump.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp")
+    set_tests_properties(tst_gpu_scope_completion_static PROPERTIES
+        LABELS "unit;ci;gpu-capability"
+        TIMEOUT 90)
+
     add_test(NAME tst_videotoolbox_decoder_static
         COMMAND "${OLR_PYTHON3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/test_videotoolbox_decoder_static.py"
@@ -985,10 +1007,12 @@ if(APPLE)
         LABELS "native-apple-ingest" TIMEOUT 120 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 elseif(WIN32)
     olr_add_native_srt_e2e_tests("native-windows-ingest")
+    set_tests_properties(e2e_native_srt_smoke PROPERTIES
+        LABELS "native-windows-ingest;delivery-gate")
     add_test(NAME e2e_native_srt_hevc_smoke
         COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
     set_tests_properties(e2e_native_srt_hevc_smoke PROPERTIES
-        LABELS "native-windows-hevc"
+        LABELS "native-windows-hevc;delivery-gate"
         TIMEOUT 180
         RUN_SERIAL TRUE
         ENVIRONMENT "${_olr_windows_tool_env}")
@@ -1142,10 +1166,21 @@ if(APPLE)
 elseif(WIN32)
     add_test(NAME e2e_native_rtmp_smoke
         COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
+    add_test(NAME e2e_native_rtmp_hevc_smoke
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23770)
     set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
-        LABELS "native-rtmp"
+        LABELS "native-rtmp;delivery-gate"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "${_olr_windows_tool_env}")
+    set_tests_properties(e2e_native_rtmp_hevc_smoke PROPERTIES
+        LABELS "native-rtmp;delivery-gate"
         TIMEOUT 180
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         ENVIRONMENT "${_olr_windows_tool_env}")
 endif()
+
+get_property(_olr_e2e_tests DIRECTORY PROPERTY TESTS)
+olr_apply_windows_test_runtime(${_olr_e2e_tests})

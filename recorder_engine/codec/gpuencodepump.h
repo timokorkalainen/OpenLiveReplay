@@ -34,15 +34,14 @@ public:
     static_assert(std::is_trivially_copyable_v<JobCallbacks>);
     static constexpr int kMaxPacketsPerJob = 8;
 
-    GpuEncodePump(NativeVideoEncoder* encoder, std::shared_ptr<GpuFence> fence, int maxQueue = 4,
+    GpuEncodePump(NativeVideoEncoder* encoder, int maxQueue = 4,
                   std::mutex* encoderMutex = nullptr);
     ~GpuEncodePump();
 
     GpuEncodePump(const GpuEncodePump&) = delete;
     GpuEncodePump& operator=(const GpuEncodePump&) = delete;
 
-    bool submit(FrameHandle frame, uint64_t fenceValue, int64_t ptsTicks, ColorMetadata color,
-                JobCallbacks callbacks);
+    bool submit(FrameHandle frame, int64_t ptsTicks, ColorMetadata color, JobCallbacks callbacks);
 
     void start();
     void stop();
@@ -61,7 +60,7 @@ private:
         bool active = false;
         uint32_t generation = 0;
         FrameHandle frame;
-        uint64_t fenceValue = 0;
+        GpuFrameSynchronization synchronization;
         int64_t ptsTicks = 0;
         ColorMetadata color;
         JobCallbacks callbacks;
@@ -80,7 +79,6 @@ private:
 
     NativeVideoEncoder* m_encoder = nullptr;
     std::mutex* m_encoderMutex = nullptr;
-    std::shared_ptr<GpuFence> m_fence;
     int m_maxQueue = 4;
     std::thread m_thread;
     mutable std::mutex m_mutex;

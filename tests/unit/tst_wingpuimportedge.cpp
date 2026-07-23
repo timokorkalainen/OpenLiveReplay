@@ -3,6 +3,8 @@
 #include "playback/output/win/wingpuimportedge.h"
 #ifdef _WIN32
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/win/d3d11gpusurface.h"
@@ -14,6 +16,8 @@
 #include <cstdlib>
 #include <d3d11.h>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include <wrl/client.h>
 
@@ -25,8 +29,33 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+template <typename Device, typename = void>
+struct CanMakeD3D11FenceWithoutAuthority : std::false_type {};
+
+template <typename Device>
+struct CanMakeD3D11FenceWithoutAuthority<
+    Device, std::void_t<decltype(makeD3D11GpuFence(std::declval<Device>()))>> : std::true_type {};
+
+template <typename Device, typename Texture, typename = void>
+struct CanKeepD3D11SurfaceWithoutAuthority : std::false_type {};
+
+template <typename Device, typename Texture>
+struct CanKeepD3D11SurfaceWithoutAuthority<
+    Device, Texture,
+    std::void_t<decltype(D3D11GpuSurface::createKept(
+        std::declval<Device>(), std::declval<Texture>(), UINT(0), 1, 1))>> : std::true_type {};
+
+static_assert(!CanMakeD3D11FenceWithoutAuthority<void*>::value,
+              "native-device fence construction must require persistent device authority");
+static_assert(
+    !CanKeepD3D11SurfaceWithoutAuthority<ComPtr<ID3D11Device>, ComPtr<ID3D11Texture2D>>::value,
+    "native-surface construction must require persistent device authority");
+
 class DeferredFence final : public GpuFence {
 public:
+    explicit DeferredFence(GpuSurfaceCompatibility compatibility)
+        : GpuFence(compatibility.deviceDomainId, compatibility.authorityEpoch) {}
+
     uint64_t signal() override { return m_next.fetch_add(1, std::memory_order_acq_rel) + 1; }
     bool wait(uint64_t value, int) override {
         waits.fetch_add(1, std::memory_order_acq_rel);
@@ -64,6 +93,10 @@ bool createTestD3D11Device(ComPtr<ID3D11Device>* device, ComPtr<ID3D11DeviceCont
     return SUCCEEDED(hr);
 }
 
+uint64_t currentDeviceAuthority() {
+    return GpuDeviceLossMonitor::instance().currentDeviceAuthorityForTest();
+}
+
 } // namespace
 #endif
 
@@ -76,8 +109,11 @@ private slots:
     void createConsistentWithProbe();
     void nullSampleYieldsFallbackNullopt();
     void surfaceKeepsTextureAndTracksFence();
+    void surfaceRejectsSuppliedDeviceMismatch();
+    void surfaceRejectsNonNv12Texture();
     void edgeRejectsForeignD3D11Device();
     void frameRejectsForeignFenceTimeline();
+    void frameGenerationBumpKeepsLiveDeviceAuthority();
     void importedFrameExposesRenderFence();
     void readToCpuDeinterleavesNv12ToI420();
     void readToCpuWaitsForPendingFenceBeforeCopy();
@@ -169,7 +205,10 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
     ComPtr<ID3D11Texture2D> texture;
     QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
 
-    auto surface = D3D11GpuSurface::createKept(device, texture, 0, 1280, 720);
+    const uint64_t authorityEpoch = currentDeviceAuthority();
+    QVERIFY(D3D11GpuSurface::createKept(device, texture, 0, 1279, 720, authorityEpoch) == nullptr);
+    QVERIFY(D3D11GpuSurface::createKept(device, texture, 1, 1280, 720, authorityEpoch) == nullptr);
+    auto surface = D3D11GpuSurface::createKept(device, texture, 0, 1280, 720, authorityEpoch);
     QVERIFY(surface != nullptr);
     QVERIFY(surface->isValid());
     QCOMPARE(int(surface->desc().format), int(FramePixelFormat::Nv12));
@@ -179,16 +218,69 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
 
     GpuSyncReadScope readScope;
     const GpuReadLease lease = readScope.read(surface);
-    std::shared_ptr<void> retained = lease.retainNativeHandle();
-    QVERIFY(retained != nullptr);
-    QCOMPARE(static_cast<ID3D11Texture2D*>(retained.get()), texture.Get());
+    QVERIFY(lease.nativeHandle() != nullptr);
+    QCOMPARE(static_cast<ID3D11Texture2D*>(lease.nativeHandle()), texture.Get());
 
     surface->retainUntilFenceRetired(5);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(5));
     surface->retainUntilFenceRetired(3);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(5));
     surface.reset();
-    QCOMPARE(static_cast<ID3D11Texture2D*>(retained.get()), texture.Get());
+    QCOMPARE(static_cast<ID3D11Texture2D*>(lease.nativeHandle()), texture.Get());
+    readScope.complete();
+#endif
+}
+
+void TestWinGpuImportEdge::surfaceRejectsSuppliedDeviceMismatch() {
+#ifndef _WIN32
+    QSKIP("D3D11GpuSurface is Windows-only");
+#else
+    ComPtr<ID3D11Device> textureDevice;
+    ComPtr<ID3D11DeviceContext> textureContext;
+    ComPtr<ID3D11Device> suppliedDevice;
+    ComPtr<ID3D11DeviceContext> suppliedContext;
+    if (!createTestD3D11Device(&textureDevice, &textureContext) ||
+        !createTestD3D11Device(&suppliedDevice, &suppliedContext)) {
+        QSKIP("two D3D11 devices are unavailable");
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    ComPtr<ID3D11Texture2D> texture;
+    QVERIFY(SUCCEEDED(textureDevice->CreateTexture2D(&desc, nullptr, &texture)));
+
+    QVERIFY(D3D11GpuSurface::createKept(suppliedDevice, texture, 0, 64, 64,
+                                        currentDeviceAuthority()) == nullptr);
+#endif
+}
+
+void TestWinGpuImportEdge::surfaceRejectsNonNv12Texture() {
+#ifndef _WIN32
+    QSKIP("D3D11GpuSurface is Windows-only");
+#else
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    if (!createTestD3D11Device(&device, &context)) QSKIP("no D3D11 test device available");
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    ComPtr<ID3D11Texture2D> texture;
+    QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
+
+    QVERIFY(D3D11GpuSurface::createKept(device, texture, 0, 64, 64, currentDeviceAuthority()) ==
+            nullptr);
 #endif
 }
 
@@ -232,8 +324,9 @@ void TestWinGpuImportEdge::frameRejectsForeignFenceTimeline() {
     ComPtr<ID3D11Texture2D> texture;
     QVERIFY(SUCCEEDED(surfaceDevice->CreateTexture2D(&desc, nullptr, &texture)));
 
-    auto surface = D3D11GpuSurface::createKept(surfaceDevice, texture, 0, 64, 64);
-    auto foreignFence = makeD3D11GpuFence(foreignDevice.Get());
+    const uint64_t authorityEpoch = currentDeviceAuthority();
+    auto surface = D3D11GpuSurface::createKept(surfaceDevice, texture, 0, 64, 64, authorityEpoch);
+    auto foreignFence = makeD3D11GpuFence(foreignDevice.Get(), authorityEpoch);
     if (!foreignFence) QSKIP("D3D11 fence unavailable");
 
     FrameMetadata meta;
@@ -242,6 +335,90 @@ void TestWinGpuImportEdge::frameRejectsForeignFenceTimeline() {
     meta.key.height = 64;
     QVERIFY(WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, foreignFence).isNull());
     QCOMPARE(surface->pendingFenceValue(), uint64_t(0));
+#endif
+}
+
+void TestWinGpuImportEdge::frameGenerationBumpKeepsLiveDeviceAuthority() {
+#ifndef _WIN32
+    QSKIP("D3D11 device authority is Windows-only");
+#else
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    auto& generations = GpuGenerationCounter::instance();
+    monitor.reset();
+    generations.resetForTest();
+    const auto resetState = qScopeGuard([&] {
+        monitor.reset();
+        generations.resetForTest();
+        const uint64_t resetAuthority = monitor.currentDeviceAuthorityForTest();
+        while (generations.current() < resetAuthority)
+            generations.bump();
+    });
+
+    const uint64_t deviceAuthority = monitor.currentDeviceAuthorityForTest();
+    while (generations.current() < deviceAuthority)
+        generations.bump();
+    QCOMPARE(generations.current(), deviceAuthority);
+
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    if (!createTestD3D11Device(&device, &context)) QSKIP("no D3D11 test device available");
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> texture;
+    QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
+
+    auto preSeekSurface = D3D11GpuSurface::createKept(device, texture, 0, 64, 64, deviceAuthority);
+    auto persistentFence = makeD3D11GpuFence(device.Get(), deviceAuthority);
+    QVERIFY(preSeekSurface != nullptr);
+    if (!persistentFence) QSKIP("D3D11 fence unavailable");
+    QCOMPARE(preSeekSurface->compatibility().authorityEpoch, deviceAuthority);
+    QCOMPARE(persistentFence->identity().authorityEpoch, deviceAuthority);
+
+    const uint64_t preSeekGeneration = generations.current();
+    const uint64_t postSeekGeneration = generations.bump();
+    QCOMPARE(postSeekGeneration, preSeekGeneration + 1);
+    QCOMPARE(monitor.currentDeviceAuthorityForTest(), deviceAuthority);
+
+    auto postSeekSurface = D3D11GpuSurface::createKept(device, texture, 0, 64, 64, deviceAuthority);
+    QVERIFY(postSeekSurface != nullptr);
+    QCOMPARE(postSeekSurface->compatibility().deviceDomainId,
+             preSeekSurface->compatibility().deviceDomainId);
+    QCOMPARE(postSeekSurface->compatibility().authorityEpoch, deviceAuthority);
+    QCOMPARE(persistentFence->identity().authorityEpoch, deviceAuthority);
+
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 64;
+    meta.gpuGeneration = postSeekGeneration;
+    uint64_t submittedFenceValue = 0;
+    const FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(
+        postSeekSurface, meta, persistentFence, {}, &submittedFenceValue);
+
+    QVERIFY(handle.isGpuBacked());
+    QCOMPARE(handle.metadata().gpuGeneration, postSeekGeneration);
+    QVERIFY(!handle.isStaleForGeneration(postSeekGeneration));
+    QVERIFY(handle.isStaleForGeneration(preSeekGeneration));
+    QVERIFY(submittedFenceValue != 0);
+    QVERIFY(persistentFence->wait(submittedFenceValue, 2000));
+    GpuRetireRegistry{}.drainCompleted();
+
+    monitor.recordLoss();
+    monitor.beginRebuild();
+    QVERIFY(monitor.currentDeviceAuthorityForTest() != deviceAuthority);
+    auto staleSurface = D3D11GpuSurface::createKept(device, texture, 0, 64, 64, deviceAuthority);
+    auto staleFence = makeD3D11GpuFence(device.Get(), deviceAuthority);
+    QVERIFY(staleSurface != nullptr);
+    QVERIFY(staleFence != nullptr);
+    QVERIFY(WinGpuImportEdge::makeGpuFrameHandleForTest(staleSurface, meta, staleFence).isNull());
 #endif
 }
 
@@ -265,22 +442,24 @@ void TestWinGpuImportEdge::importedFrameExposesRenderFence() {
     ComPtr<ID3D11Texture2D> texture;
     QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
 
-    auto surface = D3D11GpuSurface::createKept(device, texture, 0, 64, 64);
+    auto surface =
+        D3D11GpuSurface::createKept(device, texture, 0, 64, 64, currentDeviceAuthority());
     QVERIFY(surface != nullptr);
-    auto renderFence = std::make_shared<DeferredFence>();
+    auto renderFence = std::make_shared<DeferredFence>(surface->compatibility());
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 64;
     meta.key.height = 64;
 
-    const FrameHandle handle =
-        WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, renderFence);
+    uint64_t submittedFenceValue = 0;
+    const FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(
+        surface, meta, renderFence, {}, &submittedFenceValue);
 
     QVERIFY(handle.isGpuBacked());
     QVERIFY(handle.data() != nullptr);
     QVERIFY(handle.data()->gpuFence() == renderFence);
-    QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
-    renderFence->complete(1);
+    QCOMPARE(submittedFenceValue, uint64_t(1));
+    renderFence->complete(submittedFenceValue);
     GpuRetireRegistry{}.drainCompleted();
 #endif
 }
@@ -321,7 +500,8 @@ void TestWinGpuImportEdge::readToCpuDeinterleavesNv12ToI420() {
     QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
     ctx->UpdateSubresource(texture.Get(), 0, nullptr, nv12.data(), UINT(kW), 0);
 
-    auto surface = D3D11GpuSurface::createKept(device, texture, 0, kW, kH);
+    auto surface =
+        D3D11GpuSurface::createKept(device, texture, 0, kW, kH, currentDeviceAuthority());
     QVERIFY(surface != nullptr);
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
@@ -381,22 +561,25 @@ void TestWinGpuImportEdge::readToCpuWaitsForPendingFenceBeforeCopy() {
     QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
     ctx->UpdateSubresource(texture.Get(), 0, nullptr, nv12.data(), UINT(kW), 0);
 
-    auto surface = D3D11GpuSurface::createKept(device, texture, 0, kW, kH);
+    auto surface =
+        D3D11GpuSurface::createKept(device, texture, 0, kW, kH, currentDeviceAuthority());
     QVERIFY(surface != nullptr);
-    auto fence = std::make_shared<DeferredFence>();
+    auto fence = std::make_shared<DeferredFence>(surface->compatibility());
 
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = kW;
     meta.key.height = kH;
-    const FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, fence);
-    QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
+    uint64_t submittedFenceValue = 0;
+    const FrameHandle handle =
+        WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, fence, {}, &submittedFenceValue);
+    QCOMPARE(submittedFenceValue, uint64_t(1));
 
     QVERIFY(!handle.readToCpu(FramePixelFormat::Yuv420p).isValid());
     QCOMPARE(fence->waits.load(std::memory_order_acquire), 1);
-    QCOMPARE(fence->lastValue.load(std::memory_order_acquire), uint64_t(1));
+    QCOMPARE(fence->lastValue.load(std::memory_order_acquire), submittedFenceValue);
 
-    fence->complete(1);
+    fence->complete(submittedFenceValue);
     const CpuPlanes got = handle.readToCpu(FramePixelFormat::Yuv420p);
     QVERIFY(got.isValid());
     QCOMPARE(fence->waits.load(std::memory_order_acquire), 2);
@@ -541,7 +724,8 @@ void TestWinGpuImportEdge::allocFailureDegradesToCpuFallback() {
     QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
 
     D3D11GpuSurface::setForceAllocFailureForTest(true);
-    auto imported = D3D11GpuSurface::createKept(device, texture, 0, 64, 64);
+    auto imported =
+        D3D11GpuSurface::createKept(device, texture, 0, 64, 64, currentDeviceAuthority());
     D3D11GpuSurface::setForceAllocFailureForTest(false);
     QVERIFY(imported == nullptr);
 
@@ -578,19 +762,22 @@ void TestWinGpuImportEdge::surfaceSurvivesInFlightReadback() {
     QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
     ctx->UpdateSubresource(texture.Get(), 0, nullptr, nv12.data(), UINT(kW), 0);
 
-    auto surface = D3D11GpuSurface::createKept(device, texture, 0, kW, kH);
+    auto surface =
+        D3D11GpuSurface::createKept(device, texture, 0, kW, kH, currentDeviceAuthority());
     QVERIFY(surface != nullptr);
     std::weak_ptr<D3D11GpuSurface> weak = surface;
-    auto renderFence = std::make_shared<DeferredFence>();
+    auto renderFence = std::make_shared<DeferredFence>(surface->compatibility());
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = kW;
     meta.key.height = kH;
-    FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, renderFence);
-    QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
+    uint64_t submittedFenceValue = 0;
+    FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, renderFence, {},
+                                                                     &submittedFenceValue);
+    QCOMPARE(submittedFenceValue, uint64_t(1));
     surface.reset();
     QVERIFY(!weak.expired());
-    renderFence->complete(1);
+    renderFence->complete(submittedFenceValue);
     QVERIFY(handle.readToCpu(FramePixelFormat::Yuv420p).isValid());
     handle = FrameHandle();
     QVERIFY(!weak.expired());

@@ -2,16 +2,19 @@
 #define OLR_WIN_GPU_IMPORT_EDGE_H
 
 #include "playback/output/framehandle.h"
-
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/gpubudget.h"
 #endif
 
 #include <QString>
 
+#include <cstddef>
 #include <functional>
+#include <cstdint>
 #include <memory>
 #include <optional>
+
+class QSemaphore;
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -55,19 +58,34 @@ public:
     bool isAvailable() const;
     bool deviceLost() const;
 
+    static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
+                                                 FrameMetadata meta,
+                                                 std::shared_ptr<GpuFence> renderFence = nullptr,
 #ifdef OLR_GPU_PIPELINE_BUILD
-    static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
-                                                 FrameMetadata meta,
-                                                 std::shared_ptr<GpuFence> renderFence = nullptr,
                                                  GpuBudgetCharge charge = {},
-                                                 uint64_t* submittedFenceValue = nullptr);
 #else
-    static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
-                                                 FrameMetadata meta,
-                                                 std::shared_ptr<GpuFence> renderFence = nullptr,
+                                                 std::nullptr_t charge = nullptr,
+#endif
                                                  uint64_t* submittedFenceValue = nullptr);
+#ifdef OLR_GPU_PIPELINE_BUILD
+#ifdef OLR_UNIT_TEST
+    static FrameHandle makeGpuFrameHandleWithCachedCpuForTest(
+        std::shared_ptr<D3D11GpuSurface> surface, FrameMetadata meta,
+        std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge charge,
+        uint64_t* submittedFenceValue, CpuPlanes cachedCpu);
+#endif
 #endif
 #ifdef _WIN32
+    bool pollDeviceLossFor(int timeoutMs) const;
+    static std::unique_ptr<WinGpuImportEdge> createUnavailableForTest();
+    static void resetDeviceLossPollCountForTest() noexcept;
+    static int deviceLossPollCountForTest() noexcept;
+#ifdef OLR_UNIT_TEST
+    bool observeDeviceRemovedForTest(HRESULT reason, uint64_t deviceAuthorityEpoch,
+                                     uintptr_t deviceDomainId);
+    bool deviceLostStickyForTest() const noexcept;
+    void blockNextDeviceLossPollForTest(QSemaphore* entered, QSemaphore* release) noexcept;
+#endif
     void setImportTapForTest(std::function<void(const FrameHandle&)> tap);
     bool acceptsD3D11DeviceForTest(void* device) const;
     bool decodeOneForTest(Microsoft::WRL::ComPtr<ID3D11Device> device,
@@ -77,7 +95,8 @@ public:
 private:
     WinGpuImportEdge();
 #ifdef _WIN32
-    static uint64_t publishDeviceRemovedForMonitor(HRESULT reason, uint64_t deviceAuthorityEpoch);
+    static uint64_t publishDeviceRemovedForMonitor(HRESULT reason, uint64_t deviceAuthorityEpoch,
+                                                   uintptr_t deviceDomainId);
 #endif
 
     struct Impl;

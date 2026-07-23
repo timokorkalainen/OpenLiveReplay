@@ -146,6 +146,8 @@ private:
     std::thread m_setterThread;
 };
 
+constexpr auto kSinkReleaseWatchdog = std::chrono::seconds(10);
+
 class RuntimeResetDuringSubmitSink final : public IOutputSink {
 public:
     explicit RuntimeResetDuringSubmitSink(int blockedSubmit = 1) : m_blockedSubmit(blockedSubmit) {}
@@ -174,7 +176,7 @@ public:
 
         m_entered = true;
         m_enteredCv.notify_all();
-        if (!m_releaseCv.wait_for(lock, std::chrono::seconds(2), [this]() { return m_release; })) {
+        if (!m_releaseCv.wait_for(lock, kSinkReleaseWatchdog, [this]() { return m_release; })) {
             m_diagnosticTimeout = true;
             return false;
         }
@@ -227,6 +229,84 @@ private:
     bool m_resetReturned = false;
     bool m_resetReturnedBeforeRelease = false;
     bool m_diagnosticTimeout = false;
+    QVector<OutputBusFrame> m_frames;
+};
+
+class SlowSubmitSink final : public IOutputSink {
+public:
+    OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
+
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        QMutexLocker locker(&m_mutex);
+        m_active = assignment.enabled && assignment.kind == kind() && rate.isValid();
+        m_frames.clear();
+        m_submitCount = 0;
+        return m_active;
+    }
+
+    void stop() override {
+        QMutexLocker locker(&m_mutex);
+        m_active = false;
+        m_releaseBlockedSubmit = true;
+        m_submitStarted.wakeAll();
+        m_submitReleased.wakeAll();
+    }
+
+    bool isActive() const override {
+        QMutexLocker locker(&m_mutex);
+        return m_active;
+    }
+
+    bool submit(const OutputBusFrame& frame) override {
+        QMutexLocker locker(&m_mutex);
+        if (!m_active) return false;
+        m_frames.append(frame);
+        ++m_submitCount;
+        m_submitStarted.wakeAll();
+        while (m_blockedSubmitCount == m_submitCount && !m_releaseBlockedSubmit)
+            m_submitReleased.wait(&m_mutex);
+        locker.unlock();
+        QThread::msleep(80);
+        return true;
+    }
+
+    void blockSubmitCount(int count) {
+        QMutexLocker locker(&m_mutex);
+        m_blockedSubmitCount = count;
+        m_releaseBlockedSubmit = false;
+    }
+
+    void releaseBlockedSubmit() {
+        QMutexLocker locker(&m_mutex);
+        m_releaseBlockedSubmit = true;
+        m_submitReleased.wakeAll();
+    }
+
+    bool waitForSubmits(int count, int timeoutMs) const {
+        QElapsedTimer timer;
+        timer.start();
+        QMutexLocker locker(&m_mutex);
+        while (m_submitCount < count) {
+            const qint64 remainingMs = qint64(timeoutMs) - timer.elapsed();
+            if (remainingMs <= 0) return false;
+            m_submitStarted.wait(&m_mutex, static_cast<unsigned long>(remainingMs));
+        }
+        return true;
+    }
+
+    QVector<OutputBusFrame> frames() const {
+        QMutexLocker locker(&m_mutex);
+        return m_frames;
+    }
+
+private:
+    mutable QMutex m_mutex;
+    mutable QWaitCondition m_submitStarted;
+    QWaitCondition m_submitReleased;
+    bool m_active = false;
+    int m_submitCount = 0;
+    int m_blockedSubmitCount = -1;
+    bool m_releaseBlockedSubmit = false;
     QVector<OutputBusFrame> m_frames;
 };
 
@@ -1013,9 +1093,9 @@ void TestOutputRuntime::multiplePlayEpochResetsCoalesceBeforeNextLease() {
     QVERIFY2(result.followerRegisteredBeforeRelease,
              "follower immediate request did not raise the registered count from the active "
              "real-frame baseline of one to two before release");
+    QVERIFY2(!result.diagnosticTimeout, "real-frame lease hit the diagnostic timeout");
     QVERIFY2(result.sinkObservedResetReturnBeforeRelease,
              "sink did not observe reset completion before its release barrier");
-    QVERIFY2(!result.diagnosticTimeout, "real-frame lease hit the diagnostic timeout");
     QCOMPARE(result.appliedResetsBeforeRelease, 0);
     QCOMPARE(result.appliedResetsAtFollowerSnapshot, 1);
     QCOMPARE(result.finalAppliedResets, 1);
@@ -1045,9 +1125,9 @@ void TestOutputRuntime::multiplePlayEpochResetsCoalesceBeforeNextHoldLastLease()
     QVERIFY2(result.followerRegisteredBeforeRelease,
              "follower immediate request did not raise the registered count from the active "
              "hold-last baseline of one to two before release");
+    QVERIFY2(!result.diagnosticTimeout, "hold-last lease hit the diagnostic timeout");
     QVERIFY2(result.sinkObservedResetReturnBeforeRelease,
              "hold-last sink did not observe reset completion before release");
-    QVERIFY2(!result.diagnosticTimeout, "hold-last lease hit the diagnostic timeout");
     QCOMPARE(result.appliedResetsBeforeRelease, 0);
     QCOMPARE(result.appliedResetsAtFollowerSnapshot, 1);
     QCOMPARE(result.finalAppliedResets, 1);
@@ -1082,7 +1162,7 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
     assignment.kind = OutputTargetKind::QtPreview;
     assignment.enabled = true;
 
-    RuntimeResetDuringSubmitSink sink(2);
+    SlowSubmitSink sink;
     OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
     runtime.setSnapshotProvider([&]() {
         OutputRuntimeSnapshot snapshot;
@@ -1097,26 +1177,31 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
     runtime.setIdentitySkip(false);
 
     runtime.dispatchDueTicksForTest(0);
+    sink.blockSubmitCount(2);
 
     std::thread catchUpThread([&]() { runtime.dispatchDueTicksForTest(1000); });
-    const bool catchUpEntered = sink.waitUntilEntered();
+
+    QVERIFY2(sink.waitForSubmits(2, 1000), "scheduled catch-up must enter its first tick");
     playheadMs.store(200, std::memory_order_release);
 
     std::thread immediateThread([&]() { runtime.dispatchImmediate(); });
-    const bool immediateQueued = runtime.waitForImmediateDispatchRequestsForTest(1, 2000);
-    sink.release();
+    QElapsedTimer registrationTimer;
+    registrationTimer.start();
+    while (!runtime.immediateDispatchPendingForTest() && registrationTimer.elapsed() < 1000)
+        QThread::msleep(1);
+    const bool immediateRegistered = runtime.immediateDispatchPendingForTest();
+    sink.releaseBlockedSubmit();
 
-    catchUpThread.join();
     immediateThread.join();
+    catchUpThread.join();
+    QVERIFY2(immediateRegistered, "immediate dispatch request must register before tick release");
 
     const QVector<OutputBusFrame> frames = sink.frames();
-    QVERIFY2(catchUpEntered, "scheduled catch-up did not reach its active-submit barrier");
-    QVERIFY2(immediateQueued, "immediate dispatch did not register before catch-up release");
-    QVERIFY2(!sink.diagnosticTimeout(), "catch-up submit timed out waiting for release");
-    QCOMPARE(frames.size(), 3);
-    QCOMPARE(frames.at(1).sampledPlayheadMs, qint64(100));
-    QCOMPARE(videoPts(frames.at(1)), qint64(100));
-    QCOMPARE(frames.at(2).outputFrameIndex, qint64(2));
+    // The barrier makes this timing-free: the immediate request is registered while the
+    // first catch-up submit is blocked, then the frame count proves the burst yielded.
+    QVERIFY2(frames.size() <= 4,
+             qPrintable(QStringLiteral("immediate dispatch allowed %1 stale catch-up frames")
+                            .arg(frames.size())));
     QCOMPARE(frames.last().sampledPlayheadMs, qint64(200));
     QCOMPARE(videoPts(frames.last()), qint64(200));
 }

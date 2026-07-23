@@ -1,0 +1,3 @@
+int unrelatedCompileFailureMutation() {
+    return;
+}

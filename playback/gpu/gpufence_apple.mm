@@ -1,4 +1,6 @@
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
+#include "playback/gpu/gpugeneration.h"
 
 #ifdef __APPLE__
 
@@ -11,27 +13,30 @@
 #include <dispatch/dispatch.h>
 #include <memory>
 #include <mutex>
-
-GpuFence::~GpuFence() = default;
+#include <thread>
 
 namespace {
 
+std::atomic<uint64_t> nextFenceInstanceId{1};
+
 class MetalGpuFence final : public GpuFence {
 public:
-    MetalGpuFence(id<MTLSharedEvent> event, id<MTLCommandQueue> queue)
-        : m_event([event retain]), m_queue([queue retain]) {
-        m_listener =
-            [[MTLSharedEventListener alloc] initWithDispatchQueue:dispatch_queue_create(
-                                                "net.openlivereplay.gpu.render-fence",
-                                                DISPATCH_QUEUE_SERIAL)];
+    MetalGpuFence(id<MTLSharedEvent> event, id<MTLCommandQueue> queue, uint64_t authorityEpoch)
+        : GpuFence(gpuMetalDeviceDomainId((__bridge void*)queue.device), authorityEpoch),
+          m_event([event retain]), m_device([queue.device retain]), m_queue([queue retain]) {
+        m_listener = [[MTLSharedEventListener alloc]
+            initWithDispatchQueue:dispatch_queue_create("net.openlivereplay.gpu.render-fence",
+                                                        DISPATCH_QUEUE_SERIAL)];
     }
 
     ~MetalGpuFence() override {
         [m_listener release];
         [m_queue release];
+        [m_device release];
         [m_event release];
         m_listener = nil;
         m_queue = nil;
+        m_device = nil;
         m_event = nil;
     }
 
@@ -51,6 +56,16 @@ public:
         if (value == 0) return true;
         if (!m_event || !m_listener) return false;
         if (completedValue() >= value) return true;
+        if (timeoutMs == 0) return m_event.signaledValue >= value;
+        if (timeoutMs > 0) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (m_event.signaledValue >= value) return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return m_event.signaledValue >= value;
+        }
 
         struct WaitState {
             std::mutex mutex;
@@ -68,12 +83,8 @@ public:
 
         std::unique_lock<std::mutex> lock(state->mutex);
         if (m_event.signaledValue >= value) return true;
-        if (timeoutMs < 0) {
-            state->cv.wait(lock, [&] { return state->done; });
-            return true;
-        }
-        return state->cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                                  [&] { return state->done; });
+        state->cv.wait(lock, [&] { return state->done; });
+        return true;
     }
 
     uint64_t completedValue() const override {
@@ -82,6 +93,7 @@ public:
 
 private:
     id<MTLSharedEvent> m_event = nil;
+    id<MTLDevice> m_device = nil;
     id<MTLCommandQueue> m_queue = nil;
     MTLSharedEventListener* m_listener = nil;
     std::mutex m_signalMutex;
@@ -90,9 +102,33 @@ private:
 
 } // namespace
 
-std::shared_ptr<GpuFence> makeMetalGpuFence(void* metalCommandQueue) {
+GpuFence::GpuFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+    : m_identity{gpuSubmissionDetail::takeMonotonicInstanceId(nextFenceInstanceId), deviceDomainId,
+                 authorityEpoch != 0
+                     ? authorityEpoch
+                     : GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()},
+      m_ticketAuthorityKey(makeTicketAuthorityKey(m_identity, this)) {}
+
+GpuFence::~GpuFence() = default;
+
+uint64_t GpuFence::currentGpuGeneration() noexcept {
+    return GpuGenerationCounter::instance().current();
+}
+
+bool GpuFence::validatesRetirement(const GpuRetirementTicket& ticket,
+                                   const GpuSurfaceCompatibility& surface) const noexcept {
+    return validatesIssuedRetirement(ticket, surface) &&
+           ticket.m_gpuGeneration == currentGpuGeneration();
+}
+
+uintptr_t gpuMetalDeviceDomainId(void* metalDevice) {
+    id<MTLDevice> device = static_cast<id<MTLDevice>>(metalDevice);
+    return device ? static_cast<uintptr_t>(device.registryID) : 0;
+}
+
+std::shared_ptr<GpuFence> makeMetalGpuFence(void* metalCommandQueue, uint64_t authorityEpoch) {
     id<MTLCommandQueue> queue = static_cast<id<MTLCommandQueue>>(metalCommandQueue);
-    if (!queue) return nullptr;
+    if (!queue || authorityEpoch == 0) return nullptr;
 
     id<MTLDevice> device = queue.device;
     if (!device) return nullptr;
@@ -100,21 +136,28 @@ std::shared_ptr<GpuFence> makeMetalGpuFence(void* metalCommandQueue) {
     id<MTLSharedEvent> event = [device newSharedEvent];
     if (!event) return nullptr;
 
-    auto fence = std::make_shared<MetalGpuFence>(event, queue);
+    auto fence = std::make_shared<MetalGpuFence>(event, queue, authorityEpoch);
     [event release];
     return fence;
 }
 
 std::shared_ptr<GpuFence> GpuFence::create() {
+    GpuDeviceLossMonitor& monitor = GpuDeviceLossMonitor::instance();
+    const uint64_t authorityEpoch = monitor.currentDeviceAuthorityEpoch();
+    if (authorityEpoch == 0) return nullptr;
+
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return nullptr;
 
     id<MTLCommandQueue> queue = [device newCommandQueue];
     [device release];
-    if (!queue) {
+    if (!queue) return nullptr;
+    if (!monitor.isCurrentDeviceAuthority(authorityEpoch)) {
+        [queue release];
         return nullptr;
     }
-    auto fence = makeMetalGpuFence(queue);
+
+    auto fence = makeMetalGpuFence(queue, authorityEpoch);
     [queue release];
     return fence;
 }

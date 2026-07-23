@@ -33,14 +33,23 @@ bool hasRows(const QByteArray& plane, int stride, int rows, int bytesPerRow) {
     return plane.size() >= lastByte;
 }
 
-std::shared_ptr<GpuSurface> aliasGpuNv12Surface(const FrameHandle& frame) {
+bool hasExactCompatibility(GpuSurfaceCompatibility compatibility) {
+    return compatibility.deviceDomainId != 0 && compatibility.authorityEpoch != 0;
+}
+
+std::shared_ptr<GpuSurface> aliasGpuNv12Surface(const FrameHandle& frame,
+                                                GpuSurfaceCompatibility compatibility) {
     if (!frame.isGpuBacked()) return nullptr;
     auto* data = dynamic_cast<const GpuFrameData*>(frame.data());
     if (!data || data->nativeFormat() != FramePixelFormat::Nv12) return nullptr;
-    if (!data->waitForPendingFence(kInputAliasFenceTimeoutMs)) return nullptr;
 
     auto surface = data->surfacePtr();
     if (!surface || !surface->isValid()) return nullptr;
+    const GpuSurfaceCompatibility actual = surface->compatibility();
+    if (actual.deviceDomainId != compatibility.deviceDomainId ||
+        actual.authorityEpoch != compatibility.authorityEpoch)
+        return nullptr;
+    if (!data->waitForPendingFence(kInputAliasFenceTimeoutMs)) return nullptr;
     const GpuSurfaceDesc desc = surface->desc();
     if (desc.format != FramePixelFormat::Nv12 || desc.width <= 0 || desc.height <= 0) {
         return nullptr;
@@ -103,14 +112,16 @@ bool copyNv12ToPixelBuffer(const CpuPlanes& nv12, CVPixelBufferRef pb) {
     return ok;
 }
 
-std::shared_ptr<GpuSurface> uploadFrameToNv12Surface(const FrameHandle& frame) {
-    if (auto aliased = aliasGpuNv12Surface(frame)) return aliased;
+std::shared_ptr<GpuSurface> uploadFrameToNv12Surface(const FrameHandle& frame,
+                                                     GpuSurfaceCompatibility compatibility) {
+    if (!hasExactCompatibility(compatibility)) return nullptr;
+    if (auto aliased = aliasGpuNv12Surface(frame, compatibility)) return aliased;
     if (frame.isGpuBacked()) return nullptr;
 
     const CpuPlanes nv12 = readFrameAsNv12(frame);
     if (!nv12.isValid() || nv12.format != FramePixelFormat::Nv12) return nullptr;
 
-    auto surface = makeAppleNv12Surface(nv12.width, nv12.height);
+    auto surface = makeAppleNv12Surface(nv12.width, nv12.height, compatibility);
     if (!surface || !surface->isValid()) return nullptr;
 
     CVPixelBufferRef pb = retainApplePixelBufferWrapper(surface);
@@ -181,7 +192,7 @@ private:
     CVMetalTextureRef m_chroma = nullptr;
 };
 
-CVPixelBufferRef makePixelBufferWrapper(const std::shared_ptr<GpuSurface>& surface) {
+CVPixelBufferRef makePixelBufferWrapper(const GpuScopedNativeSurface& surface) {
     return retainApplePixelBufferWrapper(surface);
 }
 
@@ -211,12 +222,20 @@ CFDictionaryRef makeMetalTextureAttributes(MTLTextureUsage usage) {
     return attrs;
 }
 
-std::shared_ptr<GpuSurface> makeInputNv12Surface(const FrameHandle& frame) {
-    return uploadFrameToNv12Surface(frame);
+std::shared_ptr<GpuSurface> makeInputNv12Surface(const FrameHandle& frame,
+                                                 const std::shared_ptr<GpuRhiContext>& rhi) {
+    if (!rhi) return nullptr;
+    const GpuSurfaceCompatibility compatibility = rhi->surfaceCompatibility();
+    if (compatibility.deviceDomainId == 0 || compatibility.authorityEpoch == 0) return nullptr;
+    return uploadFrameToNv12Surface(frame, compatibility);
 }
 
-std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int width, int height) {
-    return makeAppleRgba8Surface(width, height);
+std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int width, int height,
+                                                   const std::shared_ptr<GpuRhiContext>& rhi) {
+    if (!rhi) return nullptr;
+    const GpuSurfaceCompatibility compatibility = rhi->surfaceCompatibility();
+    if (compatibility.deviceDomainId == 0 || compatibility.authorityEpoch == 0) return nullptr;
+    return makeAppleRgba8Surface(width, height, compatibility);
 }
 
 bool supportsNativeOutputSurfaces() {
@@ -224,9 +243,9 @@ bool supportsNativeOutputSurfaces() {
 }
 
 std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi* rhi,
-                                                     const std::shared_ptr<GpuSurface>& surface) {
-    if (!rhi || !surface || !surface->isValid()) return nullptr;
-    const GpuSurfaceDesc desc = surface->desc();
+                                                     const GpuScopedNativeSurface& surface) {
+    if (!rhi || !surface.valid()) return nullptr;
+    const GpuSurfaceDesc desc = surface.desc();
     if (desc.format != FramePixelFormat::Nv12 || desc.width <= 0 || desc.height <= 0) {
         return nullptr;
     }
@@ -277,9 +296,9 @@ std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi* rhi,
 }
 
 std::unique_ptr<ImportedRgbaRenderTarget>
-importRgbaRenderTarget(QRhi* rhi, const std::shared_ptr<GpuSurface>& surface) {
-    if (!rhi || !surface || !surface->isValid()) return nullptr;
-    const GpuSurfaceDesc desc = surface->desc();
+importRgbaRenderTarget(QRhi* rhi, const GpuScopedNativeSurface& surface) {
+    if (!rhi || !surface.valid()) return nullptr;
+    const GpuSurfaceDesc desc = surface.desc();
     if (desc.format != FramePixelFormat::Rgba8 || desc.width <= 0 || desc.height <= 0) {
         return nullptr;
     }
@@ -322,7 +341,7 @@ std::shared_ptr<GpuSurface>
 GpuCompositor::uploadFrameToNv12SurfaceForTest(const FrameHandle& frame,
                                                const std::shared_ptr<GpuRhiContext>& rhi) {
     if (!rhi || !rhi->isValid()) return nullptr;
-    return uploadFrameToNv12Surface(frame);
+    return uploadFrameToNv12Surface(frame, rhi->surfaceCompatibility());
 }
 
 #endif // __APPLE__
