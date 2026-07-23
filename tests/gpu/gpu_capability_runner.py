@@ -4797,6 +4797,19 @@ class GenerationReactor:
                             )
                         permit = self.native_lifecycle.permit_compiler(event)
                         self._send_command(state, permit)
+                    if isinstance(
+                        event,
+                        (
+                            MacOSWorkerSessionReported,
+                            WorkerFailure,
+                            WorkerStopped,
+                        ),
+                    ):
+                        # These events can race with an immediate worker exit.
+                        # Dispatch them before sampling the registered native
+                        # process group so a queued bounded failure diagnostic
+                        # or normal stop cannot be masked by a missing leader.
+                        return state, event
                     if isinstance(event, WorkerPayloadReady):
                         if state.pending is None:
                             raise AuditInfrastructureError(

@@ -11186,6 +11186,138 @@ class ProcessCoordinatorTests(unittest.TestCase):
             first.close()
             second.close()
 
+    def test_worker_failure_preempts_native_lifecycle_sampling(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        failure = capability_model.WorkerFailure(
+            0,
+            1,
+            None,
+            "worker bootstrap diagnostic",
+        )
+        receiver = mock.Mock()
+        receiver.poll.return_value = True
+        receiver.receive_bytes_before.return_value = (
+            capability_runner.encode_control_message(failure)
+        )
+        state = SimpleNamespace(
+            worker_index=0,
+            generation=1,
+            event_receiver=receiver,
+            process=mock.Mock(pid=1234),
+            pending=None,
+            contained=True,
+        )
+        reactor.runtime_contract = SimpleNamespace(
+            pipeline_deadline=time.monotonic() + 10.0
+        )
+        reactor.states = [state]
+        reactor.native_lifecycle = mock.Mock()
+        reactor.cancel_event = threading.Event()
+        reactor._sample_owned_forest = mock.Mock(
+            side_effect=AuditInfrastructureError(
+                "native lifecycle masked worker failure"
+            )
+        )
+
+        observed_state, observed_event = reactor._next_event_raw()
+
+        self.assertIs(observed_state, state)
+        self.assertEqual(observed_event, failure)
+        reactor._sample_owned_forest.assert_not_called()
+
+    def test_macos_session_then_failure_preempts_lifecycle_sampling(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        session = capability_model.MacOSWorkerSessionReported(
+            0,
+            1,
+            1234,
+            1234,
+            "1:2",
+        )
+        failure = capability_model.WorkerFailure(
+            0,
+            1,
+            None,
+            "worker bootstrap diagnostic",
+        )
+        receiver = mock.Mock()
+        receiver.poll.return_value = True
+        receiver.receive_bytes_before.side_effect = (
+            capability_runner.encode_control_message(session),
+            capability_runner.encode_control_message(failure),
+        )
+        state = SimpleNamespace(
+            worker_index=0,
+            generation=1,
+            event_receiver=receiver,
+            process=mock.Mock(pid=1234),
+            pending=None,
+            contained=False,
+        )
+        reactor.runtime_contract = SimpleNamespace(
+            pipeline_deadline=time.monotonic() + 10.0
+        )
+        reactor.states = [state]
+        reactor.native_lifecycle = object.__new__(
+            capability_runner._MacOSGenerationLifecycle
+        )
+        reactor.cancel_event = threading.Event()
+        reactor._sample_owned_forest = mock.Mock(
+            side_effect=AuditInfrastructureError(
+                "native lifecycle masked worker failure"
+            )
+        )
+
+        with mock.patch.object(
+            capability_runner._MacOSGenerationLifecycle,
+            "accept_worker_session",
+        ) as accept_session:
+            first_state, first_event = reactor._next_event_raw()
+            second_state, second_event = reactor._next_event_raw()
+
+        self.assertIs(first_state, state)
+        self.assertEqual(first_event, session)
+        self.assertIs(second_state, state)
+        self.assertEqual(second_event, failure)
+        accept_session.assert_called_once_with(session)
+        self.assertTrue(state.contained)
+        self.assertTrue(state.native_generation_acquired)
+        reactor._sample_owned_forest.assert_not_called()
+
+    def test_worker_stopped_preempts_native_lifecycle_sampling(self):
+        reactor = object.__new__(capability_runner.GenerationReactor)
+        stopped = capability_model.WorkerStopped(0, 1)
+        receiver = mock.Mock()
+        receiver.poll.return_value = True
+        receiver.receive_bytes_before.return_value = (
+            capability_runner.encode_control_message(stopped)
+        )
+        state = SimpleNamespace(
+            worker_index=0,
+            generation=1,
+            event_receiver=receiver,
+            process=mock.Mock(pid=1234),
+            pending=None,
+            contained=True,
+        )
+        reactor.runtime_contract = SimpleNamespace(
+            pipeline_deadline=time.monotonic() + 10.0
+        )
+        reactor.states = [state]
+        reactor.native_lifecycle = mock.Mock()
+        reactor.cancel_event = threading.Event()
+        reactor._sample_owned_forest = mock.Mock(
+            side_effect=AuditInfrastructureError(
+                "native lifecycle masked worker stop"
+            )
+        )
+
+        observed_state, observed_event = reactor._next_event_raw()
+
+        self.assertIs(observed_state, state)
+        self.assertEqual(observed_event, stopped)
+        reactor._sample_owned_forest.assert_not_called()
+
     @unittest.skipIf(os.name == "nt", "POSIX descriptor transfer")
     def test_posix_capability_socketpair_transfers_multiple_chunks(self):
         paths = []
