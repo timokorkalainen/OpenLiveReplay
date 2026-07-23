@@ -45,11 +45,14 @@
 #endif
 #include <cmath>
 #include <chrono>
+#include <array>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -114,6 +117,305 @@ constexpr qint64 kPressurePollMs = 250;
 constexpr qint64 kMintedBytesPressureSample = 64 * kMiB;
 constexpr qint64 kSecondWarningLatchMs = 10000;
 constexpr qint64 kMaxSaneAvailableMemoryBytes = 256 * kGiB;
+constexpr size_t kTerminalGpuQuarantineSlots = 256;
+constexpr size_t kTerminalGpuClearsPerReap = 1;
+#ifdef _WIN32
+constexpr int kTerminalImportPollTimeoutMs = 10;
+#endif
+#ifdef _WIN32
+constexpr size_t kTerminalGpuBackendsPerSlot = 2;
+#else
+constexpr size_t kTerminalGpuBackendsPerSlot = 1;
+#endif
+
+struct TerminalGpuOwnerQuarantineSlot {
+    std::unique_ptr<OutputFrameCache> output{};
+    std::unique_ptr<OutputFrameCache> staging{};
+    std::unique_ptr<OutputFrameCache> preroll{};
+    std::shared_ptr<const OutputFrameCache> published{};
+    GpuFrameRetireQueue retirements{};
+    std::shared_ptr<GpuRhiContext> rhiRoot{};
+#ifdef _WIN32
+    std::shared_ptr<WinGpuImportEdge> importRoot{};
+#endif
+    uint64_t recoveryParticipantId = 0;
+    bool occupied = false;
+};
+
+struct TerminalGpuReleasedRoots {
+    std::shared_ptr<GpuRhiContext> rhiRoot{};
+#ifdef _WIN32
+    std::shared_ptr<WinGpuImportEdge> importRoot{};
+#endif
+};
+
+struct TerminalGpuBackendPoll {
+    std::shared_ptr<GpuRhiContext> rhiRoot{};
+#ifdef _WIN32
+    std::shared_ptr<WinGpuImportEdge> importRoot{};
+#endif
+};
+
+struct alignas(TerminalGpuOwnerQuarantineSlot) TerminalGpuOwnerQuarantineStorage {
+    unsigned char bytes[sizeof(TerminalGpuOwnerQuarantineSlot)];
+};
+static_assert(std::is_trivially_destructible_v<TerminalGpuOwnerQuarantineStorage>);
+
+std::mutex& terminalGpuQuarantineMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+TerminalGpuOwnerQuarantineSlot& terminalGpuQuarantineSlot(size_t index) noexcept {
+    // Deliberately keep only trivial storage in static lifetime. Quarantined
+    // owners must never be destroyed by C++ static teardown after GPU roots.
+    static std::array<TerminalGpuOwnerQuarantineStorage, kTerminalGpuQuarantineSlots> storage;
+    static bool initialized = false;
+    if (!initialized) {
+        for (TerminalGpuOwnerQuarantineStorage& entry : storage)
+            ::new (static_cast<void*>(entry.bytes)) TerminalGpuOwnerQuarantineSlot;
+        initialized = true;
+    }
+    return *std::launder(reinterpret_cast<TerminalGpuOwnerQuarantineSlot*>(storage[index].bytes));
+}
+
+std::atomic<size_t>& terminalGpuQuarantineOccupiedCount() noexcept {
+    static std::atomic<size_t> count{0};
+    return count;
+}
+
+size_t& terminalGpuQuarantinePollCursor() noexcept {
+    static size_t cursor = 0;
+    return cursor;
+}
+
+size_t& terminalGpuQuarantineClearCursor() noexcept {
+    static size_t cursor = 0;
+    return cursor;
+}
+
+bool terminalFrameRetired(const FrameHandle& frame, uint64_t terminalParticipantId = 0) noexcept {
+    if (!frame.isGpuBacked() || !frame.data()) return true;
+    try {
+        if (GpuSurface* surface = frame.data()->gpuSurface(); surface) {
+            auto& monitor = GpuDeviceLossMonitor::instance();
+            const GpuSurfaceCompatibility compatibility = surface->compatibility();
+            if ((terminalParticipantId != 0 &&
+                 monitor.authorizesTerminalDeadDomain(terminalParticipantId, compatibility)) ||
+                monitor.authorizesCurrentDeadDomain(compatibility))
+                return true;
+        }
+        const GpuFrameSynchronization synchronization = frame.data()->gpuSynchronization();
+        return synchronization.isExact() &&
+               (synchronization.value == 0 ||
+                (synchronization.fence && synchronization.fence->wait(synchronization.value, 0)));
+    } catch (...) {
+        // Teardown reaping is opportunistic and must not allocate or log.
+        (void) 0;
+        return false;
+    }
+}
+
+bool terminalSlotRetired(const TerminalGpuOwnerQuarantineSlot& slot) noexcept {
+    bool retired = true;
+    auto inspect = [&](const FrameHandle& frame) noexcept {
+        if (!terminalFrameRetired(frame, slot.recoveryParticipantId)) retired = false;
+    };
+    if (slot.output) slot.output->forEachVideoFrame(inspect);
+    if (slot.staging) slot.staging->forEachVideoFrame(inspect);
+    if (slot.preroll) slot.preroll->forEachVideoFrame(inspect);
+    if (slot.published) slot.published->forEachVideoFrame(inspect);
+    slot.retirements.forEachFrame(inspect);
+    return retired;
+}
+
+bool clearTerminalSlot(TerminalGpuOwnerQuarantineSlot& slot,
+                       TerminalGpuReleasedRoots& releasedRoots) noexcept {
+    // Release all native frame owners first, while both backend roots and the
+    // exact recovery participant still preserve the proof used to retire them.
+    slot.output.reset();
+    slot.staging.reset();
+    slot.preroll.reset();
+    slot.published.reset();
+    {
+        GpuFrameRetireQueue retiring;
+        slot.retirements.swap(retiring);
+    }
+
+    if (slot.recoveryParticipantId != 0 &&
+        !GpuDeviceLossMonitor::instance().unregisterTerminalRecoveryParticipant(
+            slot.recoveryParticipantId)) {
+        // Cleanup raced a newer proof revision. Keep the roots and participant
+        // in this occupied slot and retry terminal unregister on the next reap.
+        return false;
+    }
+    slot.recoveryParticipantId = 0;
+    releasedRoots.rhiRoot = std::move(slot.rhiRoot);
+#ifdef _WIN32
+    releasedRoots.importRoot = std::move(slot.importRoot);
+#endif
+    slot.occupied = false;
+    terminalGpuQuarantineOccupiedCount().fetch_sub(1, std::memory_order_acq_rel);
+    return true;
+}
+
+bool clearOneTerminalSlot(TerminalGpuReleasedRoots& releasedRoots) noexcept {
+    size_t& cursor = terminalGpuQuarantineClearCursor();
+    size_t selected = kTerminalGpuQuarantineSlots;
+    for (size_t offset = 0; offset < kTerminalGpuQuarantineSlots; ++offset) {
+        const size_t index = (cursor + offset) % kTerminalGpuQuarantineSlots;
+        if (terminalGpuQuarantineSlot(index).occupied) {
+            selected = index;
+            break;
+        }
+    }
+    if (selected == kTerminalGpuQuarantineSlots) return false;
+    cursor = (selected + 1) % kTerminalGpuQuarantineSlots;
+    TerminalGpuOwnerQuarantineSlot& slot = terminalGpuQuarantineSlot(selected);
+    if (!terminalSlotRetired(slot)) return false;
+    (void) clearTerminalSlot(slot, releasedRoots);
+    return true;
+}
+
+bool terminalBackendAvailable(const TerminalGpuOwnerQuarantineSlot& slot,
+                              size_t backendIndex) noexcept {
+    if (!slot.occupied) return false;
+    if (backendIndex == 0) return bool(slot.rhiRoot);
+#ifdef _WIN32
+    return backendIndex == 1 && bool(slot.importRoot);
+#else
+    return false;
+#endif
+}
+
+void pollTerminalSlotBackend(const TerminalGpuBackendPoll& poll) noexcept {
+    try {
+        if (poll.rhiRoot) {
+            (void) poll.rhiRoot->pollDeviceLoss();
+            return;
+        }
+#ifdef _WIN32
+        if (poll.importRoot)
+            (void) poll.importRoot->pollDeviceLossFor(kTerminalImportPollTimeoutMs);
+#endif
+    } catch (...) {
+        // A failed authoritative observation leaves the roots retained for retry.
+        static_cast<void>(0);
+    }
+}
+
+TerminalGpuBackendPoll selectOneTerminalBackend() noexcept {
+    TerminalGpuBackendPoll poll;
+    size_t& cursor = terminalGpuQuarantinePollCursor();
+    constexpr size_t kBackendPositions = kTerminalGpuQuarantineSlots * kTerminalGpuBackendsPerSlot;
+    size_t selected = kBackendPositions;
+    for (size_t offset = 0; offset < kBackendPositions; ++offset) {
+        const size_t position = (cursor + offset) % kBackendPositions;
+        const size_t slotIndex = position / kTerminalGpuBackendsPerSlot;
+        const size_t backendIndex = position % kTerminalGpuBackendsPerSlot;
+        if (terminalBackendAvailable(terminalGpuQuarantineSlot(slotIndex), backendIndex)) {
+            selected = position;
+            break;
+        }
+    }
+    if (selected == kBackendPositions) {
+        cursor = (cursor + 1) % kBackendPositions;
+        return poll;
+    }
+    cursor = (selected + 1) % kBackendPositions;
+    const size_t slotIndex = selected / kTerminalGpuBackendsPerSlot;
+    const size_t backendIndex = selected % kTerminalGpuBackendsPerSlot;
+    const TerminalGpuOwnerQuarantineSlot& slot = terminalGpuQuarantineSlot(slotIndex);
+    if (backendIndex == 0) poll.rhiRoot = slot.rhiRoot;
+#ifdef _WIN32
+    if (backendIndex == 1) poll.importRoot = slot.importRoot;
+#endif
+    return poll;
+}
+
+void reapTerminalGpuQuarantine() noexcept {
+    TerminalGpuReleasedRoots releasedRoots;
+    TerminalGpuBackendPoll poll;
+    try {
+        if (terminalGpuQuarantineOccupiedCount().load(std::memory_order_acquire) == 0) return;
+        {
+            std::lock_guard<std::mutex> lock(terminalGpuQuarantineMutex());
+
+            // Exact retirement checks remain cheap across all slots, but releasing a
+            // retained carrier can consume its teardown deadline. Bound those releases
+            // separately and rotate their cursor fairly.
+            if (kTerminalGpuClearsPerReap > 0) (void) clearOneTerminalSlot(releasedRoots);
+
+            // Snapshot one root while the slot is stable, then release the global
+            // quarantine lock before any driver call or backend destruction.
+            poll = selectOneTerminalBackend();
+        }
+        pollTerminalSlotBackend(poll);
+    } catch (...) {
+        // Reaping is opportunistic; retain the slot and retry on a later cold path.
+        (void) 0;
+    }
+}
+
+void quarantineTerminalGpuOwners(std::unique_ptr<OutputFrameCache> output,
+                                 std::unique_ptr<OutputFrameCache> staging,
+                                 std::unique_ptr<OutputFrameCache> preroll,
+                                 std::shared_ptr<const OutputFrameCache> published,
+                                 GpuFrameRetireQueue retirements,
+                                 std::shared_ptr<GpuRhiContext> rhiRoot,
+#ifdef _WIN32
+                                 std::unique_ptr<WinGpuImportEdge> importRoot,
+#endif
+                                 uint64_t recoveryParticipantId) noexcept {
+    TerminalGpuReleasedRoots releasedRoots;
+    TerminalGpuBackendPoll poll;
+    try {
+        // A terminal GPU owner without its original recovery participant could
+        // neither preserve a late exact proof nor clear the monitor safely.
+        if (!GpuDeviceLossMonitor::instance().promoteRecoveryParticipantToTerminal(
+                recoveryParticipantId))
+            std::terminate();
+        {
+            std::lock_guard<std::mutex> lock(terminalGpuQuarantineMutex());
+            (void) clearOneTerminalSlot(releasedRoots);
+            TerminalGpuOwnerQuarantineSlot* available = nullptr;
+            for (size_t index = 0; index < kTerminalGpuQuarantineSlots; ++index) {
+                TerminalGpuOwnerQuarantineSlot& slot = terminalGpuQuarantineSlot(index);
+                if (!slot.occupied && !available) available = &slot;
+            }
+            // Exhaustion means 256 exceptional teardowns still have live GPU work.
+            // Fail-stop rather than release an in-flight native resource.
+            if (!available) std::terminate();
+            available->output = std::move(output);
+            available->staging = std::move(staging);
+            available->preroll = std::move(preroll);
+            available->published = std::move(published);
+            available->retirements.swap(retirements);
+            available->rhiRoot = std::move(rhiRoot);
+#ifdef _WIN32
+            available->importRoot = std::move(importRoot);
+#endif
+            available->recoveryParticipantId = recoveryParticipantId;
+            available->occupied = true;
+            terminalGpuQuarantineOccupiedCount().fetch_add(1, std::memory_order_release);
+            poll = selectOneTerminalBackend();
+        }
+        pollTerminalSlotBackend(poll);
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+void restoreRetireQueueOrTerminate(GpuFrameRetireQueue& owner, GpuFrameRetireQueue& local,
+                                   QMutex& mutex) noexcept {
+    if (local.isEmpty()) return;
+    try {
+        QMutexLocker locker(&mutex);
+        owner.append(std::move(local));
+    } catch (...) {
+        std::terminate();
+    }
+}
 
 std::optional<FrameHandle> cachedCpuSnapshotForDeviceLoss(const FrameHandle& frame) {
     if (!frame.isGpuBacked()) return std::nullopt;
@@ -162,31 +464,100 @@ PlaybackWorker::PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackT
     m_audioPlayer = audioPlayer;
 }
 
-PlaybackWorker::~PlaybackWorker() {
-    stop();
-    shutdownOutputGraph();
+PlaybackWorker::~PlaybackWorker() noexcept {
+    try {
+        stop();
+    } catch (...) {
+        // Continue best-effort teardown without allocating or logging.
+        (void) 0;
+    }
+    shutdownOutputGraphTerminalHandoff();
+#ifdef OLR_GPU_PIPELINE_BUILD
+    // A normal shutdown can still leave a participant registered when coordinated
+    // cleanup was transiently rejected. After graph quiescence, fall back to the
+    // monitor's allocation-free terminal removal path.
+    if (m_gpuRecoveryParticipantId != 0) {
+        auto& lossMonitor = GpuDeviceLossMonitor::instance();
+        const bool unregistered =
+            lossMonitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId).has_value() ||
+            lossMonitor.unregisterTerminalRecoveryParticipant(m_gpuRecoveryParticipantId);
+        if (unregistered) {
+            m_gpuRecoveryParticipantId = 0;
+            m_gpuPendingRecoveryGeneration = 0;
+        }
+    }
+#endif
     for (auto* track : m_decoderBank) {
-        track->nativeDecoder.reset(); // Tear down VideoToolbox before freeing track
-        if (track->codecCtx) avcodec_free_context(&track->codecCtx);
-        delete track;
+        try {
+            track->nativeDecoder.reset(); // Tear down VideoToolbox before freeing track
+            if (track->codecCtx) avcodec_free_context(&track->codecCtx);
+            delete track;
+        } catch (...) {
+            // Continue best-effort teardown without allocating or logging.
+            (void) 0;
+        }
     }
     for (auto* aTrack : m_audioDecoderBank) {
-        if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
-        delete aTrack;
+        try {
+            if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
+            delete aTrack;
+        } catch (...) {
+            // Continue best-effort teardown without allocating or logging.
+            (void) 0;
+        }
     }
-    if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
+    try {
+        if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
+    } catch (...) {
+        // Continue best-effort teardown without allocating or logging.
+        (void) 0;
+    }
     // Tier3 pre-roll: run()'s cleanup clears these on a clean exit; defensively
     // free here too in case the thread never ran (the QVectors are then empty).
     for (auto* track : m_prerollBank) {
-        track->nativeDecoder.reset(); // tear down VT/MF session before freeing track
-        if (track->codecCtx) avcodec_free_context(&track->codecCtx);
-        delete track;
+        try {
+            track->nativeDecoder.reset(); // tear down VT/MF session before freeing track
+            if (track->codecCtx) avcodec_free_context(&track->codecCtx);
+            delete track;
+        } catch (...) {
+            // Continue best-effort teardown without allocating or logging.
+            (void) 0;
+        }
     }
     for (auto* aTrack : m_prerollAudioBank) {
-        if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
-        delete aTrack;
+        try {
+            if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
+            delete aTrack;
+        } catch (...) {
+            // Continue best-effort teardown without allocating or logging.
+            (void) 0;
+        }
     }
-    if (m_prerollFmtCtx) avformat_close_input(&m_prerollFmtCtx);
+    try {
+        if (m_prerollFmtCtx) avformat_close_input(&m_prerollFmtCtx);
+    } catch (...) {
+        // Continue best-effort teardown without allocating or logging.
+        (void) 0;
+    }
+}
+
+void PlaybackWorker::shutdownOutputGraphTerminalHandoff() noexcept {
+    try {
+        shutdownOutputGraph();
+        return;
+    } catch (...) {
+#ifdef OLR_GPU_PIPELINE_BUILD
+        // Cache snapshots in normal teardown may allocate. The worker and output
+        // runtime are already quiescent here, so release every terminal graph
+        // owner without allocating while the GPU roots are still alive.
+        shutdownGpuOwnersAfterFailure();
+        m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
+                                 std::memory_order_release);
+#endif
+    }
+#ifdef OLR_UNIT_TEST
+    if (m_gpuTerminalShutdownCompletedForTest) m_gpuTerminalShutdownCompletedForTest->release();
+#endif
 }
 
 void PlaybackWorker::openFile(const QString& filePath) {
@@ -1609,8 +1980,8 @@ void PlaybackWorker::drainGpuDeviceLossEvents() const {
     if (observed < previous) m_gpuLastObservedLossCount.store(observed, std::memory_order_release);
 }
 
-void PlaybackWorker::cleanupGpuRetirementsForDeviceLoss(bool allowTokenlessTestGate,
-                                                        bool pollBackends) {
+GpuValidatedLossResult
+PlaybackWorker::cleanupGpuRetirementsForDeviceLoss(bool allowTokenlessTestGate, bool pollBackends) {
     constexpr int kDeviceLossReadbackDrainMs = 100;
     if (pollBackends) {
         const auto gpuRhi = std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire);
@@ -1636,11 +2007,13 @@ void PlaybackWorker::cleanupGpuRetirementsForDeviceLoss(bool allowTokenlessTestG
         (void) allowTokenlessTestGate;
 #endif
         recovery = lossMonitor.withCoordinatedTokenlessRecovery([&]() { return qsizetype(0); });
+        if (recovery.status == GpuValidatedLossStatus::Completed)
+            registry.drainWithBoundedWait(kDeviceLossReadbackDrainMs);
     }
-    registry.drainWithBoundedWait(kDeviceLossReadbackDrainMs);
 #ifdef OLR_UNIT_TEST
     m_gpuLastAbandonedRetainsForTest.store(recovery.abandoned, std::memory_order_release);
 #endif
+    return recovery;
 }
 
 bool PlaybackWorker::completeCoordinatedGpuRebuild(bool consumeRebuildBudget) {
@@ -1711,6 +2084,20 @@ void PlaybackWorker::sanitizeTrackBufferForDeviceLossLocked(TrackBuffer* buffer,
 
 void PlaybackWorker::handleGpuDeviceLoss() {
     auto& lossMonitor = GpuDeviceLossMonitor::instance();
+    auto releaseDeadGpuSpine = [this]() {
+        m_decodeFence.reset();
+        std::atomic_store_explicit(&m_renderFence, std::shared_ptr<GpuFence>{},
+                                   std::memory_order_release);
+        std::atomic_store_explicit(&m_stagingFence, std::shared_ptr<GpuFence>{},
+                                   std::memory_order_release);
+        m_stagedFenceValue.store(0, std::memory_order_release);
+        std::atomic_store_explicit(&m_gpuRhi, std::shared_ptr<GpuRhiContext>{},
+                                   std::memory_order_release);
+#ifdef _WIN32
+        m_winGpuImportEdge.reset();
+        m_winGpuImportTried = false;
+#endif
+    };
     const uint64_t pendingGeneration = lossMonitor.currentLossGeneration();
     if (pendingGeneration != 0 && pendingGeneration == m_gpuLastHandledLossGeneration) return;
     const GpuPipelineState state = gpuPipelineState();
@@ -1735,6 +2122,15 @@ void PlaybackWorker::handleGpuDeviceLoss() {
                                            pendingGeneration != m_gpuPendingRecoveryGeneration &&
                                            pendingGeneration != m_gpuLastHandledLossGeneration;
         if (!newerLossNeedsCleanup) {
+            if (pendingGeneration != 0 && pendingGeneration == m_gpuPendingRecoveryGeneration) {
+                const GpuValidatedLossResult cleanup = cleanupGpuRetirementsForDeviceLoss(true);
+                if (cleanup.status == GpuValidatedLossStatus::Rejected) return;
+                handoffGpuRetirementSurvivors();
+                releaseDeadGpuSpine();
+                if (!lossMonitor.acknowledgeRecoveryCleanup(m_gpuRecoveryParticipantId,
+                                                            pendingGeneration))
+                    return;
+            }
             if (m_gpuRebuildDeferredForSuspend.load(std::memory_order_acquire) &&
                 !gpuLifecycleSuspended()) {
                 resumeDeferredGpuRebuild();
@@ -1782,7 +2178,6 @@ void PlaybackWorker::handleGpuDeviceLoss() {
         sanitizeCacheForDeviceLossLocked(m_stagingCache.get(), &recoveredFrames, &removedGpuFrames);
         sanitizeCacheForDeviceLossLocked(m_prerollStagingCache.get(), &recoveredFrames,
                                          &removedGpuFrames);
-        m_gpuFrameRetireQueue = GpuFrameRetireQueue();
         const qint64 playhead = m_transport
                                     ? m_transport->currentPos()
                                     : m_lastVisiblePlayheadMs.load(std::memory_order_acquire);
@@ -1801,6 +2196,7 @@ void PlaybackWorker::handleGpuDeviceLoss() {
         recoveryCommit = commitOutputStateLocked(commit);
     }
     drainGpuDeviceLossEvents();
+    m_gpuPendingRecoveryGeneration = lossGeneration;
 
     // Release the surfaces held for readback. Previously the readback retainer was
     // left untouched on device loss, so every held surface plus its now-dead fence
@@ -1811,25 +2207,14 @@ void PlaybackWorker::handleGpuDeviceLoss() {
     // a bounded per-fence wait — safe because the live Null/WARP device's fences do
     // advance. LOCK RULE: the readback retainer has its own leaf mutex; this takes
     // no m_bufferMutex, matching the fence resets below.
-    cleanupGpuRetirementsForDeviceLoss(true);
+    const GpuValidatedLossResult cleanup = cleanupGpuRetirementsForDeviceLoss(true);
+    if (cleanup.status == GpuValidatedLossStatus::Rejected) return;
+    handoffGpuRetirementSurvivors();
 
     // LOCK RULE: this method is entered from the worker decode thread with no
     // m_bufferMutex held. Do not wait old fences here; a removed device may never
     // advance its timeline.
-    m_decodeFence.reset();
-    std::atomic_store_explicit(&m_renderFence, std::shared_ptr<GpuFence>{},
-                               std::memory_order_release);
-    std::atomic_store_explicit(&m_stagingFence, std::shared_ptr<GpuFence>{},
-                               std::memory_order_release);
-    m_stagedFenceValue.store(0, std::memory_order_release);
-    std::atomic_store_explicit(&m_gpuRhi, std::shared_ptr<GpuRhiContext>{},
-                               std::memory_order_release);
-#ifdef _WIN32
-    m_winGpuImportEdge.reset();
-    m_winGpuImportTried = false;
-#endif
-
-    m_gpuPendingRecoveryGeneration = lossGeneration;
+    releaseDeadGpuSpine();
     if (!lossMonitor.acknowledgeRecoveryCleanup(m_gpuRecoveryParticipantId, lossGeneration)) return;
 
     m_forceLiveOutputSnapshotsOnNextAttach.store(true, std::memory_order_release);
@@ -1864,18 +2249,43 @@ void PlaybackWorker::handleGpuDeviceLoss() {
     }
 }
 
+void PlaybackWorker::retryGpuRecoveryParticipantTeardown() {
+    if (gpuPipelineState() != GpuPipelineState::CpuFallback || m_gpuRecoveryParticipantId == 0 ||
+        m_gpuPendingRecoveryGeneration == 0) {
+        return;
+    }
+
+    const std::optional<qsizetype> cleanup =
+        GpuDeviceLossMonitor::instance().unregisterRecoveryParticipant(m_gpuRecoveryParticipantId);
+    if (!cleanup) return;
+#ifdef OLR_UNIT_TEST
+    m_gpuLastAbandonedRetainsForTest.store(*cleanup, std::memory_order_release);
+#endif
+    m_gpuRecoveryParticipantId = 0;
+    m_gpuPendingRecoveryGeneration = 0;
+}
+
 void PlaybackWorker::sampleGpuMemoryPressure(qint64 nowMs) {
-    if (!gpuPipelineEnabled()) return;
-    if (gpuPipelineState() != GpuPipelineState::Gpu) return;
-    if (gpuLifecycleSuspended()) return;
-    if (m_memoryPressureLatched.load(std::memory_order_acquire)) return;
+    const bool timeToPoll = nowMs - m_lastPressureSampleMs >= kPressurePollMs;
+    if (timeToPoll && terminalGpuQuarantineOccupiedCount().load(std::memory_order_acquire) > 0) {
+        reapTerminalGpuQuarantine();
+    }
+    if (!gpuPipelineEnabled()) {
+        if (timeToPoll) m_lastPressureSampleMs = nowMs;
+        return;
+    }
+    retryGpuRecoveryParticipantTeardown();
+    if (gpuPipelineState() != GpuPipelineState::Gpu || gpuLifecycleSuspended() ||
+        m_memoryPressureLatched.load(std::memory_order_acquire)) {
+        if (timeToPoll) m_lastPressureSampleMs = nowMs;
+        return;
+    }
 
     const IosGpuLifecycleSink* sink = iosGpuLifecycleSink();
     const uint64_t warningCount = sink ? sink->memoryWarningCount() : 0;
     const bool memoryWarning = warningCount != m_lastIosMemoryWarningCount;
     if (memoryWarning) m_lastIosMemoryWarningCount = warningCount;
 
-    const bool timeToPoll = nowMs - m_lastPressureSampleMs >= kPressurePollMs;
     const bool mintedBurst =
         GpuBudget::instance().mintedBytesSinceLastSample() >= kMintedBytesPressureSample;
     if (!memoryWarning && !timeToPoll && !mintedBurst) return;
@@ -2092,7 +2502,6 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
         sanitizeCacheForDeviceLossLocked(m_stagingCache.get(), &recoveredFrames, &removedGpuFrames);
         sanitizeCacheForDeviceLossLocked(m_prerollStagingCache.get(), &recoveredFrames,
                                          &removedGpuFrames);
-        m_gpuFrameRetireQueue = GpuFrameRetireQueue();
 
         const qint64 playhead = m_transport
                                     ? m_transport->currentPos()
@@ -2112,6 +2521,7 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
         recoveryCommit = commitOutputStateLocked(commit);
     }
 
+    handoffGpuRetirementSurvivors();
     m_decodeFence.reset();
     std::atomic_store_explicit(&m_renderFence, std::shared_ptr<GpuFence>{},
                                std::memory_order_release);
@@ -2142,9 +2552,14 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
             m_gpuLastAbandonedRetainsForTest.store(*cleanup, std::memory_order_release);
 #endif
             m_gpuRecoveryParticipantId = 0;
+            m_gpuPendingRecoveryGeneration = 0;
+        } else {
+            m_gpuPendingRecoveryGeneration =
+                GpuDeviceLossMonitor::instance().currentLossGeneration();
         }
+    } else {
+        m_gpuPendingRecoveryGeneration = 0;
     }
-    m_gpuPendingRecoveryGeneration = 0;
     m_gpuRebuildDeferredForSuspend.store(false, std::memory_order_release);
 }
 
@@ -2349,6 +2764,11 @@ bool PlaybackWorker::allowNativeGpuDecodeForCurrentPacket(int64_t packetPtsMs) {
 
 void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height) {
     shutdownOutputGraph();
+#ifdef OLR_GPU_PIPELINE_BUILD
+    // Graph lifecycle is a cold path and a natural opportunity to release any
+    // process-wide exceptional-teardown quarantine whose fences have since retired.
+    reapTerminalGpuQuarantine();
+#endif
     {
         QMutexLocker locker(&m_mutex);
         m_outputFeedCount = qMax(0, feedCount);
@@ -2386,22 +2806,32 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     m_stagedFenceValue.store(0, std::memory_order_release);
     if (gpuPipelineEnabled()) {
         auto& lossMonitor = GpuDeviceLossMonitor::instance();
-        const GpuRecoveryRegistration registration =
-            lossMonitor.registerRecoveryParticipantSnapshot(false);
-        m_gpuRecoveryParticipantId = registration.participantId();
-        graphGeneration = GpuGenerationCounter::instance().current();
-        if (registration.lossGeneration() != 0) {
-            m_gpuPendingRecoveryGeneration = registration.lossGeneration();
-            m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::RebuildPending),
-                                     std::memory_order_release);
-            if (gpuLifecycleSuspended()) {
-                m_gpuRebuildDeferredForSuspend.store(true, std::memory_order_release);
-            } else {
-                (void) completeCoordinatedGpuRebuild(false);
-            }
-        } else if (m_gpuRecoveryParticipantId != 0 && !rebuildGpuSpine()) {
-            if (lossMonitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId))
+        if (m_gpuRecoveryParticipantId != 0) {
+            if (lossMonitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId)) {
                 m_gpuRecoveryParticipantId = 0;
+                m_gpuPendingRecoveryGeneration = 0;
+            } else {
+                m_gpuPendingRecoveryGeneration = lossMonitor.currentLossGeneration();
+            }
+        }
+        if (m_gpuRecoveryParticipantId == 0) {
+            const GpuRecoveryRegistration registration =
+                lossMonitor.registerRecoveryParticipantSnapshot(false);
+            m_gpuRecoveryParticipantId = registration.participantId();
+            graphGeneration = GpuGenerationCounter::instance().current();
+            if (registration.lossGeneration() != 0) {
+                m_gpuPendingRecoveryGeneration = registration.lossGeneration();
+                m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::RebuildPending),
+                                         std::memory_order_release);
+                if (gpuLifecycleSuspended()) {
+                    m_gpuRebuildDeferredForSuspend.store(true, std::memory_order_release);
+                } else {
+                    (void) completeCoordinatedGpuRebuild(false);
+                }
+            } else if (m_gpuRecoveryParticipantId != 0 && !rebuildGpuSpine()) {
+                if (lossMonitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId))
+                    m_gpuRecoveryParticipantId = 0;
+            }
         }
     }
     configureGpuBudget();
@@ -2458,6 +2888,12 @@ void PlaybackWorker::shutdownOutputGraph() {
         runtime.reset();
     }
     m_outputSinks.clear();
+#ifdef OLR_UNIT_TEST
+    if (m_failShutdownAfterRuntimeDetachForTest) {
+        m_failShutdownAfterRuntimeDetachForTest = false;
+        throw std::bad_alloc();
+    }
+#endif
     {
         QMutexLocker bufferLocker(&m_bufferMutex);
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -2470,7 +2906,25 @@ void PlaybackWorker::shutdownOutputGraph() {
         // to an empty cache rather than holding stale frames from the old graph.
 #ifdef OLR_GPU_PIPELINE_BUILD
         auto previous = m_publishedCache.publish(nullptr);
+        bool restorePublishedOnFailure = true;
+        const auto restorePublished = qScopeGuard([&]() noexcept {
+            if (!restorePublishedOnFailure || !previous) return;
+            try {
+                (void) m_publishedCache.publish(std::move(previous));
+            } catch (...) {
+                // Failure to restore would release an unproven in-flight owner.
+                (void) 0;
+                std::terminate();
+            }
+        });
+#ifdef OLR_UNIT_TEST
+        if (m_failShutdownAfterPublishedCacheDetachForTest) {
+            m_failShutdownAfterPublishedCacheDetachForTest = false;
+            throw std::bad_alloc();
+        }
+#endif
         if (previous) collectEvictedGpuFramesLocked(previous->videoFramesSnapshot());
+        restorePublishedOnFailure = false;
 #else
         m_publishedCache.publish(nullptr);
 #endif
@@ -2486,6 +2940,7 @@ void PlaybackWorker::shutdownOutputGraph() {
     const auto gpuRhi = std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire);
     bool deviceLost = GpuDeviceLossMonitor::instance().isLost();
     const bool rhiLost = gpuRhi && gpuRhi->pollDeviceLoss();
+    const bool rhiPollPending = gpuRhi && gpuRhi->deviceLossPollPending();
     const bool rhiPreviouslyLost = gpuRhi && gpuRhi->deviceLost();
 #ifdef _WIN32
     // Poll every owned domain before taking the validated-proof snapshot. Do not
@@ -2500,10 +2955,20 @@ void PlaybackWorker::shutdownOutputGraph() {
         // Publish every still-observable old-domain proof and clean the process-wide
         // retirement registry before this graph acknowledges teardown.
         cleanupGpuRetirementsForDeviceLoss(false, false);
-        QMutexLocker bufferLocker(&m_bufferMutex);
-        m_gpuFrameRetireQueue = GpuFrameRetireQueue();
-    } else {
-        forceDrainEvictedGpuFrames();
+        {
+            QMutexLocker bufferLocker(&m_bufferMutex);
+            m_gpuFrameRetireQueue.releaseRetiredFrames(
+                [](const FrameHandle& frame) noexcept { return terminalFrameRetired(frame); });
+        }
+        // Exact dead-domain owners have been released individually. Preserve
+        // every incomplete or unproven survivor with its roots and participant.
+        shutdownGpuOwnersAfterFailure();
+    } else if (rhiPollPending) {
+        // A capped poll is neither proof of loss nor proof that live fences are
+        // safe to drop. Preserve every owner/root/participant for later proof.
+        shutdownGpuOwnersAfterFailure();
+    } else if (!forceDrainEvictedGpuFrames()) {
+        shutdownGpuOwnersAfterFailure();
     }
     std::atomic_store_explicit(&m_renderFence, std::shared_ptr<GpuFence>{},
                                std::memory_order_release);
@@ -2519,12 +2984,16 @@ void PlaybackWorker::shutdownOutputGraph() {
                              std::memory_order_release);
     m_memoryPressureLatched.store(false, std::memory_order_release);
     if (m_gpuRecoveryParticipantId != 0) {
-        if (GpuDeviceLossMonitor::instance().unregisterRecoveryParticipant(
-                m_gpuRecoveryParticipantId)) {
+        auto& lossMonitor = GpuDeviceLossMonitor::instance();
+        if (lossMonitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId)) {
             m_gpuRecoveryParticipantId = 0;
+            m_gpuPendingRecoveryGeneration = 0;
+        } else {
+            m_gpuPendingRecoveryGeneration = lossMonitor.currentLossGeneration();
         }
+    } else {
+        m_gpuPendingRecoveryGeneration = 0;
     }
-    m_gpuPendingRecoveryGeneration = 0;
 #endif
 }
 
@@ -2690,24 +3159,37 @@ void PlaybackWorker::drainEvictedGpuFrames() {
         if (m_gpuFrameRetireQueue.isEmpty()) return;
         m_gpuFrameRetireQueue.swap(local);
     }
+    const auto restoreLocal = qScopeGuard([&]() noexcept {
+        restoreRetireQueueOrTerminate(m_gpuFrameRetireQueue, local, m_bufferMutex);
+    });
 
-    constexpr int kRetireFenceWaitTimeoutMs = 1;
-    constexpr int kMaxRetireFenceWaitsPerDrain = 1;
-    int stalls = 0;
-    local.drain(kRetireFenceWaitTimeoutMs, &stalls, kMaxRetireFenceWaitsPerDrain);
-    for (int i = 0; i < stalls; ++i)
-        recordFenceWaitStall();
+    try {
+        constexpr int kRetireFenceWaitTimeoutMs = 1;
+        constexpr int kMaxRetireFenceWaitsPerDrain = 1;
+        int stalls = 0;
+        local.drain(kRetireFenceWaitTimeoutMs, &stalls, kMaxRetireFenceWaitsPerDrain);
+#ifdef OLR_UNIT_TEST
+        if (m_gpuRetireDrainPausedForTest) {
+            m_gpuRetireDrainPausedForTest->release();
+            if (m_gpuRetireDrainContinueForTest) m_gpuRetireDrainContinueForTest->acquire();
+        }
+#endif
+        for (int i = 0; i < stalls; ++i)
+            recordFenceWaitStall();
 
-    if (gpuDeviceLossPending()) return;
+        if (gpuDeviceLossPending()) return;
 
-    if (!local.isEmpty()) {
-        QMutexLocker bufferLocker(&m_bufferMutex);
-        m_gpuFrameRetireQueue.append(std::move(local));
+        if (!local.isEmpty()) {
+            QMutexLocker bufferLocker(&m_bufferMutex);
+            m_gpuFrameRetireQueue.append(std::move(local));
+        }
+        GpuRetireRegistry{}.drainCompleted();
+    } catch (...) {
+        return;
     }
-    GpuRetireRegistry{}.drainCompleted();
 }
 
-void PlaybackWorker::forceDrainEvictedGpuFrames() {
+bool PlaybackWorker::forceDrainEvictedGpuFrames() {
     GpuRetireRegistry{}.drainCompleted();
 
     constexpr int kForceRetireFenceWaitTimeoutMs = 10;
@@ -2722,27 +3204,165 @@ void PlaybackWorker::forceDrainEvictedGpuFrames() {
             if (m_gpuFrameRetireQueue.isEmpty()) break;
             m_gpuFrameRetireQueue.swap(local);
         }
+        const auto restoreLocal = qScopeGuard([&]() noexcept {
+            restoreRetireQueueOrTerminate(m_gpuFrameRetireQueue, local, m_bufferMutex);
+        });
 
-        int stalls = 0;
-        local.drain(kForceRetireFenceWaitTimeoutMs, &stalls, kMaxForceRetireFenceWaitsPerPass);
-        for (int i = 0; i < stalls; ++i)
-            recordFenceWaitStall();
+        try {
+            int stalls = 0;
+            local.drain(kForceRetireFenceWaitTimeoutMs, &stalls, kMaxForceRetireFenceWaitsPerPass);
+            for (int i = 0; i < stalls; ++i)
+                recordFenceWaitStall();
 
-        if (gpuDeviceLossPending()) break;
-
-        if (!local.isEmpty()) {
-            QMutexLocker bufferLocker(&m_bufferMutex);
-            m_gpuFrameRetireQueue.append(std::move(local));
-            if (passes >= kMaxForceRetireFenceWaitPasses) {
-                // Process teardown must not hang forever on a broken backend fence.
-                m_gpuFrameRetireQueue = GpuFrameRetireQueue();
-                break;
+            if (!local.isEmpty()) {
+                QMutexLocker bufferLocker(&m_bufferMutex);
+                m_gpuFrameRetireQueue.append(std::move(local));
             }
+            if (gpuDeviceLossPending()) break;
+        } catch (...) {
+            return false;
         }
     }
 
     GpuRetireRegistry{}.drainCompleted();
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    return m_gpuFrameRetireQueue.isEmpty();
 }
+
+void PlaybackWorker::handoffGpuRetirementSurvivors() noexcept {
+    try {
+        GpuFrameRetireQueue terminalRetirements;
+        {
+            QMutexLocker bufferLocker(&m_bufferMutex);
+            m_gpuFrameRetireQueue.releaseRetiredFrames(
+                [](const FrameHandle& frame) noexcept { return terminalFrameRetired(frame); });
+            if (m_gpuFrameRetireQueue.isEmpty()) return;
+            m_gpuFrameRetireQueue.swap(terminalRetirements);
+        }
+
+        // This persistent observer belongs only to the old retirement carrier.
+        // Each later epoch auto-acknowledges it and snapshots exact proof before
+        // the worker clears that epoch, so it cannot block an independent rebuild.
+        const uint64_t terminalParticipantId =
+            GpuDeviceLossMonitor::instance().registerTerminalRecoveryParticipant();
+        if (terminalParticipantId == 0) std::terminate();
+        quarantineTerminalGpuOwners({}, {}, {}, {}, std::move(terminalRetirements),
+                                    std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire),
+#ifdef _WIN32
+                                    std::move(m_winGpuImportEdge),
+#endif
+                                    terminalParticipantId);
+    } catch (...) {
+        // Dropping an unproven sanitized owner or a participant with no carrier
+        // would violate the native lifetime contract.
+        std::terminate();
+    }
+}
+
+void PlaybackWorker::shutdownGpuOwnersAfterFailure() noexcept {
+    constexpr int kTerminalGpuOwnerWaitMs = 1000;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kTerminalGpuOwnerWaitMs);
+    bool allRetired = true;
+
+    auto waitForFrame = [&](const FrameHandle& frame) noexcept {
+        if (!frame.isGpuBacked() || !frame.data()) return;
+        try {
+            if (terminalFrameRetired(frame)) return;
+            const GpuFrameSynchronization synchronization = frame.data()->gpuSynchronization();
+            if (!synchronization.isExact()) {
+                allRetired = false;
+                return;
+            }
+            if (synchronization.value == 0) return;
+            if (!synchronization.fence) {
+                allRetired = false;
+                return;
+            }
+            while (true) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    allRetired = false;
+                    return;
+                }
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+                const int waitMs =
+                    remaining <= 1 ? 1 : (remaining >= 10 ? 10 : static_cast<int>(remaining));
+                if (synchronization.fence->wait(synchronization.value, waitMs)) return;
+            }
+        } catch (...) {
+            allRetired = false;
+        }
+    };
+
+    try {
+        m_outputSinks.clear();
+    } catch (...) {
+        // Continue allocation-free owner recovery without logging.
+        (void) 0;
+    }
+
+    // These objects must leave scope before the worker's RHI/fence members are
+    // released. All producers and consumers have stopped, so no graph mutex is
+    // required for ownership transfer; the slot retains its own leaf lock.
+    try {
+        GpuFrameRetireQueue terminalRetirements;
+        std::shared_ptr<const OutputFrameCache> published = m_publishedCache.publish(nullptr);
+
+        if (m_outputCache) m_outputCache->forEachVideoFrame(waitForFrame);
+        if (m_stagingCache) m_stagingCache->forEachVideoFrame(waitForFrame);
+        if (m_prerollStagingCache) m_prerollStagingCache->forEachVideoFrame(waitForFrame);
+        if (published) published->forEachVideoFrame(waitForFrame);
+        m_gpuFrameRetireQueue.forEachFrame(waitForFrame);
+
+        m_gpuFrameRetireQueue.swap(terminalRetirements);
+        if (allRetired) {
+            m_outputCache.reset();
+            m_stagingCache.reset();
+            m_prerollStagingCache.reset();
+        } else {
+            quarantineTerminalGpuOwners(
+                std::move(m_outputCache), std::move(m_stagingCache),
+                std::move(m_prerollStagingCache), std::move(published),
+                std::move(terminalRetirements),
+                std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire),
+#ifdef _WIN32
+                std::move(m_winGpuImportEdge),
+#endif
+                m_gpuRecoveryParticipantId);
+            // Ownership transfer is complete. The worker destructor must not
+            // unregister or release roots now owned by the terminal slot.
+            m_gpuRecoveryParticipantId = 0;
+            m_gpuPendingRecoveryGeneration = 0;
+#ifdef _WIN32
+            m_winGpuImportTried = false;
+#endif
+            std::atomic_store_explicit(&m_gpuRhi, std::shared_ptr<GpuRhiContext>{},
+                                       std::memory_order_release);
+        }
+    } catch (...) {
+        // Releasing an unproven in-flight resource is worse than failing the
+        // already-terminal worker teardown.
+        (void) 0;
+        std::terminate();
+    }
+}
+
+#ifdef OLR_UNIT_TEST
+void PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest() noexcept {
+    reapTerminalGpuQuarantine();
+}
+
+void PlaybackWorker::resetTerminalGpuOwnerPollCursorForTest() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(terminalGpuQuarantineMutex());
+        terminalGpuQuarantinePollCursor() = 0;
+    } catch (...) {
+        static_cast<void>(0);
+    }
+}
+#endif
 
 void PlaybackWorker::recordFenceWaitStall() {
     QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
@@ -3171,22 +3791,30 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         if (retireQueueForCommit->isEmpty()) return;
                         retireQueueForCommit->swap(local);
                     }
+                    const auto restoreLocal = qScopeGuard([&]() noexcept {
+                        restoreRetireQueueOrTerminate(*retireQueueForCommit, local, *bufferMutex);
+                    });
 
-                    constexpr int kRetireFenceWaitTimeoutMs = 1;
-                    constexpr int kMaxRetireFenceWaitsPerDrain = 1;
-                    int stalls = 0;
-                    local.drain(kRetireFenceWaitTimeoutMs, &stalls, kMaxRetireFenceWaitsPerDrain);
-                    for (int i = 0; i < stalls; ++i) {
-                        QMutexLocker runtimeLocker(outputRuntimeMutexForCommit);
-                        if (outputRuntimeForCommit && *outputRuntimeForCommit)
-                            (*outputRuntimeForCommit)->incrementFenceWaitStalls();
-                    }
+                    try {
+                        constexpr int kRetireFenceWaitTimeoutMs = 1;
+                        constexpr int kMaxRetireFenceWaitsPerDrain = 1;
+                        int stalls = 0;
+                        local.drain(kRetireFenceWaitTimeoutMs, &stalls,
+                                    kMaxRetireFenceWaitsPerDrain);
+                        for (int i = 0; i < stalls; ++i) {
+                            QMutexLocker runtimeLocker(outputRuntimeMutexForCommit);
+                            if (outputRuntimeForCommit && *outputRuntimeForCommit)
+                                (*outputRuntimeForCommit)->incrementFenceWaitStalls();
+                        }
 
-                    if (!local.isEmpty()) {
-                        QMutexLocker bufferLocker(bufferMutex);
-                        retireQueueForCommit->append(std::move(local));
+                        if (!local.isEmpty()) {
+                            QMutexLocker bufferLocker(bufferMutex);
+                            retireQueueForCommit->append(std::move(local));
+                        }
+                        GpuRetireRegistry{}.drainCompleted();
+                    } catch (...) {
+                        return;
                     }
-                    GpuRetireRegistry{}.drainCompleted();
                 };
 #endif
                 auto commitMediaFrame = [&](FrameHandle mediaFrame, int64_t framePtsMs) -> bool {
@@ -4723,7 +5351,7 @@ void PlaybackWorker::run() {
     m_running = true;
 
     auto clearDecoders = [this]() {
-        shutdownOutputGraph();
+        shutdownOutputGraphTerminalHandoff();
         QMutexLocker bufferLocker(&m_bufferMutex);
         for (auto* track : m_decoderBank) {
             track->nativeDecoder.reset(); // Tear down VideoToolbox before freeing track

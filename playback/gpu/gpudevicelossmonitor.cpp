@@ -26,15 +26,71 @@ uint64_t GpuDeviceLossMonitor::lossCount() const {
     return m_lossCount.load(std::memory_order_acquire);
 }
 
-void GpuDeviceLossMonitor::beginLossEpochLocked(uint64_t generation) {
+bool GpuDeviceLossMonitor::authorizesCurrentDeadDomain(
+    GpuSurfaceCompatibility compatibility) const noexcept {
+    try {
+        if (compatibility.deviceDomainId == 0 || compatibility.authorityEpoch == 0) return false;
+        std::lock_guard<std::mutex> lock(m_epochMutex);
+        const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
+        if (generation == 0 || !m_lost.load(std::memory_order_acquire) || !m_realLossProof)
+            return false;
+        for (const DeadDeviceToken& token : *m_realLossProof) {
+            if (token.observedGeneration() == generation &&
+                token.deviceDomainId() == compatibility.deviceDomainId &&
+                token.authorityEpoch() == compatibility.authorityEpoch) {
+                return true;
+            }
+        }
+    } catch (...) {
+        // A proof query is conservative when the monitor cannot be inspected.
+        static_cast<void>(0);
+    }
+    return false;
+}
+
+bool GpuDeviceLossMonitor::authorizesTerminalDeadDomain(
+    uint64_t participantId, GpuSurfaceCompatibility compatibility) const noexcept {
+    try {
+        if (participantId == 0 || compatibility.deviceDomainId == 0 ||
+            compatibility.authorityEpoch == 0)
+            return false;
+        std::lock_guard<std::mutex> lock(m_epochMutex);
+        if (m_terminalRecoveryParticipants.count(participantId) == 0) return false;
+        const auto retained = m_terminalDeadDomainProofs.find(participantId);
+        if (retained != m_terminalDeadDomainProofs.end()) {
+            for (const DeadDeviceToken& token : retained->second) {
+                if (token.deviceDomainId() == compatibility.deviceDomainId &&
+                    token.authorityEpoch() == compatibility.authorityEpoch)
+                    return true;
+            }
+        }
+        const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
+        if (generation == 0 || !m_lost.load(std::memory_order_acquire) || !m_realLossProof)
+            return false;
+        for (const DeadDeviceToken& token : *m_realLossProof) {
+            if (token.observedGeneration() == generation &&
+                token.deviceDomainId() == compatibility.deviceDomainId &&
+                token.authorityEpoch() == compatibility.authorityEpoch)
+                return true;
+        }
+    } catch (...) {
+        // A terminal proof query is conservative when state cannot be inspected.
+        static_cast<void>(0);
+    }
+    return false;
+}
+
+void GpuDeviceLossMonitor::beginLossEpochLocked(
+    uint64_t generation, std::unordered_set<uint64_t>&& pendingParticipants,
+    std::unordered_set<uint64_t>&& cleanupAcknowledgedParticipants) noexcept {
     m_rebuildInProgress = false;
     m_realLossToken.reset();
-    m_realLossTokens.clear();
+    m_realLossProof.reset();
     m_realLossRevision = 0;
     m_deliveredProofRevision = 0;
     m_tokenlessRecoveryObserved = false;
-    m_pendingRecoveryParticipants = m_recoveryParticipants;
-    m_cleanupAcknowledgedParticipants.clear();
+    m_pendingRecoveryParticipants = std::move(pendingParticipants);
+    m_cleanupAcknowledgedParticipants = std::move(cleanupAcknowledgedParticipants);
     m_recoveryGeneration = 0;
     m_recoveryAuthorityEpoch = 0;
     if (++m_recoveryRevision == 0) ++m_recoveryRevision;
@@ -58,7 +114,7 @@ uint64_t GpuDeviceLossMonitor::clearLossEpochLocked() {
     m_lost.store(false, std::memory_order_release);
     m_lossGeneration.store(0, std::memory_order_release);
     m_realLossToken.reset();
-    m_realLossTokens.clear();
+    m_realLossProof.reset();
     m_realLossRevision = 0;
     m_deliveredProofRevision = 0;
     m_tokenlessRecoveryObserved = false;
@@ -67,6 +123,38 @@ uint64_t GpuDeviceLossMonitor::clearLossEpochLocked() {
     m_recoveryGeneration = 0;
     m_recoveryAuthorityEpoch = 0;
     return retiredGeneration;
+}
+
+bool GpuDeviceLossMonitor::snapshotTerminalProofAndRemovePendingLocked() {
+    try {
+        auto nextProofs = m_terminalDeadDomainProofs;
+        if (m_realLossProof) {
+            for (const uint64_t participantId : m_terminalRecoveryParticipants) {
+                auto& retained = nextProofs[participantId];
+                for (const DeadDeviceToken& token : *m_realLossProof) {
+                    bool duplicate = false;
+                    for (const DeadDeviceToken& existing : retained) {
+                        if (existing.observedGeneration() == token.observedGeneration() &&
+                            existing.deviceDomainId() == token.deviceDomainId() &&
+                            existing.authorityEpoch() == token.authorityEpoch()) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) retained.push_back(token);
+                }
+            }
+        }
+        m_terminalDeadDomainProofs.swap(nextProofs);
+        for (const uint64_t participantId : m_terminalRecoveryParticipants) {
+            m_pendingRecoveryParticipants.erase(participantId);
+            m_cleanupAcknowledgedParticipants.erase(participantId);
+        }
+        return true;
+    } catch (...) {
+        // Do not mutate proof or participant state unless the full snapshot exists.
+        return false;
+    }
 }
 
 uint64_t GpuDeviceLossMonitor::recordTokenlessLoss() {
@@ -83,14 +171,30 @@ uint64_t GpuDeviceLossMonitor::recordTokenlessLoss() {
 #endif
         std::unique_lock<std::mutex> epochLock(m_epochMutex);
         if (m_lost.load(std::memory_order_acquire)) {
-            return m_lossGeneration.load(std::memory_order_acquire);
+            generation = m_lossGeneration.load(std::memory_order_acquire);
+            // With no participant, publication itself owns cleanup. A rejected
+            // attempt must remain retryable on the next identical observation.
+            if (m_rebuildInProgress || !m_pendingRecoveryParticipants.empty() ||
+                (m_realLossProof && !m_realLossProof->empty())) {
+                return generation;
+            }
+            m_tokenlessRecoveryObserved = true;
+        } else {
+            auto pendingParticipants = m_recoveryParticipants;
+            auto cleanupAcknowledgedParticipants = m_terminalRecoveryParticipants;
+#ifdef OLR_UNIT_TEST
+            if (m_failNextLossPreparationForTest) {
+                m_failNextLossPreparationForTest = false;
+                throw std::bad_alloc();
+            }
+#endif
+            generation = GpuGenerationCounter::instance().bump();
+            beginLossEpochLocked(generation, std::move(pendingParticipants),
+                                 std::move(cleanupAcknowledgedParticipants));
+            m_lossCount.fetch_add(1, std::memory_order_acq_rel);
+            m_undrained.fetch_add(1, std::memory_order_acq_rel);
+            m_lost.store(true, std::memory_order_release);
         }
-
-        generation = GpuGenerationCounter::instance().bump();
-        beginLossEpochLocked(generation);
-        m_lossCount.fetch_add(1, std::memory_order_acq_rel);
-        m_undrained.fetch_add(1, std::memory_order_acq_rel);
-        m_lost.store(true, std::memory_order_release);
         if (m_pendingRecoveryParticipants.empty()) {
             m_tokenlessRecoveryObserved = true;
             epochLock.unlock();
@@ -143,6 +247,7 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
     uint64_t supersededGeneration = 0;
     uint64_t acceptedRevision = 0;
     std::vector<DeadDeviceToken> acceptedProof;
+    std::shared_ptr<const std::vector<DeadDeviceToken>> deliveryProof;
     bool immediateDeliveryRequired = false;
     bool cleanupOnlyProof = false;
     bool clearZeroParticipantEpoch = false;
@@ -152,8 +257,12 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
             generation = deviceAuthorityEpoch == m_cleanupAuthorityEpoch && m_cleanupGeneration != 0
                              ? m_cleanupGeneration
                              : GpuGenerationCounter::instance().current();
-            acceptedProof.push_back(
-                DeadDeviceToken(provenance, generation, deviceDomainId, deviceAuthorityEpoch));
+            try {
+                acceptedProof.push_back(
+                    DeadDeviceToken(provenance, generation, deviceDomainId, deviceAuthorityEpoch));
+            } catch (...) {
+                return 0;
+            }
             cleanupOnlyProof = true;
         }
         const bool replacementDeviceLoss =
@@ -166,39 +275,72 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
             // but cannot mutate the current loss epoch.
         } else if (m_lost.load(std::memory_order_acquire) && !replacementDeviceLoss) {
             generation = m_lossGeneration.load(std::memory_order_acquire);
-            for (const DeadDeviceToken& token : m_realLossTokens) {
-                if (token.deviceDomainId() == deviceDomainId) return generation;
+            const auto currentProof = m_realLossProof;
+            bool duplicateDomain = false;
+            if (currentProof) {
+                for (const DeadDeviceToken& token : *currentProof) {
+                    if (token.deviceDomainId() == deviceDomainId) {
+                        duplicateDomain = true;
+                        break;
+                    }
+                }
             }
-            const uint64_t precedingRevision = m_realLossTokens.empty()
-                                                   ? std::numeric_limits<uint64_t>::max()
-                                                   : m_realLossRevision;
-            immediateDeliveryRequired =
-                m_tokenlessRecoveryObserved || m_deliveredProofRevision == precedingRevision;
-            // A single adapter reset can kill more than one device domain. An earlier
-            // tokenless submission failure identifies where submission first failed,
-            // but it is not authority to reject later driver proof from another owned
-            // domain. Accept every current-authority observation in this loss epoch.
-            const DeadDeviceToken token(provenance, generation, deviceDomainId,
-                                        m_deviceAuthorityEpoch);
-            acceptedProof.push_back(token);
-            m_realLossTokens.push_back(token);
-            ++m_realLossRevision;
-            acceptedRevision = m_realLossRevision;
-            if (!m_realLossToken) m_realLossToken = token;
-            if (m_pendingRecoveryParticipants.empty()) {
+            if (duplicateDomain) {
+                const bool publicationOwnsRetry =
+                    m_tokenlessRecoveryObserved || m_pendingRecoveryParticipants.empty();
+                if (!publicationOwnsRetry || m_deliveredProofRevision >= m_realLossRevision)
+                    return generation;
                 immediateDeliveryRequired = true;
-                clearZeroParticipantEpoch = true;
+                acceptedRevision = m_realLossRevision;
+                deliveryProof = currentProof;
+                clearZeroParticipantEpoch = m_pendingRecoveryParticipants.empty();
+            } else {
+                const uint64_t precedingRevision = !currentProof || currentProof->empty()
+                                                       ? std::numeric_limits<uint64_t>::max()
+                                                       : m_realLossRevision;
+                immediateDeliveryRequired =
+                    m_tokenlessRecoveryObserved || m_deliveredProofRevision == precedingRevision;
+                // A single adapter reset can kill more than one device domain. An earlier
+                // tokenless submission failure identifies where submission first failed,
+                // but it is not authority to reject later driver proof from another owned
+                // domain. Accept every current-authority observation in this loss epoch.
+                const DeadDeviceToken token(provenance, generation, deviceDomainId,
+                                            m_deviceAuthorityEpoch);
+                auto nextProof = currentProof
+                                     ? std::make_shared<std::vector<DeadDeviceToken>>(*currentProof)
+                                     : std::make_shared<std::vector<DeadDeviceToken>>();
+                nextProof->push_back(token);
+                m_realLossProof = std::move(nextProof);
+                ++m_realLossRevision;
+                acceptedRevision = m_realLossRevision;
+                if (!m_realLossToken) m_realLossToken = token;
+                if (m_pendingRecoveryParticipants.empty()) {
+                    immediateDeliveryRequired = true;
+                    clearZeroParticipantEpoch = true;
+                }
+                if (immediateDeliveryRequired) deliveryProof = m_realLossProof;
             }
         } else {
             if (replacementDeviceLoss)
                 supersededGeneration = m_lossGeneration.load(std::memory_order_acquire);
+            auto pendingParticipants = m_recoveryParticipants;
+            auto cleanupAcknowledgedParticipants = m_terminalRecoveryParticipants;
+            auto nextProof = std::make_shared<std::vector<DeadDeviceToken>>();
+            nextProof->reserve(1);
+#ifdef OLR_UNIT_TEST
+            if (m_failNextLossPreparationForTest) {
+                m_failNextLossPreparationForTest = false;
+                throw std::bad_alloc();
+            }
+#endif
             generation = GpuGenerationCounter::instance().bump();
-            beginLossEpochLocked(generation);
             const DeadDeviceToken token(provenance, generation, deviceDomainId,
                                         m_deviceAuthorityEpoch);
-            acceptedProof.push_back(token);
+            nextProof->push_back(token);
+            beginLossEpochLocked(generation, std::move(pendingParticipants),
+                                 std::move(cleanupAcknowledgedParticipants));
             m_realLossToken = token;
-            m_realLossTokens = {token};
+            m_realLossProof = std::move(nextProof);
             ++m_realLossRevision;
             acceptedRevision = m_realLossRevision;
             m_lossCount.fetch_add(1, std::memory_order_acq_rel);
@@ -207,6 +349,7 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
             if (m_pendingRecoveryParticipants.empty()) {
                 immediateDeliveryRequired = true;
                 clearZeroParticipantEpoch = true;
+                deliveryProof = m_realLossProof;
             }
         }
     }
@@ -219,18 +362,50 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
 #endif
 
     if (cleanupOnlyProof) {
+        bool terminalProofPublished = false;
+        try {
+#ifdef OLR_UNIT_TEST
+            if (m_failNextTerminalProofMergeForTest.exchange(false, std::memory_order_acq_rel))
+                return 0;
+#endif
+            std::lock_guard<std::mutex> lock(m_epochMutex);
+            auto nextProofs = m_terminalDeadDomainProofs;
+            for (const uint64_t participantId : m_terminalRecoveryParticipants) {
+                auto& retained = nextProofs[participantId];
+                for (const DeadDeviceToken& token : acceptedProof) {
+                    bool duplicate = false;
+                    for (const DeadDeviceToken& existing : retained) {
+                        if (existing.observedGeneration() == token.observedGeneration() &&
+                            existing.deviceDomainId() == token.deviceDomainId() &&
+                            existing.authorityEpoch() == token.authorityEpoch()) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) retained.push_back(token);
+                }
+            }
+            m_terminalDeadDomainProofs.swap(nextProofs);
+            terminalProofPublished = !m_terminalRecoveryParticipants.empty();
+        } catch (...) {
+            // Keep the roles and their prior proof unchanged so a later poll can retry.
+            return 0;
+        }
         GpuValidatedDeadDomains deadDomain(acceptedProof);
-        return GpuRetireRegistry{}.abandonAllNoWait(deadDomain) > 0 ? generation : 0;
+        return GpuRetireRegistry{}.abandonAllNoWait(deadDomain) > 0 || terminalProofPublished
+                   ? generation
+                   : 0;
     }
 
-    // Initial proof delivery remains worker-owned. Once tokenless recovery has
-    // observed the epoch or a preceding proof revision has been delivered,
-    // publication is the only guaranteed production event for a newly accepted
-    // domain. Carry only that proof out of the epoch lock and release it without
-    // waiting; m_proofDeliveryMutex prevents rebuild/clear from overtaking this
-    // cold-path handoff.
+    // Initial proof delivery remains worker-owned. Once publication owns delivery,
+    // carry the immutable full revision so a rejected older revision cannot be
+    // skipped when a newer exact-domain proof arrives.
     if (immediateDeliveryRequired) {
-        GpuValidatedDeadDomains deadDomain(acceptedProof);
+        if (!deliveryProof || deliveryProof->empty()) return generation;
+#ifdef OLR_UNIT_TEST
+        m_lastImmediateProofSizeForTest = deliveryProof->size();
+#endif
+        GpuValidatedDeadDomains deadDomain(*deliveryProof);
         const GpuValidatedLossResult result =
             GpuRecoveryCoordinator::instance().coordinate(generation, acceptedRevision, [&]() {
                 return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
@@ -271,7 +446,7 @@ std::optional<DeadDeviceToken> GpuDeviceLossMonitor::realLossToken() const {
 
 std::vector<DeadDeviceToken> GpuDeviceLossMonitor::realLossTokens() const {
     std::lock_guard<std::mutex> lock(m_epochMutex);
-    return m_realLossTokens;
+    return m_realLossProof ? *m_realLossProof : std::vector<DeadDeviceToken>{};
 }
 
 bool GpuDeviceLossMonitor::consumeLossEvent() {
@@ -292,12 +467,30 @@ GpuDeviceLossMonitor::registerRecoveryParticipantSnapshot(bool ownsCurrentDevice
         participantId = m_nextRecoveryParticipantId++;
         if (participantId == 0) participantId = m_nextRecoveryParticipantId++;
     }
-    m_recoveryParticipants.insert(participantId);
     uint64_t lossGeneration = 0;
-    if (m_lost.load(std::memory_order_acquire)) {
-        lossGeneration = m_lossGeneration.load(std::memory_order_acquire);
-        m_pendingRecoveryParticipants.insert(participantId);
-        if (!ownsCurrentDevice) m_cleanupAcknowledgedParticipants.insert(participantId);
+    bool primaryInserted = false;
+    bool pendingInserted = false;
+    bool acknowledgedInserted = false;
+    try {
+        primaryInserted = m_recoveryParticipants.insert(participantId).second;
+#ifdef OLR_UNIT_TEST
+        if (m_failRegistrationAfterPrimaryInsertForTest) {
+            m_failRegistrationAfterPrimaryInsertForTest = false;
+            throw std::bad_alloc();
+        }
+#endif
+        if (m_lost.load(std::memory_order_acquire)) {
+            lossGeneration = m_lossGeneration.load(std::memory_order_acquire);
+            pendingInserted = m_pendingRecoveryParticipants.insert(participantId).second;
+            if (!ownsCurrentDevice)
+                acknowledgedInserted =
+                    m_cleanupAcknowledgedParticipants.insert(participantId).second;
+        }
+    } catch (...) {
+        if (acknowledgedInserted) m_cleanupAcknowledgedParticipants.erase(participantId);
+        if (pendingInserted) m_pendingRecoveryParticipants.erase(participantId);
+        if (primaryInserted) m_recoveryParticipants.erase(participantId);
+        throw;
     }
     return GpuRecoveryRegistration(participantId, lossGeneration);
 }
@@ -306,16 +499,90 @@ uint64_t GpuDeviceLossMonitor::registerRecoveryParticipant(bool ownsCurrentDevic
     return registerRecoveryParticipantSnapshot(ownsCurrentDevice).participantId();
 }
 
+uint64_t GpuDeviceLossMonitor::registerTerminalRecoveryParticipant() {
+    std::lock_guard<std::mutex> lock(m_epochMutex);
+    uint64_t participantId = m_nextRecoveryParticipantId++;
+    if (participantId == 0) participantId = m_nextRecoveryParticipantId++;
+    while (participantId == 0 || m_recoveryParticipants.count(participantId) != 0) {
+        participantId = m_nextRecoveryParticipantId++;
+        if (participantId == 0) participantId = m_nextRecoveryParticipantId++;
+    }
+    bool primaryInserted = false;
+    bool terminalInserted = false;
+    bool proofInserted = false;
+    bool pendingInserted = false;
+    bool acknowledgedInserted = false;
+    try {
+        primaryInserted = m_recoveryParticipants.insert(participantId).second;
+#ifdef OLR_UNIT_TEST
+        if (m_failRegistrationAfterPrimaryInsertForTest) {
+            m_failRegistrationAfterPrimaryInsertForTest = false;
+            throw std::bad_alloc();
+        }
+#endif
+        terminalInserted = m_terminalRecoveryParticipants.insert(participantId).second;
+        proofInserted =
+            m_terminalDeadDomainProofs.try_emplace(participantId, std::vector<DeadDeviceToken>{})
+                .second;
+        if (m_lost.load(std::memory_order_acquire)) {
+            pendingInserted = m_pendingRecoveryParticipants.insert(participantId).second;
+            acknowledgedInserted = m_cleanupAcknowledgedParticipants.insert(participantId).second;
+        }
+    } catch (...) {
+        if (acknowledgedInserted) m_cleanupAcknowledgedParticipants.erase(participantId);
+        if (pendingInserted) m_pendingRecoveryParticipants.erase(participantId);
+        if (proofInserted) m_terminalDeadDomainProofs.erase(participantId);
+        if (terminalInserted) m_terminalRecoveryParticipants.erase(participantId);
+        if (primaryInserted) m_recoveryParticipants.erase(participantId);
+        throw;
+    }
+    return participantId;
+}
+
+bool GpuDeviceLossMonitor::promoteRecoveryParticipantToTerminal(uint64_t participantId) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(m_epochMutex);
+        if (participantId == 0 || m_recoveryParticipants.count(participantId) == 0) return false;
+
+        bool terminalInserted = false;
+        bool acknowledgedInserted = false;
+        try {
+            terminalInserted = m_terminalRecoveryParticipants.insert(participantId).second;
+#ifdef OLR_UNIT_TEST
+            if (terminalInserted &&
+                m_failNextTerminalPromotionForTest.exchange(false, std::memory_order_acq_rel))
+                throw std::bad_alloc();
+#endif
+            if (m_lost.load(std::memory_order_acquire) &&
+                m_pendingRecoveryParticipants.count(participantId) != 0) {
+                acknowledgedInserted =
+                    m_cleanupAcknowledgedParticipants.insert(participantId).second;
+            }
+        } catch (...) {
+            if (acknowledgedInserted) m_cleanupAcknowledgedParticipants.erase(participantId);
+            if (terminalInserted) m_terminalRecoveryParticipants.erase(participantId);
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 std::optional<qsizetype>
-GpuDeviceLossMonitor::unregisterRecoveryParticipant(uint64_t participantId) {
-    if (participantId == 0) return qsizetype(0);
-    constexpr int kTokenlessDrainMs = 100;
-    uint64_t retiredGeneration = 0;
-    qsizetype abandoned = 0;
-    {
+GpuDeviceLossMonitor::unregisterRecoveryParticipant(uint64_t participantId) noexcept {
+    try {
+        if (participantId == 0) return qsizetype(0);
+        constexpr int kTokenlessDrainMs = 100;
+        uint64_t retiredGeneration = 0;
+        qsizetype abandoned = 0;
         std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
         std::unique_lock<std::mutex> epochLock(m_epochMutex);
-        if (m_recoveryParticipants.count(participantId) == 0) return qsizetype(0);
+        if (m_recoveryParticipants.count(participantId) == 0) {
+            m_terminalRecoveryParticipants.erase(participantId);
+            m_terminalDeadDomainProofs.erase(participantId);
+            return qsizetype(0);
+        }
 
         const bool pendingActiveEpoch = m_lost.load(std::memory_order_acquire) &&
                                         m_pendingRecoveryParticipants.count(participantId) != 0;
@@ -328,6 +595,8 @@ GpuDeviceLossMonitor::unregisterRecoveryParticipant(uint64_t participantId) {
             }
 #endif
             m_recoveryParticipants.erase(participantId);
+            m_terminalRecoveryParticipants.erase(participantId);
+            m_terminalDeadDomainProofs.erase(participantId);
             m_pendingRecoveryParticipants.erase(participantId);
             m_cleanupAcknowledgedParticipants.erase(participantId);
             return qsizetype(0);
@@ -336,33 +605,35 @@ GpuDeviceLossMonitor::unregisterRecoveryParticipant(uint64_t participantId) {
         uint64_t lossGeneration = 0;
         uint64_t proofRevision = 0;
         uint64_t authorityEpoch = 0;
-        std::vector<DeadDeviceToken> proof;
+        std::shared_ptr<const std::vector<DeadDeviceToken>> proof;
         bool tokenless = false;
         lossGeneration = m_lossGeneration.load(std::memory_order_acquire);
         proofRevision = m_realLossRevision;
         authorityEpoch = m_rebuildInProgress && m_cleanupGeneration == lossGeneration
                              ? m_cleanupAuthorityEpoch
                              : m_deviceAuthorityEpoch;
-        proof = m_realLossTokens;
-        tokenless = proof.empty();
+        proof = m_realLossProof;
+        tokenless = !proof || proof->empty();
         if (tokenless) m_tokenlessRecoveryObserved = true;
         epochLock.unlock();
 
         GpuValidatedLossResult cleanup;
         if (lossGeneration != 0) {
-            bool proofValid = !proof.empty();
-            for (const DeadDeviceToken& token : proof) {
-                if (token.observedGeneration() != lossGeneration ||
-                    token.authorityEpoch() != authorityEpoch) {
-                    proofValid = false;
-                    break;
+            bool proofValid = proof && !proof->empty();
+            if (proof) {
+                for (const DeadDeviceToken& token : *proof) {
+                    if (token.observedGeneration() != lossGeneration ||
+                        token.authorityEpoch() != authorityEpoch) {
+                        proofValid = false;
+                        break;
+                    }
                 }
             }
             GpuRetireRegistry registry;
             if (proofValid) {
                 cleanup = GpuRecoveryCoordinator::instance().coordinate(
                     lossGeneration, proofRevision, [&]() {
-                        GpuValidatedDeadDomains deadDomains(proof);
+                        GpuValidatedDeadDomains deadDomains(*proof);
                         return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
                                                       registry.abandonAllNoWait(deadDomains)};
                     });
@@ -384,9 +655,11 @@ GpuDeviceLossMonitor::unregisterRecoveryParticipant(uint64_t participantId) {
             m_pendingRecoveryParticipants.count(participantId) == 0) {
             return std::nullopt;
         }
-        if (!proof.empty() && m_realLossRevision == proofRevision)
+        if (proof && !proof->empty() && m_realLossRevision == proofRevision)
             m_deliveredProofRevision = proofRevision;
         if (m_recoveryParticipants.erase(participantId) != 0) {
+            m_terminalRecoveryParticipants.erase(participantId);
+            m_terminalDeadDomainProofs.erase(participantId);
             const bool wasPending = m_pendingRecoveryParticipants.erase(participantId) != 0;
             m_cleanupAcknowledgedParticipants.erase(participantId);
             if (wasPending && m_lost.load(std::memory_order_acquire) &&
@@ -396,9 +669,86 @@ GpuDeviceLossMonitor::unregisterRecoveryParticipant(uint64_t participantId) {
                 retiredGeneration = clearLossEpochLocked();
             }
         }
+        epochLock.unlock();
+        GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
+        return abandoned;
+    } catch (...) {
+        return std::nullopt;
     }
-    GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
-    return abandoned;
+}
+
+bool GpuDeviceLossMonitor::unregisterTerminalRecoveryParticipant(uint64_t participantId) noexcept {
+    try {
+        if (participantId == 0) return true;
+#ifdef OLR_UNIT_TEST
+        if (m_rejectNextTerminalUnregisterForTest.exchange(false, std::memory_order_acq_rel))
+            return false;
+#endif
+        constexpr int kTokenlessDrainMs = 100;
+        uint64_t retiredGeneration = 0;
+        std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
+        std::unique_lock<std::mutex> epochLock(m_epochMutex);
+        if (m_recoveryParticipants.count(participantId) == 0) {
+            m_terminalRecoveryParticipants.erase(participantId);
+            m_terminalDeadDomainProofs.erase(participantId);
+            return true;
+        }
+
+        const bool pendingActiveEpoch = m_lost.load(std::memory_order_acquire) &&
+                                        m_pendingRecoveryParticipants.count(participantId) != 0;
+        if (pendingActiveEpoch) {
+            const uint64_t lossGeneration = m_lossGeneration.load(std::memory_order_acquire);
+            const uint64_t proofRevision = m_realLossRevision;
+            const uint64_t authorityEpoch =
+                m_rebuildInProgress && m_cleanupGeneration == lossGeneration
+                    ? m_cleanupAuthorityEpoch
+                    : m_deviceAuthorityEpoch;
+            const std::shared_ptr<const std::vector<DeadDeviceToken>> proof = m_realLossProof;
+            bool proofValid = proof && !proof->empty();
+            if (proof) {
+                for (const DeadDeviceToken& token : *proof) {
+                    if (token.observedGeneration() != lossGeneration ||
+                        token.authorityEpoch() != authorityEpoch) {
+                        proofValid = false;
+                        break;
+                    }
+                }
+            }
+            if (!proofValid) m_tokenlessRecoveryObserved = true;
+            epochLock.unlock();
+            GpuRetireRegistry registry;
+            if (proofValid) {
+                GpuValidatedDeadDomains deadDomains(*proof);
+                (void) registry.abandonAllNoWait(deadDomains);
+            } else {
+                (void) registry.drainWithBoundedWait(kTokenlessDrainMs);
+            }
+            epochLock.lock();
+            if (m_lossGeneration.load(std::memory_order_acquire) != lossGeneration ||
+                m_pendingRecoveryParticipants.count(participantId) == 0) {
+                return false;
+            }
+            if (proofValid && m_realLossRevision == proofRevision)
+                m_deliveredProofRevision = proofRevision;
+        }
+
+        const bool wasPending = m_pendingRecoveryParticipants.erase(participantId) != 0;
+        m_cleanupAcknowledgedParticipants.erase(participantId);
+        m_recoveryParticipants.erase(participantId);
+        m_terminalRecoveryParticipants.erase(participantId);
+        m_terminalDeadDomainProofs.erase(participantId);
+        if (wasPending && m_lost.load(std::memory_order_acquire) &&
+            m_pendingRecoveryParticipants.empty()) {
+            const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
+            beginRecoveryLocked(generation);
+            retiredGeneration = clearLossEpochLocked();
+        }
+        epochLock.unlock();
+        GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool GpuDeviceLossMonitor::acknowledgeRecoveryCleanup(uint64_t participantId,
@@ -408,7 +758,9 @@ bool GpuDeviceLossMonitor::acknowledgeRecoveryCleanup(uint64_t participantId,
     if (participantId == 0 || lossGeneration == 0 ||
         m_lossGeneration.load(std::memory_order_acquire) != lossGeneration ||
         !m_lost.load(std::memory_order_acquire) ||
-        m_pendingRecoveryParticipants.count(participantId) == 0)
+        m_pendingRecoveryParticipants.count(participantId) == 0 ||
+        (m_realLossProof && !m_realLossProof->empty() &&
+         m_deliveredProofRevision != m_realLossRevision))
         return false;
     m_cleanupAcknowledgedParticipants.insert(participantId);
     return true;
@@ -420,8 +772,11 @@ GpuRecoveryTicket GpuDeviceLossMonitor::beginRebuild(uint64_t participantId) {
     const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
     if (participantId == 0 || generation == 0 || !m_lost.load(std::memory_order_acquire) ||
         m_recoveryParticipants.count(participantId) == 0 ||
+        m_terminalRecoveryParticipants.count(participantId) != 0 ||
         m_pendingRecoveryParticipants.count(participantId) == 0 ||
-        m_cleanupAcknowledgedParticipants.size() != m_pendingRecoveryParticipants.size())
+        m_cleanupAcknowledgedParticipants.size() != m_pendingRecoveryParticipants.size() ||
+        (m_realLossProof && !m_realLossProof->empty() &&
+         m_deliveredProofRevision != m_realLossRevision))
         return GpuRecoveryTicket(0, 0, 0, 0, 0);
     beginRecoveryLocked(generation);
     return GpuRecoveryTicket(generation, m_realLossRevision, m_recoveryAuthorityEpoch,
@@ -430,30 +785,43 @@ GpuRecoveryTicket GpuDeviceLossMonitor::beginRebuild(uint64_t participantId) {
 
 bool GpuDeviceLossMonitor::clearForRebuild(const GpuRecoveryTicket& ticket) {
     if (!ticket.isValid()) return false;
-    uint64_t retiredGeneration = 0;
-    {
-        std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
-        std::lock_guard<std::mutex> lock(m_epochMutex);
-        const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
-        if (!m_lost.load(std::memory_order_acquire) || generation != ticket.m_lossGeneration ||
-            m_recoveryGeneration != ticket.m_lossGeneration ||
-            m_recoveryRevision != ticket.m_recoveryRevision ||
-            m_recoveryAuthorityEpoch != ticket.m_authorityEpoch ||
-            ticket.m_proofRevision > m_realLossRevision ||
-            m_recoveryParticipants.count(ticket.m_participantId) == 0 ||
-            m_pendingRecoveryParticipants.erase(ticket.m_participantId) == 0)
-            return false;
-        if (m_pendingRecoveryParticipants.empty()) retiredGeneration = clearLossEpochLocked();
+    try {
+        uint64_t retiredGeneration = 0;
+        {
+            std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
+            std::lock_guard<std::mutex> lock(m_epochMutex);
+            const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
+            if (!m_lost.load(std::memory_order_acquire) || generation != ticket.m_lossGeneration ||
+                m_recoveryGeneration != ticket.m_lossGeneration ||
+                m_recoveryRevision != ticket.m_recoveryRevision ||
+                m_recoveryAuthorityEpoch != ticket.m_authorityEpoch ||
+                ticket.m_proofRevision != m_realLossRevision ||
+                (m_realLossProof && !m_realLossProof->empty() &&
+                 m_deliveredProofRevision != m_realLossRevision) ||
+                m_recoveryParticipants.count(ticket.m_participantId) == 0 ||
+                m_terminalRecoveryParticipants.count(ticket.m_participantId) != 0 ||
+                m_pendingRecoveryParticipants.count(ticket.m_participantId) == 0)
+                return false;
+            if (!snapshotTerminalProofAndRemovePendingLocked()) return false;
+            if (m_pendingRecoveryParticipants.erase(ticket.m_participantId) == 0) return false;
+            m_cleanupAcknowledgedParticipants.erase(ticket.m_participantId);
+            if (m_pendingRecoveryParticipants.empty()) retiredGeneration = clearLossEpochLocked();
+        }
+        GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
+        return true;
+    } catch (...) {
+        return false;
     }
-    GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
-    return true;
 }
 
 void GpuDeviceLossMonitor::beginRebuild() {
     std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
     std::lock_guard<std::mutex> lock(m_epochMutex);
     const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
-    if (generation != 0 && m_lost.load(std::memory_order_acquire)) beginRecoveryLocked(generation);
+    if (generation != 0 && m_lost.load(std::memory_order_acquire) &&
+        (!m_realLossProof || m_realLossProof->empty() ||
+         m_deliveredProofRevision == m_realLossRevision))
+        beginRecoveryLocked(generation);
 }
 
 void GpuDeviceLossMonitor::clearForRebuild() {
@@ -462,10 +830,20 @@ void GpuDeviceLossMonitor::clearForRebuild() {
     {
         std::lock_guard<std::mutex> lock(m_epochMutex);
         const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
-        if (generation == 0 || !m_lost.load(std::memory_order_acquire) ||
-            !m_pendingRecoveryParticipants.empty())
+        bool hasNonTerminalPending = false;
+        for (const uint64_t participantId : m_pendingRecoveryParticipants) {
+            if (m_terminalRecoveryParticipants.count(participantId) == 0) {
+                hasNonTerminalPending = true;
+                break;
+            }
+        }
+        if (generation == 0 || !m_lost.load(std::memory_order_acquire) || hasNonTerminalPending ||
+            (m_realLossProof && !m_realLossProof->empty() &&
+             m_deliveredProofRevision != m_realLossRevision))
             return;
         beginRecoveryLocked(generation);
+        if (!snapshotTerminalProofAndRemovePendingLocked()) return;
+        if (!m_pendingRecoveryParticipants.empty()) return;
         retiredGeneration = clearLossEpochLocked();
     }
     GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
@@ -485,11 +863,13 @@ void GpuDeviceLossMonitor::reset() {
         m_undrained.store(0, std::memory_order_release);
         m_lossGeneration.store(0, std::memory_order_release);
         m_realLossToken.reset();
-        m_realLossTokens.clear();
+        m_realLossProof.reset();
         m_realLossRevision = 0;
         m_deliveredProofRevision = 0;
         m_tokenlessRecoveryObserved = false;
         m_recoveryParticipants.clear();
+        m_terminalRecoveryParticipants.clear();
+        m_terminalDeadDomainProofs.clear();
         m_pendingRecoveryParticipants.clear();
         m_cleanupAcknowledgedParticipants.clear();
         m_recoveryGeneration = 0;
@@ -498,6 +878,14 @@ void GpuDeviceLossMonitor::reset() {
         m_cleanupAuthorityEpoch = 0;
         m_cleanupGeneration = 0;
         m_nextRecoveryParticipantId = 1;
+#ifdef OLR_UNIT_TEST
+        m_failNextLossPreparationForTest = false;
+        m_failRegistrationAfterPrimaryInsertForTest = false;
+        m_rejectNextTerminalUnregisterForTest.store(false, std::memory_order_release);
+        m_failNextTerminalProofMergeForTest.store(false, std::memory_order_release);
+        m_failNextTerminalPromotionForTest.store(false, std::memory_order_release);
+        m_lastImmediateProofSizeForTest = 0;
+#endif
     }
     GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
 #ifdef OLR_UNIT_TEST

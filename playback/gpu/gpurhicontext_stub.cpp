@@ -61,26 +61,30 @@ public:
                 return false;
             }
         }
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (m_stop) return false;
+        try {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_stop) return false;
 
-        bool done = false;
-        bool succeeded = false;
-        m_jobs.append([&] {
-            try {
-                job();
-                succeeded = true;
-            } catch (...) {
-            }
-            {
-                std::lock_guard<std::mutex> doneLock(m_mutex);
-                done = true;
-            }
+            bool done = false;
+            bool succeeded = false;
+            m_jobs.append([&] {
+                try {
+                    job();
+                    succeeded = true;
+                } catch (...) {
+                }
+                {
+                    std::lock_guard<std::mutex> doneLock(m_mutex);
+                    done = true;
+                }
+                m_cond.notify_all();
+            });
             m_cond.notify_all();
-        });
-        m_cond.notify_all();
-        m_cond.wait(lock, [&] { return done; });
-        return succeeded;
+            m_cond.wait(lock, [&] { return done; });
+            return succeeded;
+        } catch (...) {
+            std::terminate();
+        }
     }
 
     void requestStop() {
@@ -200,7 +204,14 @@ bool GpuRhiContext::deviceLost() const {
     return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
 }
 
+bool GpuRhiContext::deviceLossPollPending() const noexcept {
+    return false;
+}
+
 bool GpuRhiContext::pollDeviceLoss() const {
+#ifdef OLR_UNIT_TEST
+    m_deviceLossPollCountForTest.fetch_add(1, std::memory_order_relaxed);
+#endif
     return deviceLost();
 }
 

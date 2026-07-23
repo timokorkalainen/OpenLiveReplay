@@ -23,14 +23,14 @@ if(DEFINED GENERATE_MUTATION)
 #endif]=])
     elseif(GENERATE_MUTATION STREQUAL "LOSS_GENERATION")
         set(expected_statement [=[if (token.observedGeneration() != generation ||
-                token.authorityEpoch() != m_deviceAuthorityEpoch)
-                return {};]=])
+                    token.authorityEpoch() != m_deviceAuthorityEpoch)
+                    return {};]=])
         set(mutated_statement [=[#ifdef OLR_MUTATE_GPU_LOSS_GENERATION
-            if (token.authorityEpoch() != m_deviceAuthorityEpoch) return {};
+                if (token.authorityEpoch() != m_deviceAuthorityEpoch) return {};
 #else
-            if (token.observedGeneration() != generation ||
-                token.authorityEpoch() != m_deviceAuthorityEpoch)
-                return {};
+                if (token.observedGeneration() != generation ||
+                    token.authorityEpoch() != m_deviceAuthorityEpoch)
+                    return {};
 #endif]=])
     elseif(GENERATE_MUTATION STREQUAL "RETIRE_PUBLICATION")
         set(expected_statement [=[if (!GpuReadbackRetainer::publish(prepared.m_handle, ticket)) return false;]=])

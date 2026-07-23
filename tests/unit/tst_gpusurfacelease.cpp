@@ -758,6 +758,13 @@ void TestGpuSurfaceLease::copiedLossEvidenceCannotAbandonSameDomainReplacementAu
     const std::vector<DeadDeviceToken> staleEvidence = monitor.realLossTokens();
 
     const uint64_t lossGeneration = monitor.currentLossGenerationForTest();
+    const GpuValidatedLossResult cleanup =
+        monitor.withValidatedDeadDomains([&](const GpuValidatedDeadDomains& deadDomains) {
+            return registry.abandonAllNoWait(deadDomains);
+        });
+    QCOMPARE(cleanup.status, GpuValidatedLossStatus::Completed);
+    QCOMPARE(cleanup.abandoned, qsizetype(1));
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
     QVERIFY(monitor.acknowledgeRecoveryCleanup(participant, lossGeneration));
     const GpuRecoveryTicket ticket = monitor.beginRebuild(participant);
     QVERIFY(ticket.isValid());
@@ -775,7 +782,7 @@ void TestGpuSurfaceLease::copiedLossEvidenceCannotAbandonSameDomainReplacementAu
                  .retirement,
              GpuRetirementDisposition::Quarantined);
 
-    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, staleEvidence), qsizetype(1));
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, staleEvidence), qsizetype(0));
     QCOMPARE(registry.pendingRetainCount(), qsizetype(1));
     QVERIFY(replacementSurface.use_count() > 1);
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(replacementAuthority, deviceDomain) != 0);

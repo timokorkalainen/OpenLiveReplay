@@ -14,6 +14,8 @@
 #include <memory>
 #include <optional>
 
+class QSemaphore;
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -74,6 +76,16 @@ public:
 #endif
 #endif
 #ifdef _WIN32
+    bool pollDeviceLossFor(int timeoutMs) const;
+    static std::unique_ptr<WinGpuImportEdge> createUnavailableForTest();
+    static void resetDeviceLossPollCountForTest() noexcept;
+    static int deviceLossPollCountForTest() noexcept;
+#ifdef OLR_UNIT_TEST
+    bool observeDeviceRemovedForTest(HRESULT reason, uint64_t deviceAuthorityEpoch,
+                                     uintptr_t deviceDomainId);
+    bool deviceLostStickyForTest() const noexcept;
+    void blockNextDeviceLossPollForTest(QSemaphore* entered, QSemaphore* release) noexcept;
+#endif
     void setImportTapForTest(std::function<void(const FrameHandle&)> tap);
     bool acceptsD3D11DeviceForTest(void* device) const;
     bool decodeOneForTest(Microsoft::WRL::ComPtr<ID3D11Device> device,

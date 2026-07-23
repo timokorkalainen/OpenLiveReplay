@@ -15,6 +15,9 @@
 #include "playback/output/asyncgpureadbacksink.h"
 #include "playback/output/qtpreviewsink.h"
 #include "playback/output/queuedoutputsink.h"
+#ifdef _WIN32
+#include "playback/output/win/wingpuimportedge.h"
+#endif
 #include "playback/playbacktransport.h"
 #include "playback/playbackworker.h"
 
@@ -73,6 +76,11 @@ struct GpuDeviceLossMonitorTestAuthority {
         mutex.unlock();
         return true;
     }
+    static size_t participantCount() {
+        auto& monitor = GpuDeviceLossMonitor::instance();
+        std::lock_guard<std::mutex> lock(monitor.m_epochMutex);
+        return monitor.m_recoveryParticipants.size();
+    }
 };
 #endif
 
@@ -98,6 +106,12 @@ private slots:
     void workerLifecycleDoesNotResetAnotherWorkersLoss();
     void deviceLostTeardownCleansRegistryWithoutClearingSurvivor();
     void memoryPressureFallbackCleansValidatedRetainsBeforeUnregister();
+    void concurrentRetireRestoreMergesNewEvictionsDuringLoss();
+    void runtimeDeviceLossHandoffsUnprovenSanitizedRetirement();
+    void memoryPressureFallbackHandoffsIncompleteSanitizedRetirement();
+    void terminalPressureCarriersDoNotBlockLaterRecoveryAndRetainExactProof();
+    void cleanupOnlyProofReleasesMatchingTerminalCarrierAfterTokenlessClear();
+    void cpuFallbackRetriesRejectedParticipantTeardownWithoutRebuild();
     void lateExternalProofWithoutParticipantsCleansAndRetiresEpoch();
     void tokenlessUnregisterKeepsIncompleteRetainUntilOldAuthorityProof();
     void multiParticipantUnregisterCleansBeforeFinalEpochClear();
@@ -109,7 +123,24 @@ private slots:
     void proofFromOlderRetiredAuthorityCleansAfterNewerEpoch();
     void lossTelemetryIsObservedIndependentlyByEachWorker();
     void blockedRenderThreadPollAndTeardownStayBounded();
+    void blockedRenderThreadCoalescesTimedOutLossPolls();
+    void shutdownPendingDeviceLossPollQuarantinesOwners();
     void shutdownPollDetectsLossBeforeRetirementDrain();
+    void shutdownExactLossReleasesDeadAndQuarantinesMixedUnprovenOwner();
+    void shutdownTokenlessLossQuarantinesUnprovenOwner();
+    void shutdownAllocationFailureReleasesTerminalOwnersBeforeGpuRoots();
+    void terminalHandoffKeepsExactProofUntilMixedOwnersRetire();
+    void terminalHandoffAcceptsLateExactProof();
+    void exceptionalPreLossTerminalHandoffDoesNotBlockLaterRebuild();
+    void terminalHandoffPollsRetainedRhiFromCpuFallback();
+    void terminalHandoffPollsOneRetainedContextPerRoundRobinReap();
+    void terminalHandoffPollsOneBackendPerReapWithinDualRootSlot();
+    void terminalHandoffClearsOneTerminalCarrierPerReap();
+    void terminalReaperUsesBoundedWaitInsteadOfCompletedValue();
+    void terminalHandoffRetriesRejectedTerminalUnregister();
+    void startedWorkerShutdownFailureUsesTerminalOwnerHandoff();
+    void shutdownProvenDeadOwnerSkipsFenceWait();
+    void rejectedExactCleanupRetriesBeforeRebuild();
     void replacementLossBeforeFailedRebuildCommitRemainsRecoverable();
     void activeLossInitializationDefersWhileLifecycleSuspended();
     void lossRecoveryCommitsSubmittedIdentityAndEpoch();
@@ -201,17 +232,44 @@ public:
     uint64_t signal() override { return ++m_signalled; }
     bool wait(uint64_t value, int) override {
         m_waitCalls.fetch_add(1, std::memory_order_acq_rel);
+        if (m_completed.load(std::memory_order_acquire) >= value) return true;
         if (!m_completeOnWait) return false;
         m_completed.store(value, std::memory_order_release);
         return true;
     }
     uint64_t completedValue() const override { return m_completed.load(std::memory_order_acquire); }
     int waitCalls() const { return m_waitCalls.load(std::memory_order_acquire); }
+    void complete(uint64_t value) { m_completed.store(value, std::memory_order_release); }
 
 private:
     const bool m_completeOnWait;
     uint64_t m_signalled = 0;
     std::atomic<uint64_t> m_completed{0};
+    std::atomic<int> m_waitCalls{0};
+};
+
+class WaitOnlyLossFence final : public GpuFence {
+public:
+    WaitOnlyLossFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
+
+    uint64_t signal() override { return 1; }
+    bool wait(uint64_t, int timeoutMs) override {
+        m_waitCalls.fetch_add(1, std::memory_order_acq_rel);
+        return timeoutMs == 0 && m_complete.load(std::memory_order_acquire);
+    }
+    uint64_t completedValue() const override {
+        m_completedCalls.fetch_add(1, std::memory_order_acq_rel);
+        throw std::runtime_error("completedValue must not be used by terminal teardown");
+    }
+    void complete() { m_complete.store(true, std::memory_order_release); }
+    void resetCompletedCalls() { m_completedCalls.store(0, std::memory_order_release); }
+    int completedCalls() const { return m_completedCalls.load(std::memory_order_acquire); }
+    int waitCalls() const { return m_waitCalls.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<bool> m_complete{false};
+    mutable std::atomic<int> m_completedCalls{0};
     std::atomic<int> m_waitCalls{0};
 };
 
@@ -228,6 +286,37 @@ protected:
 
 private:
     GpuSurfaceCompatibility m_compatibility;
+};
+
+struct TeardownOrderState {
+    std::atomic<int> destroyed{0};
+    std::atomic<bool> rhiAliveAtSurfaceDestruction{false};
+};
+
+class TeardownOrderSurface final : public GpuSurface {
+public:
+    TeardownOrderSurface(std::weak_ptr<GpuRhiContext> rhi,
+                         std::shared_ptr<TeardownOrderState> state,
+                         GpuSurfaceCompatibility compatibility)
+        : m_rhi(std::move(rhi)), m_state(std::move(state)), m_compatibility(compatibility) {}
+    ~TeardownOrderSurface() override {
+        m_state->rhiAliveAtSurfaceDestruction.store(!m_rhi.expired(), std::memory_order_release);
+        m_state->destroyed.fetch_add(1, std::memory_order_acq_rel);
+    }
+    GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 16}; }
+    bool isValid() const override { return true; }
+    GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
+
+protected:
+    void* nativeHandle() const override {
+        static int handle = 0;
+        return &handle;
+    }
+
+private:
+    std::weak_ptr<GpuRhiContext> m_rhi{};
+    std::shared_ptr<TeardownOrderState> m_state{};
+    GpuSurfaceCompatibility m_compatibility{};
 };
 
 struct SubmittedAdapter {
@@ -518,6 +607,424 @@ void TestGpuDeviceLostWorker::memoryPressureFallbackCleansValidatedRetainsBefore
     QVERIFY(!monitor.isLost());
     QVERIFY(monitor.currentDeviceAuthorityForTest() != authority);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+}
+
+void TestGpuDeviceLostWorker::concurrentRetireRestoreMergesNewEvictionsDuringLoss() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+    auto firstFence = std::make_shared<ObservableLossFence>(0xA7041, authority, false);
+    auto secondFence = std::make_shared<ObservableLossFence>(0xA7042, authority, false);
+    FrameMetadata firstMetadata;
+    firstMetadata.key.feedIndex = 0;
+    firstMetadata.key.ptsMs = 0;
+    FrameMetadata secondMetadata = firstMetadata;
+    secondMetadata.key.ptsMs = 40;
+    auto firstSurface = std::make_shared<TeardownOrderSurface>(
+        rhi, std::make_shared<TeardownOrderState>(), GpuSurfaceCompatibility{0xA7041, authority});
+    auto secondSurface = std::make_shared<TeardownOrderSurface>(
+        rhi, std::make_shared<TeardownOrderState>(), GpuSurfaceCompatibility{0xA7042, authority});
+    FrameHandle first = makeGpuFrameHandle(firstSurface, rhi, firstMetadata, firstFence, 1, {});
+    FrameHandle second = makeGpuFrameHandle(secondSurface, rhi, secondMetadata, secondFence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    PlaybackWorker worker({&provider}, &transport);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker.m_gpuRecoveryParticipantId != 0);
+    worker.m_gpuFrameRetireQueue.collect(first);
+    QSemaphore paused;
+    QSemaphore proceed;
+    worker.m_gpuRetireDrainPausedForTest = &paused;
+    worker.m_gpuRetireDrainContinueForTest = &proceed;
+    std::thread drainer([&] { worker.drainEvictedGpuFrames(); });
+    QVERIFY2(paused.tryAcquire(1, 5000), "retire drain did not reach deterministic pause");
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_gpuFrameRetireQueue.collect(second);
+    }
+    monitor.recordLoss();
+    proceed.release();
+    drainer.join();
+    worker.m_gpuRetireDrainPausedForTest = nullptr;
+    worker.m_gpuRetireDrainContinueForTest = nullptr;
+
+    QCOMPARE(worker.m_gpuFrameRetireQueue.size(), 2);
+    monitor.reset();
+    worker.m_gpuRecoveryParticipantId = 0;
+    firstFence->complete(1);
+    secondFence->complete(1);
+    worker.drainEvictedGpuFrames();
+    QCOMPARE(worker.m_gpuFrameRetireQueue.size(), 0);
+}
+
+void TestGpuDeviceLostWorker::runtimeDeviceLossHandoffsUnprovenSanitizedRetirement() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    DefaultIosGpuLifecycleSink lifecycle;
+    setIosGpuLifecycleSink(&lifecycle);
+
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+    const std::weak_ptr<GpuRhiContext> retainedRoot = rhi;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t deadDomain = 0xA704C;
+    constexpr uintptr_t liveDomain = 0xA704D;
+    const auto deadState = std::make_shared<TeardownOrderState>();
+    const auto liveState = std::make_shared<TeardownOrderState>();
+    auto deadFence = std::make_shared<ObservableLossFence>(deadDomain, authority, false);
+    auto liveFence = std::make_shared<ObservableLossFence>(liveDomain, authority, false);
+    FrameMetadata deadMetadata;
+    deadMetadata.key.feedIndex = 0;
+    deadMetadata.key.ptsMs = 0;
+    FrameMetadata liveMetadata = deadMetadata;
+    liveMetadata.key.ptsMs = 40;
+    auto deadSurface = std::make_shared<TeardownOrderSurface>(
+        rhi, deadState, GpuSurfaceCompatibility{deadDomain, authority});
+    auto liveSurface = std::make_shared<TeardownOrderSurface>(
+        rhi, liveState, GpuSurfaceCompatibility{liveDomain, authority});
+    FrameHandle deadFrame = makeGpuFrameHandle(deadSurface, rhi, deadMetadata, deadFence, 1, {});
+    FrameHandle liveFrame = makeGpuFrameHandle(liveSurface, rhi, liveMetadata, liveFence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&provider}, &transport);
+    std::atomic_store_explicit(&worker.m_gpuRhi, rhi, std::memory_order_release);
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    const uint64_t workerParticipant = worker.m_gpuRecoveryParticipantId;
+    QVERIFY(workerParticipant != 0);
+    worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 16, 16);
+    worker.m_outputCache->insertVideoFrame(placeholderFrame(-40));
+    worker.m_outputCache->insertVideoFrame(deadFrame);
+    worker.m_outputCache->insertVideoFrame(liveFrame);
+
+    lifecycle.onEnterBackground();
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, deadDomain) != 0);
+    deadSurface.reset();
+    liveSurface.reset();
+    deadFrame = {};
+    liveFrame = {};
+    rhi.reset();
+    worker.handleGpuDeviceLoss();
+
+    QCOMPARE(deadFence->waitCalls(), 0);
+    QVERIFY(liveFence->waitCalls() > 0);
+    QCOMPARE(deadState->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(liveState->destroyed.load(std::memory_order_acquire), 0);
+    QVERIFY(deadState->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(!retainedRoot.expired());
+    QCOMPARE(worker.m_gpuFrameRetireQueue.size(), 0);
+    QCOMPARE(worker.m_gpuRecoveryParticipantId, workerParticipant);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(2));
+    QVERIFY(monitor.isLost());
+    QVERIFY(worker.m_outputCache);
+    const QVector<FrameHandle> cpuFrames = worker.m_outputCache->videoFramesSnapshot();
+    QCOMPARE(cpuFrames.size(), 1);
+    QVERIFY(!cpuFrames.constFirst().isGpuBacked());
+    QVERIFY(cpuFrames.constFirst().metadata().key.isPlaceholder);
+
+    liveFence->complete(1);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(liveState->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(liveState->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(retainedRoot.expired());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QCOMPARE(worker.m_gpuRecoveryParticipantId, workerParticipant);
+
+    worker.shutdownOutputGraph();
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::memoryPressureFallbackHandoffsIncompleteSanitizedRetirement() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+    const std::weak_ptr<GpuRhiContext> retainedRoot = rhi;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t domain = 0xA704E;
+    const auto state = std::make_shared<TeardownOrderState>();
+    auto fence = std::make_shared<ObservableLossFence>(domain, authority, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{domain, authority});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&provider}, &transport);
+    std::atomic_store_explicit(&worker.m_gpuRhi, rhi, std::memory_order_release);
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker.m_gpuRecoveryParticipantId != 0);
+    worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 16, 16);
+    worker.m_outputCache->insertVideoFrame(placeholderFrame(-40));
+    worker.m_outputCache->insertVideoFrame(frame);
+
+    surface.reset();
+    frame = {};
+    rhi.reset();
+    worker.evaluateGpuMemoryPressureForTest(64 * 1024 * 1024, false, 1000);
+
+    QVERIFY(fence->waitCalls() > 0);
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+    QVERIFY(!retainedRoot.expired());
+    QCOMPARE(worker.m_gpuFrameRetireQueue.size(), 0);
+    QCOMPARE(worker.m_gpuRecoveryParticipantId, uint64_t(0));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(!monitor.isLost());
+    QVERIFY(worker.m_outputCache);
+    const QVector<FrameHandle> cpuFrames = worker.m_outputCache->videoFramesSnapshot();
+    QCOMPARE(cpuFrames.size(), 1);
+    QVERIFY(!cpuFrames.constFirst().isGpuBacked());
+    QVERIFY(cpuFrames.constFirst().metadata().key.isPlaceholder);
+
+    fence->complete(1);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(state->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(retainedRoot.expired());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::terminalPressureCarriersDoNotBlockLaterRecoveryAndRetainExactProof() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr std::array<uintptr_t, 2> domains{0xA704F, 0xA7050};
+    std::array<std::shared_ptr<TeardownOrderState>, 2> states{
+        std::make_shared<TeardownOrderState>(), std::make_shared<TeardownOrderState>()};
+    std::array<std::shared_ptr<ObservableLossFence>, 2> fences{
+        std::make_shared<ObservableLossFence>(domains[0], authority, false),
+        std::make_shared<ObservableLossFence>(domains[1], authority, false)};
+    std::array<std::weak_ptr<GpuRhiContext>, 2> retainedRoots;
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    for (size_t index = 0; index < domains.size(); ++index) {
+        auto rhiOwner = std::make_shared<int>(0);
+        std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+        rhiOwner.reset();
+        retainedRoots[index] = rhi;
+        FrameMetadata metadata;
+        metadata.key.feedIndex = 0;
+        metadata.key.ptsMs = qint64(index * 40);
+        auto surface = std::make_shared<TeardownOrderSurface>(
+            rhi, states[index], GpuSurfaceCompatibility{domains[index], authority});
+        FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fences[index], 1, {});
+        auto worker =
+            std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+        std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+        worker->m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                         std::memory_order_release);
+        worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+        QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+        worker->m_gpuFrameRetireQueue.collect(frame);
+        surface.reset();
+        frame = {};
+        rhi.reset();
+
+        worker->evaluateGpuMemoryPressureForTest(64 * 1024 * 1024, false, 1000);
+        QCOMPARE(states[index]->destroyed.load(std::memory_order_acquire), 0);
+        worker.reset();
+    }
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(2));
+    QVERIFY(!retainedRoots[0].expired());
+    QVERIFY(!retainedRoots[1].expired());
+
+    const uint64_t recoveryParticipant = monitor.registerRecoveryParticipant();
+    QVERIFY(recoveryParticipant != 0);
+    const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, domains[0]);
+    QVERIFY(generation != 0);
+    const GpuValidatedLossResult delivery = monitor.withValidatedDeadDomains(
+        [](const GpuValidatedDeadDomains&) { return qsizetype(0); });
+    QCOMPARE(delivery.status, GpuValidatedLossStatus::Completed);
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(recoveryParticipant, generation));
+    const GpuRecoveryTicket ticket = monitor.beginRebuild(recoveryParticipant);
+
+    QVERIFY2(ticket.isValid(), "terminal carriers blocked the later worker rebuild");
+    QVERIFY(monitor.clearForRebuild(ticket));
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.unregisterRecoveryParticipant(recoveryParticipant).has_value());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(2));
+    QCOMPARE(states[0]->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 0);
+
+    for (int attempt = 0; attempt < 4; ++attempt)
+        PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(states[0]->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 0);
+    QVERIFY(states[0]->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(retainedRoots[0].expired());
+    QVERIFY(!retainedRoots[1].expired());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+
+    fences[1]->complete(1);
+    for (int attempt = 0; attempt < 4; ++attempt)
+        PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(states[1]->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(retainedRoots[1].expired());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::cleanupOnlyProofReleasesMatchingTerminalCarrierAfterTokenlessClear() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t oldAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr std::array<uintptr_t, 2> domains{0xA7051, 0xA7052};
+    std::array<std::shared_ptr<TeardownOrderState>, 2> states{
+        std::make_shared<TeardownOrderState>(), std::make_shared<TeardownOrderState>()};
+    std::array<std::shared_ptr<ObservableLossFence>, 2> fences{
+        std::make_shared<ObservableLossFence>(domains[0], oldAuthority, false),
+        std::make_shared<ObservableLossFence>(domains[1], oldAuthority, false)};
+    std::array<std::weak_ptr<GpuRhiContext>, 2> retainedRoots;
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    for (size_t index = 0; index < domains.size(); ++index) {
+        auto rhiOwner = std::make_shared<int>(0);
+        std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+        rhiOwner.reset();
+        retainedRoots[index] = rhi;
+        FrameMetadata metadata;
+        metadata.key.feedIndex = 0;
+        metadata.key.ptsMs = qint64(index * 40);
+        auto surface = std::make_shared<TeardownOrderSurface>(
+            rhi, states[index], GpuSurfaceCompatibility{domains[index], oldAuthority});
+        FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fences[index], 1, {});
+        auto worker =
+            std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+        std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+        worker->m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                         std::memory_order_release);
+        worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+        QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+        worker->m_gpuFrameRetireQueue.collect(frame);
+        surface.reset();
+        frame = {};
+        rhi.reset();
+
+        worker->evaluateGpuMemoryPressureForTest(64 * 1024 * 1024, false, 1000);
+        QCOMPARE(states[index]->destroyed.load(std::memory_order_acquire), 0);
+        worker.reset();
+    }
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(2));
+
+    const uint64_t recoveryParticipant = monitor.registerRecoveryParticipant();
+    QVERIFY(recoveryParticipant != 0);
+    const uint64_t tokenlessGeneration = monitor.recordLoss();
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(recoveryParticipant, tokenlessGeneration));
+    const GpuRecoveryTicket ticket = monitor.beginRebuild(recoveryParticipant);
+    QVERIFY(ticket.isValid());
+    QVERIFY(monitor.clearForRebuild(ticket));
+    QVERIFY(!monitor.isLost());
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::capture() != oldAuthority);
+    QVERIFY(monitor.unregisterRecoveryParticipant(recoveryParticipant).has_value());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(2));
+
+    // No global retirement-registry entry matches this late old-backend proof.
+    // Its zero abandonment result must not prevent terminal proof persistence.
+#ifdef _WIN32
+    auto importEdge = WinGpuImportEdge::createUnavailableForTest();
+    QVERIFY(importEdge);
+    monitor.failNextTerminalProofMergeForTest();
+    QVERIFY(importEdge->observeDeviceRemovedForTest(DXGI_ERROR_DEVICE_REMOVED, oldAuthority,
+                                                    domains[0]));
+    QVERIFY2(!importEdge->deviceLostStickyForTest(),
+             "failed terminal proof persistence must leave import-edge polling retryable");
+    for (int attempt = 0; attempt < 2; ++attempt)
+        PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(states[0]->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 0);
+
+    QVERIFY(importEdge->observeDeviceRemovedForTest(DXGI_ERROR_DEVICE_REMOVED, oldAuthority,
+                                                    domains[0]));
+    QVERIFY(importEdge->deviceLostStickyForTest());
+#else
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(oldAuthority, domains[0]) != 0);
+#endif
+    QVERIFY(!monitor.isLost());
+
+    for (int attempt = 0; attempt < 4; ++attempt)
+        PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(states[0]->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 0);
+    QVERIFY(states[0]->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(retainedRoots[0].expired());
+    QVERIFY(!retainedRoots[1].expired());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+
+    fences[1]->complete(1);
+    for (int attempt = 0; attempt < 4; ++attempt)
+        PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(states[1]->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(retainedRoots[1].expired());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::cpuFallbackRetriesRejectedParticipantTeardownWithoutRebuild() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    auto& coordinator = GpuRecoveryCoordinator::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&provider}, &transport);
+    worker.initializeOutputGraph(1, 64, 48);
+    worker.m_outputRuntime->stopRuntime();
+    monitor.reset();
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+
+    constexpr uintptr_t deadDomain = 0xA704B;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    PublishLossOnStopSink sink(authority, deadDomain);
+    worker.m_outputRuntime->setEndpoints({{ndiFeedAssignment(), &sink}});
+    coordinator.failNextAdmissionForTest();
+
+    worker.evaluateGpuMemoryPressureForTest(64 * 1024 * 1024, false, 1000);
+    const uint64_t pendingGeneration = monitor.currentLossGenerationForTest();
+
+    QVERIFY(pendingGeneration != 0);
+    QVERIFY(worker.m_gpuRecoveryParticipantId != 0);
+    QCOMPARE(worker.m_gpuPendingRecoveryGeneration, pendingGeneration);
+    QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
+    QVERIFY(!worker.m_gpuRhi);
+
+    worker.sampleGpuMemoryPressure(1250);
+
+    QCOMPARE(worker.m_gpuRecoveryParticipantId, uint64_t(0));
+    QCOMPARE(worker.m_gpuPendingRecoveryGeneration, uint64_t(0));
+    QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
+    QVERIFY(!worker.m_gpuRhi);
+    QVERIFY(!monitor.isLost());
 }
 
 void TestGpuDeviceLostWorker::lateExternalProofWithoutParticipantsCleansAndRetiresEpoch() {
@@ -1019,6 +1526,84 @@ void TestGpuDeviceLostWorker::blockedRenderThreadPollAndTeardownStayBounded() {
 #endif
 }
 
+void TestGpuDeviceLostWorker::blockedRenderThreadCoalescesTimedOutLossPolls() {
+#ifndef _WIN32
+    QSKIP("deadline-aware D3D render-thread polling is Windows-specific");
+#else
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi || !rhi->isValid()) QSKIP("no WARP RHI backend available");
+
+    const auto entered = std::make_shared<QSemaphore>();
+    const auto release = std::make_shared<QSemaphore>();
+    const auto exited = std::make_shared<QSemaphore>();
+    QVERIFY(rhi->queueBlockingRenderJobForTest(entered, release, exited));
+    QVERIFY(entered->tryAcquire(1, 5000));
+
+    QVERIFY(!rhi->pollDeviceLoss());
+    QVERIFY(!rhi->pollDeviceLoss());
+    QCOMPARE(rhi->deviceLossPollExecutionCountForTest(), 0);
+
+    release->release();
+    QVERIFY2(exited->tryAcquire(1, 5000), "blocked render job did not exit");
+    QTRY_COMPARE_WITH_TIMEOUT(rhi->deviceLossPollExecutionCountForTest(), 1, 5000);
+#endif
+}
+
+void TestGpuDeviceLostWorker::shutdownPendingDeviceLossPollQuarantinesOwners() {
+#ifndef _WIN32
+    QSKIP("timed D3D render-thread polling is Windows-specific");
+#else
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi || !rhi->isValid()) QSKIP("no WARP RHI backend available");
+    const auto rhiFence = rhi->createFence();
+    if (!rhiFence) QSKIP("no WARP fence available");
+    const GpuFenceIdentity identity = rhiFence->identity();
+
+    const auto entered = std::make_shared<QSemaphore>();
+    const auto release = std::make_shared<QSemaphore>();
+    const auto exited = std::make_shared<QSemaphore>();
+    QVERIFY(rhi->queueBlockingRenderJobForTest(entered, release, exited));
+    QVERIFY(entered->tryAcquire(1, 5000));
+    QVERIFY(!rhi->pollDeviceLoss());
+    QVERIFY(rhi->deviceLossPollPending());
+
+    const auto state = std::make_shared<TeardownOrderState>();
+    auto fence = std::make_shared<ObservableLossFence>(identity.deviceDomainId,
+                                                       identity.authorityEpoch, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{identity.deviceDomainId, identity.authorityEpoch});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+    FrameProvider provider;
+    PlaybackTransport transport;
+    PlaybackWorker worker({&provider}, &transport);
+    std::atomic_store_explicit(&worker.m_gpuRhi, rhi, std::memory_order_release);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 16, 16);
+    worker.m_outputCache->insertVideoFrame(frame);
+    surface.reset();
+    frame = {};
+
+    worker.shutdownOutputGraph();
+    QVERIFY(rhi->deviceLossPollPending());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+
+    release->release();
+    QVERIFY(exited->tryAcquire(1, 5000));
+    fence->complete(1);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    monitor.reset();
+#endif
+}
+
 void TestGpuDeviceLostWorker::shutdownPollDetectsLossBeforeRetirementDrain() {
 #ifndef _WIN32
     QSKIP("D3D device-removal polling is Windows-specific");
@@ -1065,6 +1650,895 @@ void TestGpuDeviceLostWorker::shutdownPollDetectsLossBeforeRetirementDrain() {
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
     QVERIFY(!monitor.isLost());
 #endif
+}
+
+void TestGpuDeviceLostWorker::shutdownExactLossReleasesDeadAndQuarantinesMixedUnprovenOwner() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+    const std::weak_ptr<GpuRhiContext> retainedRoot = rhi;
+
+    const auto deadState = std::make_shared<TeardownOrderState>();
+    const auto liveState = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t deadDomain = 0xA110A;
+    constexpr uintptr_t liveDomain = 0xA110B;
+    auto deadFence = std::make_shared<ObservableLossFence>(deadDomain, authority, false);
+    auto liveFence = std::make_shared<ObservableLossFence>(liveDomain, authority, false);
+    FrameMetadata deadMetadata;
+    deadMetadata.key.feedIndex = 0;
+    deadMetadata.key.ptsMs = 0;
+    FrameMetadata liveMetadata = deadMetadata;
+    liveMetadata.key.ptsMs = 40;
+    auto deadSurface = std::make_shared<TeardownOrderSurface>(
+        rhi, deadState, GpuSurfaceCompatibility{deadDomain, authority});
+    auto liveSurface = std::make_shared<TeardownOrderSurface>(
+        rhi, liveState, GpuSurfaceCompatibility{liveDomain, authority});
+    FrameHandle deadFrame = makeGpuFrameHandle(deadSurface, rhi, deadMetadata, deadFence, 1, {});
+    FrameHandle liveFrame = makeGpuFrameHandle(liveSurface, rhi, liveMetadata, liveFence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&provider}, &transport);
+    std::atomic_store_explicit(&worker.m_gpuRhi, rhi, std::memory_order_release);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker.m_gpuRecoveryParticipantId != 0);
+    worker.m_gpuFrameRetireQueue.collect(deadFrame);
+    worker.m_gpuFrameRetireQueue.collect(liveFrame);
+    QCOMPARE(worker.m_gpuFrameRetireQueue.size(), 2);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, deadDomain) != 0);
+
+    deadSurface.reset();
+    liveSurface.reset();
+    deadFrame = {};
+    liveFrame = {};
+    rhi.reset();
+    worker.shutdownOutputGraph();
+
+    QCOMPARE(deadFence->waitCalls(), 0);
+    QVERIFY(liveFence->waitCalls() > 0);
+    QCOMPARE(deadState->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(liveState->destroyed.load(std::memory_order_acquire), 0);
+    QVERIFY(deadState->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(!retainedRoot.expired());
+    QCOMPARE(worker.m_gpuFrameRetireQueue.size(), 0);
+    QCOMPARE(worker.m_gpuRecoveryParticipantId, uint64_t(0));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(monitor.isLost());
+
+    liveFence->complete(1);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(liveState->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(liveState->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(retainedRoot.expired());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(!monitor.isLost());
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::shutdownTokenlessLossQuarantinesUnprovenOwner() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+    const std::weak_ptr<GpuRhiContext> retainedRoot = rhi;
+
+    const auto state = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t domain = 0xA110D;
+    auto fence = std::make_shared<ObservableLossFence>(domain, authority, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{domain, authority});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&provider}, &transport);
+    std::atomic_store_explicit(&worker.m_gpuRhi, rhi, std::memory_order_release);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker.m_gpuRecoveryParticipantId != 0);
+    worker.m_gpuFrameRetireQueue.collect(frame);
+    QCOMPARE(worker.m_gpuFrameRetireQueue.size(), 1);
+    monitor.recordLoss();
+
+    surface.reset();
+    frame = {};
+    rhi.reset();
+    worker.shutdownOutputGraph();
+
+    QVERIFY(fence->waitCalls() > 0);
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+    QVERIFY(!retainedRoot.expired());
+    QCOMPARE(worker.m_gpuFrameRetireQueue.size(), 0);
+    QCOMPARE(worker.m_gpuRecoveryParticipantId, uint64_t(0));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(monitor.isLost());
+
+    fence->complete(1);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(state->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(retainedRoot.expired());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(!monitor.isLost());
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::shutdownAllocationFailureReleasesTerminalOwnersBeforeGpuRoots() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+
+    const auto state = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t domain = 0xA110C;
+    auto fence = std::make_shared<ObservableLossFence>(domain, authority, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{domain, authority});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    auto worker = std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+    worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xDEAD) != 0);
+    worker->m_outputCache = std::make_unique<OutputFrameCache>(1, 16, 16);
+    worker->m_stagingCache = std::make_unique<OutputFrameCache>(1, 16, 16);
+    worker->m_prerollStagingCache = std::make_unique<OutputFrameCache>(1, 16, 16);
+    auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+    published->insertVideoFrame(frame);
+    worker->m_publishedCache.publish(std::move(published));
+    worker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+    GpuRecoveryCoordinator::instance().failNextAdmissionForTest();
+
+    surface.reset();
+    frame = {};
+    rhi.reset();
+    QElapsedTimer teardownElapsed;
+    teardownElapsed.start();
+    worker.reset();
+
+    QVERIFY2(teardownElapsed.elapsed() < 2000, "exceptional teardown exceeded its bounded wait");
+    QVERIFY(fence->waitCalls() > 0);
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(monitor.isLost());
+
+    fence->complete(1);
+    auto reaper = std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    reaper->m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                     std::memory_order_release);
+    reaper->m_lastPressureSampleMs = 0;
+    reaper->sampleGpuMemoryPressure(250);
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(state->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(!monitor.isLost());
+    reaper.reset();
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::terminalHandoffKeepsExactProofUntilMixedOwnersRetire() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+
+    const auto deadState = std::make_shared<TeardownOrderState>();
+    const auto liveState = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t deadDomain = 0xA1110;
+    constexpr uintptr_t liveDomain = 0xA1111;
+    auto deadFence = std::make_shared<ObservableLossFence>(deadDomain, authority, false);
+    auto liveFence = std::make_shared<ObservableLossFence>(liveDomain, authority, false);
+    FrameMetadata deadMetadata;
+    deadMetadata.key.feedIndex = 0;
+    deadMetadata.key.ptsMs = 0;
+    FrameMetadata liveMetadata = deadMetadata;
+    liveMetadata.key.ptsMs = 40;
+    auto deadSurface = std::make_shared<TeardownOrderSurface>(
+        rhi, deadState, GpuSurfaceCompatibility{deadDomain, authority});
+    auto liveSurface = std::make_shared<TeardownOrderSurface>(
+        rhi, liveState, GpuSurfaceCompatibility{liveDomain, authority});
+    FrameHandle deadFrame = makeGpuFrameHandle(deadSurface, rhi, deadMetadata, deadFence, 1, {});
+    FrameHandle liveFrame = makeGpuFrameHandle(liveSurface, rhi, liveMetadata, liveFence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    auto worker = std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+    worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, deadDomain) != 0);
+    auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+    published->insertVideoFrame(deadFrame);
+    published->insertVideoFrame(liveFrame);
+    worker->m_publishedCache.publish(std::move(published));
+    worker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+    GpuRecoveryCoordinator::instance().failNextAdmissionForTest();
+
+    deadSurface.reset();
+    liveSurface.reset();
+    deadFrame = {};
+    liveFrame = {};
+    rhi.reset();
+    worker.reset();
+
+    QCOMPARE(deadFence->waitCalls(), 0);
+    QVERIFY(liveFence->waitCalls() > 0);
+    QCOMPARE(deadState->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(liveState->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(monitor.isLost());
+
+    liveFence->complete(1);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(deadState->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(liveState->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(deadState->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QVERIFY(liveState->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(!monitor.isLost());
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::terminalHandoffAcceptsLateExactProof() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+
+    const auto state = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t domain = 0xA1112;
+    auto fence = std::make_shared<ObservableLossFence>(domain, authority, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{domain, authority});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    auto worker = std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+    worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+    auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+    published->insertVideoFrame(frame);
+    worker->m_publishedCache.publish(std::move(published));
+    worker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+
+    surface.reset();
+    frame = {};
+    rhi.reset();
+    worker.reset();
+
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(!monitor.isLost());
+    const int waitCallsBeforeProof = fence->waitCalls();
+
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, domain) != 0);
+    QVERIFY(monitor.isLost());
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+
+    QCOMPARE(fence->waitCalls(), waitCallsBeforeProof);
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(state->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(!monitor.isLost());
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::exceptionalPreLossTerminalHandoffDoesNotBlockLaterRebuild() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+
+    const auto state = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t domain = 0xA1114;
+    auto fence = std::make_shared<ObservableLossFence>(domain, authority, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{domain, authority});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    auto terminalWorker =
+        std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    std::atomic_store_explicit(&terminalWorker->m_gpuRhi, rhi, std::memory_order_release);
+    terminalWorker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(terminalWorker->m_gpuRecoveryParticipantId != 0);
+    auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+    published->insertVideoFrame(frame);
+    terminalWorker->m_publishedCache.publish(std::move(published));
+    terminalWorker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+
+    surface.reset();
+    frame = {};
+    rhi.reset();
+    terminalWorker.reset();
+
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(!monitor.isLost());
+
+    const uint64_t recoveryParticipant = monitor.registerRecoveryParticipant();
+    QVERIFY(recoveryParticipant != 0);
+    const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, domain);
+    QVERIFY(generation != 0);
+    const GpuValidatedLossResult delivery = monitor.withValidatedDeadDomains(
+        [](const GpuValidatedDeadDomains&) { return qsizetype(0); });
+    QCOMPARE(delivery.status, GpuValidatedLossStatus::Completed);
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(recoveryParticipant, generation));
+    const GpuRecoveryTicket ticket = monitor.beginRebuild(recoveryParticipant);
+
+    QVERIFY2(ticket.isValid(), "exceptional terminal carrier blocked a later worker rebuild");
+    QVERIFY(monitor.clearForRebuild(ticket));
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.unregisterRecoveryParticipant(recoveryParticipant).has_value());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(state->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::terminalHandoffPollsRetainedRhiFromCpuFallback() {
+#ifndef _WIN32
+    QSKIP("poll-only retained QRhi device-loss injection is Windows-specific");
+#else
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi || !rhi->isValid()) QSKIP("no WARP RHI backend available");
+    const auto rhiFence = rhi->createFence();
+    if (!rhiFence) QSKIP("no WARP fence available");
+    const GpuFenceIdentity identity = rhiFence->identity();
+    const std::weak_ptr<GpuRhiContext> retainedRoot = rhi;
+
+    const auto state = std::make_shared<TeardownOrderState>();
+    auto fence = std::make_shared<ObservableLossFence>(identity.deviceDomainId,
+                                                       identity.authorityEpoch, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{identity.deviceDomainId, identity.authorityEpoch});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    auto worker = std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+    worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+    auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+    published->insertVideoFrame(frame);
+    worker->m_publishedCache.publish(std::move(published));
+    worker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+
+    surface.reset();
+    frame = {};
+    worker.reset();
+
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(!monitor.isLost());
+    rhi->injectPollOnlyDeviceLostForTest();
+    rhi.reset();
+    QVERIFY(!retainedRoot.expired());
+
+    PlaybackWorker reaper({&provider}, &transport);
+    reaper.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::CpuFallback),
+                                    std::memory_order_release);
+    reaper.m_lastPressureSampleMs = 0;
+    reaper.sampleGpuMemoryPressure(250);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(state->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(!monitor.isLost());
+    QVERIFY(retainedRoot.expired());
+    monitor.reset();
+#endif
+}
+
+void TestGpuDeviceLostWorker::terminalHandoffPollsOneRetainedContextPerRoundRobinReap() {
+#ifndef _WIN32
+    QSKIP("poll-only retained QRhi device-loss injection is Windows-specific");
+#else
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+
+    std::array<std::shared_ptr<GpuRhiContext>, 2> rhis;
+    std::array<std::weak_ptr<GpuRhiContext>, 2> retainedRoots;
+    std::array<std::shared_ptr<TeardownOrderState>, 2> states;
+    std::array<std::shared_ptr<ObservableLossFence>, 2> fences;
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+
+    for (size_t index = 0; index < rhis.size(); ++index) {
+        rhis[index] = GpuRhiContext::createWarpForTest();
+        if (!rhis[index] || !rhis[index]->isValid()) QSKIP("no WARP RHI backend available");
+        const auto rhiFence = rhis[index]->createFence();
+        if (!rhiFence) QSKIP("no WARP fence available");
+        const GpuFenceIdentity identity = rhiFence->identity();
+        retainedRoots[index] = rhis[index];
+        states[index] = std::make_shared<TeardownOrderState>();
+        fences[index] = std::make_shared<ObservableLossFence>(identity.deviceDomainId,
+                                                              identity.authorityEpoch, false);
+        FrameMetadata metadata;
+        metadata.key.feedIndex = 0;
+        metadata.key.ptsMs = qint64(index) * 40;
+        auto surface = std::make_shared<TeardownOrderSurface>(
+            rhis[index], states[index],
+            GpuSurfaceCompatibility{identity.deviceDomainId, identity.authorityEpoch});
+        FrameHandle frame =
+            makeGpuFrameHandle(surface, rhis[index], metadata, fences[index], 1, {});
+
+        auto worker =
+            std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+        std::atomic_store_explicit(&worker->m_gpuRhi, rhis[index], std::memory_order_release);
+        worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+        QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+        auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+        published->insertVideoFrame(frame);
+        worker->m_publishedCache.publish(std::move(published));
+        worker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+        surface.reset();
+        frame = {};
+        worker.reset();
+    }
+
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(2));
+    const int firstBaseline = rhis[0]->deviceLossPollExecutionCountForTest();
+    const int secondBaseline = rhis[1]->deviceLossPollExecutionCountForTest();
+    rhis[0]->injectPollOnlyDeviceLostForTest();
+    rhis[1]->injectPollOnlyDeviceLostForTest();
+
+    PlaybackWorker::resetTerminalGpuOwnerPollCursorForTest();
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(rhis[0]->deviceLossPollExecutionCountForTest() - firstBaseline, 1);
+    QCOMPARE(rhis[1]->deviceLossPollExecutionCountForTest() - secondBaseline, 0);
+    QCOMPARE(states[0]->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 0);
+
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(rhis[0]->deviceLossPollExecutionCountForTest() - firstBaseline, 1);
+    QCOMPARE(rhis[1]->deviceLossPollExecutionCountForTest() - secondBaseline, 1);
+    QCOMPARE(states[0]->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 0);
+
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(states[0]->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(!monitor.isLost());
+
+    rhis = {};
+    QVERIFY(retainedRoots[0].expired());
+    QVERIFY(retainedRoots[1].expired());
+    monitor.reset();
+#endif
+}
+
+void TestGpuDeviceLostWorker::terminalHandoffPollsOneBackendPerReapWithinDualRootSlot() {
+#ifndef _WIN32
+    QSKIP("dual retained RHI/import roots are Windows-specific");
+#else
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi || !rhi->isValid()) QSKIP("no WARP RHI backend available");
+    auto importRoot = WinGpuImportEdge::createUnavailableForTest();
+    QVERIFY(importRoot != nullptr);
+    const auto rhiFence = rhi->createFence();
+    if (!rhiFence) QSKIP("no WARP fence available");
+    const GpuFenceIdentity identity = rhiFence->identity();
+    auto fence = std::make_shared<ObservableLossFence>(identity.deviceDomainId,
+                                                       identity.authorityEpoch, false);
+    const auto state = std::make_shared<TeardownOrderState>();
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{identity.deviceDomainId, identity.authorityEpoch});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+    FrameProvider provider;
+    PlaybackTransport transport;
+    auto worker = std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+    worker->m_winGpuImportEdge = std::move(importRoot);
+    worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+    published->insertVideoFrame(frame);
+    worker->m_publishedCache.publish(std::move(published));
+    worker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+    surface.reset();
+    frame = {};
+    const int rhiBaseline = rhi->deviceLossPollExecutionCountForTest();
+    WinGpuImportEdge::resetDeviceLossPollCountForTest();
+    PlaybackWorker::resetTerminalGpuOwnerPollCursorForTest();
+    worker.reset();
+    QCOMPARE(rhi->deviceLossPollExecutionCountForTest() - rhiBaseline, 1);
+    QCOMPARE(WinGpuImportEdge::deviceLossPollCountForTest(), 0);
+
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(rhi->deviceLossPollExecutionCountForTest() - rhiBaseline, 1);
+    QCOMPARE(WinGpuImportEdge::deviceLossPollCountForTest(), 1);
+
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(rhi->deviceLossPollExecutionCountForTest() - rhiBaseline, 2);
+    QCOMPARE(WinGpuImportEdge::deviceLossPollCountForTest(), 1);
+
+    fence->complete(1);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    monitor.reset();
+#endif
+}
+
+void TestGpuDeviceLostWorker::terminalHandoffClearsOneTerminalCarrierPerReap() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+
+    std::array<std::shared_ptr<GpuRhiContext>, 2> rhis;
+    std::array<std::weak_ptr<GpuRhiContext>, 2> retainedRoots;
+    std::array<std::shared_ptr<TeardownOrderState>, 2> states;
+    std::array<std::shared_ptr<ObservableLossFence>, 2> fences;
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+
+    for (size_t index = 0; index < rhis.size(); ++index) {
+        auto owner = std::make_shared<int>(0);
+        rhis[index] = std::shared_ptr<GpuRhiContext>(owner, nullptr);
+        owner.reset();
+        retainedRoots[index] = rhis[index];
+        states[index] = std::make_shared<TeardownOrderState>();
+        const uintptr_t domain = 0xA1120 + index;
+        fences[index] = std::make_shared<ObservableLossFence>(domain, authority, false);
+        FrameMetadata metadata;
+        metadata.key.feedIndex = 0;
+        metadata.key.ptsMs = qint64(index) * 40;
+        auto surface = std::make_shared<TeardownOrderSurface>(
+            rhis[index], states[index], GpuSurfaceCompatibility{domain, authority});
+        FrameHandle frame =
+            makeGpuFrameHandle(surface, rhis[index], metadata, fences[index], 1, {});
+
+        auto worker =
+            std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+        std::atomic_store_explicit(&worker->m_gpuRhi, rhis[index], std::memory_order_release);
+        worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+        QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+        auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+        published->insertVideoFrame(frame);
+        worker->m_publishedCache.publish(std::move(published));
+        worker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+        surface.reset();
+        frame = {};
+        worker.reset();
+    }
+
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(2));
+    fences[0]->complete(1);
+    fences[1]->complete(1);
+    rhis = {};
+
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(states[0]->destroyed.load(std::memory_order_acquire) +
+                 states[1]->destroyed.load(std::memory_order_acquire),
+             1);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(states[0]->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(states[1]->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(retainedRoots[0].expired());
+    QVERIFY(retainedRoots[1].expired());
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::terminalReaperUsesBoundedWaitInsteadOfCompletedValue() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto owner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(owner, nullptr);
+    owner.reset();
+    const auto state = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t domain = 0xA1130;
+    auto fence = std::make_shared<WaitOnlyLossFence>(domain, authority);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{domain, authority});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+    FrameProvider provider;
+    PlaybackTransport transport;
+    auto worker = std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+    worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+    published->insertVideoFrame(frame);
+    worker->m_publishedCache.publish(std::move(published));
+    worker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+    surface.reset();
+    frame = {};
+    rhi.reset();
+    worker.reset();
+
+    fence->resetCompletedCalls();
+    fence->complete();
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(fence->completedCalls(), 0);
+    QVERIFY(fence->waitCalls() > 0);
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::terminalHandoffRetriesRejectedTerminalUnregister() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+    const std::weak_ptr<GpuRhiContext> retainedRoot = rhi;
+
+    const auto state = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t domain = 0xA1113;
+    auto fence = std::make_shared<ObservableLossFence>(domain, authority, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{domain, authority});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    auto worker = std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+    worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+    auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+    published->insertVideoFrame(frame);
+    worker->m_publishedCache.publish(std::move(published));
+    worker->m_failShutdownAfterPublishedCacheDetachForTest = true;
+
+    surface.reset();
+    frame = {};
+    rhi.reset();
+    worker.reset();
+
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(!retainedRoot.expired());
+
+    monitor.failNextTerminalUnregisterForTest();
+    fence->complete(1);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(state->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+    QVERIFY(!retainedRoot.expired());
+
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(retainedRoot.expired());
+    QVERIFY(!monitor.isLost());
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::startedWorkerShutdownFailureUsesTerminalOwnerHandoff() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+
+    const auto state = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t unrelatedDomain = 0x51DE;
+    auto fence = std::make_shared<ObservableLossFence>(unrelatedDomain, authority, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{unrelatedDomain, authority});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&provider}, &transport);
+    std::atomic_store_explicit(&worker.m_gpuRhi, rhi, std::memory_order_release);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker.m_gpuRecoveryParticipantId != 0);
+    auto published = std::make_shared<OutputFrameCache>(1, 16, 16);
+    published->insertVideoFrame(frame);
+    worker.m_publishedCache.publish(std::move(published));
+    worker.m_failShutdownAfterPublishedCacheDetachForTest = true;
+    QSemaphore terminalHandoffCompleted;
+    worker.m_gpuTerminalShutdownCompletedForTest = &terminalHandoffCompleted;
+    worker.openFile(QStringLiteral("missing-started-worker-shutdown-fixture.ts"));
+
+    surface.reset();
+    frame = {};
+    rhi.reset();
+    QElapsedTimer elapsed;
+    elapsed.start();
+    worker.start();
+    const bool handoffCompleted = terminalHandoffCompleted.tryAcquire(1, 3000);
+    worker.stop();
+    worker.m_gpuTerminalShutdownCompletedForTest = nullptr;
+
+    QVERIFY2(handoffCompleted, "run-loop terminal owner handoff did not complete");
+    QVERIFY2(elapsed.elapsed() < 4000, "started worker did not exit within the bounded handoff");
+    QVERIFY(!worker.isRunning());
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 0);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(1));
+
+    fence->complete(1);
+    PlaybackWorker::reapTerminalGpuOwnerQuarantineForTest();
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(state->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::shutdownProvenDeadOwnerSkipsFenceWait() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto rhiOwner = std::make_shared<int>(0);
+    std::shared_ptr<GpuRhiContext> rhi(rhiOwner, nullptr);
+    rhiOwner.reset();
+
+    const auto state = std::make_shared<TeardownOrderState>();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    constexpr uintptr_t domain = 0xD34D;
+    auto fence = std::make_shared<ObservableLossFence>(domain, authority, false);
+    FrameMetadata metadata;
+    metadata.key.feedIndex = 0;
+    metadata.key.ptsMs = 0;
+    auto surface = std::make_shared<TeardownOrderSurface>(
+        rhi, state, GpuSurfaceCompatibility{domain, authority});
+    FrameHandle frame = makeGpuFrameHandle(surface, rhi, metadata, fence, 1, {});
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    auto worker = std::make_unique<PlaybackWorker>(QList<FrameProvider*>{&provider}, &transport);
+    std::atomic_store_explicit(&worker->m_gpuRhi, rhi, std::memory_order_release);
+    worker->m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    QVERIFY(worker->m_gpuRecoveryParticipantId != 0);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, domain) != 0);
+    worker->m_outputCache = std::make_unique<OutputFrameCache>(1, 16, 16);
+    worker->m_outputCache->insertVideoFrame(frame);
+    worker->m_failShutdownAfterRuntimeDetachForTest = true;
+    GpuRecoveryCoordinator::instance().failNextAdmissionForTest();
+
+    surface.reset();
+    frame = {};
+    rhi.reset();
+    QElapsedTimer teardownElapsed;
+    teardownElapsed.start();
+    worker.reset();
+
+    QVERIFY2(teardownElapsed.elapsed() < 250, "proven-dead owner waited on an unusable fence");
+    QCOMPARE(fence->waitCalls(), 0);
+    QCOMPARE(state->destroyed.load(std::memory_order_acquire), 1);
+    QVERIFY(state->rhiAliveAtSurfaceDestruction.load(std::memory_order_acquire));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
+    QVERIFY(!monitor.isLost());
+    monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::rejectedExactCleanupRetriesBeforeRebuild() {
+    qunsetenv("OLR_GPU_PIPELINE");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    auto& coordinator = GpuRecoveryCoordinator::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t deadDomain = 0xD34DCAFE;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<IncompleteLossFence>(deadDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deadDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&provider}, &transport);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+    const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, deadDomain);
+    QVERIFY(generation != 0);
+    coordinator.failNextAdmissionForTest();
+
+    worker.handleGpuDeviceLoss();
+
+    QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::RebuildPending);
+    QCOMPARE(worker.m_gpuPendingRecoveryGeneration, generation);
+    QVERIFY(monitor.isLost());
+    QCOMPARE(monitor.realLossTokens().size(), size_t(1));
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QCOMPARE(monitor.currentDeviceAuthorityForTest(), authority);
+
+    worker.handleGpuDeviceLoss();
+
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.currentDeviceAuthorityForTest() != authority);
+    QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
 }
 
 void TestGpuDeviceLostWorker::replacementLossBeforeFailedRebuildCommitRemainsRecoverable() {
@@ -1618,6 +3092,9 @@ void TestGpuDeviceLostWorker::tokenlessUpgradeDuringRecoveryReleasesQuarantineAu
     const qsizetype pendingAfterWorker = registry.pendingRetainCount();
     const int completingWaitsAfterWorker = completingLiveFence->waitCalls();
     const int persistentWaitsAfterWorker = persistentLiveFence->waitCalls();
+    const auto stateAfterRejectedCleanup = worker.gpuPipelineState();
+    worker.handleGpuDeviceLoss();
+    const auto stateAfterRetry = worker.gpuPipelineState();
     const bool completingCleanupPublished =
         GpuDeviceLossMonitorTestAuthority::publish(authority, completingLiveDomain) != 0;
     const bool persistentCleanupPublished =
@@ -1626,14 +3103,15 @@ void TestGpuDeviceLostWorker::tokenlessUpgradeDuringRecoveryReleasesQuarantineAu
 
     QVERIFY(reachedUpgradeWindow);
     QVERIFY(proofPublished);
-    QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
+    QCOMPARE(stateAfterRejectedCleanup, PlaybackWorker::GpuPipelineState::RebuildPending);
+    QCOMPARE(stateAfterRetry, PlaybackWorker::GpuPipelineState::CpuFallback);
     QCOMPARE(pendingAfterPublisher, pendingBefore + 2);
     QCOMPARE(completingWaitsAfterPublisher, 0);
     QCOMPARE(persistentWaitsAfterPublisher, 0);
-    QCOMPARE(pendingAfterWorker, pendingBefore + 1);
-    QCOMPARE(completingWaitsAfterWorker, 1);
-    QCOMPARE(persistentWaitsAfterWorker, 1);
-    QVERIFY(!completingCleanupPublished);
+    QCOMPARE(pendingAfterWorker, pendingBefore + 2);
+    QCOMPARE(completingWaitsAfterWorker, 0);
+    QCOMPARE(persistentWaitsAfterWorker, 0);
+    QVERIFY(completingCleanupPublished);
     QVERIFY(persistentCleanupPublished);
     QCOMPARE(pendingAfterCleanup, pendingBefore);
 }
@@ -1790,7 +3268,10 @@ void TestGpuDeviceLostWorker::lateProofPublisherAndWorkerShareExactRecovery() {
     QVERIFY(recoveryHadNotLockedEpoch);
     QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
-    QCOMPARE(storage.abandonmentShardVisits, uint64_t(1));
+    // Revision 2 carries both exact domains so a rejected revision 1 cannot be
+    // skipped. The domains intentionally hash to distinct retirement shards;
+    // the worker follows the cached revision-2 result and adds no third visit.
+    QCOMPARE(storage.abandonmentShardVisits, uint64_t(2));
 }
 
 void TestGpuDeviceLostWorker::lossSanitizesDecoderTrackBuffers() {

@@ -86,9 +86,13 @@ std::atomic<uint64_t>& nextReservation() {
 } // namespace
 
 #ifdef OLR_UNIT_TEST
-void GpuRetireRegistry::registerRetire(std::shared_ptr<GpuSurface> surface,
-                                       GpuRetirementTicket ticket) const {
-    const std::shared_ptr<GpuFence> fence = ticket.fence();
+void GpuRetireRegistry::registerRetire(
+    // The by-value parameters pin both owners for the complete registration transaction.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    std::shared_ptr<GpuSurface> surface,
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    GpuRetirementTicket ticket) const {
+    const std::shared_ptr<GpuFence>& fence = ticket.fence();
     if (!surface || !fence || ticket.value() == 0) return;
     try {
         if (!fence->validatesRetirement(ticket, surface->compatibility())) return;
@@ -97,14 +101,15 @@ void GpuRetireRegistry::registerRetire(std::shared_ptr<GpuSurface> surface,
     }
     const uint64_t reservation = gpuSubmissionDetail::takeMonotonicInstanceId(nextReservation());
     if (reservation == 0) return;
-    const std::shared_ptr<GpuSurface> owner = surface;
     const GpuRetirePreparedHandle prepared =
-        GpuReadbackRetainer::prepare(&owner, 1, fence, reservation);
+        GpuReadbackRetainer::prepare(&surface, 1, fence, reservation);
     if (!prepared) return;
     if (GpuReadbackRetainer::publish(prepared, ticket)) {
         try {
             surface->retainUntilFenceRetired(ticket.value());
         } catch (...) {
+            // This compatibility helper is test-only; publication already pins the owner.
+            static_cast<void>(0);
         }
     } else {
         GpuReadbackRetainer::release(prepared);
@@ -154,8 +159,11 @@ GpuRetireRegistry::prepareRetirement(const std::shared_ptr<GpuSurface>* surfaces
     return PreparedBatch(this, prepared);
 }
 
-bool GpuRetireRegistry::publishPrepared(PreparedBatch& prepared,
-                                        GpuRetirementTicket ticket) const noexcept {
+bool GpuRetireRegistry::publishPrepared(
+    PreparedBatch& prepared,
+    // The by-value ticket makes this an explicit ownership/consumption boundary.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    GpuRetirementTicket ticket) const noexcept {
     if (!prepared || prepared.m_registry != this) return false;
     if (!GpuReadbackRetainer::publish(prepared.m_handle, ticket)) return false;
     prepared.m_registry = nullptr;

@@ -799,6 +799,300 @@ def audit_apple_rhi_surface_compatibility(source, label):
             f"{label}: queue provenance must be recorded only from QRhi Metal native handles")
 
 
+def audit_apple_rhi_readback_cleanup(source, label):
+    frame_guard = function_block(source, "class AppleReadbackFrameGuard")
+    end_method = function_block(frame_guard, "QRhi::FrameOpResult end()")
+    disarm = end_method.find("m_frameOpen = false")
+    end_call = end_method.find("endOffscreenFrame")
+    require(disarm >= 0 and end_call > disarm,
+            f"{label}: Apple frame cleanup must disarm before ambiguous endOffscreenFrame")
+    require("m_complete" not in frame_guard and "complete()" not in frame_guard,
+            f"{label}: Apple frame cleanup must not carry an inert completion latch")
+
+    batch_guard = function_block(source, "class AppleReadbackBatchGuard")
+    require(re.search(r"catch\s*\(\s*\.\.\.\s*\)\s*\{[^}]*"
+                      r"(?:static_cast\s*<\s*void\s*>|\(\s*void\s*\))",
+                      batch_guard, re.DOTALL),
+            f"{label}: Apple batch cleanup catch must document an intentional no-op")
+
+    for signature in ("CpuPlanes readbackRgba8WithRhi", "CpuPlanes readbackNv12WithRhi"):
+        block = function_block(source, signature)
+        begin = block.find("beginOffscreenFrame")
+        frame_guard = block.find("AppleReadbackFrameGuard")
+        batch_guard = block.find("AppleReadbackBatchGuard")
+        transfer = block.find("batchGuard.take()")
+        finish = block.find("rhi->finish()")
+        require(begin >= 0 and frame_guard > begin,
+                f"{label}: {signature} must arm cleanup after beginOffscreenFrame")
+        require(batch_guard > frame_guard and transfer > batch_guard,
+                f"{label}: {signature} must guard the update batch until QRhi accepts it")
+        require(finish > transfer,
+                f"{label}: {signature} must synchronously finish accepted readback work")
+
+
+def audit_apple_timed_device_loss_poll(source, label):
+    render_thread_name = ("class GpuRenderThread" if "class GpuRenderThread" in source
+                          else "class D3DRenderThread")
+    render_thread = function_block(source, render_thread_name)
+    require("invokeFor" in render_thread and "wait_for" in render_thread,
+            f"{label}: render thread must expose a bounded invocation path")
+    synchronous_invoke = function_block(render_thread, "bool invoke(")
+    require("invokeFor" not in synchronous_invoke and
+            "make_shared" not in synchronous_invoke and
+            "wait_for" not in synchronous_invoke and
+            re.search(r"InvokeState\s+\w+\s*;", synchronous_invoke) and
+            re.search(r"m_jobs\s*\.\s*append", synchronous_invoke) and
+            re.search(r"finished\s*\.\s*wait", synchronous_invoke),
+            f"{label}: ordinary synchronous invokes must use caller-owned state, "
+            "not the allocating timed path")
+    require(re.search(r"try\s*\{\s*std\s*::\s*unique_lock[^;]*;[^}]*"
+                      r"finished\s*\.\s*wait.*\}\s*catch\s*"
+                      r"\(\s*\.\.\.\s*\)\s*\{[^}]*std\s*::\s*terminate",
+                      synchronous_invoke, re.DOTALL),
+            f"{label}: caller-stack wait lock construction and wait must fail-stop")
+    poll = function_block(source, "bool GpuRhiContext::pollDeviceLoss() const")
+    require("invokeFor" in poll and re.search(r"\[\s*impl\s*,\s*authority\s*\]", poll),
+            f"{label}: pollDeviceLoss must use timed value-captured render work")
+    require("[&]" not in poll,
+            f"{label}: timed-out poll work must not retain reference captures")
+    require(re.search(r"try\s*\{[^}]*invokeFor.*\}\s*catch\s*\(\s*\.\.\.\s*\)\s*\{"
+                      r"[^}]*deviceLossPollPending[^}]*false",
+                      poll, re.DOTALL),
+            f"{label}: pre-enqueue failure must re-arm device-loss polling")
+
+    if "class GpuRenderThread" in source:
+        require("struct QueuedJob" in render_thread and
+                re.search(r"void\s+quarantine\s*\(\s*\)", render_thread) and
+                re.search(r"cancelled\s*\.\s*swap\s*\(\s*m_jobs\s*\)", render_thread) and
+                re.search(r"job\s*\.\s*cancel\s*\(\s*\)", render_thread) and
+                re.search(r"\[\s*state\s*,\s*completion\s*,\s*finish\s*\]\s*\{"
+                          r"[^}]*finish\s*\(\s*completion\s*\)", render_thread, re.DOTALL),
+                f"{label}: timed queue jobs must be cancellable during quarantine")
+        require("m_abandonCleanup" in render_thread and "delete rhi" in render_thread,
+                f"{label}: quarantined render threads must abandon QRhi cleanup")
+        destructor = function_block(source, "GpuRhiContext::~GpuRhiContext()")
+        require(re.search(r"unique_ptr\s*<\s*Impl\s*>\s+\w+\s*=\s*std\s*::\s*move\s*"
+                          r"\(\s*m_impl\s*\)", destructor) and
+                re.search(r"thread\s*\.\s*wait\s*\(\s*100\s*\)", destructor) and
+                re.search(r"thread\s*\.\s*quarantine\s*\(\s*\)", destructor) and
+                ".release()" in destructor,
+                f"{label}: context teardown must bound join then quarantine a live carrier")
+        hot_path = function_block(source, "bool GpuRhiContext::invokeOnRenderThread")
+        require("invokeFor" not in hot_path and
+                re.search(r"thread\s*\.\s*invoke\s*\(\s*\[\s*&\s*\]", hot_path) and
+                "renderJob" not in hot_path,
+                f"{label}: ordinary synchronous render invokes must remain allocation-free")
+        require(re.search(r"invokeFor\s*\(.*?\[\s*impl\s*\]\s*\{[^}]*"
+                          r"deviceLossPollPending[^}]*false", poll, re.DOTALL),
+                f"{label}: queued poll cancellation must clear the coalescing bit")
+
+
+def audit_stub_synchronous_invoke_fail_stop(source, label):
+    render_thread = function_block(source, "class NullRenderThread")
+    synchronous_invoke = function_block(render_thread, "bool invoke(")
+    require(re.search(r"try\s*\{\s*std\s*::\s*unique_lock[^;]*;.*"
+                      r"m_jobs\s*\.\s*append.*m_cond\s*\.\s*wait.*"
+                      r"\}\s*catch\s*\(\s*\.\.\.\s*\)\s*\{[^}]*"
+                      r"std\s*::\s*terminate",
+                      synchronous_invoke, re.DOTALL),
+            f"{label}: accepted stack-captured work must fail-stop across lock/wait setup")
+
+
+def audit_apple_finite_fence_wait(source, label):
+    wait = function_block(source, "bool wait(uint64_t value, int timeoutMs)")
+    zero_timeout = wait.find("timeoutMs == 0")
+    finite_timeout = wait.find("timeoutMs > 0")
+    wait_state = wait.find("struct WaitState")
+    listener = wait.find("notifyListener")
+    require(0 <= zero_timeout < finite_timeout < wait_state < listener,
+            f"{label}: zero and finite waits must return before listener state is installed")
+    finite_branch = wait[finite_timeout:wait_state]
+    require("signaledValue" in finite_branch and
+            "steady_clock" in finite_branch and
+            ("sleep_for" in finite_branch or "msleep" in finite_branch),
+            f"{label}: finite waits must use bounded allocation-free signaled-value polling")
+
+
+def audit_compositor_frame_disarm(source, label):
+    guard = function_block(source, "class OffscreenFrameGuard")
+    finish = function_block(guard, "QRhi::FrameOpResult finish()")
+    disarm = finish.find("m_open = false")
+    end_call = finish.find("endOffscreenFrame")
+    require(disarm >= 0 and end_call > disarm,
+            f"{label}: compositor frame guard must disarm before ambiguous endOffscreenFrame")
+
+def audit_terminal_wait_contract(source, label):
+    retired = function_block(source, "bool terminalFrameRetired")
+    shutdown = function_block(source, "void PlaybackWorker::shutdownGpuOwnersAfterFailure")
+    require("completedValue" not in retired and
+            re.search(r"fence\s*->\s*wait\s*\([^,]+,\s*0\s*\)", retired),
+            f"{label}: terminal probes must use the fence timeout contract")
+    require("completedValue" not in shutdown and "fence->wait" in shutdown,
+            f"{label}: terminal deadline waits must not call completedValue directly")
+
+
+def audit_win_import_device_loss_sticky(source, label):
+    observation = function_block(source, "bool noteDeviceLostReason")
+    publication = re.search(
+        r"(?:const\s+)?uint64_t\s+(?P<generation>\w+)\s*=\s*"
+        r"WinGpuImportEdge::publishDeviceRemovedForMonitor\s*\(",
+        observation,
+    )
+    sticky_call_pattern = (
+        r"(?:deviceLossState\s*->\s*)?deviceLost\s*\.\s*store\s*\(\s*true\s*,"
+    )
+    sticky_calls = list(re.finditer(sticky_call_pattern, observation))
+    gated_sticky = None
+    if publication:
+        generation = re.escape(publication.group("generation"))
+        gated_sticky = re.search(
+            rf"if\s*\(\s*{generation}\s*!=\s*0\s*\)\s*(?:\{{\s*)?"
+            rf"{sticky_call_pattern}",
+            observation[publication.end():],
+        )
+    gated_end = (publication.end() + gated_sticky.end()
+                 if publication and gated_sticky else -1)
+    authoritative_return = observation.find("return true", gated_end)
+    require(
+        publication is not None and gated_sticky is not None and len(sticky_calls) == 1
+        and sticky_calls[0].start() >= publication.end()
+        and authoritative_return > gated_end,
+        f"{label}: sticky loss state must wait for durable monitor proof publication",
+    )
+
+
+def audit_terminal_quarantine_participant_promotion(source, label):
+    handoff = function_block(source, "void quarantineTerminalGpuOwners")
+    promotion = handoff.find("promoteRecoveryParticipantToTerminal")
+    first_store = handoff.find("available->output")
+    require(
+        promotion >= 0 and first_store >= 0 and promotion < first_store,
+        f"{label}: recovery participant must be promoted before terminal slot ownership transfer",
+    )
+
+
+def audit_retire_queue_exception_safety(source, worker, label):
+    drain = function_block(source, "int GpuFrameRetireQueue::drain")
+    require("QVector<Entry> pending" not in drain and
+            re.search(r"\*\s*survivor\s*=\s*std::move\s*\(\s*\*\s*current\s*\)", drain) and
+            re.search(r"catch\s*\(\s*\.\.\.\s*\)", drain),
+            f"{label}: drain must compact survivors by noexcept move and contain fence exceptions")
+
+    append = function_block(source, "void GpuFrameRetireQueue::append")
+    reserve = append.find("m_entries.reserve")
+    other_move = append.find("m_entries.append(std::move(entry))")
+    clear = append.find("other.m_entries.clear()")
+    require(0 <= reserve < other_move < clear and "QVector<Entry> merged" not in append,
+            f"{label}: append must reserve before moving entries without shared-owner copies")
+
+    restore = function_block(worker, "void restoreRetireQueueOrTerminate")
+    require("owner.append(std::move(local))" in restore and
+            "if (!owner.isEmpty()) std::terminate()" not in restore and
+            worker.count("restoreRetireQueueOrTerminate") >= 4,
+            f"{label}: swap-local drains must merge survivors with concurrent owner arrivals")
+
+
+def audit_terminal_import_reaping(worker, win_import, label):
+    reap = function_block(worker, "void reapTerminalGpuQuarantine")
+    poll = function_block(worker, "void pollTerminalSlotBackend")
+    clear = function_block(worker, "bool clearTerminalSlot")
+    require("pollDeviceLossFor" in poll and "deviceLost()" not in poll,
+            f"{label}: terminal import polling must use the deadline-aware edge contract")
+    reap_items = tokens(reap)
+    reap_braces = token_pairs(reap_items, "{", "}")
+    lock_call = next((index for index, (value, _) in enumerate(reap_items)
+                      if value == "terminalGpuQuarantineMutex"), None)
+    poll_call = next((index for index, (value, _) in enumerate(reap_items)
+                      if value == "pollTerminalSlotBackend"), None)
+    lock_scope = (direct_enclosing_brace(reap_braces, lock_call)
+                  if lock_call is not None else None)
+    require(lock_scope is not None and poll_call is not None
+            and reap_braces[lock_scope] < poll_call,
+            f"{label}: backend polling must execute after the quarantine lock scope")
+    require("slot.importRoot.reset()" not in clear and "std::move(slot.importRoot)" in clear,
+            f"{label}: import roots must be detached for destruction outside the quarantine lock")
+    destructor = function_block(win_import, "WinGpuImportEdge::~WinGpuImportEdge")
+    require("CoUninitialize" not in destructor and "coOwned" not in win_import and
+            "ScopedComApartment" in win_import,
+            f"{label}: COM initialization must be balanced on each calling thread")
+
+
+def terminal_import_audit_mutation_self_tests():
+    safe_sticky = """
+bool noteDeviceLostReason(HRESULT reason, uintptr_t domainId) const {
+    if (FAILED(reason)) {
+        const uint64_t generation = WinGpuImportEdge::publishDeviceRemovedForMonitor(
+            reason, deviceAuthorityEpoch, domainId);
+        if (generation != 0)
+            deviceLossState->deviceLost.store(true, std::memory_order_release);
+        return true;
+    }
+    return false;
+}
+"""
+    audit_win_import_device_loss_sticky(safe_sticky, "shared sticky carrier mutation")
+    for unsafe, message in (
+        (safe_sticky.replace(
+            "        if (generation != 0)\n"
+            "            deviceLossState->deviceLost.store(true, std::memory_order_release);",
+            "        deviceLossState->deviceLost.store(true, std::memory_order_release);",
+        ), "unconditional shared sticky publication must be rejected"),
+        (safe_sticky.replace(
+            "        const uint64_t generation = WinGpuImportEdge::publishDeviceRemovedForMonitor(\n"
+            "            reason, deviceAuthorityEpoch, domainId);\n"
+            "        if (generation != 0)\n"
+            "            deviceLossState->deviceLost.store(true, std::memory_order_release);",
+            "        deviceLossState->deviceLost.store(true, std::memory_order_release);\n"
+            "        const uint64_t generation = WinGpuImportEdge::publishDeviceRemovedForMonitor(\n"
+            "            reason, deviceAuthorityEpoch, domainId);",
+        ), "sticky publication before durable proof must be rejected"),
+    ):
+        try:
+            audit_win_import_device_loss_sticky(unsafe, "unsafe sticky mutation")
+        except AssertionError:
+            continue
+        raise AssertionError(message)
+
+    safe_worker = """
+bool clearTerminalSlot() {
+    releasedRoots.importRoot = std::move(slot.importRoot);
+    return true;
+}
+void pollTerminalSlotBackend() {
+    poll.importRoot->pollDeviceLossFor(10);
+}
+void reapTerminalGpuQuarantine() {
+    TerminalGpuBackendPoll poll;
+    {
+        std::lock_guard<std::mutex> lock(terminalGpuQuarantineMutex());
+        poll = selectOneTerminalBackend();
+    }
+    pollTerminalSlotBackend(poll);
+}
+"""
+    safe_import = """
+class ScopedComApartment {};
+WinGpuImportEdge::~WinGpuImportEdge() {
+    m_impl.reset();
+}
+"""
+    audit_terminal_import_reaping(safe_worker, safe_import, "unlocked poll mutation")
+    unsafe_worker = safe_worker.replace(
+        "        poll = selectOneTerminalBackend();\n"
+        "    }\n"
+        "    pollTerminalSlotBackend(poll);",
+        "        poll = selectOneTerminalBackend();\n"
+        "        pollTerminalSlotBackend(poll);\n"
+        "    }",
+    )
+    try:
+        audit_terminal_import_reaping(unsafe_worker, safe_import, "locked poll mutation")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("terminal backend polling inside the quarantine lock must be rejected")
+
+
 def apple_rhi_surface_compatibility_mutation_self_tests():
     safe = """
 GpuSurfaceCompatibility GpuRhiContext::surfaceCompatibility() const noexcept {
@@ -4087,6 +4381,7 @@ def main():
     gpu_read_lease_snapshot_model_mutation_self_tests()
     imported_nv12_backing_lifetime_mutation_self_tests()
     apple_scoped_wrapper_pixel_format_mutation_self_tests()
+    terminal_import_audit_mutation_self_tests()
     scoped_surface_escape_mutation_self_tests()
     native_submit_adapter_mutation_self_tests()
     first_party_source_discovery_mutation_self_tests()
@@ -4111,15 +4406,33 @@ def main():
     frame_data_path = Path(sys.argv[5])
 
     audit_apple_fence_factory(apple_fence, "Apple default Metal fence factory")
+    audit_apple_finite_fence_wait(apple_fence, "Apple Metal fence finite wait")
     audit_imported_nv12_backing_lifetime(compositor, "GPU compositor imported NV12 lifetime")
     audit_bound_apple_surface_domain(apple_surface, "Apple surface compatibility")
     apple_rhi = (frame_data_path.parents[2] / "playback/gpu/gpurhicontext_apple.mm").read_text(
         encoding="utf-8")
     audit_apple_rhi_surface_compatibility(apple_rhi, "Apple RHI surface compatibility")
+    audit_apple_rhi_readback_cleanup(apple_rhi, "Apple QRhi readback cleanup")
+    audit_apple_timed_device_loss_poll(apple_rhi, "Apple timed device-loss polling")
+    windows_rhi = (frame_data_path.parents[2] / "playback/gpu/gpurhicontext_win.cpp").read_text(
+        encoding="utf-8")
+    audit_apple_timed_device_loss_poll(windows_rhi, "Windows timed device-loss polling")
+    stub_rhi = (frame_data_path.parents[2] / "playback/gpu/gpurhicontext_stub.cpp").read_text(
+        encoding="utf-8")
+    audit_stub_synchronous_invoke_fail_stop(stub_rhi, "Stub synchronous render invoke")
     compositor_apple = (frame_data_path.parents[2] / "playback/gpu/gpucompositor_apple.mm").read_text(
         encoding="utf-8")
     audit_apple_compositor_context_binding(compositor_apple,
                                            "Apple compositor context binding")
+    audit_compositor_frame_disarm(compositor, "GPU compositor frame cleanup")
+    audit_terminal_wait_contract(playback_worker, "terminal GPU owner teardown")
+    audit_win_import_device_loss_sticky(win_import, "Windows GPU import device loss")
+    audit_terminal_quarantine_participant_promotion(playback_worker,
+                                                    "terminal GPU owner quarantine")
+    audit_retire_queue_exception_safety(retire_queue, playback_worker,
+                                        "GPU retire queue exception safety")
+    audit_terminal_import_reaping(playback_worker, win_import,
+                                  "terminal Windows import reaping")
     audit_apple_bound_wrap_calls(vt_importer, playback_worker, "Apple decoded surface binding")
     lease_header = (frame_data_path.parents[2] / "playback/gpu/gpusurfacelease.h").read_text(
         encoding="utf-8")

@@ -181,12 +181,16 @@ private:
                 GpuDeviceLossMonitor::instance().recordSubmissionFailure(
                     preparedFence.deviceDomainId);
             } catch (...) {
+                // Loss reporting is best-effort; the owners are already quarantined.
+                static_cast<void>(0);
             }
         } else if (result.outcome == GpuSubmitOutcome::SubmittedWithError) {
             try {
                 GpuDeviceLossMonitor::instance().recordSubmissionFailure(
                     preparedFence.deviceDomainId);
             } catch (...) {
+                // Preserve the adapter's submitted-with-error result if reporting fails.
+                static_cast<void>(0);
             }
         }
         return result;

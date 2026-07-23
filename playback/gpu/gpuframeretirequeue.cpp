@@ -3,6 +3,7 @@
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpusurface.h"
 
+#include <type_traits>
 #include <utility>
 
 void GpuFrameRetireQueue::collect(FrameHandle frame) {
@@ -21,32 +22,46 @@ void GpuFrameRetireQueue::collect(const QVector<FrameHandle>& frames) {
 int GpuFrameRetireQueue::drain(int timeoutMs, int* stalls, int maxWaits) {
     if (m_entries.isEmpty()) return 0;
 
-    QVector<Entry> pending;
+    static_assert(std::is_nothrow_move_assignable_v<Entry>);
     int released = 0;
     int waits = 0;
-    for (Entry& entry : m_entries) {
+    auto survivor = m_entries.begin();
+    for (auto current = m_entries.begin(); current != m_entries.end(); ++current) {
         bool retired = false;
-        if (entry.fence) {
-            retired = entry.fence->completedValue() >= entry.fenceValue;
-            if (!retired && (maxWaits < 0 || waits < maxWaits)) {
-                waits++;
-                retired = entry.fence->wait(entry.fenceValue, timeoutMs);
+        try {
+            if (current->fence) {
+                retired = current->fence->completedValue() >= current->fenceValue;
+                if (!retired && (maxWaits < 0 || waits < maxWaits)) {
+                    waits++;
+                    retired = current->fence->wait(current->fenceValue, timeoutMs);
+                }
             }
+        } catch (...) {
+            retired = false;
         }
 
         if (retired) {
             released++;
         } else {
+            if (survivor != current) *survivor = std::move(*current);
+            ++survivor;
             if (stalls) (*stalls)++;
-            pending.append(std::move(entry));
         }
     }
 
-    m_entries = std::move(pending);
+    m_entries.erase(survivor, m_entries.end());
     return released;
 }
 
 void GpuFrameRetireQueue::append(GpuFrameRetireQueue&& other) {
+    if (other.m_entries.isEmpty()) return;
+    static_assert(std::is_nothrow_move_constructible_v<Entry>);
+    if (m_entries.isEmpty()) {
+        m_entries.swap(other.m_entries);
+        return;
+    }
+
+    m_entries.reserve(m_entries.size() + other.m_entries.size());
     for (Entry& entry : other.m_entries)
         m_entries.append(std::move(entry));
     other.m_entries.clear();

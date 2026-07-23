@@ -22,20 +22,26 @@
 #include <QHash>
 #include <QMutex>
 #include <QMutexLocker>
+#ifdef OLR_UNIT_TEST
+#include <QSemaphore>
+#endif
 #include <QStringList>
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <d3d10.h>
 #include <d3d11.h>
 #include <functional>
+#include <future>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfobjects.h>
 #include <mftransform.h>
 #include <objbase.h>
+#include <thread>
 #include <utility>
 #include <wrl/client.h>
 
@@ -47,8 +53,26 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+#ifdef OLR_UNIT_TEST
+std::atomic<int> winDeviceLossPollCallsForTest{0};
+#endif
+
 constexpr const char* kMfHardwareDecoderEnv = "OLR_MF_VIDEO_ENABLE_HARDWARE";
 constexpr int kD3DReadbackFenceTimeoutMs = 2000;
+
+class ScopedComApartment {
+public:
+    ScopedComApartment() noexcept : m_result(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+    ~ScopedComApartment() {
+        if (SUCCEEDED(m_result)) CoUninitialize();
+    }
+
+    bool usable() const noexcept { return SUCCEEDED(m_result) || m_result == RPC_E_CHANGED_MODE; }
+    HRESULT result() const noexcept { return m_result; }
+
+private:
+    HRESULT m_result = E_FAIL;
+};
 
 uintptr_t deviceDomainId(ID3D11Device* device) {
     ComPtr<IUnknown> identity;
@@ -273,14 +297,29 @@ bool winGpuImportProbeForcesHardwareDecoderForTest() {
 #endif
 
 struct WinGpuImportEdge::Impl {
+    struct DeviceLossPollState {
+        std::atomic<bool> deviceLost{false};
+        std::atomic<bool> pollPending{false};
+#ifdef OLR_UNIT_TEST
+        std::atomic<QSemaphore*> blockEntered{nullptr};
+        std::atomic<QSemaphore*> blockRelease{nullptr};
+#endif
+    };
+
     ComPtr<ID3D11Device> device;
     ComPtr<IMFDXGIDeviceManager> manager;
     UINT resetToken = 0;
-    bool coOwned = false;
     bool mfStarted = false;
     uint64_t deviceAuthorityEpoch = 0;
-    mutable std::atomic<bool> deviceLost{false};
+    std::shared_ptr<DeviceLossPollState> deviceLossState = std::make_shared<DeviceLossPollState>();
     std::function<void(const FrameHandle&)> importTap;
+
+    ~Impl() {
+        ScopedComApartment apartment;
+        if (mfStarted) MFShutdown();
+        manager.Reset();
+        device.Reset();
+    }
 
     bool ownsDevice(ID3D11Device* candidate) const {
         if (!candidate || !device) return false;
@@ -290,16 +329,19 @@ struct WinGpuImportEdge::Impl {
                SUCCEEDED(device.As(&edgeIdentity)) && candidateIdentity.Get() == edgeIdentity.Get();
     }
 
-    bool noteDeviceLostIfRemoved() const {
-        if (!device) return false;
-        const HRESULT reason = device->GetDeviceRemovedReason();
+    bool noteDeviceLostReason(HRESULT reason, uintptr_t domainId) const {
         if (FAILED(reason)) {
-            WinGpuImportEdge::publishDeviceRemovedForMonitor(reason, deviceAuthorityEpoch,
-                                                             deviceDomainId(device.Get()));
-            deviceLost.store(true, std::memory_order_release);
+            const uint64_t generation = WinGpuImportEdge::publishDeviceRemovedForMonitor(
+                reason, deviceAuthorityEpoch, domainId);
+            if (generation != 0) deviceLossState->deviceLost.store(true, std::memory_order_release);
             return true;
         }
         return false;
+    }
+
+    bool noteDeviceLostIfRemoved() const {
+        return device &&
+               noteDeviceLostReason(device->GetDeviceRemovedReason(), deviceDomainId(device.Get()));
     }
 };
 
@@ -314,8 +356,7 @@ uint64_t WinGpuImportEdge::publishDeviceRemovedForMonitor(HRESULT reason,
 }
 
 WinGpuImportEdge::~WinGpuImportEdge() {
-    if (m_impl && m_impl->mfStarted) MFShutdown();
-    if (m_impl && m_impl->coOwned) CoUninitialize();
+    m_impl.reset();
 }
 
 std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::create(QString* error) {
@@ -326,12 +367,11 @@ std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::create(QString* error) {
     }
 
     auto edge = std::unique_ptr<WinGpuImportEdge>(new WinGpuImportEdge());
-    const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(coHr) && coHr != RPC_E_CHANGED_MODE) {
-        if (error) *error = hresultString("CoInitializeEx", coHr);
+    ScopedComApartment apartment;
+    if (!apartment.usable()) {
+        if (error) *error = hresultString("CoInitializeEx", apartment.result());
         return nullptr;
     }
-    edge->m_impl->coOwned = SUCCEEDED(coHr);
 
     const HRESULT mfHr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
     if (FAILED(mfHr)) {
@@ -352,14 +392,107 @@ std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::create(QString* error) {
 }
 
 bool WinGpuImportEdge::isAvailable() const {
-    return m_impl && m_impl->device && !m_impl->deviceLost.load(std::memory_order_acquire);
+    return m_impl && m_impl->device &&
+           !m_impl->deviceLossState->deviceLost.load(std::memory_order_acquire);
 }
 
 bool WinGpuImportEdge::deviceLost() const {
+#ifdef OLR_UNIT_TEST
+    winDeviceLossPollCallsForTest.fetch_add(1, std::memory_order_acq_rel);
+#endif
     if (!m_impl) return false;
-    if (m_impl->deviceLost.load(std::memory_order_acquire)) return true;
+    if (m_impl->deviceLossState->deviceLost.load(std::memory_order_acquire)) return true;
     return m_impl->noteDeviceLostIfRemoved();
 }
+
+bool WinGpuImportEdge::pollDeviceLossFor(int timeoutMs) const {
+#ifdef OLR_UNIT_TEST
+    winDeviceLossPollCallsForTest.fetch_add(1, std::memory_order_acq_rel);
+#endif
+    if (!m_impl) return false;
+    const auto state = m_impl->deviceLossState;
+    if (state->deviceLost.load(std::memory_order_acquire)) return true;
+
+#ifdef OLR_UNIT_TEST
+    QSemaphore* const blockEntered = state->blockEntered.exchange(nullptr);
+    QSemaphore* const blockRelease = state->blockRelease.exchange(nullptr);
+#else
+    constexpr void* blockEntered = nullptr;
+    constexpr void* blockRelease = nullptr;
+#endif
+    const ComPtr<ID3D11Device> device = m_impl->device;
+    if (!device && !blockEntered) return false;
+    bool expected = false;
+    if (!state->pollPending.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire))
+        return state->deviceLost.load(std::memory_order_acquire);
+
+    const uint64_t authority = m_impl->deviceAuthorityEpoch;
+    auto completion = std::make_shared<std::promise<void>>();
+    std::future<void> completed = completion->get_future();
+    try {
+        std::thread([state, device, authority, completion, blockEntered, blockRelease] {
+            ScopedComApartment apartment;
+#ifdef OLR_UNIT_TEST
+            if (blockEntered) blockEntered->release();
+            if (blockRelease) blockRelease->acquire();
+#endif
+            if (device) {
+                const HRESULT reason = device->GetDeviceRemovedReason();
+                if (FAILED(reason)) {
+                    const uint64_t generation = WinGpuImportEdge::publishDeviceRemovedForMonitor(
+                        reason, authority, deviceDomainId(device.Get()));
+                    if (generation != 0) state->deviceLost.store(true, std::memory_order_release);
+                }
+            }
+            state->pollPending.store(false, std::memory_order_release);
+            try {
+                completion->set_value();
+            } catch (...) {
+                static_cast<void>(0);
+            }
+        }).detach();
+    } catch (...) {
+        state->pollPending.store(false, std::memory_order_release);
+        return state->deviceLost.load(std::memory_order_acquire);
+    }
+    const int boundedTimeoutMs = timeoutMs < 0 ? 0 : timeoutMs;
+    (void) completed.wait_for(std::chrono::milliseconds(boundedTimeoutMs));
+    return state->deviceLost.load(std::memory_order_acquire);
+}
+
+#ifdef OLR_UNIT_TEST
+std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::createUnavailableForTest() {
+    return std::unique_ptr<WinGpuImportEdge>(new WinGpuImportEdge);
+}
+
+void WinGpuImportEdge::resetDeviceLossPollCountForTest() noexcept {
+    winDeviceLossPollCallsForTest.store(0, std::memory_order_release);
+}
+
+int WinGpuImportEdge::deviceLossPollCountForTest() noexcept {
+    return winDeviceLossPollCallsForTest.load(std::memory_order_acquire);
+}
+
+bool WinGpuImportEdge::observeDeviceRemovedForTest(HRESULT reason, uint64_t deviceAuthorityEpoch,
+                                                   uintptr_t deviceDomainId) {
+    if (!m_impl) return false;
+    if (m_impl->deviceLossState->deviceLost.load(std::memory_order_acquire)) return true;
+    m_impl->deviceAuthorityEpoch = deviceAuthorityEpoch;
+    return m_impl->noteDeviceLostReason(reason, deviceDomainId);
+}
+
+bool WinGpuImportEdge::deviceLostStickyForTest() const noexcept {
+    return m_impl && m_impl->deviceLossState->deviceLost.load(std::memory_order_acquire);
+}
+
+void WinGpuImportEdge::blockNextDeviceLossPollForTest(QSemaphore* entered,
+                                                      QSemaphore* release) noexcept {
+    if (!m_impl) return;
+    m_impl->deviceLossState->blockRelease.store(release, std::memory_order_release);
+    m_impl->deviceLossState->blockEntered.store(entered, std::memory_order_release);
+}
+#endif
 
 std::optional<FrameHandle> WinGpuImportEdge::tryImport(void* mfSampleOpaque, int feedIndex,
                                                        qint64 ptsMs, int width, int height,

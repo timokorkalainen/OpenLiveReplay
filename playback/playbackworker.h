@@ -45,6 +45,7 @@ class DecodeDoneFence;
 class GpuFence;
 class GpuRhiContext;
 class QSemaphore;
+struct GpuValidatedLossResult;
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
 class WinGpuImportEdge;
 #endif
@@ -87,6 +88,11 @@ class PlaybackWorker : public QThread {
     QSemaphore* m_gpuContinueTokenlessRecoveryForTest = nullptr;
     QSemaphore* m_gpuBeforeRecoveryCommitForTest = nullptr;
     QSemaphore* m_gpuContinueRecoveryCommitForTest = nullptr;
+    bool m_failShutdownAfterRuntimeDetachForTest = false;
+    bool m_failShutdownAfterPublishedCacheDetachForTest = false;
+    QSemaphore* m_gpuTerminalShutdownCompletedForTest = nullptr;
+    QSemaphore* m_gpuRetireDrainPausedForTest = nullptr;
+    QSemaphore* m_gpuRetireDrainContinueForTest = nullptr;
 #endif
 public:
     struct ResidencyWindowParams {
@@ -152,7 +158,7 @@ public:
 
     explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
                             AudioPlayer* audioPlayer = nullptr, QObject* parent = nullptr);
-    ~PlaybackWorker();
+    ~PlaybackWorker() noexcept;
 
     struct OperatorSeekResult {
         bool completed = false;
@@ -226,6 +232,8 @@ public:
 #ifdef OLR_GPU_PIPELINE_BUILD
     void evaluateGpuMemoryPressureForTest(uint64_t availableBytes, bool memoryWarning,
                                           qint64 nowMs = 0);
+    static void reapTerminalGpuOwnerQuarantineForTest() noexcept;
+    static void resetTerminalGpuOwnerPollCursorForTest() noexcept;
     static int64_t manualSeekCommitFillToForTest(int64_t target, int64_t frameDurationMs,
                                                  const GpuPrefetchPlan& prefetchPlan);
 #endif
@@ -429,6 +437,7 @@ private:
     // clear every TrackBuffer (holds m_bufferMutex); leaves m_outputCache intact
     void initializeOutputGraph(int feedCount, int width, int height);
     void shutdownOutputGraph();
+    void shutdownOutputGraphTerminalHandoff() noexcept;
     void rebuildOutputEndpoints();
     OutputRuntimeSnapshot makeOutputSnapshot() const;
     void refreshOutputAfterSeekCommit();
@@ -444,7 +453,9 @@ private:
     void collectEvictedGpuFramesLocked(const OutputFrameCache::EvictedVideoFrames& evictedFrames);
     void collectEvictedGpuFrameLocked(const FrameHandle& frame);
     void drainEvictedGpuFrames();
-    void forceDrainEvictedGpuFrames();
+    bool forceDrainEvictedGpuFrames();
+    void handoffGpuRetirementSurvivors() noexcept;
+    void shutdownGpuOwnersAfterFailure() noexcept;
     void recordFenceWaitStall();
     bool ensureWindowsGpuImportFencesReadyForDecode();
     void configureGpuBudget();
@@ -454,7 +465,9 @@ private:
     bool gpuDeviceLossPending() const;
     bool consumeGpuDeviceLossRebuildBudget();
     void drainGpuDeviceLossEvents() const;
-    void cleanupGpuRetirementsForDeviceLoss(bool allowTokenlessTestGate, bool pollBackends = true);
+    void retryGpuRecoveryParticipantTeardown();
+    GpuValidatedLossResult cleanupGpuRetirementsForDeviceLoss(bool allowTokenlessTestGate,
+                                                              bool pollBackends = true);
     bool completeCoordinatedGpuRebuild(bool consumeRebuildBudget);
     void handleGpuDeviceLoss();
     void sampleGpuMemoryPressure(qint64 nowMs);

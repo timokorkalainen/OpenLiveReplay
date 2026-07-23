@@ -5,7 +5,9 @@
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/framehandle.h"
 
+#include <atomic>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 class FakeGpuSurface final : public GpuSurface {
@@ -51,6 +53,31 @@ private:
     uint64_t m_completedValue = 0;
 };
 
+class ThrowingFence final : public GpuFence {
+public:
+    enum class ThrowPoint { CompletedValue, Wait };
+
+    explicit ThrowingFence(ThrowPoint throwPoint) : m_throwPoint(throwPoint) {}
+
+    uint64_t signal() override { return 1; }
+    bool wait(uint64_t, int) override {
+        if (m_completed.load(std::memory_order_acquire)) return true;
+        if (m_throwPoint == ThrowPoint::Wait) throw std::runtime_error("wait failed");
+        return false;
+    }
+    uint64_t completedValue() const override {
+        if (m_completed.load(std::memory_order_acquire)) return 1;
+        if (m_throwPoint == ThrowPoint::CompletedValue)
+            throw std::runtime_error("completedValue failed");
+        return 0;
+    }
+    void complete() { m_completed.store(true, std::memory_order_release); }
+
+private:
+    ThrowPoint m_throwPoint;
+    std::atomic<bool> m_completed{false};
+};
+
 static FrameHandle makeGpuFrame(uint64_t pendingFence, const std::shared_ptr<GpuFence>& fence) {
     auto surface = std::make_shared<FakeGpuSurface>(pendingFence);
     FrameMetadata meta;
@@ -70,6 +97,7 @@ private slots:
     void timeoutRetainsFrameAndCountsStall();
     void completedFenceReleasesFrame();
     void drainBudgetLimitsFenceWaitsPerPass();
+    void fenceExceptionsRemainUnretired();
 };
 
 void TestEvictionGuard::ignoresCpuAndUnfencedGpuFrames() {
@@ -140,6 +168,29 @@ void TestEvictionGuard::drainBudgetLimitsFenceWaitsPerPass() {
     QCOMPARE(queue.drain(1, &stalls, 1), 0);
 
     QCOMPARE(fence->waitCalls, 1);
+    QCOMPARE(stalls, 2);
+    QCOMPARE(queue.size(), 2);
+}
+
+void TestEvictionGuard::fenceExceptionsRemainUnretired() {
+    GpuFrameRetireQueue queue;
+    auto completedValueFence =
+        std::make_shared<ThrowingFence>(ThrowingFence::ThrowPoint::CompletedValue);
+    auto waitFence = std::make_shared<ThrowingFence>(ThrowingFence::ThrowPoint::Wait);
+    queue.collect(makeGpuFrame(4, completedValueFence));
+    queue.collect(makeGpuFrame(5, waitFence));
+
+    int stalls = 0;
+    bool threw = false;
+    int released = -1;
+    try {
+        released = queue.drain(0, &stalls);
+    } catch (...) {
+        threw = true;
+    }
+
+    QVERIFY(!threw);
+    QCOMPARE(released, 0);
     QCOMPARE(stalls, 2);
     QCOMPARE(queue.size(), 2);
 }

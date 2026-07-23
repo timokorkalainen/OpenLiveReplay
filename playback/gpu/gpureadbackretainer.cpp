@@ -72,7 +72,8 @@ struct FenceGroup {
     uint16_t freeNext = kNoFenceGroup;
 };
 
-struct RetireShard {
+// RetireStorage initializes the hash heads to kNoFenceGroup before publishing the singleton.
+struct RetireShard { // NOLINT(cppcoreguidelines-pro-type-member-init)
     QMutex mutex;
     std::array<RetireNode, kNodesPerShard> nodes;
     std::array<FenceGroup, kFenceGroupsPerShard> fenceGroups;
@@ -388,7 +389,8 @@ std::shared_ptr<GpuFence> detachNodeFromFenceGroup(RetireShard& shard, size_t sh
     return {};
 }
 
-struct DeferredReleases {
+// The arrays are raw placement-new storage; only constructed prefixes may be read or destroyed.
+struct DeferredReleases { // NOLINT(cppcoreguidelines-pro-type-member-init)
     using Owner = std::shared_ptr<GpuSurface>;
     using Fence = std::shared_ptr<GpuFence>;
     using OwnerSlot = std::aligned_storage_t<sizeof(Owner), alignof(Owner)>;
@@ -399,7 +401,7 @@ struct DeferredReleases {
     size_t ownerCount = 0;
     size_t fenceCount = 0;
 
-    DeferredReleases() noexcept = default;
+    DeferredReleases() noexcept = default; // NOLINT(cppcoreguidelines-pro-type-member-init)
     DeferredReleases(const DeferredReleases&) = delete;
     DeferredReleases& operator=(const DeferredReleases&) = delete;
     ~DeferredReleases() { clear(); }
@@ -499,13 +501,14 @@ struct FenceProbe {
     uint64_t completedValue = 0;
 };
 
-struct FenceProbeWorkspace {
+// The array is raw placement-new storage; only the constructed prefix may be read or destroyed.
+struct FenceProbeWorkspace { // NOLINT(cppcoreguidelines-pro-type-member-init)
     using Slot = std::aligned_storage_t<sizeof(FenceProbe), alignof(FenceProbe)>;
 
     std::array<Slot, kFenceGroupsPerShard> values;
     size_t used = 0;
 
-    FenceProbeWorkspace() noexcept = default;
+    FenceProbeWorkspace() noexcept = default; // NOLINT(cppcoreguidelines-pro-type-member-init)
     FenceProbeWorkspace(const FenceProbeWorkspace&) = delete;
     FenceProbeWorkspace& operator=(const FenceProbeWorkspace&) = delete;
     ~FenceProbeWorkspace() { clear(); }
@@ -897,6 +900,8 @@ int GpuReadbackRetainer::drainWithBoundedWait(int totalTimeoutMs) {
             try {
                 completedMaximum = probe.fence->wait(probe.maximumValue, remainingMs);
             } catch (...) {
+                // A throwing backend wait is treated exactly like an incomplete wait.
+                static_cast<void>(0);
             }
             if (completedMaximum)
                 probe.completedValue = probe.maximumValue;

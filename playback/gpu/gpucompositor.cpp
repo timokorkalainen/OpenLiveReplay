@@ -20,6 +20,7 @@
 #include <rhi/qrhi.h>
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -28,6 +29,14 @@
 namespace {
 
 constexpr int kMaxGridSources = 16;
+
+#ifdef OLR_UNIT_TEST
+std::atomic<bool> failRenderPassForTest{false};
+std::atomic<bool> failBeginFrameForTest{false};
+std::atomic<bool> failFrameOpForTest{false};
+std::atomic<int> recoveredRenderPassCountForTest{0};
+std::atomic<int> recoveredOffscreenFrameCountForTest{0};
+#endif
 
 template <size_t N, size_t Capacity, typename Adapter>
 GpuSubmissionResult submitCompactedOwners(GpuOpScope& operation, Adapter& adapter,
@@ -75,8 +84,127 @@ struct RenderSource {
 
 struct RenderGridResult {
     CpuPlanes readback;
-    bool rendered = false;
+};
+
+struct RenderGridProgress {
     bool submissionAttempted = false;
+    bool rendered = false;
+    bool frameOpFailed = false;
+    bool deviceLossPolled = false;
+};
+
+void pollSubmittedFailureOnce(const std::shared_ptr<GpuRhiContext>& rhi,
+                              RenderGridProgress& progress) noexcept {
+    if (!rhi || (!progress.frameOpFailed && !progress.submissionAttempted) ||
+        progress.deviceLossPolled)
+        return;
+    progress.deviceLossPolled = true;
+    try {
+        (void) rhi->pollDeviceLoss();
+    } catch (...) {
+        // The submission failure remains authoritative even if its diagnostic poll fails.
+    }
+}
+
+GpuSubmitOutcome renderAdapterOutcome(const RenderGridProgress& progress, bool invoked) noexcept {
+    if (!progress.submissionAttempted) return GpuSubmitOutcome::NotSubmitted;
+    return invoked && progress.rendered ? GpuSubmitOutcome::Submitted
+                                        : GpuSubmitOutcome::SubmittedWithError;
+}
+
+GpuSubmitOutcome renderAdapterExceptionOutcome(const RenderGridProgress& progress) noexcept {
+    return progress.submissionAttempted ? GpuSubmitOutcome::SubmittedWithError
+                                        : GpuSubmitOutcome::NotSubmitted;
+}
+
+class ResourceUpdateBatchGuard final {
+public:
+    explicit ResourceUpdateBatchGuard(QRhiResourceUpdateBatch* batch) noexcept : m_batch(batch) {}
+    ~ResourceUpdateBatchGuard() noexcept {
+        try {
+            if (m_batch) m_batch->release();
+        } catch (...) {
+            // Cleanup is best-effort in a noexcept guard.
+            static_cast<void>(0);
+        }
+    }
+
+    ResourceUpdateBatchGuard(const ResourceUpdateBatchGuard&) = delete;
+    ResourceUpdateBatchGuard& operator=(const ResourceUpdateBatchGuard&) = delete;
+
+    QRhiResourceUpdateBatch* take() noexcept {
+        // QRhi's contract transfers and releases the batch when it is passed to
+        // beginPass/endPass. Disarm before the call so an exception cannot make
+        // this guard release a batch already accepted by QRhi.
+        QRhiResourceUpdateBatch* batch = m_batch;
+        m_batch = nullptr;
+        return batch;
+    }
+
+private:
+    QRhiResourceUpdateBatch* m_batch = nullptr;
+};
+
+class OffscreenFrameGuard final {
+public:
+    OffscreenFrameGuard(QRhi* rhi, RenderGridProgress& progress) noexcept
+        : m_rhi(rhi), m_progress(progress) {}
+
+    ~OffscreenFrameGuard() noexcept {
+        if (!m_open || !m_rhi) return;
+        if (m_passOpen && m_commandBuffer) {
+            try {
+                m_commandBuffer->endPass();
+            } catch (...) {
+                // Cleanup is best-effort in a noexcept guard.
+                m_progress.frameOpFailed = true;
+            }
+#ifdef OLR_UNIT_TEST
+            recoveredRenderPassCountForTest.fetch_add(1, std::memory_order_relaxed);
+#endif
+            m_passOpen = false;
+        }
+        try {
+            if (m_rhi->endOffscreenFrame() != QRhi::FrameOpSuccess) m_progress.frameOpFailed = true;
+        } catch (...) {
+            // Cleanup is best-effort in a noexcept guard.
+            m_progress.frameOpFailed = true;
+        }
+#ifdef OLR_UNIT_TEST
+        recoveredOffscreenFrameCountForTest.fetch_add(1, std::memory_order_relaxed);
+#endif
+    }
+
+    OffscreenFrameGuard(const OffscreenFrameGuard&) = delete;
+    OffscreenFrameGuard& operator=(const OffscreenFrameGuard&) = delete;
+
+    void passOpened(QRhiCommandBuffer* commandBuffer) noexcept {
+        m_commandBuffer = commandBuffer;
+        m_passOpen = commandBuffer != nullptr;
+    }
+
+    void passClosed() noexcept { m_passOpen = false; }
+
+    QRhi::FrameOpResult finish() {
+        // endOffscreenFrame may throw after QRhi has accepted the end. Disarm
+        // first so unwinding never retries an ambiguous frame boundary.
+        m_open = false;
+        try {
+            const QRhi::FrameOpResult result = m_rhi->endOffscreenFrame();
+            if (result != QRhi::FrameOpSuccess) m_progress.frameOpFailed = true;
+            return result;
+        } catch (...) {
+            m_progress.frameOpFailed = true;
+            throw;
+        }
+    }
+
+private:
+    QRhi* m_rhi = nullptr;
+    RenderGridProgress& m_progress;
+    QRhiCommandBuffer* m_commandBuffer = nullptr;
+    bool m_passOpen = false;
+    bool m_open = true;
 };
 
 QList<FrameHandle> dropStaleInputs(const QList<FrameHandle>& frames, uint64_t generation) {
@@ -239,7 +367,7 @@ template <typename NativeAt>
 RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<RenderSource>& sources, int frameCount,
                                    int width, int height, ColorMetadata color,
                                    GpuCompositor::ScaleQuality quality, NativeAt&& nativeAt,
-                                   size_t outputSlot) {
+                                   size_t outputSlot, RenderGridProgress& progress) {
     RenderGridResult result;
     if (!rhi || width <= 0 || height <= 0) return {};
     for (int i = 0; i < qMin(frameCount, sources.size()); ++i) {
@@ -311,6 +439,7 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<RenderSource>& sources
 
     QRhiResourceUpdateBatch* updates = rhi->nextResourceUpdateBatch();
     if (!updates) return {};
+    ResourceUpdateBatchGuard updatesGuard(updates);
     updates->updateDynamicBuffer(ubuf.get(), 0, sizeof(GridUniformBlock), &uniforms);
 
     std::unique_ptr<QRhiTexture> dummyLumaTexture;
@@ -352,22 +481,14 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<RenderSource>& sources
             const GpuScopedNativeSurface* nativeSource = nativeAt(source.nativeSlot);
             auto imported =
                 nativeSource ? gpucompositor::importNv12Source(rhi, *nativeSource) : nullptr;
-            if (!imported) {
-                updates->release();
-                return {};
-            }
+            if (!imported) return {};
             std::unique_ptr<QRhiTexture> yTex(rhi->newTexture(QRhiTexture::R8, QSize(srcW, srcH)));
             std::unique_ptr<QRhiTexture> uvTex(
                 rhi->newTexture(QRhiTexture::RG8, QSize(chromaW, chromaH)));
-            if (!yTex || !uvTex) {
-                updates->release();
-                return {};
-            }
+            if (!yTex || !uvTex) return {};
             if (!yTex->createFrom(imported->lumaNativeTexture()) ||
-                !uvTex->createFrom(imported->chromaNativeTexture())) {
-                updates->release();
+                !uvTex->createFrom(imported->chromaNativeTexture()))
                 return {};
-            }
             importedSources.push_back(std::move(imported));
             lumaTextures.push_back(yTex.get());
             chromaTextures.push_back(uvTex.get());
@@ -381,24 +502,16 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<RenderSource>& sources
             std::unique_ptr<QRhiTexture> yTex(rhi->newTexture(QRhiTexture::R8, QSize(srcW, srcH)));
             std::unique_ptr<QRhiTexture> uvTex(
                 rhi->newTexture(QRhiTexture::RG8, QSize(chromaW, chromaH)));
-            if (!yTex || !uvTex) {
-                updates->release();
-                return {};
-            }
+            if (!yTex || !uvTex) return {};
             if (!yTex->create() || !uvTex->create() ||
-                !uploadNv12Planes(updates, yTex.get(), uvTex.get(), source.nv12)) {
-                updates->release();
+                !uploadNv12Planes(updates, yTex.get(), uvTex.get(), source.nv12))
                 return {};
-            }
             lumaTextures.push_back(yTex.get());
             chromaTextures.push_back(uvTex.get());
             ownedLumaTextures.push_back(std::move(yTex));
             ownedChromaTextures.push_back(std::move(uvTex));
         } else {
-            if (!ensureDummyTextures()) {
-                updates->release();
-                return {};
-            }
+            if (!ensureDummyTextures()) return {};
             lumaTextures.push_back(dummyLumaTexture.get());
             chromaTextures.push_back(dummyChromaTexture.get());
         }
@@ -418,55 +531,67 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<RenderSource>& sources
                                                        sampler.get()));
 
     std::unique_ptr<QRhiShaderResourceBindings> srb(rhi->newShaderResourceBindings());
-    if (!srb) {
-        updates->release();
-        return {};
-    }
+    if (!srb) return {};
     srb->setBindings(bindings.cbegin(), bindings.cend());
-    if (!srb->create()) {
-        updates->release();
-        return {};
-    }
+    if (!srb->create()) return {};
 
     std::unique_ptr<QRhiGraphicsPipeline> pipeline(rhi->newGraphicsPipeline());
-    if (!pipeline) {
-        updates->release();
-        return {};
-    }
+    if (!pipeline) return {};
     pipeline->setShaderStages({{QRhiShaderStage::Vertex, vert}, {QRhiShaderStage::Fragment, frag}});
     QRhiVertexInputLayout inputLayout;
     pipeline->setVertexInputLayout(inputLayout);
     pipeline->setShaderResourceBindings(srb.get());
     pipeline->setRenderPassDescriptor(rpDesc.get());
-    if (!pipeline->create()) {
-        updates->release();
-        return result;
-    }
+    if (!pipeline->create()) return result;
 
     QRhiReadbackResult readback;
     QRhiCommandBuffer* cb = nullptr;
-    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess || !cb) {
-        updates->release();
+#ifdef OLR_UNIT_TEST
+    if (failBeginFrameForTest.exchange(false, std::memory_order_acq_rel)) {
+        progress.frameOpFailed = true;
         return {};
     }
-    result.submissionAttempted = true;
+#endif
+    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess) {
+        progress.frameOpFailed = true;
+        return {};
+    }
+    progress.submissionAttempted = true;
+    OffscreenFrameGuard frameGuard(rhi, progress);
+    if (!cb) return {};
 
-    cb->beginPass(renderTarget.get(), QColor(0, 0, 0, 255), {1.0f, 0}, updates);
+    cb->beginPass(renderTarget.get(), QColor(0, 0, 0, 255), {1.0f, 0}, updatesGuard.take());
+    frameGuard.passOpened(cb);
     cb->setGraphicsPipeline(pipeline.get());
     cb->setViewport(QRhiViewport(0, 0, static_cast<float>(width), static_cast<float>(height)));
     cb->setShaderResources(srb.get());
     cb->draw(3);
+#ifdef OLR_UNIT_TEST
+    if (failRenderPassForTest.exchange(false, std::memory_order_acq_rel)) throw std::bad_alloc();
+#endif
     QRhiResourceUpdateBatch* afterPassUpdates = nullptr;
     if (!hasNativeOutput) {
         afterPassUpdates = rhi->nextResourceUpdateBatch();
+        ResourceUpdateBatchGuard afterPassUpdatesGuard(afterPassUpdates);
         if (afterPassUpdates) {
             afterPassUpdates->readBackTexture(QRhiReadbackDescription(output.get()), &readback);
         }
+        cb->endPass(afterPassUpdatesGuard.take());
+    } else {
+        cb->endPass();
     }
-    cb->endPass(afterPassUpdates);
+    frameGuard.passClosed();
 
-    if (rhi->endOffscreenFrame() != QRhi::FrameOpSuccess) return result;
-    result.rendered = true;
+    QRhi::FrameOpResult frameResult = frameGuard.finish();
+#ifdef OLR_UNIT_TEST
+    if (failFrameOpForTest.exchange(false, std::memory_order_acq_rel))
+        frameResult = QRhi::FrameOpDeviceLost;
+#endif
+    if (frameResult != QRhi::FrameOpSuccess) {
+        progress.frameOpFailed = true;
+        return result;
+    }
+    progress.rendered = true;
     if (!hasNativeOutput) {
         if (!afterPassUpdates || readback.format != QRhiTexture::RGBA8 ||
             readback.pixelSize != QSize(width, height)) {
@@ -523,6 +648,42 @@ std::shared_ptr<GpuCompositor> GpuCompositor::create(std::shared_ptr<GpuRhiConte
     impl->rhi = std::move(rhi);
     return std::shared_ptr<GpuCompositor>(new GpuCompositor(std::move(impl)));
 }
+
+#ifdef OLR_UNIT_TEST
+GpuSubmitOutcome GpuCompositor::renderExceptionOutcomeForTest(bool submissionAttempted) noexcept {
+    RenderGridProgress progress;
+    progress.submissionAttempted = submissionAttempted;
+    return renderAdapterExceptionOutcome(progress);
+}
+
+GpuSubmitOutcome GpuCompositor::renderDispatchOutcomeForTest(bool submissionAttempted, bool invoked,
+                                                             bool rendered) noexcept {
+    RenderGridProgress progress{submissionAttempted, rendered};
+    return renderAdapterOutcome(progress, invoked);
+}
+
+void GpuCompositor::injectRenderPassFailureForTest() noexcept {
+    recoveredRenderPassCountForTest.store(0, std::memory_order_release);
+    recoveredOffscreenFrameCountForTest.store(0, std::memory_order_release);
+    failRenderPassForTest.store(true, std::memory_order_release);
+}
+
+void GpuCompositor::injectBeginFrameFailureForTest() noexcept {
+    failBeginFrameForTest.store(true, std::memory_order_release);
+}
+
+void GpuCompositor::injectFrameOpFailureForTest() noexcept {
+    failFrameOpForTest.store(true, std::memory_order_release);
+}
+
+int GpuCompositor::recoveredRenderPassesForTest() noexcept {
+    return recoveredRenderPassCountForTest.load(std::memory_order_acquire);
+}
+
+int GpuCompositor::recoveredOffscreenFramesForTest() noexcept {
+    return recoveredOffscreenFrameCountForTest.load(std::memory_order_acquire);
+}
+#endif
 
 #ifndef __APPLE__
 std::shared_ptr<GpuSurface>
@@ -584,21 +745,27 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
         const size_t outputSlot = retirementOwnerCount;
         retirementOwners[retirementOwnerCount++] = surface;
         RenderGridResult renderResult;
+        RenderGridProgress renderProgress;
         auto adapter = [&](const auto& nativeView) noexcept {
-            const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
-                auto nativeAt = [&](size_t slot) -> const GpuScopedNativeSurface* {
-                    return slot < nativeView.size() ? &nativeView[slot] : nullptr;
-                };
-                renderResult =
-                    renderGridWithRhi(rhi, renderSources, cappedFrameCount(filtered), width, height,
-                                      color, quality, nativeAt, outputSlot);
-            });
-            if (!invoked || !renderResult.submissionAttempted)
-                return GpuSubmitOutcome::NotSubmitted;
-            return renderResult.rendered ? GpuSubmitOutcome::Submitted
-                                         : GpuSubmitOutcome::SubmittedWithError;
+            try {
+                const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
+                    auto nativeAt = [&](size_t slot) -> const GpuScopedNativeSurface* {
+                        return slot < nativeView.size() ? &nativeView[slot] : nullptr;
+                    };
+                    renderResult = renderGridWithRhi(rhi, renderSources, cappedFrameCount(filtered),
+                                                     width, height, color, quality, nativeAt,
+                                                     outputSlot, renderProgress);
+                });
+                if (renderProgress.frameOpFailed ||
+                    (renderProgress.submissionAttempted && !invoked))
+                    pollSubmittedFailureOnce(m_impl->rhi, renderProgress);
+                return renderAdapterOutcome(renderProgress, invoked);
+            } catch (...) {
+                pollSubmittedFailureOnce(m_impl->rhi, renderProgress);
+                return renderAdapterExceptionOutcome(renderProgress);
+            }
         };
-        const auto submission =
+        auto submission =
             submitCompactedOwners<1>(operation, adapter, retirementOwners, retirementOwnerCount);
         if (!submission.succeeded()) return FrameHandle{};
         FrameMetadata meta = makeCompositeMetadata(width, height, generation);
@@ -674,32 +841,49 @@ CpuPlanes GpuCompositor::composeGridToCpuForGeneration(const QList<FrameHandle>&
         }
         RenderGridResult renderResult;
         if (ownerCount == 0) {
-            const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
-                auto noNativeSlot = [](size_t) -> const GpuScopedNativeSurface* { return nullptr; };
-                renderResult = renderGridWithRhi(rhi, renderSources, cappedFrameCount(filtered),
-                                                 width, height, color, quality, noNativeSlot,
-                                                 std::numeric_limits<size_t>::max());
-            });
-            return invoked ? renderResult.readback : CpuPlanes{};
+            RenderGridProgress renderProgress;
+            try {
+                const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
+                    auto noNativeSlot = [](size_t) -> const GpuScopedNativeSurface* {
+                        return nullptr;
+                    };
+                    renderResult = renderGridWithRhi(
+                        rhi, renderSources, cappedFrameCount(filtered), width, height, color,
+                        quality, noNativeSlot, std::numeric_limits<size_t>::max(), renderProgress);
+                });
+                if (renderProgress.frameOpFailed ||
+                    (renderProgress.submissionAttempted && !invoked))
+                    pollSubmittedFailureOnce(m_impl->rhi, renderProgress);
+                return invoked ? renderResult.readback : CpuPlanes{};
+            } catch (...) {
+                pollSubmittedFailureOnce(m_impl->rhi, renderProgress);
+                return CpuPlanes{};
+            }
         }
 
         const std::shared_ptr<GpuFence> renderFence = m_impl->rhi->createFence();
         if (!renderFence) return {};
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
+        RenderGridProgress renderProgress;
         auto adapter = [&](const auto& nativeView) noexcept {
-            const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
-                auto nativeAt = [&](size_t slot) -> const GpuScopedNativeSurface* {
-                    return slot < nativeView.size() ? &nativeView[slot] : nullptr;
-                };
-                renderResult =
-                    renderGridWithRhi(rhi, renderSources, cappedFrameCount(filtered), width, height,
-                                      color, quality, nativeAt, std::numeric_limits<size_t>::max());
-            });
-            if (!invoked || !renderResult.submissionAttempted)
-                return GpuSubmitOutcome::NotSubmitted;
-            return renderResult.rendered ? GpuSubmitOutcome::Submitted
-                                         : GpuSubmitOutcome::SubmittedWithError;
+            try {
+                const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
+                    auto nativeAt = [&](size_t slot) -> const GpuScopedNativeSurface* {
+                        return slot < nativeView.size() ? &nativeView[slot] : nullptr;
+                    };
+                    renderResult = renderGridWithRhi(
+                        rhi, renderSources, cappedFrameCount(filtered), width, height, color,
+                        quality, nativeAt, std::numeric_limits<size_t>::max(), renderProgress);
+                });
+                if (renderProgress.frameOpFailed ||
+                    (renderProgress.submissionAttempted && !invoked))
+                    pollSubmittedFailureOnce(m_impl->rhi, renderProgress);
+                return renderAdapterOutcome(renderProgress, invoked);
+            } catch (...) {
+                pollSubmittedFailureOnce(m_impl->rhi, renderProgress);
+                return renderAdapterExceptionOutcome(renderProgress);
+            }
         };
         const auto submission = submitCompactedOwners<1>(operation, adapter, owners, ownerCount);
         return submission.driverAccepted() ? renderResult.readback : CpuPlanes{};

@@ -13,6 +13,7 @@
 #include <dispatch/dispatch.h>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 namespace {
 
@@ -55,6 +56,16 @@ public:
         if (value == 0) return true;
         if (!m_event || !m_listener) return false;
         if (completedValue() >= value) return true;
+        if (timeoutMs == 0) return m_event.signaledValue >= value;
+        if (timeoutMs > 0) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (m_event.signaledValue >= value) return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return m_event.signaledValue >= value;
+        }
 
         struct WaitState {
             std::mutex mutex;
@@ -72,12 +83,8 @@ public:
 
         std::unique_lock<std::mutex> lock(state->mutex);
         if (m_event.signaledValue >= value) return true;
-        if (timeoutMs < 0) {
-            state->cv.wait(lock, [&] { return state->done; });
-            return true;
-        }
-        return state->cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                                  [&] { return state->done; });
+        state->cv.wait(lock, [&] { return state->done; });
+        return true;
     }
 
     uint64_t completedValue() const override {

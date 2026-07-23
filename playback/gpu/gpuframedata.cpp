@@ -152,8 +152,8 @@ FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta,
                                std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge charge) {
-    return makeGpuFrameHandle(std::move(surface), std::move(rhi), std::move(meta),
-                              std::move(renderFence), 0, std::move(charge));
+    return makeGpuFrameHandle(std::move(surface), std::move(rhi), meta, std::move(renderFence), 0,
+                              std::move(charge));
 }
 
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,

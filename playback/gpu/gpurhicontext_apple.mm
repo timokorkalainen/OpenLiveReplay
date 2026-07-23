@@ -24,6 +24,7 @@
 #include <rhi/qrhi_platform.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -267,6 +268,67 @@ CpuPlanes yuv420pFromNv12Readbacks(const QRhiReadbackResult& yReadback,
     return out;
 }
 
+class AppleReadbackBatchGuard final {
+public:
+    explicit AppleReadbackBatchGuard(QRhiResourceUpdateBatch* batch) noexcept : m_batch(batch) {}
+    ~AppleReadbackBatchGuard() noexcept {
+        try {
+            if (m_batch) m_batch->release();
+        } catch (...) {
+            // Cleanup is best-effort in a noexcept guard.
+            static_cast<void>(0);
+        }
+    }
+
+    AppleReadbackBatchGuard(const AppleReadbackBatchGuard&) = delete;
+    AppleReadbackBatchGuard& operator=(const AppleReadbackBatchGuard&) = delete;
+
+    explicit operator bool() const noexcept { return m_batch != nullptr; }
+    QRhiResourceUpdateBatch* get() const noexcept { return m_batch; }
+    QRhiResourceUpdateBatch* take() noexcept {
+        QRhiResourceUpdateBatch* batch = m_batch;
+        m_batch = nullptr;
+        return batch;
+    }
+
+private:
+    QRhiResourceUpdateBatch* m_batch = nullptr;
+};
+
+class AppleReadbackFrameGuard final {
+public:
+    AppleReadbackFrameGuard(QRhi* rhi, GpuSubmitOutcome& outcome) noexcept
+        : m_rhi(rhi), m_outcome(outcome) {}
+    ~AppleReadbackFrameGuard() noexcept {
+        if (!m_frameOpen || !m_rhi) return;
+        m_outcome = GpuSubmitOutcome::Submitted;
+        try {
+            if (m_rhi->endOffscreenFrame() != QRhi::FrameOpSuccess)
+                m_outcome = GpuSubmitOutcome::SubmittedWithError;
+        } catch (...) {
+            m_outcome = GpuSubmitOutcome::SubmittedWithError;
+        }
+    }
+
+    AppleReadbackFrameGuard(const AppleReadbackFrameGuard&) = delete;
+    AppleReadbackFrameGuard& operator=(const AppleReadbackFrameGuard&) = delete;
+
+    QRhi::FrameOpResult end() {
+        m_outcome = GpuSubmitOutcome::Submitted;
+        // QRhi may throw after accepting the frame end. Never retry that
+        // ambiguous boundary from the destructor.
+        m_frameOpen = false;
+        const QRhi::FrameOpResult result = m_rhi->endOffscreenFrame();
+        if (result != QRhi::FrameOpSuccess) m_outcome = GpuSubmitOutcome::SubmittedWithError;
+        return result;
+    }
+
+private:
+    QRhi* m_rhi = nullptr;
+    GpuSubmitOutcome& m_outcome;
+    bool m_frameOpen = true;
+};
+
 CpuPlanes readbackRgba8WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDesc& desc,
                                GpuSubmitOutcome& outcome) {
     outcome = GpuSubmitOutcome::NotSubmitted;
@@ -303,25 +365,23 @@ CpuPlanes readbackRgba8WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceD
     if (!texture->createFrom(nativeTexture)) return out;
 
     QRhiCommandBuffer* cb = nullptr;
-    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess || !cb) return out;
+    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess) return out;
+    AppleReadbackFrameGuard frameGuard(rhi, outcome);
+    if (!cb) return out;
 
     QRhiReadbackResult readback;
-    QRhiResourceUpdateBatch* batch = rhi->nextResourceUpdateBatch();
-    if (batch) {
-        batch->readBackTexture(QRhiReadbackDescription(texture.get()), &readback);
-        cb->resourceUpdate(batch);
+    AppleReadbackBatchGuard batchGuard(rhi->nextResourceUpdateBatch());
+    if (batchGuard) {
+        batchGuard.get()->readBackTexture(QRhiReadbackDescription(texture.get()), &readback);
+        cb->resourceUpdate(batchGuard.take());
     }
-    // Calling endOffscreenFrame crosses the submission boundary. Mark it first
-    // so an exception during the call is handled as possibly submitted.
-    outcome = GpuSubmitOutcome::Submitted;
-    const QRhi::FrameOpResult end = rhi->endOffscreenFrame();
-    outcome = end == QRhi::FrameOpSuccess ? GpuSubmitOutcome::Submitted
-                                          : GpuSubmitOutcome::SubmittedWithError;
+    const QRhi::FrameOpResult end = frameGuard.end();
     if (end == QRhi::FrameOpSuccess) {
-        if (rhi->finish() == QRhi::FrameOpSuccess)
+        if (rhi->finish() == QRhi::FrameOpSuccess) {
             out = rgba8FromReadback(readback, desc);
-        else
+        } else {
             outcome = GpuSubmitOutcome::SubmittedWithError;
+        }
     }
 
     return out;
@@ -377,28 +437,26 @@ CpuPlanes readbackNv12WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDe
     if (!yTex->createFrom(yNative) || !uvTex->createFrom(uvNative)) return out;
 
     QRhiCommandBuffer* cb = nullptr;
-    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess || !cb) return out;
+    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess) return out;
+    AppleReadbackFrameGuard frameGuard(rhi, outcome);
+    if (!cb) return out;
 
     QRhiReadbackResult yReadback;
     QRhiReadbackResult uvReadback;
-    QRhiResourceUpdateBatch* batch = rhi->nextResourceUpdateBatch();
-    if (batch) {
-        batch->readBackTexture(QRhiReadbackDescription(yTex.get()), &yReadback);
-        batch->readBackTexture(QRhiReadbackDescription(uvTex.get()), &uvReadback);
-        cb->resourceUpdate(batch);
+    AppleReadbackBatchGuard batchGuard(rhi->nextResourceUpdateBatch());
+    if (batchGuard) {
+        batchGuard.get()->readBackTexture(QRhiReadbackDescription(yTex.get()), &yReadback);
+        batchGuard.get()->readBackTexture(QRhiReadbackDescription(uvTex.get()), &uvReadback);
+        cb->resourceUpdate(batchGuard.take());
     }
 
-    // Calling endOffscreenFrame crosses the submission boundary. Mark it first
-    // so an exception during the call is handled as possibly submitted.
-    outcome = GpuSubmitOutcome::Submitted;
-    const QRhi::FrameOpResult end = rhi->endOffscreenFrame();
-    outcome = end == QRhi::FrameOpSuccess ? GpuSubmitOutcome::Submitted
-                                          : GpuSubmitOutcome::SubmittedWithError;
+    const QRhi::FrameOpResult end = frameGuard.end();
     if (end == QRhi::FrameOpSuccess) {
-        if (rhi->finish() == QRhi::FrameOpSuccess)
+        if (rhi->finish() == QRhi::FrameOpSuccess) {
             out = yuv420pFromNv12Readbacks(yReadback, uvReadback, desc);
-        else
+        } else {
             outcome = GpuSubmitOutcome::SubmittedWithError;
+        }
     }
 
     return out;
@@ -409,6 +467,8 @@ CpuPlanes readbackNv12WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDe
 // GpuRhiContext::presentOnMainThread for any present/UIKit interaction.
 class GpuRenderThread final : public QThread {
 public:
+    enum class InvokeResult { Rejected, Completed, Failed, TimedOut };
+
     explicit GpuRenderThread(QRhi::Implementation backend) : m_backend(backend) {}
 
     QRhi* rhi = nullptr;
@@ -436,24 +496,91 @@ public:
         m_cond.notify_all();
 
         while (true) {
-            std::function<void()> job;
+            QueuedJob job;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_cond.wait(lock, [&] { return !m_jobs.isEmpty() || m_stop; });
                 if (m_stop && m_jobs.isEmpty()) break;
                 job = m_jobs.takeFirst();
             }
-            job();
+            job.run();
         }
 
-        delete rhi;
-        rhi = nullptr;
+        if (!m_abandonCleanup.load(std::memory_order_acquire)) {
+            delete rhi;
+            rhi = nullptr;
+        }
     }
 
     bool waitReady() {
         std::unique_lock<std::mutex> lock(m_mutex);
         m_cond.wait(lock, [&] { return m_ready; });
         return rhi != nullptr;
+    }
+
+    InvokeResult invokeFor(std::function<void()> job, int timeoutMs,
+                           std::function<void()> completion = {}) {
+        auto finish = [](const std::function<void()>& callback) noexcept {
+            try {
+                if (callback) callback();
+            } catch (...) {
+                static_cast<void>(0);
+            }
+        };
+        if (QThread::currentThread() == this) {
+            try {
+                job();
+                finish(completion);
+                return InvokeResult::Completed;
+            } catch (...) {
+                finish(completion);
+                return InvokeResult::Failed;
+            }
+        }
+        const auto state = std::make_shared<InvokeState>();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stop) return InvokeResult::Rejected;
+            m_jobs.append({[state, job = std::move(job), completion, finish] {
+                               bool succeeded = false;
+                               try {
+                                   job();
+                                   succeeded = true;
+                               } catch (...) {
+                               }
+                               finish(completion);
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state->mutex);
+                                   state->succeeded = succeeded;
+                                   state->done = true;
+                               }
+                               state->finished.notify_all();
+                           },
+                           [state, completion, finish] {
+                               finish(completion);
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state->mutex);
+                                   state->done = true;
+                                   state->succeeded = false;
+                               }
+                               state->finished.notify_all();
+                           }});
+        }
+        m_cond.notify_all();
+        std::unique_lock<std::mutex> doneLock(state->mutex);
+        try {
+            if (timeoutMs < 0) {
+                state->finished.wait(doneLock, [state] { return state->done; });
+            } else if (!state->finished.wait_for(doneLock, std::chrono::milliseconds(timeoutMs),
+                                                 [state] { return state->done; })) {
+                return InvokeResult::TimedOut;
+            }
+        } catch (...) {
+            // The queue owns the value-captured job. Its eventual completion
+            // still clears the per-context pending bit.
+            return InvokeResult::TimedOut;
+        }
+        return state->succeeded ? InvokeResult::Completed : InvokeResult::Failed;
     }
 
     bool invoke(std::function<void()> job) {
@@ -465,26 +592,41 @@ public:
                 return false;
             }
         }
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (m_stop) return false;
-
-        bool done = false;
-        bool succeeded = false;
-        m_jobs.append([&] {
-            try {
-                job();
-                succeeded = true;
-            } catch (...) {
-            }
-            {
-                std::lock_guard<std::mutex> doneLock(m_mutex);
-                done = true;
-            }
-            m_cond.notify_all();
-        });
+        InvokeState state;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stop) return false;
+            m_jobs.append({[&state, &job] {
+                               bool succeeded = false;
+                               try {
+                                   job();
+                                   succeeded = true;
+                               } catch (...) {
+                               }
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state.mutex);
+                                   state.succeeded = succeeded;
+                                   state.done = true;
+                                   state.finished.notify_all();
+                               }
+                           },
+                           [&state] {
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state.mutex);
+                                   state.done = true;
+                                   state.succeeded = false;
+                                   state.finished.notify_all();
+                               }
+                           }});
+        }
         m_cond.notify_all();
-        m_cond.wait(lock, [&] { return done; });
-        return succeeded;
+        try {
+            std::unique_lock<std::mutex> doneLock(state.mutex);
+            state.finished.wait(doneLock, [&state] { return state.done; });
+        } catch (...) {
+            std::terminate();
+        }
+        return state.succeeded;
     }
 
     void requestStop() {
@@ -495,11 +637,37 @@ public:
         m_cond.notify_all();
     }
 
+    void quarantine() {
+        QList<QueuedJob> cancelled;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_abandonCleanup.store(true, std::memory_order_release);
+            m_stop = true;
+            cancelled.swap(m_jobs);
+        }
+        for (QueuedJob& job : cancelled)
+            if (job.cancel) job.cancel();
+        m_cond.notify_all();
+    }
+
 private:
+    struct InvokeState {
+        std::mutex mutex;
+        std::condition_variable finished;
+        bool done = false;
+        bool succeeded = false;
+    };
+
+    struct QueuedJob {
+        std::function<void()> run;
+        std::function<void()> cancel;
+    };
+
     QRhi::Implementation m_backend = QRhi::Null;
     std::mutex m_mutex;
     std::condition_variable m_cond;
-    QList<std::function<void()>> m_jobs;
+    QList<QueuedJob> m_jobs;
+    std::atomic<bool> m_abandonCleanup{false};
     bool m_ready = false;
     bool m_stop = false;
 };
@@ -516,6 +684,7 @@ public:
     uint64_t deviceAuthorityEpoch = 0;
     std::atomic<bool> metalCommandQueueBound{false};
     std::atomic<bool> deviceLost{false};
+    std::atomic<bool> deviceLossPollPending{false};
 #ifdef OLR_UNIT_TEST
     std::atomic<int> rhiReadbacks{0};
 #endif
@@ -539,8 +708,14 @@ GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl,
 
 GpuRhiContext::~GpuRhiContext() {
     if (!m_impl) return;
-    m_impl->thread.requestStop();
-    m_impl->thread.wait();
+    std::unique_ptr<Impl> retiring = std::move(m_impl);
+    retiring->thread.requestStop();
+    if (retiring->thread.wait(100)) return;
+    // A wedged Metal/QRhi call cannot be joined under a teardown/quarantine
+    // lock. Cancel pending invokes, leave the running carrier valid, and retain
+    // the Impl for process lifetime just as the Windows backend does.
+    retiring->thread.quarantine();
+    static_cast<void>(retiring.release());
 }
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
@@ -644,19 +819,44 @@ bool GpuRhiContext::deviceLost() const {
     return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
 }
 
+bool GpuRhiContext::deviceLossPollPending() const noexcept {
+    return m_impl && m_impl->deviceLossPollPending.load(std::memory_order_acquire);
+}
+
 bool GpuRhiContext::pollDeviceLoss() const {
+#ifdef OLR_UNIT_TEST
+    m_deviceLossPollCountForTest.fetch_add(1, std::memory_order_relaxed);
+#endif
     if (!m_impl || !m_impl->valid) return false;
     if (m_impl->deviceLost.load(std::memory_order_acquire)) return true;
+    bool expected = false;
+    if (!m_impl->deviceLossPollPending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return m_impl->deviceLost.load(std::memory_order_acquire);
+    }
+    constexpr int kDeviceLossPollTimeoutMs = 50;
+    Impl* const impl = m_impl.get();
     const uint64_t authority = m_impl->deviceAuthorityEpoch;
-    m_impl->thread.invoke([&] {
-        QRhi* rhi = m_impl->thread.rhi;
-        if (!rhi || !rhi->isDeviceLost()) return;
-        if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, authority,
-                metalDeviceDomainId(rhi)) != 0)
-            m_impl->deviceLost.store(true, std::memory_order_release);
-    });
-    return m_impl->deviceLost.load(std::memory_order_acquire);
+    GpuRenderThread::InvokeResult invoked = GpuRenderThread::InvokeResult::Rejected;
+    try {
+        invoked = impl->thread.invokeFor(
+            [impl, authority] {
+                QRhi* rhi = impl->thread.rhi;
+                if (!rhi || !rhi->isDeviceLost()) return;
+                if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, authority,
+                        metalDeviceDomainId(rhi)) != 0)
+                    impl->deviceLost.store(true, std::memory_order_release);
+            },
+            kDeviceLossPollTimeoutMs,
+            [impl] { impl->deviceLossPollPending.store(false, std::memory_order_release); });
+    } catch (...) {
+        impl->deviceLossPollPending.store(false, std::memory_order_release);
+        return false;
+    }
+    if (invoked == GpuRenderThread::InvokeResult::Rejected)
+        impl->deviceLossPollPending.store(false, std::memory_order_release);
+    return impl->deviceLost.load(std::memory_order_acquire);
 }
 
 void GpuRhiContext::injectDeviceLostForTest() {

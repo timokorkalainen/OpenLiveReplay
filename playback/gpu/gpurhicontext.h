@@ -90,6 +90,9 @@ public:
     }
     static std::shared_ptr<GpuRhiContext> createReadbackFenceFailureForTest();
     int rhiReadbackCountForTest() const;
+    int deviceLossPollCountForTest() const noexcept {
+        return m_deviceLossPollCountForTest.load(std::memory_order_acquire);
+    }
 #ifdef _WIN32
     static uint64_t captureD3D11RemovalAuthorityForTest();
     static D3D11RemovalObservationForTest observeD3D11RemovalForTest(void* device,
@@ -97,6 +100,7 @@ public:
     bool queueBlockingRenderJobForTest(const std::shared_ptr<QSemaphore>& entered,
                                        const std::shared_ptr<QSemaphore>& release,
                                        const std::shared_ptr<QSemaphore>& exited);
+    int deviceLossPollExecutionCountForTest() const noexcept;
     static uint64_t quarantinedContextCountForTest();
     void injectPollOnlyDeviceLostForTest();
 #endif
@@ -121,6 +125,7 @@ public:
     // thread. iOS marshals to the main queue; macOS and stubs run inline.
     void presentOnMainThread(const std::function<void()>& block);
     bool deviceLost() const;
+    bool deviceLossPollPending() const noexcept;
     // Rare-path authoritative poll used to upgrade a tokenless submission
     // failure before recovery decides whether dead-fence waits are legal.
     bool pollDeviceLoss() const;
@@ -171,6 +176,7 @@ private:
     std::shared_ptr<std::atomic<int>> m_injectedReadbackFenceFactoryCallsForTest;
     std::atomic<bool> m_lastReadbackHadNativeHandleForTest{false};
     std::atomic<uint32_t> m_lastReadbackSubresourceForTest{0};
+    mutable std::atomic<int> m_deviceLossPollCountForTest{0};
 #endif
 };
 
