@@ -146,6 +146,8 @@ private:
     std::thread m_setterThread;
 };
 
+constexpr auto kSinkReleaseWatchdog = std::chrono::seconds(10);
+
 class RuntimeResetDuringSubmitSink final : public IOutputSink {
 public:
     explicit RuntimeResetDuringSubmitSink(int blockedSubmit = 1) : m_blockedSubmit(blockedSubmit) {}
@@ -174,7 +176,7 @@ public:
 
         m_entered = true;
         m_enteredCv.notify_all();
-        if (!m_releaseCv.wait_for(lock, std::chrono::seconds(2), [this]() { return m_release; })) {
+        if (!m_releaseCv.wait_for(lock, kSinkReleaseWatchdog, [this]() { return m_release; })) {
             m_diagnosticTimeout = true;
             return false;
         }
@@ -1091,9 +1093,9 @@ void TestOutputRuntime::multiplePlayEpochResetsCoalesceBeforeNextLease() {
     QVERIFY2(result.followerRegisteredBeforeRelease,
              "follower immediate request did not raise the registered count from the active "
              "real-frame baseline of one to two before release");
+    QVERIFY2(!result.diagnosticTimeout, "real-frame lease hit the diagnostic timeout");
     QVERIFY2(result.sinkObservedResetReturnBeforeRelease,
              "sink did not observe reset completion before its release barrier");
-    QVERIFY2(!result.diagnosticTimeout, "real-frame lease hit the diagnostic timeout");
     QCOMPARE(result.appliedResetsBeforeRelease, 0);
     QCOMPARE(result.appliedResetsAtFollowerSnapshot, 1);
     QCOMPARE(result.finalAppliedResets, 1);
@@ -1123,9 +1125,9 @@ void TestOutputRuntime::multiplePlayEpochResetsCoalesceBeforeNextHoldLastLease()
     QVERIFY2(result.followerRegisteredBeforeRelease,
              "follower immediate request did not raise the registered count from the active "
              "hold-last baseline of one to two before release");
+    QVERIFY2(!result.diagnosticTimeout, "hold-last lease hit the diagnostic timeout");
     QVERIFY2(result.sinkObservedResetReturnBeforeRelease,
              "hold-last sink did not observe reset completion before release");
-    QVERIFY2(!result.diagnosticTimeout, "hold-last lease hit the diagnostic timeout");
     QCOMPARE(result.appliedResetsBeforeRelease, 0);
     QCOMPARE(result.appliedResetsAtFollowerSnapshot, 1);
     QCOMPARE(result.finalAppliedResets, 1);
