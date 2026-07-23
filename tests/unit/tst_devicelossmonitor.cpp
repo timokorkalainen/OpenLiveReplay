@@ -802,15 +802,15 @@ void TestDeviceLossMonitor::lossPreparationFailureDoesNotAdvanceGenerationOrLatc
     monitor.reset();
     const uint64_t tokenlessGeneration = GpuGenerationCounter::instance().current();
     GpuDeviceLossMonitorTestAuthority::failNextLossPreparation();
-    QVERIFY_EXCEPTION_THROWN(monitor.recordLoss(), std::bad_alloc);
+    QVERIFY_THROWS_EXCEPTION(std::bad_alloc, monitor.recordLoss());
     QCOMPARE(GpuGenerationCounter::instance().current(), tokenlessGeneration);
     QVERIFY(!monitor.isLost());
 
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     const uint64_t authoritativeGeneration = GpuGenerationCounter::instance().current();
     GpuDeviceLossMonitorTestAuthority::failNextLossPreparation();
-    QVERIFY_EXCEPTION_THROWN(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA18),
-                             std::bad_alloc);
+    QVERIFY_THROWS_EXCEPTION(std::bad_alloc,
+                             GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA18));
     QCOMPARE(GpuGenerationCounter::instance().current(), authoritativeGeneration);
     QVERIFY(!monitor.isLost());
     monitor.reset();
@@ -821,7 +821,7 @@ void TestDeviceLossMonitor::registrationFailureRollsBackPrimaryParticipant() {
     monitor.reset();
     QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
     GpuDeviceLossMonitorTestAuthority::failRegistrationAfterPrimaryInsert();
-    QVERIFY_EXCEPTION_THROWN(monitor.registerRecoveryParticipantSnapshot(), std::bad_alloc);
+    QVERIFY_THROWS_EXCEPTION(std::bad_alloc, monitor.registerRecoveryParticipantSnapshot());
     QCOMPARE(GpuDeviceLossMonitorTestAuthority::participantCount(), size_t(0));
     monitor.reset();
 }
