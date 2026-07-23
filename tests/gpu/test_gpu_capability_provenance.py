@@ -402,6 +402,126 @@ class ProvenanceTests(unittest.TestCase):
                 deps=(self.main_identity,),
             )
 
+    def test_clang_source_first_bootstrap_returns_to_primary_source(self):
+        for command_line in (b"<command line>", b"<command-line>"):
+            stream = (
+                b'# 1 "D:/repo/playback/a.cpp"\n'
+                b'# 1 "<built-in>" 1\n'
+                b'# 1 "<built-in>" 3\n'
+                b'# 447 "<built-in>" 3\n'
+                + b'# 1 "' + command_line + b'" 1\n'
+                b'# 1 "<built-in>" 2\n'
+                b'# 1 "D:/repo/playback/a.cpp" 2\n'
+                b'int ok;\n'
+            )
+            with self.subTest(command_line=command_line):
+                view = self.parse(
+                    stream,
+                    family=CompilerFamily.CLANG,
+                    deps=(self.main_identity,),
+                    chunks=(1, 3, 17, 2, 31),
+                )
+                self.assertEqual(
+                    b"".join(token.spelling for token in view.tokens),
+                    b"intok;",
+                )
+
+    def test_clang_source_first_bootstrap_rejects_malformed_sequences(self):
+        prefix = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b'# 1 "<built-in>" 1\n'
+        )
+        suffix = (
+            b'# 1 "<command line>" 1\n'
+            b'# 1 "<built-in>" 2\n'
+            b'# 1 "D:/repo/playback/a.cpp" 2\n'
+            b'int ok;\n'
+        )
+        malformed = (
+            prefix + suffix,
+            prefix + b'# 1 "<command line>" 1\n# 1 "<built-in>" 3\n' + suffix,
+            prefix + b'int early;\n' + suffix,
+            prefix + b'# 1 "<built-in>" 3\n' + suffix.replace(
+                b'D:/repo/playback/a.cpp" 2',
+                b'D:/repo/playback/h.h" 2',
+            ),
+        )
+        for stream in malformed:
+            with self.subTest(stream=stream), self.assertRaisesRegex(
+                AuditInfrastructureError, "Clang|real-file"
+            ):
+                self.parse(
+                    stream,
+                    family=CompilerFamily.CLANG,
+                    deps=(self.main_identity, self.header_identity),
+                )
+
+    def test_clang_source_first_bootstrap_rejects_truncation_and_bad_flags(self):
+        anchor = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b'# 1 "<built-in>" 1\n'
+        )
+        system = anchor + b'# 1 "<built-in>" 3\n'
+        command = system + b'# 1 "<command line>" 1\n'
+        returned = command + b'# 1 "<built-in>" 2\n'
+        for stream in (anchor, system, command, returned):
+            with self.subTest(kind="truncated", stream=stream), self.assertRaisesRegex(
+                AuditInfrastructureError, "truncated Clang"
+            ):
+                self.parse(stream, family=CompilerFamily.CLANG)
+
+        malformed = (
+            system + b'# 0 "<built-in>" 3\n',
+            system + b'# 1 "<built-in>" 4\n',
+            system + b'# 1 "<command line>"\n',
+            command + b'# 1 "<built-in>" 1\n',
+            returned + b'# 1 "D:/repo/playback/a.cpp"\n',
+        )
+        for stream in malformed:
+            with self.subTest(kind="flags", stream=stream), self.assertRaisesRegex(
+                AuditInfrastructureError, "Clang"
+            ):
+                self.parse(stream, family=CompilerFamily.CLANG)
+
+        backwards = (
+            anchor
+            + b'# 447 "<built-in>" 3\n'
+            + b'# 1 "<built-in>" 3\n'
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "backwards"):
+            self.parse(backwards, family=CompilerFamily.CLANG)
+
+    def test_clang_source_first_bootstrap_does_not_relax_other_markers(self):
+        stream = (
+            b'# 1 "D:/repo/playback/a.cpp"\n'
+            b'# 1 "<built-in>" 1\n'
+            b'# 1 "<built-in>" 3\n'
+            b'# 447 "<built-in>" 3\n'
+            b'# 1 "<command line>" 1\n'
+            b'# 1 "<built-in>" 2\n'
+            b'# 1 "D:/repo/playback/a.cpp" 2\n'
+            b'int ok;\n'
+        )
+        with self.assertRaisesRegex(AuditInfrastructureError, "pseudo-file"):
+            self.parse(
+                stream + b'# 1 "<built-in>" 1\n',
+                family=CompilerFamily.CLANG,
+                deps=(self.main_identity,),
+            )
+        with self.assertRaisesRegex(AuditInfrastructureError, "pseudo-file"):
+            self.parse(stream, deps=(self.main_identity,))
+
+    def test_clang_direct_primary_source_marker_remains_supported(self):
+        view = self.parse(
+            b'# 1 "D:/repo/playback/a.cpp"\nint ok;\n',
+            family=CompilerFamily.CLANG,
+            deps=(self.main_identity,),
+        )
+        self.assertEqual(
+            b"".join(token.spelling for token in view.tokens),
+            b"intok;",
+        )
+
     def test_gcc_real_file_line_zero_is_allowed_only_in_bootstrap(self):
         stream = (
             b'# 0 "D:/repo/playback/a.cpp"\n'

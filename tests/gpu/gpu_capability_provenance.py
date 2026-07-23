@@ -40,6 +40,11 @@ _BOOTSTRAP_PSEUDO_FILES = frozenset(
     {"<built-in>", "<command-line>", "<command line>"}
 )
 _COMMAND_LINE_PSEUDO_FILES = frozenset({"<command-line>", "<command line>"})
+_CLANG_BOOTSTRAP_NONE = 0
+_CLANG_BOOTSTRAP_BUILTIN_ENTERED = 1
+_CLANG_BOOTSTRAP_BUILTIN_SYSTEM = 2
+_CLANG_BOOTSTRAP_COMMAND_ENTERED = 3
+_CLANG_BOOTSTRAP_COMMAND_RETURNED = 4
 _DEPENDENCY_DOCUMENT_BYTES = 4 * 1024 * 1024
 _DEPENDENCY_FILE_BYTES = 256 * 1024 * 1024
 _DEPENDENCY_DOCUMENT_ENTRIES = 65_536
@@ -599,6 +604,9 @@ class PreprocessedStreamBuilder:
         "_seen_primary_source_marker",
         "_bootstrap_command_line_active",
         "_bootstrap_root_entered",
+        "_clang_source_anchor_candidate",
+        "_clang_bootstrap_phase",
+        "_clang_bootstrap_builtin_line",
         "_in_block_comment",
         "_finalized",
         "_peak_rss_bytes",
@@ -658,6 +666,9 @@ class PreprocessedStreamBuilder:
         self._seen_primary_source_marker = False
         self._bootstrap_command_line_active = False
         self._bootstrap_root_entered = False
+        self._clang_source_anchor_candidate = False
+        self._clang_bootstrap_phase = _CLANG_BOOTSTRAP_NONE
+        self._clang_bootstrap_builtin_line = 0
         self._in_block_comment = False
         self._finalized = False
         self._peak_rss_bytes = 0
@@ -760,9 +771,75 @@ class PreprocessedStreamBuilder:
         self._next_instance += 1
         return frame
 
+    def _apply_clang_bootstrap_marker(
+        self, line: int, path: Path, relative: bool, flags: tuple[int, ...]
+    ) -> None:
+        pseudo_path = str(path)
+        phase = self._clang_bootstrap_phase
+        if phase == _CLANG_BOOTSTRAP_BUILTIN_ENTERED:
+            if pseudo_path != "<built-in>" or flags != (3,) or line < 1:
+                raise _fail("Clang built-in bootstrap system marker is invalid")
+            self._clang_bootstrap_phase = _CLANG_BOOTSTRAP_BUILTIN_SYSTEM
+            self._clang_bootstrap_builtin_line = line
+            return
+        if phase == _CLANG_BOOTSTRAP_BUILTIN_SYSTEM:
+            if pseudo_path == "<built-in>" and flags == (3,):
+                if line < self._clang_bootstrap_builtin_line:
+                    raise _fail("Clang built-in bootstrap line moved backwards")
+                self._clang_bootstrap_builtin_line = line
+                return
+            if pseudo_path in _COMMAND_LINE_PSEUDO_FILES and line == 1 and flags == (1,):
+                self._clang_bootstrap_phase = _CLANG_BOOTSTRAP_COMMAND_ENTERED
+                return
+            raise _fail("Clang command-line bootstrap entry is invalid")
+        if phase == _CLANG_BOOTSTRAP_COMMAND_ENTERED:
+            if pseudo_path != "<built-in>" or line != 1 or flags != (2,):
+                raise _fail("Clang command-line bootstrap return is invalid")
+            self._clang_bootstrap_phase = _CLANG_BOOTSTRAP_COMMAND_RETURNED
+            return
+        if phase == _CLANG_BOOTSTRAP_COMMAND_RETURNED:
+            if (
+                pseudo_path.startswith("<")
+                or line != 1
+                or flags != (2,)
+                or _path_key(path) != _path_key(self._configuration.source.canonical)
+            ):
+                raise _fail("Clang primary-source bootstrap return is invalid")
+            key = _path_key(path)
+            self._marker_id(path, relative)
+            self._stack.append(self._new_frame(key, line))
+            self._current_line = line
+            self._seen_primary_source_marker = True
+            self._seen_real_marker = True
+            self._clang_bootstrap_phase = _CLANG_BOOTSTRAP_NONE
+            self._clang_bootstrap_builtin_line = 0
+            return
+        raise _fail("Clang bootstrap state is invalid")
+
     def _apply_gcc_marker(
         self, line: int, path: Path, relative: bool, flags: tuple[int, ...]
     ) -> None:
+        if self._configuration.family == CompilerFamily.CLANG:
+            if self._clang_source_anchor_candidate:
+                if (
+                    str(path) == "<built-in>"
+                    and line == 1
+                    and flags == (1,)
+                    and not self._seen_real_code
+                    and len(self._stack) == 1
+                    and self._stack[0].line == 1
+                ):
+                    self._stack.clear()
+                    self._current_line = 0
+                    self._seen_primary_source_marker = False
+                    self._seen_real_marker = False
+                    self._clang_source_anchor_candidate = False
+                    self._clang_bootstrap_phase = _CLANG_BOOTSTRAP_BUILTIN_ENTERED
+                    return
+                self._clang_source_anchor_candidate = False
+            if self._clang_bootstrap_phase != _CLANG_BOOTSTRAP_NONE:
+                self._apply_clang_bootstrap_marker(line, path, relative, flags)
+                return
         if (
             line == 1
             and not flags
@@ -850,6 +927,11 @@ class PreprocessedStreamBuilder:
             self._seen_primary_source_marker = True
             self._bootstrap_command_line_active = False
             self._bootstrap_root_entered = False
+            self._clang_source_anchor_candidate = (
+                self._configuration.family == CompilerFamily.CLANG
+                and line == 1
+                and not flags
+            )
         elif (
             self._bootstrap_command_line_active
             and stack_was_empty
@@ -916,6 +998,7 @@ class PreprocessedStreamBuilder:
     def _append_token(self, spelling: bytes) -> None:
         if not self._stack:
             raise _fail("compiler output contains code without a real-file marker")
+        self._clang_source_anchor_candidate = False
         spelling_id = self._spelling_ids_by_value.get(spelling)
         intern_addition = 0
         if spelling_id is None:
@@ -1247,6 +1330,8 @@ class PreprocessedStreamBuilder:
             self._line_buffer.clear()
         if self._in_block_comment:
             raise _fail("compiler output contains an unterminated comment")
+        if self._clang_bootstrap_phase != _CLANG_BOOTSTRAP_NONE:
+            raise _fail("truncated Clang bootstrap sequence")
         if not self._seen_real_marker:
             raise _fail("compiler output contains no real-file marker")
         if self._configuration.family in {CompilerFamily.GCC, CompilerFamily.CLANG} and len(self._stack) != 1:
