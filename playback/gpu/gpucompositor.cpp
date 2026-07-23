@@ -103,6 +103,7 @@ void pollSubmittedFailureOnce(const std::shared_ptr<GpuRhiContext>& rhi,
         (void) rhi->pollDeviceLoss();
     } catch (...) {
         // The submission failure remains authoritative even if its diagnostic poll fails.
+        static_cast<void>(0);
     }
 }
 

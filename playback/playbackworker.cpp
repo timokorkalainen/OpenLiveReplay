@@ -2963,11 +2963,10 @@ void PlaybackWorker::shutdownOutputGraph() {
         // Exact dead-domain owners have been released individually. Preserve
         // every incomplete or unproven survivor with its roots and participant.
         shutdownGpuOwnersAfterFailure();
-    } else if (rhiPollPending) {
+    } else if (rhiPollPending || !forceDrainEvictedGpuFrames()) {
         // A capped poll is neither proof of loss nor proof that live fences are
-        // safe to drop. Preserve every owner/root/participant for later proof.
-        shutdownGpuOwnersAfterFailure();
-    } else if (!forceDrainEvictedGpuFrames()) {
+        // safe to drop. Short-circuit the normal bounded drain while polling,
+        // and preserve every owner/root/participant if that drain fails.
         shutdownGpuOwnersAfterFailure();
     }
     std::atomic_store_explicit(&m_renderFence, std::shared_ptr<GpuFence>{},
