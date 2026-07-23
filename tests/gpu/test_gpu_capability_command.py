@@ -3212,6 +3212,55 @@ class ConfigurationTests(unittest.TestCase):
                 from gpu_capability_command import _probe_compiler_version
                 _probe_compiler_version(capability, CompilerFamily.GCC, self.build, self.environment)
 
+    def test_failed_compiler_probe_reports_bounded_stderr(self):
+        capability = open_compiler_executable_capability(
+            self.compiler,
+            self.dependency_roots,
+            time.monotonic() + 60.0,
+            compiler_family=CompilerFamily.GCC,
+        )
+        self.addCleanup(capability.native_owner.close)
+
+        class FailedProcess:
+            pid = 4242
+            returncode = 1
+
+            class Handle:
+                def Close(self): pass
+
+            def __init__(self, *_args, stderr, **_kwargs):
+                self._handle = self.Handle()
+                stderr.write(
+                    b"macOS gate failure detail\x1b" + b"x" * 5000 + b"hidden-tail"
+                )
+                stderr.flush()
+
+            def poll(self): return self.returncode
+            def wait(self, timeout=None): return self.returncode
+            def kill(self): self.returncode = -9
+
+        with mock.patch(
+            "gpu_capability_command.subprocess.Popen", FailedProcess
+        ), mock.patch(
+            "gpu_capability_command._native_process_start_token",
+            return_value="test-process-start",
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "attach"
+        ), mock.patch.object(
+            capability_command._ProbeContainment, "release"
+        ), self.assertRaises(AuditInfrastructureError) as raised:
+            capability_command._run_probe_command(
+                capability,
+                ("--version",),
+                self.build,
+                self.environment,
+                time.monotonic() + 10.0,
+            )
+        message = str(raised.exception)
+        self.assertIn("macOS gate failure detail\\x1b", message)
+        self.assertIn("[output truncated]", message)
+        self.assertNotIn("hidden-tail", message)
+
     def test_probe_post_launch_preparation_failure_cleans_once_and_preserves_primary(self):
         capability = open_compiler_executable_capability(
             self.compiler,

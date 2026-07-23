@@ -136,6 +136,7 @@ _MSVC_AMBIGUOUS_PREFIX_OPTIONS = (
 )
 _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
+_VERSION_FAILURE_DETAIL_BYTES = 4096
 _RUNTIME_ENUMERATION_ENTRIES = 4096
 _RUNTIME_CLOSURE_FILES = 256
 _RUNTIME_PATH_COMPONENTS = 256
@@ -2206,14 +2207,25 @@ def _run_probe_command(
         ).st_size
         if observed > _VERSION_BYTES:
             raise AuditInfrastructureError("compiler version output limit exceeded")
-        if returncode != 0:
-            raise AuditInfrastructureError(
-                f"compiler version probe failed with exit={returncode}: {compiler}"
-            )
         stdout_stream.seek(0)
         stderr_stream.seek(0)
         stdout = stdout_stream.read(_VERSION_BYTES + 1)
         stderr = stderr_stream.read(_VERSION_BYTES + 1)
+        if returncode != 0:
+            detail_bytes = (stderr or stdout)[:_VERSION_FAILURE_DETAIL_BYTES]
+            detail = detail_bytes.decode("utf-8", errors="backslashreplace").strip()
+            detail = "".join(
+                character
+                if character in "\n\t" or ord(character) >= 0x20
+                else f"\\x{ord(character):02x}"
+                for character in detail
+            )
+            suffix = f": {detail}" if detail else ""
+            if len(stderr or stdout) > len(detail_bytes):
+                suffix += " [output truncated]"
+            raise AuditInfrastructureError(
+                f"compiler version probe failed with exit={returncode}: {compiler}{suffix}"
+            )
     if stdout and stderr:
         combined = stdout.rstrip(b"\r\n") + b"\n" + stderr
     else:
