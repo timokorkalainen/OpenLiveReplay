@@ -42,7 +42,6 @@ constexpr int kAudioSampleRate = 48000;
 constexpr int64_t kForwardJumpMs = 3000;
 constexpr int64_t kBackwardToleranceMs = -200;
 constexpr int64_t kSupportedVideoProbeMs = 5000;
-constexpr qint64 kRtmpTimestampWrap90k = (qint64(1) << 32) * 90;
 constexpr int kMaxAmf0ScanDepth = 64;
 constexpr char kReconnectRequestCode[] = "NetConnection.Connect.ReconnectRequest";
 

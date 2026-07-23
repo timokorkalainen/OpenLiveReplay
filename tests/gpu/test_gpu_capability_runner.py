@@ -7517,6 +7517,13 @@ class ProcessCoordinatorTests(unittest.TestCase):
         }]
         database.write_text(json.dumps(entry), encoding="utf-8")
 
+        linux_rendezvous_client = None
+        attempt_rendezvous_clients = []
+        if sys.platform.startswith("linux"):
+            from gpu_capability_process_tree import LinuxRendezvousClient
+
+            linux_rendezvous_client = LinuxRendezvousClient(os.environ)
+
         def full_pipeline_attempt(*, kind, worker_count, runtime_parameters,
                                   cache_root, included_stages, preparation,
                                   operation_deadline, cleanup_deadline):
@@ -7534,9 +7541,9 @@ class ProcessCoordinatorTests(unittest.TestCase):
             inspection_cache = CompilerInspectionCache(cache_root)
             registry = capability_runner.CompilerCapabilityRegistry(authority)
             if sys.platform.startswith("linux"):
-                from gpu_capability_process_tree import LinuxRendezvousClient
-
-                native = LinuxRendezvousClient(os.environ)
+                native = linux_rendezvous_client
+                self.assertIsNotNone(native)
+                attempt_rendezvous_clients.append(native)
                 native.hello(operation_deadline)
                 run_accountant = (
                     capability_runner.LinuxCompilerAuditAttemptAccountant(native))
@@ -7646,6 +7653,10 @@ class ProcessCoordinatorTests(unittest.TestCase):
                              2)
             self.assertTrue(all(memory.accounting_complete
                                 for _kind, _cache, memory in attempts))
+            if sys.platform.startswith("linux"):
+                self.assertEqual(len(attempt_rendezvous_clients), 2)
+                self.assertIs(attempt_rendezvous_clients[0],
+                              attempt_rendezvous_clients[1])
         finally:
             _clear_compiler_inspection_memo_for_tests()
 
