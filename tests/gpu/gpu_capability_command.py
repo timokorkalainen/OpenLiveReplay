@@ -2025,10 +2025,10 @@ def _held_compiler_launch(
 ) -> tuple[tuple[str, ...], dict[str, object]]:
     """Select the executable through the already-held native capability.
 
-    POSIX executes the transferred descriptor path.  Windows CreateProcess
-    necessarily accepts a name; the parent registry retains non-write/delete
-    shared handles through generation reap, so this is the attested locked
-    name and the child performs no path lookup or identity refresh.
+    Linux executes the transferred descriptor path.  Windows CreateProcess
+    and macOS accept the attested canonical name; their parent-side capability
+    owners retain the native handle and path-generation guards through process
+    launch and post-execution validation.
     """
 
     if (
@@ -2046,11 +2046,14 @@ def _held_compiler_launch(
             (str(capability.executable_identity.canonical), *prepared_arguments[1:]),
             {},
         )
+    if capability.platform_kind == "macos":
+        return (
+            (str(capability.executable_identity.canonical), *prepared_arguments[1:]),
+            {},
+        )
     executable_fd = owner.executable_fd
     if capability.platform_kind == "linux":
         executable = f"/proc/self/fd/{executable_fd}"
-    elif capability.platform_kind == "macos":
-        executable = f"/dev/fd/{executable_fd}"
     else:
         raise AuditInfrastructureError("held compiler launch platform is invalid")
     return (

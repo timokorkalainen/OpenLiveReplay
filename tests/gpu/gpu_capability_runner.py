@@ -2407,6 +2407,7 @@ def _compiler_capability_from_bootstrap(
         )
     streams = list(transferred_streams)
     native_owner = None
+    observer = None
     try:
         for stream, _path, expected in zip(
             streams, file_paths, file_snapshots
@@ -2428,6 +2429,13 @@ def _compiler_capability_from_bootstrap(
                 raise AuditInfrastructureError(
                     "worker compiler capability transferred identity differs"
                 )
+        platform_kind = document["platform_kind"]
+        if platform_kind == "macos":
+            observer = _FilesystemGenerationObserver(
+                tuple((path, True) for path in directory_paths)
+                + tuple((path, False) for path in alias_paths)
+                + tuple((path, False) for path in file_paths)
+            )
         native_owner = _CompilerCapabilityOwner(
             tuple(streams),
             file_paths,
@@ -2437,13 +2445,14 @@ def _compiler_capability_from_bootstrap(
             alias_snapshots,
             directory_paths,
             directory_snapshots,
-            None,
+            observer,
             authority,
             macos_shared_cache_uuid=owner_document[
                 "macos_shared_cache_uuid"
             ],
-            validate_paths=False,
+            validate_paths=platform_kind == "macos",
         )
+        observer = None
         capability = CompilerExecutableCapability(
             document["platform_kind"],
             _identity_from_wire_document(document["executable_identity"]),
@@ -2476,6 +2485,11 @@ def _compiler_capability_from_bootstrap(
             except BaseException:
                 pass
         if native_owner is None:
+            if observer is not None:
+                try:
+                    observer.close()
+                except BaseException:
+                    pass
             for stream in reversed(streams):
                 try:
                     stream.close()

@@ -11134,7 +11134,25 @@ class ProcessCoordinatorTests(unittest.TestCase):
                 registry.close()
             replacement.unlink(missing_ok=True)
 
-    def test_child_bootstrap_uses_only_transferred_handles_without_path_or_watcher(self):
+    def _retarget_bootstrap_document_platform(self, document, platform_kind):
+        closure_digest = capability_command._runtime_closure_digest(
+            self.capability.resolved_runtime_closure,
+            platform_kind,
+            "",
+        )
+        capability_digest = capability_command._compiler_capability_digest(
+            platform_kind,
+            self.capability.trusted_toolchain_root,
+            self.capability.executable_identity.canonical,
+            self.capability.executable_sha256,
+            closure_digest,
+            self.authority.portable_authority_digest,
+        )
+        document["platform_kind"] = platform_kind
+        document["resolved_runtime_closure_digest"] = closure_digest
+        document["digest"] = capability_digest
+
+    def test_child_bootstrap_linux_uses_only_transferred_handles_without_path_or_watcher(self):
         streams = tuple(
             os.fdopen(os.dup(stream.fileno()), "rb", closefd=True)
             for stream in self.capability.native_owner.streams
@@ -11159,6 +11177,7 @@ class ProcessCoordinatorTests(unittest.TestCase):
             _cookie,
             _count,
         ) = capability_runner._decode_worker_bootstrap(payload)
+        self._retarget_bootstrap_document_platform(documents[0], "linux")
         child_capability = None
         try:
             with mock.patch.object(
@@ -11193,6 +11212,298 @@ class ProcessCoordinatorTests(unittest.TestCase):
                     if not stream.closed:
                         stream.close()
 
+    def test_child_bootstrap_macos_rearms_transferred_path_generation_guard(self):
+        streams = tuple(
+            os.fdopen(os.dup(stream.fileno()), "rb", closefd=True)
+            for stream in self.capability.native_owner.streams
+        )
+        payload = capability_runner._encode_worker_bootstrap(
+            (self.configuration,),
+            self.authority,
+            {},
+            AuditLimits(),
+            self.engine,
+            time.monotonic() + 10.0,
+            transfer_cookie="a" * 64,
+            transferred_handles={},
+        )
+        (
+            authority,
+            documents,
+            _snapshot,
+            _limits,
+            _engine,
+            deadline,
+            _cookie,
+            _count,
+        ) = capability_runner._decode_worker_bootstrap(payload)
+        self._retarget_bootstrap_document_platform(documents[0], "macos")
+        child_capability = None
+        observer = mock.Mock()
+        try:
+            with mock.patch.object(
+                capability_runner,
+                "_FilesystemGenerationObserver",
+                return_value=observer,
+            ) as make_observer:
+                child_capability = capability_runner._compiler_capability_from_bootstrap(
+                    documents[0],
+                    authority,
+                    deadline,
+                    threading.Event(),
+                    streams,
+                )
+            make_observer.assert_called_once_with(
+                tuple((Path(path), True) for path in documents[0]["owner"]["directory_paths"])
+                + tuple((Path(path), False) for path in documents[0]["owner"]["alias_paths"])
+                + tuple((Path(path), False) for path in documents[0]["owner"]["file_paths"])
+            )
+            self.assertIs(child_capability.native_owner.observer, observer)
+            self.assertTrue(child_capability.native_owner.validate_paths)
+        finally:
+            if child_capability is not None:
+                child_capability.native_owner.close()
+            else:
+                for stream in reversed(streams):
+                    if not stream.closed:
+                        stream.close()
+
+    def _macos_transferred_script_capability(self):
+        compiler = self.toolchain / "macos-compiler"
+        replacement = self.toolchain / "macos-compiler-replacement"
+        original_script = (
+            b"#!/bin/sh\n"
+            b"printf 'g++ (GCC) 14.1.0\\n'\n"
+            b"if [ -n \"$OLR_TEST_READY\" ]; then\n"
+            b"  : > \"$OLR_TEST_READY\"\n"
+            b"  sleep 1\n"
+            b"fi\n"
+        )
+        replacement_script = (
+            b"#!/bin/sh\n"
+            b"printf 'replacement g++ (GCC) 14.1.0\\n'\n"
+            b": > \"$OLR_REPLACEMENT_MARKER\"\n"
+            b"while [ ! -e \"$OLR_REPLACEMENT_RELEASE\" ]; do sleep 0.01; done\n"
+        )
+        compiler.write_bytes(original_script)
+        replacement.write_bytes(replacement_script)
+        compiler.chmod(0o755)
+        replacement.chmod(0o755)
+        parent = open_compiler_executable_capability(
+            compiler,
+            self.authority,
+            time.monotonic() + 10.0,
+            _query_driver=False,
+        )
+        configuration = dataclasses.replace(
+            self.configuration,
+            compiler=compiler,
+            compiler_capability_digest=parent.capability_digest,
+            compiler_capability=parent,
+        )
+        streams = tuple(
+            os.fdopen(os.dup(stream.fileno()), "rb", closefd=True)
+            for stream in parent.native_owner.streams
+        )
+        child = None
+        try:
+            payload = capability_runner._encode_worker_bootstrap(
+                (configuration,),
+                self.authority,
+                {},
+                AuditLimits(),
+                self.engine,
+                time.monotonic() + 10.0,
+                transfer_cookie="a" * 64,
+                transferred_handles={},
+            )
+            decoded = capability_runner._decode_worker_bootstrap(payload)
+            child = capability_runner._compiler_capability_from_bootstrap(
+                decoded[1][0],
+                decoded[0],
+                decoded[5],
+                threading.Event(),
+                streams,
+            )
+            return parent, child, compiler, replacement
+        except BaseException:
+            if child is not None:
+                child.native_owner.close()
+            else:
+                for stream in reversed(streams):
+                    if not stream.closed:
+                        stream.close()
+            parent.native_owner.close()
+            raise
+
+    def _macos_test_launch_observer(self, deadline, active):
+        test = self
+
+        class Observer:
+            macos_launch_deadline = deadline
+
+            def authorize_macos_compiler_exec(_self, process_start):
+                return capability_model.MacOSInspectionExecPermit(
+                    "transferred-owner-test",
+                    process_start.pid,
+                    process_start.pid,
+                    "d" * 64,
+                )
+
+            def register_compiler_process_launch(_self, event, carrier):
+                active[event.process_start] = carrier
+
+            def complete_compiler_process_launch(_self, event, carrier):
+                test.assertIs(active.pop(event.process_start), carrier)
+
+            def fail_compiler_process_launch(_self, event, carrier):
+                if active.get(event.process_start) is carrier:
+                    active.pop(event.process_start)
+
+        return Observer()
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS path-generation guard")
+    def test_macos_transferred_owner_rejects_persistent_replacement_before_launch(self):
+        parent, child, compiler, replacement = self._macos_transferred_script_capability()
+        displaced = self.toolchain / "macos-compiler-displaced"
+        try:
+            compiler.rename(displaced)
+            replacement.rename(compiler)
+            with mock.patch.object(
+                capability_command.subprocess,
+                "Popen",
+            ) as popen, self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "generation|changed|path chain|identity",
+            ):
+                capability_command._run_probe_command(
+                    child,
+                    ("--version",),
+                    self.root,
+                    os.environ,
+                    time.monotonic() + 10.0,
+                )
+            popen.assert_not_called()
+        finally:
+            child.native_owner.close()
+            parent.native_owner.close()
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS permit-to-exec guard")
+    def test_macos_transferred_owner_rejects_permit_to_exec_swap_restore(self):
+        parent, child, compiler, replacement = self._macos_transferred_script_capability()
+        displaced = self.toolchain / "macos-compiler-displaced"
+        deadline = time.monotonic() + 10.0
+        active = {}
+        observer = self._macos_test_launch_observer(deadline, active)
+        marker = self.root / "macos-replacement-marker"
+        release = self.root / "macos-replacement-release"
+        environment = dict(os.environ)
+        environment["OLR_REPLACEMENT_MARKER"] = str(marker)
+        environment["OLR_REPLACEMENT_RELEASE"] = str(release)
+
+        real_write = capability_command._write_length_prefixed_fd
+        swapped = False
+
+        def install_replacement_release_permit_and_restore(descriptor, payload):
+            nonlocal swapped
+            compiler.rename(displaced)
+            replacement.rename(compiler)
+            real_write(descriptor, payload)
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            if not marker.exists():
+                raise AssertionError("replacement compiler did not execute")
+            try:
+                compiler.rename(replacement)
+                displaced.rename(compiler)
+                swapped = True
+            finally:
+                release.write_bytes(b"release\n")
+
+        try:
+            with mock.patch.object(
+                capability_command,
+                "_write_length_prefixed_fd",
+                side_effect=install_replacement_release_permit_and_restore,
+            ), self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "generation|changed|path chain|identity",
+            ):
+                capability_command._run_probe_command(
+                    child,
+                    ("--version",),
+                    self.root,
+                    environment,
+                    deadline,
+                    launch_observer=observer,
+                )
+            self.assertTrue(swapped)
+            self.assertTrue(marker.is_file())
+            self.assertEqual(active, {})
+        finally:
+            if displaced.exists():
+                if compiler.exists() and not replacement.exists():
+                    compiler.rename(replacement)
+                displaced.rename(compiler)
+            release.write_bytes(b"release\n")
+            child.native_owner.close()
+            parent.native_owner.close()
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS during-exec guard")
+    def test_macos_transferred_owner_rejects_during_exec_swap_restore(self):
+        parent, child, compiler, replacement = self._macos_transferred_script_capability()
+        displaced = self.toolchain / "macos-compiler-displaced"
+        ready = self.root / "macos-compiler-ready"
+        deadline = time.monotonic() + 10.0
+        active = {}
+        observer = self._macos_test_launch_observer(deadline, active)
+        mutation_error = []
+        stop_mutator = threading.Event()
+
+        def swap_restore_during_exec():
+            try:
+                while (
+                    not ready.exists()
+                    and not stop_mutator.is_set()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                if stop_mutator.is_set():
+                    return
+                if not ready.exists():
+                    raise AssertionError("compiler did not reach its execution barrier")
+                compiler.rename(displaced)
+                replacement.rename(compiler)
+                compiler.rename(replacement)
+                displaced.rename(compiler)
+            except BaseException as error:
+                mutation_error.append(error)
+
+        mutator = threading.Thread(target=swap_restore_during_exec)
+        environment = dict(os.environ)
+        environment["OLR_TEST_READY"] = str(ready)
+        try:
+            mutator.start()
+            with self.assertRaisesRegex(
+                AuditInfrastructureError,
+                "generation|changed|path chain|identity",
+            ):
+                capability_command._run_probe_command(
+                    child,
+                    ("--version",),
+                    self.root,
+                    environment,
+                    deadline,
+                    launch_observer=observer,
+                )
+        finally:
+            stop_mutator.set()
+            mutator.join()
+            child.native_owner.close()
+            parent.native_owner.close()
+        self.assertEqual(mutation_error, [])
+        self.assertEqual(active, {})
+
     def test_registry_final_close_releases_path_generation_guard_for_rename(self):
         registry = capability_runner.CompilerCapabilityRegistry(self.authority)
         registry.register(self.capability)
@@ -11201,7 +11512,7 @@ class ProcessCoordinatorTests(unittest.TestCase):
         self.compiler.rename(renamed)
         self.assertTrue(renamed.is_file())
 
-    def test_held_executable_launch_uses_native_descriptor_path_on_posix(self):
+    def test_held_executable_launch_uses_native_descriptor_path_on_linux(self):
         arguments, options = capability_command._held_compiler_launch(
             dataclasses.replace(self.capability, platform_kind="linux"),
             (str(self.compiler), "--version"),
@@ -11214,18 +11525,17 @@ class ProcessCoordinatorTests(unittest.TestCase):
             options["pass_fds"],
             (self.capability.native_owner.executable_fd,),
         )
+
+    def test_held_executable_launch_uses_guarded_canonical_path_on_macos(self):
         arguments, options = capability_command._held_compiler_launch(
             dataclasses.replace(self.capability, platform_kind="macos"),
             (str(self.compiler), "--version"),
         )
         self.assertEqual(
             arguments[0],
-            f"/dev/fd/{self.capability.native_owner.executable_fd}",
+            str(self.capability.executable_identity.canonical),
         )
-        self.assertEqual(
-            options["pass_fds"],
-            (self.capability.native_owner.executable_fd,),
-        )
+        self.assertEqual(options, {})
 
     def test_fake_preprocessor_has_bounded_cpu_and_crash_coordinator_modes(self):
         fixture = Path(__file__).parent / "fixtures" / "fake_preprocessor.py"
