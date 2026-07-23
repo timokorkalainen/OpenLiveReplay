@@ -419,7 +419,10 @@ void TestDeckLinkSink::gpuNativeRejectsMatchedStaleAuthorityWithoutWaiting() {
 }
 
 void TestDeckLinkSink::gpuNativeRejectsLossLatchedCurrentPairWithoutWaiting() {
-    GpuDeviceLossMonitor::instance().recordLoss();
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
+    monitor.recordLoss();
     auto fence = std::make_shared<ManualFence>();
     fence->completed = 7;
     OutputBusFrame frame = pendingGpuBusFrame(fence, 7);
@@ -431,6 +434,7 @@ void TestDeckLinkSink::gpuNativeRejectsLossLatchedCurrentPairWithoutWaiting() {
     QVERIFY(!sink.submit(frame));
     QCOMPARE(fence->waits, 0);
     QCOMPARE(backend.gpuScheduled, 0);
+    QVERIFY(monitor.unregisterRecoveryParticipant(participant).has_value());
 }
 
 void TestDeckLinkSink::gpuNativeRejectsStaleGenerationWithoutWaiting() {

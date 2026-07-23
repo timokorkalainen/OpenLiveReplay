@@ -561,6 +561,8 @@ void TestGpuSurfaceAllocator::degradedPostSubmitExceptionRetainsAndRecordsFailur
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     configureDeniedGpuBudget();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
 
     const GpuSurfaceCompatibility compatibility{0xA110C, monitor.currentDeviceAuthorityForTest()};
     auto surface = std::make_shared<TestSurface>(compatibility);
@@ -595,6 +597,7 @@ void TestGpuSurfaceAllocator::degradedPostSubmitExceptionRetainsAndRecordsFailur
     registry.drainCompleted();
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
     QVERIFY(weakSurface.expired());
+    QVERIFY(monitor.unregisterRecoveryParticipant(participant).has_value());
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
 }

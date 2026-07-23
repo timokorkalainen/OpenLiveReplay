@@ -37,14 +37,18 @@ void TestIosGpuLifecycle::init() {
 }
 
 void TestIosGpuLifecycle::backgroundBumpsGenerationAndSuspends() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     DefaultIosGpuLifecycleSink sink;
     const uint64_t before = GpuGenerationCounter::instance().current();
     QVERIFY(!sink.isSuspended());
     sink.onEnterBackground();
     QVERIFY(sink.isSuspended());
-    QVERIFY(GpuDeviceLossMonitor::instance().isLost());
+    QVERIFY(monitor.isLost());
     QVERIFY(GpuGenerationCounter::instance().current() > before);
     QCOMPARE(sink.generationAtLastBackground(), GpuGenerationCounter::instance().current());
+    QVERIFY(monitor.unregisterRecoveryParticipant(participant).has_value());
 }
 
 void TestIosGpuLifecycle::foregroundClearsSuspend() {

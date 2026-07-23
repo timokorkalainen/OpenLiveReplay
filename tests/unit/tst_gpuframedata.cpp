@@ -275,6 +275,8 @@ void TestGpuFrameData::exceptionAfterSubmissionRetainsAndLatchesFailure() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
     const GpuSurfaceCompatibility compatibility{0xD3F3, monitor.currentDeviceAuthorityForTest()};
@@ -299,6 +301,7 @@ void TestGpuFrameData::exceptionAfterSubmissionRetainsAndLatchesFailure() {
     contextFence->complete(1);
     registry.drainCompleted();
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QVERIFY(monitor.unregisterRecoveryParticipant(participant).has_value());
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
 }

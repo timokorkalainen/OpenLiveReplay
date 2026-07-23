@@ -251,6 +251,7 @@ void TestDeviceLossMonitor::replacementDeviceLossRestartsRecoveryEpoch() {
 void TestDeviceLossMonitor::validatedRecoveryRejectsMismatchedLossGeneration() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA08);
     QVERIFY(generation != 0);
@@ -271,6 +272,7 @@ void TestDeviceLossMonitor::validatedRecoveryRejectsMismatchedLossGeneration() {
 void TestDeviceLossMonitor::validatedRecoveryCallbackRunsAfterEpochUnlock() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA10) != 0);
 
@@ -307,6 +309,7 @@ void TestDeviceLossMonitor::validatedRecoveryCallbackRunsAfterEpochUnlock() {
 void TestDeviceLossMonitor::tokenlessRecoveryCallbackRunsAfterEpochUnlock() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     monitor.recordSubmissionFailure(0xA09);
 
     QSemaphore callbackEntered;
@@ -342,6 +345,7 @@ void TestDeviceLossMonitor::tokenlessRecoveryCallbackRunsAfterEpochUnlock() {
 void TestDeviceLossMonitor::validatedRecoveryRunsOnceForConcurrentWorkers() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA11) != 0);
 
@@ -374,6 +378,7 @@ void TestDeviceLossMonitor::validatedRecoveryRunsOnceForConcurrentWorkers() {
 void TestDeviceLossMonitor::rebuildInvalidatesUnconsumedRecoveryAuthority() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA12) != 0);
     monitor.beginRebuild();
@@ -392,6 +397,7 @@ void TestDeviceLossMonitor::rebuildInvalidatesUnconsumedRecoveryAuthority() {
 void TestDeviceLossMonitor::tokenlessEpochCanUpgradeToValidatedRecovery() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     const uint64_t generation = monitor.recordSubmissionFailure(0xA13);
     bool called = false;
@@ -421,6 +427,7 @@ void TestDeviceLossMonitor::tokenlessEpochCanUpgradeToValidatedRecovery() {
 void TestDeviceLossMonitor::expandedDeadDomainProofRunsNewRecoveryRevision() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA14);
     int callbacks = 0;
@@ -553,6 +560,7 @@ void TestDeviceLossMonitor::recordLossSetsLatchAndBumpsGeneration() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
     GpuGenerationCounter::instance().resetForTest();
+    QVERIFY(m.registerRecoveryParticipant() != 0);
     QVERIFY(!m.isLost());
     QCOMPARE(m.lossCount(), uint64_t(0));
     const uint64_t gen = m.recordLoss();
@@ -566,6 +574,8 @@ void TestDeviceLossMonitor::recordLossIsIdempotentUntilRebuildClearsLatch() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
     GpuGenerationCounter::instance().resetForTest();
+    const uint64_t firstParticipant = m.registerRecoveryParticipant();
+    QVERIFY(firstParticipant != 0);
 
     const uint64_t firstGen = m.recordLoss();
     const uint64_t duplicateGen = m.recordLoss();
@@ -574,7 +584,8 @@ void TestDeviceLossMonitor::recordLossIsIdempotentUntilRebuildClearsLatch() {
     QVERIFY(m.consumeLossEvent());
     QVERIFY(!m.consumeLossEvent());
 
-    m.clearForRebuild();
+    QVERIFY(m.unregisterRecoveryParticipant(firstParticipant).has_value());
+    QVERIFY(m.registerRecoveryParticipant() != 0);
     const uint64_t secondGen = m.recordLoss();
     QVERIFY(secondGen > firstGen);
     QCOMPARE(m.lossCount(), uint64_t(2));
@@ -584,6 +595,7 @@ void TestDeviceLossMonitor::recordLossIsIdempotentUntilRebuildClearsLatch() {
 void TestDeviceLossMonitor::consumeLossEventDrainsWithoutClearingLatch() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
+    QVERIFY(m.registerRecoveryParticipant() != 0);
     m.recordLoss();
     QVERIFY(m.consumeLossEvent());  // one pending event drained
     QVERIFY(!m.consumeLossEvent()); // none left
@@ -594,9 +606,13 @@ void TestDeviceLossMonitor::clearForRebuildClearsLatchKeepsGeneration() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
     GpuGenerationCounter::instance().resetForTest();
-    m.recordLoss();
+    const uint64_t participant = m.registerRecoveryParticipant();
+    const uint64_t generation = m.recordLoss();
     const uint64_t genAfterLoss = GpuGenerationCounter::instance().current();
-    m.clearForRebuild();
+    QVERIFY(m.acknowledgeRecoveryCleanup(participant, generation));
+    const GpuRecoveryTicket ticket = m.beginRebuild(participant);
+    QVERIFY(ticket.isValid());
+    QVERIFY(m.clearForRebuild(ticket));
     QVERIFY(!m.isLost()); // GPU path may resume
     QCOMPARE(GpuGenerationCounter::instance().current(),
              genAfterLoss); // dead surfaces stay stale
@@ -606,6 +622,7 @@ void TestDeviceLossMonitor::tokenlessLossUpgradesFromSameDeviceProof() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
     GpuGenerationCounter::instance().resetForTest();
+    QVERIFY(m.registerRecoveryParticipant() != 0);
     const uint64_t deviceAuthorityEpoch = GpuDeviceLossMonitorTestAuthority::capture();
     const uint64_t lossGeneration = m.recordSubmissionFailure(1);
     QVERIFY(!m.realLossToken().has_value());
@@ -620,6 +637,7 @@ void TestDeviceLossMonitor::tokenlessLossUpgradesFromSameDeviceProof() {
 void TestDeviceLossMonitor::tokenlessLossAcceptsAllAuthoritativeDeadDomains() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
+    QVERIFY(m.registerRecoveryParticipant() != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     const uint64_t generation = m.recordSubmissionFailure(11);
     QVERIFY(!m.realLossToken().has_value());
@@ -638,6 +656,7 @@ void TestDeviceLossMonitor::tokenlessLossAcceptsAllAuthoritativeDeadDomains() {
 void TestDeviceLossMonitor::realLossTracksMultipleDeviceDomains() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
+    QVERIFY(m.registerRecoveryParticipant() != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, 11);
     QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(authority, 22), generation);
@@ -668,6 +687,7 @@ void TestDeviceLossMonitor::tokenlessLossStaysTokenlessWithoutDriverProof() {
 void TestDeviceLossMonitor::realLossPublicationIsAtomicWithEpoch() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish();
 
     QVERIFY(monitor.isLost());
@@ -701,6 +721,7 @@ void TestDeviceLossMonitor::rebuildAuthorityRejectsOldDeviceAcceptsReplacement()
     monitor.clearForRebuild();
 
     QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(oldAuthority), uint64_t(0));
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(replacementAuthority) != 0);
     QVERIFY(monitor.realLossToken().has_value());
 }

@@ -740,6 +740,8 @@ void TestGpuSurfaceLease::copiedLossEvidenceCannotAbandonSameDomainReplacementAu
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     const uint64_t oldAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
 
     auto oldFence = std::make_shared<ZeroSignalFence>(deviceDomain, oldAuthority);
     auto oldSurface =
@@ -755,10 +757,13 @@ void TestGpuSurfaceLease::copiedLossEvidenceCannotAbandonSameDomainReplacementAu
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(oldAuthority, deviceDomain) != 0);
     const std::vector<DeadDeviceToken> staleEvidence = monitor.realLossTokens();
 
-    monitor.beginRebuild();
+    const uint64_t lossGeneration = monitor.currentLossGenerationForTest();
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(participant, lossGeneration));
+    const GpuRecoveryTicket ticket = monitor.beginRebuild(participant);
+    QVERIFY(ticket.isValid());
     const uint64_t replacementAuthority = GpuDeviceLossMonitorTestAuthority::capture();
     QVERIFY(replacementAuthority != oldAuthority);
-    monitor.clearForRebuild();
+    QVERIFY(monitor.clearForRebuild(ticket));
     auto replacementFence = std::make_shared<ZeroSignalFence>(deviceDomain, replacementAuthority);
     auto replacementSurface = std::make_shared<FakeLeaseSurface>(
         reinterpret_cast<void*>(0x5A111), true,
@@ -787,6 +792,8 @@ void TestGpuSurfaceLease::authoritativeLossRejectsLateSubmissionAndAbandonsPreLo
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     GpuRetireRegistry registry;
     auto oldFence = std::make_shared<ZeroSignalFence>(deviceDomain, authority);
     auto oldSurface = std::make_shared<FakeLeaseSurface>(
@@ -1693,7 +1700,10 @@ void TestGpuSurfaceLease::acceptedSubmissionPublishesWhenGenerationChangesInside
 
 void TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedWithErrorOwners() {
     GpuGenerationCounter::instance().resetForTest();
-    GpuDeviceLossMonitor::instance().reset();
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
     const uint64_t authority = currentDeviceAuthority();
@@ -1712,7 +1722,7 @@ void TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedWithErrorOwners() {
     QVERIFY(operation.submitted());
     QVERIFY(!operation.cancel());
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
-    QVERIFY(GpuDeviceLossMonitor::instance().isLost());
+    QVERIFY(monitor.isLost());
     fence->setCompleted(result.fenceValue);
     registry.drainCompleted();
     GpuDeviceLossMonitor::instance().reset();
@@ -1721,7 +1731,10 @@ void TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedWithErrorOwners() {
 
 void TestGpuSurfaceLease::fusedSubmissionQuarantinesZeroSignal() {
     GpuGenerationCounter::instance().resetForTest();
-    GpuDeviceLossMonitor::instance().reset();
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
@@ -1743,11 +1756,11 @@ void TestGpuSurfaceLease::fusedSubmissionQuarantinesZeroSignal() {
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
     QCOMPARE(registry.diagnostics().signalFailureCount, failuresBefore + 1);
     QVERIFY(registry.diagnostics().quarantineCount >= 1);
-    QVERIFY(GpuDeviceLossMonitor::instance().isLost());
-    QVERIFY(!GpuDeviceLossMonitor::instance().realLossToken().has_value());
+    QVERIFY(monitor.isLost());
+    QVERIFY(!monitor.realLossToken().has_value());
 
     GpuDeviceLossMonitorTestAuthority::publish(authority, 0xB1);
-    const auto token = GpuDeviceLossMonitor::instance().realLossToken();
+    const auto token = monitor.realLossToken();
     QVERIFY(token.has_value());
     QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(1));
     GpuDeviceLossMonitor::instance().reset();
@@ -1756,7 +1769,10 @@ void TestGpuSurfaceLease::fusedSubmissionQuarantinesZeroSignal() {
 
 void TestGpuSurfaceLease::fusedSubmissionQuarantinesPostAcceptThrow() {
     GpuGenerationCounter::instance().resetForTest();
-    GpuDeviceLossMonitor::instance().reset();
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
@@ -1778,7 +1794,7 @@ void TestGpuSurfaceLease::fusedSubmissionQuarantinesPostAcceptThrow() {
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
 
     GpuDeviceLossMonitorTestAuthority::publish(authority, 0xC1);
-    const auto token = GpuDeviceLossMonitor::instance().realLossToken();
+    const auto token = monitor.realLossToken();
     QVERIFY(token.has_value());
     QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(1));
     QCOMPARE(surface.use_count(), ownersBefore);
@@ -1813,6 +1829,8 @@ void TestGpuSurfaceLease::fusedMultiNodeFailureStatesCoverEveryOwner() {
 
     monitor.reset();
     {
+        const uint64_t participant = monitor.registerRecoveryParticipant();
+        QVERIFY(participant != 0);
         const uint64_t authority = currentDeviceAuthority();
         const qsizetype pendingBefore = registry.pendingRetainCount();
         auto fence = std::make_shared<FakeFence>(0xC3, authority);
@@ -1830,6 +1848,8 @@ void TestGpuSurfaceLease::fusedMultiNodeFailureStatesCoverEveryOwner() {
 
     monitor.reset();
     {
+        const uint64_t participant = monitor.registerRecoveryParticipant();
+        QVERIFY(participant != 0);
         const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
         const qsizetype pendingBefore = registry.pendingRetainCount();
         auto fence = std::make_shared<ZeroSignalFence>(0xC4, authority);
@@ -1847,6 +1867,8 @@ void TestGpuSurfaceLease::fusedMultiNodeFailureStatesCoverEveryOwner() {
 
     monitor.reset();
     {
+        const uint64_t participant = monitor.registerRecoveryParticipant();
+        QVERIFY(participant != 0);
         const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
         const qsizetype pendingBefore = registry.pendingRetainCount();
         auto fence = std::make_shared<ThrowingSignalFence>(0xC5, authority);
@@ -1900,7 +1922,8 @@ void TestGpuSurfaceLease::fusedSubmissionNeverConsumesPostAcceptAllocationFailur
 
 void TestGpuSurfaceLease::fusedSubmissionAllPostAcceptOutcomesDoNotAllocate() {
     GpuGenerationCounter::instance().resetForTest();
-    GpuDeviceLossMonitor::instance().reset();
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
     GpuRetireRegistry registry;
 
     auto verify = [&](const std::shared_ptr<GpuFence>& fence, uintptr_t domain,
@@ -1932,7 +1955,9 @@ void TestGpuSurfaceLease::fusedSubmissionAllPostAcceptOutcomesDoNotAllocate() {
     submittedFence->setCompleted(submittedValue);
     registry.drainCompleted();
 
-    GpuDeviceLossMonitor::instance().reset();
+    monitor.reset();
+    const uint64_t submittedErrorParticipant = monitor.registerRecoveryParticipant();
+    QVERIFY(submittedErrorParticipant != 0);
     auto submittedErrorFence = std::make_shared<FakeFence>(0xC3, currentDeviceAuthority());
     uint64_t submittedErrorValue = 0;
     verify(submittedErrorFence, 0xC3, GpuSubmitOutcome::SubmittedWithError,
@@ -1940,24 +1965,26 @@ void TestGpuSurfaceLease::fusedSubmissionAllPostAcceptOutcomesDoNotAllocate() {
     submittedErrorFence->setCompleted(submittedErrorValue);
     registry.drainCompleted();
 
-    GpuDeviceLossMonitor::instance().reset();
+    monitor.reset();
+    const uint64_t zeroParticipant = monitor.registerRecoveryParticipant();
+    QVERIFY(zeroParticipant != 0);
     const uint64_t zeroAuthority = GpuDeviceLossMonitorTestAuthority::capture();
     verify(std::make_shared<ZeroSignalFence>(0xC4, zeroAuthority), 0xC4,
            GpuSubmitOutcome::Submitted, GpuRetirementDisposition::Quarantined);
     QCOMPARE(registry.drainWithBoundedWait(0), 0);
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(zeroAuthority, 0xC4) != 0);
-    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(
-                 registry, *GpuDeviceLossMonitor::instance().realLossToken()),
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *monitor.realLossToken()),
              qsizetype(1));
 
-    GpuDeviceLossMonitor::instance().reset();
+    monitor.reset();
+    const uint64_t throwingParticipant = monitor.registerRecoveryParticipant();
+    QVERIFY(throwingParticipant != 0);
     const uint64_t throwingAuthority = GpuDeviceLossMonitorTestAuthority::capture();
     verify(std::make_shared<ThrowingSignalFence>(0xC5, throwingAuthority), 0xC5,
            GpuSubmitOutcome::Submitted, GpuRetirementDisposition::Quarantined);
     QCOMPARE(registry.drainWithBoundedWait(0), 0);
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(throwingAuthority, 0xC5) != 0);
-    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(
-                 registry, *GpuDeviceLossMonitor::instance().realLossToken()),
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *monitor.realLossToken()),
              qsizetype(1));
     GpuDeviceLossMonitor::instance().reset();
     GpuGenerationCounter::instance().resetForTest();
@@ -2064,6 +2091,8 @@ void TestGpuSurfaceLease::boundedWaitSkipsDeadTask3DomainAndWaitsLiveDomain() {
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     GpuRetireRegistry registry;
     auto deadFence = std::make_shared<FakeFence>(0xD4, authority);
     auto liveFence = std::make_shared<FakeFence>(0xD5, authority);
@@ -2097,6 +2126,8 @@ void TestGpuSurfaceLease::boundedWaitStillWaitsLiveTask3DomainAfterGenerationCha
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     const uint64_t authority = currentDeviceAuthority();
     auto fence = std::make_shared<FakeFence>(0xD6, authority);
     fence->setRetireOnWait(true);
@@ -2122,6 +2153,8 @@ void TestGpuSurfaceLease::boundedWaitRetainsTask3QuarantineUntilAuthoritativeAba
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
     constexpr uintptr_t deviceDomain = 0xD7;
@@ -2155,6 +2188,8 @@ void TestGpuSurfaceLease::zeroSignalQuarantineReleasesAfterAuthoritativeUpgrade(
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t deviceAuthorityEpoch = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
     constexpr uintptr_t deviceDomain = 0xA0;
@@ -2187,6 +2222,8 @@ void TestGpuSurfaceLease::deadTokenAbandonsOnlyMatchingDeviceDomain() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     auto deadSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xB), true,
                                                           GpuSurfaceCompatibility{11, authority});
     auto liveSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xC), true,
@@ -2221,6 +2258,8 @@ void TestGpuSurfaceLease::multipleDeadTokensAbandonInOnePass() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     auto firstSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD), true,
                                                            GpuSurfaceCompatibility{31, authority});
     auto secondSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xE), true,
@@ -2573,6 +2612,8 @@ void TestGpuSurfaceLease::diagnosticsSnapshotIsExactAcrossDeterministicShardHand
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t authorityEpoch = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     GpuRetireRegistry registry;
 
     auto oldFence = std::make_shared<ZeroSignalFence>(oldDomain, authorityEpoch);
@@ -2587,6 +2628,8 @@ void TestGpuSurfaceLease::diagnosticsSnapshotIsExactAcrossDeterministicShardHand
     const std::vector<DeadDeviceToken> deadTokens = monitor.realLossTokens();
     QCOMPARE(deadTokens.size(), size_t(1));
     monitor.reset();
+    const uint64_t replacementParticipant = monitor.registerRecoveryParticipant();
+    QVERIFY(replacementParticipant != 0);
     const uint64_t replacementAuthority = currentDeviceAuthority();
 
     const GpuRetireDiagnostics before = registry.diagnostics();
@@ -2629,6 +2672,8 @@ void TestGpuSurfaceLease::diagnosticsRemainConsistentDuringValidatedAbandon() {
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t authorityEpoch = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     GpuRetireRegistry registry;
     for (int record = 0; record < kRecords; ++record) {
         const uintptr_t deviceDomain = firstDeviceDomain + uintptr_t(record % kDomains);

@@ -6,6 +6,7 @@
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpuopscope.h"
+#include "playback/gpu/gpurecoverycoordinator.h"
 #include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
@@ -45,6 +46,33 @@ struct GpuDeviceLossMonitorTestAuthority {
     static void setRecoveryAttemptingGate(QSemaphore* attempting) {
         GpuDeviceLossMonitor::instance().m_recoveryAttemptingForTest = attempting;
     }
+    static void setNoLossUnregisterGate(QSemaphore* entered, QSemaphore* proceed) {
+        auto& monitor = GpuDeviceLossMonitor::instance();
+        monitor.m_beforeNoLossUnregisterEraseForTest = entered;
+        monitor.m_continueNoLossUnregisterEraseForTest = proceed;
+    }
+    static void setAfterDeliveryLockGate(QSemaphore* entered, QSemaphore* proceed) {
+        auto& monitor = GpuDeviceLossMonitor::instance();
+        monitor.m_afterDeliveryLockForTest = entered;
+        monitor.m_continueAfterDeliveryLockForTest = proceed;
+    }
+    static void setEpochLockGate(QSemaphore* entered, QSemaphore* proceed) {
+        auto& monitor = GpuDeviceLossMonitor::instance();
+        monitor.m_epochLockHeldForTest = entered;
+        monitor.m_continueEpochLockForTest = proceed;
+    }
+    static bool proofDeliveryMutexAvailable() {
+        auto& mutex = GpuDeviceLossMonitor::instance().m_proofDeliveryMutex;
+        if (!mutex.try_lock()) return false;
+        mutex.unlock();
+        return true;
+    }
+    static bool epochMutexAvailable() {
+        auto& mutex = GpuDeviceLossMonitor::instance().m_epochMutex;
+        if (!mutex.try_lock()) return false;
+        mutex.unlock();
+        return true;
+    }
 };
 #endif
 
@@ -69,6 +97,16 @@ private slots:
     void lateProofPublisherAndWorkerShareExactRecovery();
     void workerLifecycleDoesNotResetAnotherWorkersLoss();
     void deviceLostTeardownCleansRegistryWithoutClearingSurvivor();
+    void memoryPressureFallbackCleansValidatedRetainsBeforeUnregister();
+    void lateExternalProofWithoutParticipantsCleansAndRetiresEpoch();
+    void tokenlessUnregisterKeepsIncompleteRetainUntilOldAuthorityProof();
+    void multiParticipantUnregisterCleansBeforeFinalEpochClear();
+    void registrationDuringUnregisterCleanupJoinsPendingEpoch();
+    void noLossUnregisterSerializesTokenlessPublisher();
+    void waitingOldAuthorityPublisherCleansAfterTokenlessUnregister();
+    void lossPublishersAcquireDeliveryBeforeEpoch();
+    void rebuildInProgressAllowsOtherParticipantUnregister();
+    void proofFromOlderRetiredAuthorityCleansAfterNewerEpoch();
     void lossTelemetryIsObservedIndependentlyByEachWorker();
     void blockedRenderThreadPollAndTeardownStayBounded();
     void shutdownPollDetectsLossBeforeRetirementDrain();
@@ -120,6 +158,26 @@ public:
 private:
     uint64_t m_signalled = 0;
     std::atomic<uint64_t> m_completed{0};
+};
+
+class BlockingIncompleteLossFence final : public GpuFence {
+public:
+    BlockingIncompleteLossFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
+
+    uint64_t signal() override { return ++m_signalled; }
+    bool wait(uint64_t, int) override {
+        waitEntered.release();
+        releaseWait.acquire();
+        return false;
+    }
+    uint64_t completedValue() const override { return 0; }
+
+    QSemaphore waitEntered;
+    QSemaphore releaseWait;
+
+private:
+    uint64_t m_signalled = 0;
 };
 
 class IncompleteLossFence final : public GpuFence {
@@ -220,6 +278,34 @@ private:
     bool m_active = false;
 };
 
+class PublishLossOnStopSink final : public IOutputSink {
+public:
+    PublishLossOnStopSink(uint64_t authority, uintptr_t deviceDomain)
+        : m_authority(authority), m_deviceDomain(deviceDomain) {}
+
+    OutputTargetKind kind() const override { return OutputTargetKind::Ndi; }
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        m_active = assignment.enabled && assignment.kind == kind() && rate.isValid();
+        return m_active;
+    }
+    void stop() override {
+        if (m_active && m_publishedGeneration == 0) {
+            m_publishedGeneration =
+                GpuDeviceLossMonitorTestAuthority::publish(m_authority, m_deviceDomain);
+        }
+        m_active = false;
+    }
+    bool isActive() const override { return m_active; }
+    bool submit(const OutputBusFrame&) override { return m_active; }
+    uint64_t publishedGeneration() const { return m_publishedGeneration; }
+
+private:
+    const uint64_t m_authority;
+    const uintptr_t m_deviceDomain;
+    bool m_active = false;
+    uint64_t m_publishedGeneration = 0;
+};
+
 OutputTargetAssignment ndiFeedAssignment() {
     OutputTargetAssignment assignment;
     assignment.id = QStringLiteral("feed0-ndi");
@@ -272,6 +358,11 @@ FrameHandle placeholderFrame(qint64 ptsMs) {
 void TestGpuDeviceLostWorker::cleanup() {
     qunsetenv("OLR_GPU_PIPELINE");
     setIosGpuLifecycleSink(nullptr);
+    GpuDeviceLossMonitorTestAuthority::setNoLossUnregisterGate(nullptr, nullptr);
+    GpuDeviceLossMonitorTestAuthority::setProofDeliveryGate(nullptr, nullptr);
+    GpuDeviceLossMonitorTestAuthority::setRecoveryAttemptingGate(nullptr);
+    GpuDeviceLossMonitorTestAuthority::setAfterDeliveryLockGate(nullptr, nullptr);
+    GpuDeviceLossMonitorTestAuthority::setEpochLockGate(nullptr, nullptr);
     GpuDeviceLossMonitor::instance().reset();
     GpuGenerationCounter::instance().resetForTest();
 }
@@ -283,6 +374,8 @@ void TestGpuDeviceLostWorker::lossCountReflectsRecordedEvents() {
     OutputDispatchStats stats;
     QCOMPARE(stats.gpuDeviceLossEvents, qint64(0));
 
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     QCOMPARE(monitor.lossCount(), uint64_t(0));
     monitor.recordLoss();
     monitor.recordLoss();
@@ -290,7 +383,7 @@ void TestGpuDeviceLostWorker::lossCountReflectsRecordedEvents() {
     QVERIFY(monitor.consumeLossEvent());
     QVERIFY(!monitor.consumeLossEvent());
 
-    monitor.clearForRebuild();
+    QVERIFY(monitor.unregisterRecoveryParticipant(participant).has_value());
     monitor.recordLoss();
     QCOMPARE(monitor.lossCount(), uint64_t(2));
     QVERIFY(monitor.consumeLossEvent());
@@ -381,6 +474,493 @@ void TestGpuDeviceLostWorker::deviceLostTeardownCleansRegistryWithoutClearingSur
 
     survivor.shutdownOutputGraph();
     monitor.reset();
+}
+
+void TestGpuDeviceLostWorker::memoryPressureFallbackCleansValidatedRetainsBeforeUnregister() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    FrameProvider provider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&provider}, &transport);
+    worker.initializeOutputGraph(1, 64, 48);
+    worker.m_outputRuntime->stopRuntime();
+    monitor.reset();
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+
+    constexpr uintptr_t deadDomain = 0xA704;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<IncompleteLossFence>(deadDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deadDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+
+    PublishLossOnStopSink sink(authority, deadDomain);
+    worker.m_outputRuntime->setEndpoints({{ndiFeedAssignment(), &sink}});
+
+    worker.evaluateGpuMemoryPressureForTest(64 * 1024 * 1024, false, 1000);
+
+    QVERIFY(sink.publishedGeneration() != 0);
+    QCOMPARE(worker.m_gpuRecoveryParticipantId, uint64_t(0));
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.currentDeviceAuthorityForTest() != authority);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+}
+
+void TestGpuDeviceLostWorker::lateExternalProofWithoutParticipantsCleansAndRetiresEpoch() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    constexpr uintptr_t deadDomain = 0xA705;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<IncompleteLossFence>(deadDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deadDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+
+    const uint64_t firstGeneration =
+        GpuDeviceLossMonitorTestAuthority::publish(authority, deadDomain);
+    QVERIFY(firstGeneration != 0);
+
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.currentDeviceAuthorityForTest() != authority);
+    QCOMPARE(GpuRecoveryCoordinator::instance().cachedRecoveryCountForTest(), size_t(0));
+
+    constexpr uintptr_t freshDomain = 0xA708;
+    const uint64_t freshAuthority = monitor.currentDeviceAuthorityForTest();
+    auto freshFence = std::make_shared<IncompleteLossFence>(freshDomain, freshAuthority);
+    auto freshSurface = std::make_shared<CompatibleLossSurface>(freshDomain, freshAuthority);
+    GpuOpScope freshOperation(freshFence, registry);
+    QCOMPARE(freshOperation
+                 .submitRetained(
+                     adapter,
+                     GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{freshSurface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    const uint64_t freshGeneration =
+        GpuDeviceLossMonitorTestAuthority::publish(freshAuthority, freshDomain);
+    QVERIFY(freshGeneration > firstGeneration);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QVERIFY(!monitor.isLost());
+}
+
+void TestGpuDeviceLostWorker::tokenlessUnregisterKeepsIncompleteRetainUntilOldAuthorityProof() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    constexpr uintptr_t deadDomain = 0xA706;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<IncompleteLossFence>(deadDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deadDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QVERIFY(monitor.recordSubmissionFailure(deadDomain) != 0);
+
+    const std::optional<qsizetype> cleanup = monitor.unregisterRecoveryParticipant(participant);
+
+    QVERIFY(cleanup.has_value());
+    QCOMPARE(*cleanup, qsizetype(0));
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.currentDeviceAuthorityForTest() != authority);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, deadDomain) != 0);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+}
+
+void TestGpuDeviceLostWorker::multiParticipantUnregisterCleansBeforeFinalEpochClear() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    constexpr uintptr_t deadDomain = 0xA707;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t firstParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t finalParticipant = monitor.registerRecoveryParticipant();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<IncompleteLossFence>(deadDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deadDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, deadDomain) != 0);
+
+    const std::optional<qsizetype> firstCleanup =
+        monitor.unregisterRecoveryParticipant(firstParticipant);
+
+    QVERIFY(firstCleanup.has_value());
+    QCOMPARE(*firstCleanup, qsizetype(1));
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QVERIFY(monitor.isLost());
+    QCOMPARE(monitor.currentDeviceAuthorityForTest(), authority);
+
+    const std::optional<qsizetype> finalCleanup =
+        monitor.unregisterRecoveryParticipant(finalParticipant);
+    QVERIFY(finalCleanup.has_value());
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.currentDeviceAuthorityForTest() != authority);
+}
+
+void TestGpuDeviceLostWorker::registrationDuringUnregisterCleanupJoinsPendingEpoch() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    constexpr uintptr_t deviceDomain = 0xA709;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t firstParticipant = monitor.registerRecoveryParticipant();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<BlockingLossFence>(deviceDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deviceDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QVERIFY(monitor.recordSubmissionFailure(deviceDomain) != 0);
+
+    std::optional<qsizetype> firstCleanup;
+    std::thread cleanupThread(
+        [&]() { firstCleanup = monitor.unregisterRecoveryParticipant(firstParticipant); });
+    const bool cleanupWaiting = fence->waitEntered.tryAcquire(1, 5000);
+    const uint64_t joiningParticipant =
+        cleanupWaiting ? monitor.registerRecoveryParticipant() : uint64_t(0);
+    fence->releaseWait.release();
+    cleanupThread.join();
+
+    QVERIFY(cleanupWaiting);
+    QVERIFY(firstCleanup.has_value());
+    QVERIFY(joiningParticipant != 0);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QVERIFY(monitor.isLost());
+    QCOMPARE(monitor.currentDeviceAuthorityForTest(), authority);
+
+    const std::optional<qsizetype> finalCleanup =
+        monitor.unregisterRecoveryParticipant(joiningParticipant);
+    QVERIFY(finalCleanup.has_value());
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.currentDeviceAuthorityForTest() != authority);
+}
+
+void TestGpuDeviceLostWorker::noLossUnregisterSerializesTokenlessPublisher() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    constexpr uintptr_t deviceDomain = 0xA70A;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<IncompleteLossFence>(deviceDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deviceDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+
+    QSemaphore unregisterEntered;
+    QSemaphore continueUnregister;
+    GpuDeviceLossMonitorTestAuthority::setNoLossUnregisterGate(&unregisterEntered,
+                                                               &continueUnregister);
+    std::optional<qsizetype> unregisterResult;
+    std::thread unregisterThread(
+        [&]() { unregisterResult = monitor.unregisterRecoveryParticipant(participant); });
+    const bool entered = unregisterEntered.tryAcquire(1, 5000);
+    const bool unregisterHeldDelivery =
+        entered && !GpuDeviceLossMonitorTestAuthority::proofDeliveryMutexAvailable();
+    const bool unregisterHeldEpoch =
+        entered && !GpuDeviceLossMonitorTestAuthority::epochMutexAvailable();
+    QSemaphore publisherAcquiredDelivery;
+    QSemaphore continuePublisher;
+    GpuDeviceLossMonitorTestAuthority::setAfterDeliveryLockGate(&publisherAcquiredDelivery,
+                                                                &continuePublisher);
+    uint64_t tokenlessGeneration = 0;
+    std::thread publisherThread(
+        [&]() { tokenlessGeneration = monitor.recordSubmissionFailure(deviceDomain); });
+    continueUnregister.release();
+    unregisterThread.join();
+    const bool publisherEnteredAfterUnregister = publisherAcquiredDelivery.tryAcquire(1, 5000);
+    const bool publisherHeldDelivery =
+        publisherEnteredAfterUnregister &&
+        !GpuDeviceLossMonitorTestAuthority::proofDeliveryMutexAvailable();
+    const bool publisherHadNotLockedEpoch =
+        publisherEnteredAfterUnregister && GpuDeviceLossMonitorTestAuthority::epochMutexAvailable();
+    continuePublisher.release();
+    publisherThread.join();
+    GpuDeviceLossMonitorTestAuthority::setNoLossUnregisterGate(nullptr, nullptr);
+    GpuDeviceLossMonitorTestAuthority::setAfterDeliveryLockGate(nullptr, nullptr);
+
+    QVERIFY(entered);
+    QVERIFY(unregisterHeldDelivery);
+    QVERIFY(unregisterHeldEpoch);
+    QVERIFY(publisherEnteredAfterUnregister);
+    QVERIFY(publisherHeldDelivery);
+    QVERIFY(publisherHadNotLockedEpoch);
+    QVERIFY(unregisterResult.has_value());
+    QVERIFY(tokenlessGeneration != 0);
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.currentDeviceAuthorityForTest() != authority);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, deviceDomain) != 0);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+}
+
+void TestGpuDeviceLostWorker::waitingOldAuthorityPublisherCleansAfterTokenlessUnregister() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    constexpr uintptr_t deviceDomain = 0xA70B;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<BlockingIncompleteLossFence>(deviceDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deviceDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(operation
+                 .submitRetained(adapter, GpuSurfacePack<1>(
+                                              std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QVERIFY(monitor.recordSubmissionFailure(deviceDomain) != 0);
+
+    std::optional<qsizetype> unregisterResult;
+    std::thread unregisterThread(
+        [&]() { unregisterResult = monitor.unregisterRecoveryParticipant(participant); });
+    const bool cleanupWaiting = fence->waitEntered.tryAcquire(1, 5000);
+    const bool unregisterHeldDelivery =
+        cleanupWaiting && !GpuDeviceLossMonitorTestAuthority::proofDeliveryMutexAvailable();
+    QSemaphore proofAccepted;
+    QSemaphore continueProof;
+    GpuDeviceLossMonitorTestAuthority::setProofDeliveryGate(&proofAccepted, &continueProof);
+    uint64_t proofGeneration = 0;
+    std::thread publisherThread([&]() {
+        proofGeneration = GpuDeviceLossMonitorTestAuthority::publish(authority, deviceDomain);
+    });
+    fence->releaseWait.release();
+    unregisterThread.join();
+    const bool publisherEnteredAfterUnregister = proofAccepted.tryAcquire(1, 5000);
+    const bool publisherHeldDelivery =
+        publisherEnteredAfterUnregister &&
+        !GpuDeviceLossMonitorTestAuthority::proofDeliveryMutexAvailable();
+    const bool publisherReleasedEpoch =
+        publisherEnteredAfterUnregister && GpuDeviceLossMonitorTestAuthority::epochMutexAvailable();
+    continueProof.release();
+    publisherThread.join();
+    GpuDeviceLossMonitorTestAuthority::setProofDeliveryGate(nullptr, nullptr);
+
+    QVERIFY(cleanupWaiting);
+    QVERIFY(unregisterHeldDelivery);
+    QVERIFY(publisherEnteredAfterUnregister);
+    QVERIFY(publisherHeldDelivery);
+    QVERIFY(publisherReleasedEpoch);
+    QVERIFY(unregisterResult.has_value());
+    QCOMPARE(*unregisterResult, qsizetype(0));
+    QVERIFY(proofGeneration != 0);
+    QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.currentDeviceAuthorityForTest() != authority);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+}
+
+void TestGpuDeviceLostWorker::rebuildInProgressAllowsOtherParticipantUnregister() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t rebuildingParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t departingParticipant = monitor.registerRecoveryParticipant();
+    const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA70C);
+    QVERIFY(generation != 0);
+    const GpuValidatedLossResult cleanup = monitor.withValidatedDeadDomains(
+        [](const GpuValidatedDeadDomains&) { return qsizetype(0); });
+    QCOMPARE(cleanup.status, GpuValidatedLossStatus::Completed);
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(rebuildingParticipant, generation));
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(departingParticipant, generation));
+
+    const GpuRecoveryTicket ticket = monitor.beginRebuild(rebuildingParticipant);
+    QVERIFY(ticket.isValid());
+    monitor.beginRebuild();
+    const std::optional<qsizetype> unregisterResult =
+        monitor.unregisterRecoveryParticipant(departingParticipant);
+
+    QVERIFY(unregisterResult.has_value());
+    QVERIFY(monitor.isLost());
+    QVERIFY(monitor.clearForRebuild(ticket));
+    QVERIFY(!monitor.isLost());
+}
+
+void TestGpuDeviceLostWorker::proofFromOlderRetiredAuthorityCleansAfterNewerEpoch() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    GpuRetireRegistry registry;
+    SubmittedAdapter adapter;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    struct RetiredEpoch {
+        uint64_t authority = 0;
+        uint64_t generation = 0;
+        GpuRetirementDisposition retirement = GpuRetirementDisposition::None;
+        bool unregisterCompleted = false;
+        bool stillLost = false;
+    };
+    auto leaveIncompleteTokenlessEpoch = [&](uintptr_t deviceDomain) -> RetiredEpoch {
+        const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+        const uint64_t participant = monitor.registerRecoveryParticipant();
+        auto fence = std::make_shared<IncompleteLossFence>(deviceDomain, authority);
+        auto surface = std::make_shared<CompatibleLossSurface>(deviceDomain, authority);
+        GpuOpScope operation(fence, registry);
+        const GpuRetirementDisposition retirement =
+            operation
+                .submitRetained(adapter,
+                                GpuSurfacePack<1>(
+                                    std::array<std::shared_ptr<GpuSurface>, 1>{std::move(surface)}))
+                .retirement;
+        const uint64_t generation = monitor.recordLoss();
+        const bool unregisterCompleted =
+            monitor.unregisterRecoveryParticipant(participant).has_value();
+        return RetiredEpoch{authority, generation, retirement, unregisterCompleted,
+                            monitor.isLost()};
+    };
+
+    constexpr uintptr_t firstDomain = 0xA70D;
+    constexpr uintptr_t secondDomain = 0xA70E;
+    const RetiredEpoch first = leaveIncompleteTokenlessEpoch(firstDomain);
+    QCOMPARE(first.retirement, GpuRetirementDisposition::Published);
+    QVERIFY(first.generation != 0);
+    QVERIFY(first.unregisterCompleted);
+    QVERIFY(!first.stillLost);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    const RetiredEpoch second = leaveIncompleteTokenlessEpoch(secondDomain);
+    QCOMPARE(second.retirement, GpuRetirementDisposition::Published);
+    QVERIFY(second.generation != 0);
+    QVERIFY(second.unregisterCompleted);
+    QVERIFY(!second.stillLost);
+    QVERIFY(second.authority != first.authority);
+    QVERIFY(second.generation > first.generation);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
+
+    const uint64_t currentAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t lossCountBeforeProof = monitor.lossCount();
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(first.authority, 0xA70F), uint64_t(0));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(currentAuthority + 1000, firstDomain),
+             uint64_t(0));
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(first.authority, firstDomain) != 0);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QVERIFY(!monitor.isLost());
+    QCOMPARE(monitor.currentLossGenerationForTest(), uint64_t(0));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::capture(), currentAuthority);
+    QCOMPARE(monitor.lossCount(), lossCountBeforeProof);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(second.authority, secondDomain) != 0);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+}
+
+void TestGpuDeviceLostWorker::lossPublishersAcquireDeliveryBeforeEpoch() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    struct Observation {
+        bool epochHeld = false;
+        bool deliveryEntered = false;
+        bool deliveryOwnedAtGate = false;
+        bool deliveryOwnedWhileWaitingForEpoch = false;
+        uint64_t generation = 0;
+    };
+    auto exercise = [&](bool authoritative) {
+        monitor.reset();
+        GpuGenerationCounter::instance().resetForTest();
+        const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+        QSemaphore epochHeld;
+        QSemaphore continueEpoch;
+        QSemaphore deliveryEntered;
+        QSemaphore continueDelivery;
+        GpuDeviceLossMonitorTestAuthority::setEpochLockGate(&epochHeld, &continueEpoch);
+        std::thread epochHolder([&]() { (void) GpuDeviceLossMonitorTestAuthority::capture(); });
+        Observation observation;
+        observation.epochHeld = epochHeld.tryAcquire(1, 5000);
+        GpuDeviceLossMonitorTestAuthority::setAfterDeliveryLockGate(&deliveryEntered,
+                                                                    &continueDelivery);
+        std::thread publisher([&]() {
+            observation.generation =
+                authoritative ? GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA70F)
+                              : monitor.recordSubmissionFailure(0xA70F);
+        });
+        observation.deliveryEntered = deliveryEntered.tryAcquire(1, 5000);
+        observation.deliveryOwnedAtGate =
+            observation.deliveryEntered &&
+            !GpuDeviceLossMonitorTestAuthority::proofDeliveryMutexAvailable();
+        continueDelivery.release();
+        observation.deliveryOwnedWhileWaitingForEpoch =
+            observation.deliveryEntered &&
+            !GpuDeviceLossMonitorTestAuthority::proofDeliveryMutexAvailable();
+        continueEpoch.release();
+        epochHolder.join();
+        publisher.join();
+        GpuDeviceLossMonitorTestAuthority::setAfterDeliveryLockGate(nullptr, nullptr);
+        GpuDeviceLossMonitorTestAuthority::setEpochLockGate(nullptr, nullptr);
+        return observation;
+    };
+
+    const Observation tokenless = exercise(false);
+    QVERIFY(tokenless.epochHeld);
+    QVERIFY(tokenless.deliveryEntered);
+    QVERIFY(tokenless.deliveryOwnedAtGate);
+    QVERIFY(tokenless.deliveryOwnedWhileWaitingForEpoch);
+    QVERIFY(tokenless.generation != 0);
+
+    const Observation authoritative = exercise(true);
+    QVERIFY(authoritative.epochHeld);
+    QVERIFY(authoritative.deliveryEntered);
+    QVERIFY(authoritative.deliveryOwnedAtGate);
+    QVERIFY(authoritative.deliveryOwnedWhileWaitingForEpoch);
+    QVERIFY(authoritative.generation != 0);
 }
 
 void TestGpuDeviceLostWorker::lossTelemetryIsObservedIndependentlyByEachWorker() {
@@ -538,6 +1118,8 @@ void TestGpuDeviceLostWorker::activeLossInitializationDefersWhileLifecycleSuspen
     DefaultIosGpuLifecycleSink lifecycle;
     setIosGpuLifecycleSink(&lifecycle);
     lifecycle.onEnterBackground();
+    const uint64_t existingParticipant = monitor.registerRecoveryParticipant();
+    QVERIFY(existingParticipant != 0);
     const uint64_t generation = monitor.recordLoss();
 
     FrameProvider provider;
@@ -545,6 +1127,7 @@ void TestGpuDeviceLostWorker::activeLossInitializationDefersWhileLifecycleSuspen
     transport.setFrameRate(25, 1);
     PlaybackWorker worker({&provider}, &transport);
     worker.initializeOutputGraph(1, 64, 48);
+    QVERIFY(monitor.unregisterRecoveryParticipant(existingParticipant).has_value());
 
     QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::RebuildPending);
     QCOMPARE(worker.m_gpuPendingRecoveryGeneration, generation);
@@ -582,7 +1165,10 @@ bool TestGpuDeviceLostWorker::installTestGpuSpine(PlaybackWorker& worker) const 
 
 void TestGpuDeviceLostWorker::readbackObservedLossRecordsProcessLatch() {
     GpuGenerationCounter::instance().resetForTest();
-    GpuDeviceLossMonitor::instance().reset();
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
 
     auto rhi = createTestRhi();
     if (!rhi || !rhi->isValid()) QSKIP("no test RHI backend available");
@@ -601,8 +1187,9 @@ void TestGpuDeviceLostWorker::readbackObservedLossRecordsProcessLatch() {
             .planes;
 
     QVERIFY(!planes.isValid());
-    QVERIFY(GpuDeviceLossMonitor::instance().isLost());
+    QVERIFY(monitor.isLost());
     QVERIFY(GpuGenerationCounter::instance().current() > gen0);
+    QVERIFY(monitor.unregisterRecoveryParticipant(participant).has_value());
 }
 
 void TestGpuDeviceLostWorker::staleGenerationReadbackDoesNotRecordNewLoss() {
@@ -942,13 +1529,14 @@ void TestGpuDeviceLostWorker::lateDeadDomainProofReleasesQuarantineAutomatically
         GpuRetirementDisposition::Published);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
 
-    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, firstDomain) != 0);
     FrameProvider feedProvider;
     PlaybackTransport transport;
     transport.setFrameRate(25, 1);
     PlaybackWorker worker({&feedProvider}, &transport);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
     worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
                                     std::memory_order_release);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, firstDomain) != 0);
     worker.handleGpuDeviceLoss();
     QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
@@ -1070,6 +1658,7 @@ void TestGpuDeviceLostWorker::acceptedProofDeliveryCompletesBeforeRebuildCanClea
              GpuRetirementDisposition::Published);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
 
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, firstDomain) != 0);
     QCOMPARE(
         monitor
@@ -1137,6 +1726,13 @@ void TestGpuDeviceLostWorker::lateProofPublisherAndWorkerShareExactRecovery() {
              GpuRetirementDisposition::Published);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
 
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.m_gpuRecoveryParticipantId = monitor.registerRecoveryParticipant();
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, firstDomain) != 0);
     QCOMPARE(
         monitor
@@ -1154,15 +1750,15 @@ void TestGpuDeviceLostWorker::lateProofPublisherAndWorkerShareExactRecovery() {
         GpuRetireRegistry::setStorageProbeEnabledForTest(false);
     });
     const bool accepted = proofAccepted.tryAcquire(1, 5000);
+    const bool publisherHeldDelivery =
+        accepted && !GpuDeviceLossMonitorTestAuthority::proofDeliveryMutexAvailable();
+    const bool publisherReleasedEpoch =
+        accepted && GpuDeviceLossMonitorTestAuthority::epochMutexAvailable();
 
-    FrameProvider feedProvider;
-    PlaybackTransport transport;
-    transport.setFrameRate(25, 1);
-    PlaybackWorker worker({&feedProvider}, &transport);
-    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
-                                    std::memory_order_release);
-    QSemaphore recoveryAttempting;
-    GpuDeviceLossMonitorTestAuthority::setRecoveryAttemptingGate(&recoveryAttempting);
+    QSemaphore recoveryAcquiredDelivery;
+    QSemaphore continueRecovery;
+    GpuDeviceLossMonitorTestAuthority::setAfterDeliveryLockGate(&recoveryAcquiredDelivery,
+                                                                &continueRecovery);
     std::thread recovery;
     if (accepted) {
         recovery = std::thread([&]() {
@@ -1171,16 +1767,27 @@ void TestGpuDeviceLostWorker::lateProofPublisherAndWorkerShareExactRecovery() {
             GpuRetireRegistry::setStorageProbeEnabledForTest(false);
         });
     }
-    const bool recoveryReachedMonitor = accepted && recoveryAttempting.tryAcquire(1, 5000);
     continueDelivery.release();
     publisher.join();
+    const bool recoveryEnteredAfterPublisher =
+        accepted && recoveryAcquiredDelivery.tryAcquire(1, 5000);
+    const bool recoveryHeldDelivery =
+        recoveryEnteredAfterPublisher &&
+        !GpuDeviceLossMonitorTestAuthority::proofDeliveryMutexAvailable();
+    const bool recoveryHadNotLockedEpoch =
+        recoveryEnteredAfterPublisher && GpuDeviceLossMonitorTestAuthority::epochMutexAvailable();
+    continueRecovery.release();
     if (recovery.joinable()) recovery.join();
     GpuDeviceLossMonitorTestAuthority::setProofDeliveryGate(nullptr, nullptr);
-    GpuDeviceLossMonitorTestAuthority::setRecoveryAttemptingGate(nullptr);
+    GpuDeviceLossMonitorTestAuthority::setAfterDeliveryLockGate(nullptr, nullptr);
     const GpuRetireStorageSnapshot storage = GpuRetireRegistry::storageSnapshotForTest();
 
     QVERIFY(accepted);
-    QVERIFY(recoveryReachedMonitor);
+    QVERIFY(publisherHeldDelivery);
+    QVERIFY(publisherReleasedEpoch);
+    QVERIFY(recoveryEnteredAfterPublisher);
+    QVERIFY(recoveryHeldDelivery);
+    QVERIFY(recoveryHadNotLockedEpoch);
     QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
     QCOMPARE(storage.abandonmentShardVisits, uint64_t(1));
@@ -1365,6 +1972,9 @@ void TestGpuDeviceLostWorker::armedCutDeviceLossCommitsRecoveryEpochBeforeHoldLa
     }
     const uint64_t generationBeforeLoss = GpuGenerationCounter::instance().current();
     const uint64_t lossCountBefore = GpuDeviceLossMonitor::instance().lossCount();
+    worker.m_gpuRecoveryParticipantId =
+        GpuDeviceLossMonitor::instance().registerRecoveryParticipant();
+    QVERIFY(worker.m_gpuRecoveryParticipantId != 0);
     worker.m_gpuRhi->injectDeviceLostForTest();
     QVERIFY(worker.m_gpuRhi->deviceLost());
     const uint64_t recoveryGeneration = GpuDeviceLossMonitor::instance().recordLoss();

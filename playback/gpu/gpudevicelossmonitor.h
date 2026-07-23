@@ -191,7 +191,8 @@ public:
     // clears only after every snapshotted participant has acknowledged teardown/rebuild.
     uint64_t registerRecoveryParticipant(bool ownsCurrentDevice = true);
     GpuRecoveryRegistration registerRecoveryParticipantSnapshot(bool ownsCurrentDevice = true);
-    void unregisterRecoveryParticipant(uint64_t participantId);
+    // nullopt means active-epoch cleanup was rejected and the participant remains registered.
+    std::optional<qsizetype> unregisterRecoveryParticipant(uint64_t participantId);
     bool acknowledgeRecoveryCleanup(uint64_t participantId, uint64_t lossGeneration);
     GpuRecoveryTicket beginRebuild(uint64_t participantId);
     bool clearForRebuild(const GpuRecoveryTicket& ticket);
@@ -219,6 +220,7 @@ private:
 #endif
 
     uint64_t captureDeviceAuthorityEpoch() const;
+    uint64_t recordTokenlessLoss();
     uint64_t publishRealDeviceLoss(DeadDeviceToken::Provenance provenance,
                                    uint64_t deviceAuthorityEpoch, uintptr_t deviceDomainId);
     void beginLossEpochLocked(uint64_t generation);
@@ -256,6 +258,12 @@ private:
     QSemaphore* m_proofAcceptedForTest = nullptr;
     QSemaphore* m_continueProofDeliveryForTest = nullptr;
     QSemaphore* m_recoveryAttemptingForTest = nullptr;
+    QSemaphore* m_beforeNoLossUnregisterEraseForTest = nullptr;
+    QSemaphore* m_continueNoLossUnregisterEraseForTest = nullptr;
+    QSemaphore* m_afterDeliveryLockForTest = nullptr;
+    QSemaphore* m_continueAfterDeliveryLockForTest = nullptr;
+    QSemaphore* m_epochLockHeldForTest = nullptr;
+    QSemaphore* m_continueEpochLockForTest = nullptr;
 #endif
 };
 

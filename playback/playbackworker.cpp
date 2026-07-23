@@ -1674,8 +1674,8 @@ bool PlaybackWorker::completeCoordinatedGpuRebuild(bool consumeRebuildBudget) {
                                  std::memory_order_release);
     }
     if (!rebuilt) {
-        monitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId);
-        m_gpuRecoveryParticipantId = 0;
+        if (monitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId))
+            m_gpuRecoveryParticipantId = 0;
     }
     return true;
 }
@@ -2057,6 +2057,14 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
     ++m_counters.gpuMemoryPressureLevel2;
 
     detachOutputEndpointsForDeviceLoss();
+    const auto gpuRhi = std::atomic_load_explicit(&m_gpuRhi, std::memory_order_acquire);
+    if (gpuRhi) {
+        (void) gpuRhi->pollDeviceLoss();
+        (void) gpuRhi->deviceLost();
+    }
+#ifdef _WIN32
+    if (m_winGpuImportEdge) (void) m_winGpuImportEdge->deviceLost();
+#endif
     m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
                              std::memory_order_release);
     const uint64_t pressureGeneration = GpuGenerationCounter::instance().bump();
@@ -2126,8 +2134,15 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
         refreshOutputAfterSeekCommit();
     }
     if (m_gpuRecoveryParticipantId != 0) {
-        GpuDeviceLossMonitor::instance().unregisterRecoveryParticipant(m_gpuRecoveryParticipantId);
-        m_gpuRecoveryParticipantId = 0;
+        const std::optional<qsizetype> cleanup =
+            GpuDeviceLossMonitor::instance().unregisterRecoveryParticipant(
+                m_gpuRecoveryParticipantId);
+        if (cleanup) {
+#ifdef OLR_UNIT_TEST
+            m_gpuLastAbandonedRetainsForTest.store(*cleanup, std::memory_order_release);
+#endif
+            m_gpuRecoveryParticipantId = 0;
+        }
     }
     m_gpuPendingRecoveryGeneration = 0;
     m_gpuRebuildDeferredForSuspend.store(false, std::memory_order_release);
@@ -2385,8 +2400,8 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
                 (void) completeCoordinatedGpuRebuild(false);
             }
         } else if (m_gpuRecoveryParticipantId != 0 && !rebuildGpuSpine()) {
-            lossMonitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId);
-            m_gpuRecoveryParticipantId = 0;
+            if (lossMonitor.unregisterRecoveryParticipant(m_gpuRecoveryParticipantId))
+                m_gpuRecoveryParticipantId = 0;
         }
     }
     configureGpuBudget();
@@ -2504,8 +2519,10 @@ void PlaybackWorker::shutdownOutputGraph() {
                              std::memory_order_release);
     m_memoryPressureLatched.store(false, std::memory_order_release);
     if (m_gpuRecoveryParticipantId != 0) {
-        GpuDeviceLossMonitor::instance().unregisterRecoveryParticipant(m_gpuRecoveryParticipantId);
-        m_gpuRecoveryParticipantId = 0;
+        if (GpuDeviceLossMonitor::instance().unregisterRecoveryParticipant(
+                m_gpuRecoveryParticipantId)) {
+            m_gpuRecoveryParticipantId = 0;
+        }
     }
     m_gpuPendingRecoveryGeneration = 0;
 #endif
