@@ -68,14 +68,14 @@ void TestGpuEncodeSurface::throwingPacketCallbackReleasesSurfaceReadScope() {
     auto enc = NativeVideoEncoder::create({320, 240, 30, 1, 4'000'000}, &err);
     if (!enc) QSKIP("no hardware H.264 encoder on this platform");
     bool callbackInvoked = false;
-    QVERIFY_THROWS_EXCEPTION(std::runtime_error, enc->encodeSurface(
-                                                     surface.get(), 0, ColorMetadata{},
-                                                     [&](const QByteArray&, int64_t, bool) {
-                                                         callbackInvoked = true;
-                                                         throw std::runtime_error(
-                                                             "intentional packet callback failure");
-                                                     },
-                                                     &err));
+    auto onPacket = [&](const QByteArray&, int64_t, bool) {
+        callbackInvoked = true;
+        throw std::runtime_error("intentional packet callback failure");
+    };
+    QVERIFY_THROWS_EXCEPTION(std::runtime_error,
+                             enc->encodeSurface(surface.get(), 0, ColorMetadata{},
+                                                NativeVideoEncoder::PacketCallback::bind(onPacket),
+                                                &err));
     QVERIFY(callbackInvoked);
 #endif
 }
