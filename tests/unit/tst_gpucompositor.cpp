@@ -4,6 +4,7 @@
 #include <QtTest>
 
 #include <QFile>
+#include <QScopeGuard>
 #include <rhi/qshader.h>
 
 #include "framepsnr.h"
@@ -762,11 +763,12 @@ void TestGpuCompositor::swallowedRenderExceptionAfterSubmissionIsSubmittedWithEr
 }
 
 void TestGpuCompositor::renderPassExceptionClosesPassAndFrame() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const auto resetMonitor = qScopeGuard([&monitor] { monitor.reset(); });
 #ifdef __APPLE__
     auto rhi = GpuRhiContext::create();
 #else
-    auto& monitor = GpuDeviceLossMonitor::instance();
-    monitor.reset();
     auto rhi = GpuRhiContext::createWarpForTest();
 #endif
     if (!rhi) QSKIP("required native QRhi backend unavailable");
@@ -781,18 +783,28 @@ void TestGpuCompositor::renderPassExceptionClosesPassAndFrame() {
     QVERIFY(!failed.isValid());
     QCOMPARE(GpuCompositor::recoveredRenderPassesForTest(), 1);
     QCOMPARE(GpuCompositor::recoveredOffscreenFramesForTest(), 1);
-#ifdef _WIN32
+#ifdef __APPLE__
+    // SubmittedWithError deliberately rotates device authority. Apple offscreen
+    // frames submit synchronously, so tokenless recovery can drain and clear
+    // before this call returns; continue on a context from the new authority.
+    QVERIFY(!monitor.isLost());
+    comp.reset();
+    rhi.reset();
+    rhi = GpuRhiContext::create();
+    QVERIFY2(rhi != nullptr, "native QRhi backend must rebuild after tokenless recovery");
+    comp = GpuCompositor::create(rhi);
+    QVERIFY2(comp != nullptr, "compositor must rebuild after tokenless recovery");
+#elif defined(_WIN32)
     QVERIFY(!monitor.isLost());
     QCOMPARE(rhi->deviceLossPollCountForTest(), 1);
 #endif
 
     const CpuPlanes recovered =
         comp->composeGridToCpu(frames, 16, 16, color, GpuCompositor::ScaleQuality::NearestCompat);
-    QVERIFY2(recovered.isValid(), "cleanup must leave QRhi usable for the next frame");
+    QVERIFY2(recovered.isValid(), "cleanup must leave the backend usable after recovery");
 #ifdef _WIN32
     QVERIFY(!monitor.isLost());
     QCOMPARE(rhi->deviceLossPollCountForTest(), 1);
-    monitor.reset();
 #endif
 }
 
@@ -882,6 +894,10 @@ void TestGpuCompositor::successfulFrameDoesNotPollDeviceLoss() {
 
 #ifdef __APPLE__
 void TestGpuCompositor::nativeOwnerRenderExceptionRetainsOwner() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const auto resetMonitor = qScopeGuard([&monitor] { monitor.reset(); });
+    QVERIFY(monitor.registerRecoveryParticipant() != 0);
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no native RHI backend");
     auto comp = GpuCompositor::create(rhi);
@@ -898,6 +914,7 @@ void TestGpuCompositor::nativeOwnerRenderExceptionRetainsOwner() {
     const CpuPlanes failed =
         comp->composeGridToCpu({gpuFrame}, 32, 16, {}, GpuCompositor::ScaleQuality::NearestCompat);
     QVERIFY(!failed.isValid());
+    QVERIFY(monitor.isLost());
     QVERIFY2(surface->pendingFenceValue() != 0,
              "submitted exception path must retain the exact native owner");
     QCOMPARE(GpuCompositor::recoveredRenderPassesForTest(), 1);
