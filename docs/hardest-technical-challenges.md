@@ -11,7 +11,7 @@ faith.
 |---|-----------|-------------|--------|
 | 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Bounded interleaving model + source/compiled mutation gates + blocked-sink latency gate | **Gated: fixed protocol holds over 523 states aggregated across 11 scenario graphs; all 10 model mutations refute; compiled reset-removal control is killed** |
 | 2 | Rate-agnostic timecode alignment with a proven phase-error bound | Falsifier + exact-rational bound sweep + drop-in C++ module | **Ran: shipped code RED (−5000 ms on aligned cameras); replacement 0 violations / 3,969 cells, zero slack** |
-| 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + real-TDR fault-lane design | **Designed: full headers, 6-site migration, harness + mutations** |
+| 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + contained real-TDR worker-recovery lane | **Implemented: handle gate, epoch-bound loss authority, real fence/TDR evidence, production worker recovery** |
 
 ---
 
@@ -483,7 +483,10 @@ private:
 };
 
 // Move-only view of a surface INSIDE one GPU op. The only public route to
-// the native handle. Cannot outlive its scope (scope tracks and stamps it).
+// The following is the original design sketch. The implementation uses a
+// self-contained, independently owned native snapshot: escaping a lease cannot
+// create a borrowed-handle UAF. Shared-surface reads alias the existing control
+// block and add no allocation; raw-surface reads retain the native object.
 class GpuReadLease {
 public:
     GpuReadLease(GpuReadLease&&) noexcept = default;
@@ -601,12 +604,27 @@ compiling, which is the point):
 | [`wingpuimportedge.cpp:500-503`](../playback/output/win/wingpuimportedge.cpp) (sync readback) | relies on implicit synchronous completion | `SyncReadbackScope`; `complete()` invoked after `Unmap` |
 | [`vtkeepsurfaceimporter_apple.mm:36-41`](../playback/gpu/vtkeepsurfaceimporter_apple.mm) | manual keep | `GpuOpScope` with the VT decode fence |
 
-`handleGpuDeviceLoss` (`:1385-1482`) becomes
-`handleGpuDeviceLoss(DeadDeviceToken)` for the real path (existing behavior:
-`abandonAllNoWait`, fence resets, generation bump, rebuild budget) and
-`handleGpuDeviceLoss(InjectedDeviceLossForTest)` for tests (identical
-orchestration, `drainWithBoundedWait` instead of the no-wait free). No fence
-wait is added to the real path — the LOCK RULE at `:1438-1440` is preserved.
+`handleGpuDeviceLoss` keeps a single signature; the REAL/INJECTED split is made
+inside the monitor rather than by overload. The sketch above proposed
+`handleGpuDeviceLoss(DeadDeviceToken)` versus
+`handleGpuDeviceLoss(InjectedDeviceLossForTest)`, but a token cannot legitimately
+exist at the worker's call site: it is minted under the monitor's epoch lock at
+the driver-authoritative observation, and its validity depends on the loss
+generation and authority epoch current *at cleanup time*, not at call time.
+Handing one to the worker would mean either publishing a mintable token type or
+validating a stale value.
+
+The shipped shape instead routes cleanup through two monitor entry points:
+`withValidatedDeadDomains()` re-reads the stored proof under `m_epochMutex`,
+rejects it if any token's generation or authority epoch has moved, and otherwise
+invokes the callback with a `GpuValidatedDeadDomains` that authorizes the no-wait
+free for exactly the proven-dead `(deviceDomainId, authorityEpoch)` pairs; when
+no valid proof exists the worker falls through to
+`withCoordinatedTokenlessRecovery()`, which runs the bounded-wait drain. Injected
+loss reaches only `recordLoss()`, so it never stores a token and can never take
+the no-wait path. This preserves the acceptance criterion — the no-wait free is
+reachable only with driver-authoritative provenance — while keeping the token
+itself unforgeable and unexported. No fence wait is added to the real path.
 
 ### Solution part 2 — real-backend fault harness (falsifiability)
 
@@ -615,9 +633,11 @@ Opt-in Windows CI lane (`OLR_GPU_FAULT_LANE=1`, mirroring the
 WARP/Null, mirroring the QSKIP-on-no-RHI pattern at
 [`tst_gpu_devicelost_worker.cpp:157,174`](../tests/unit/tst_gpu_devicelost_worker.cpp)):
 
-1. **Genuine device removal.** A child process creates its own D3D11 device on
-   the same adapter and dispatches a bounded-infinite compute shader
-   (`while(true)` with a watchdog-visible dispatch size). Windows TDR
+1. **Genuine device removal.** A Job-contained child creates a real
+   `PlaybackWorker` on the admitted adapter and dispatches a bounded-infinite
+   compute shader on that worker's exact D3D11 device. The shader repeatedly
+   reads the exact worker-cache NV12 surface whose fenced retain is under test;
+   its loop condition is stored separately and remains immutable. Windows TDR
    (`TdrDelay`, default 2 s) resets the adapter; the app under test observes a
    **real** `GetDeviceRemovedReason()` failure
    (`DXGI_ERROR_DEVICE_HUNG`/`DEVICE_RESET`) at
@@ -632,12 +652,13 @@ WARP/Null, mirroring the QSKIP-on-no-RHI pattern at
    that the retire registry holds the surface; after idle, assert completion
    and release. This validates on real hardware the property the stub fence
    trivializes.
-3. **Assertions** (replacing the atomic-bool checks): device-loss event
-   recorded; GPU generation advanced; post-loss blackout ≤ 1500 ms with zero
-   placeholder/gray frames and frames flowing
-   (the existing `devicelost` e2e oracle,
-   [`run_playback_e2e.sh:1164-1237`](../tests/e2e/run_playback_e2e.sh), now
-   driven by a real removal); ASan reports no UAF.
+3. **Assertions** (replacing atomic-bool checks): device-loss event recorded;
+   GPU generation advanced; active-epoch real-loss token published; no wait on
+   the dead fence; pending retains released; the pre-loss GPU frame rejected;
+   its cached CPU fallback preserved; and coherent production output resumed
+   within 10 seconds. The child flushes a structured removal checkpoint before
+   recovery and a recovery-result checkpoint afterward, so abnormal post-TDR
+   exits retain parsed driver evidence as well as bounded raw output.
 4. **Mutations the lane must catch** (proving falsifiability):
    - *(a)* route the injected-loss overload to `abandonAllNoWait` (bypassing
      the token) → on a **live** device the abandoned surfaces are still
@@ -648,12 +669,28 @@ WARP/Null, mirroring the QSKIP-on-no-RHI pattern at
 ### How to apply
 
 Land `gpusurfacelease.h` + the `GpuSurface` visibility change; migrate the six
-sites one at a time behind the existing unit + `e2e_play` + `devicelost`
-gates (CPU-off path stays byte-identical — this is a typing change, not a
-behavior change); convert `handleGpuDeviceLoss` to the token/injected
-overloads; add the negative-compile check and the opt-in fault lane. Per
+sites one at a time behind the existing unit + `e2e_play` + `devicelost` gates;
+route `handleGpuDeviceLoss` through the monitor's validated/tokenless recovery
+entry points; add the negative-compile check and the opt-in fault lane. Per
 CLAUDE.md, the `playbackworker.cpp` changes take an independent concurrency
 review.
+
+Two expectations in the sketch above did not survive contact with the
+implementation, and the difference is worth recording rather than papering over:
+
+- **This is not purely a typing change.** Where the sketch assumed the CPU-off
+  path stays byte-identical, a refused typed submission now fails the operation
+  that previously proceeded without a retain. That is the correct trade — handing
+  out a surface whose retirement was never registered is the use-after-free this
+  challenge exists to prevent — but it is a behavior change, and the mint site
+  must attribute the refusal distinctly rather than booking it as a memory-budget
+  degrade.
+- **The scope types are two, not one.** `GpuOpScope` fuses handle access with
+  retirement registration as designed. The synchronous variant, `GpuSyncReadScope`,
+  registers nothing: it pins the owner for the duration of one callback. Keeping
+  its `read()`/`complete()` pair public would leave a route to a raw handle with no
+  obligation, so `withRead()` is the only public entry point and the paired
+  acquire/complete calls are private.
 
 ---
 

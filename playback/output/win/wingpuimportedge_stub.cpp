@@ -45,11 +45,11 @@ std::shared_ptr<D3D11GpuSurface> WinGpuImportEdge::tryImportSurface(void*, int, 
 #ifdef OLR_GPU_PIPELINE_BUILD
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface>,
                                                         FrameMetadata, std::shared_ptr<GpuFence>,
-                                                        GpuBudgetCharge, uint64_t*) {
+                                                        GpuBudgetCharge, uint64_t*, bool*) {
 #else
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface>,
                                                         FrameMetadata, std::shared_ptr<GpuFence>,
-                                                        uint64_t*) {
+                                                        std::nullptr_t, uint64_t*, bool*) {
 #endif
     return FrameHandle();
 }

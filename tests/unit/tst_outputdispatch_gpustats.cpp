@@ -47,6 +47,7 @@ void TestOutputDispatchGpuStats::newFieldsDefaultZero() {
     QCOMPARE(stats.readbackDrops, qint64(0));
     QCOMPARE(stats.fenceWaitStalls, qint64(0));
     QCOMPARE(stats.gpuOomDegrades, qint64(0));
+    QCOMPARE(stats.gpuSubmissionRefusalDegrades, qint64(0));
     QCOMPARE(stats.gpuDeviceLossEvents, qint64(0));
     QCOMPARE(stats.gpuReadbacks, qint64(0));
     QCOMPARE(stats.uniqueGpuReadbackSurfaces, qint64(0));
@@ -88,6 +89,7 @@ void TestOutputDispatchGpuStats::cpuPathLeavesGpuCountersZero() {
     QCOMPARE(stats.readbackDrops, qint64(0));
     QCOMPARE(stats.fenceWaitStalls, qint64(0));
     QCOMPARE(stats.gpuOomDegrades, qint64(0));
+    QCOMPARE(stats.gpuSubmissionRefusalDegrades, qint64(0));
     QCOMPARE(stats.gpuDeviceLossEvents, qint64(0));
     QCOMPARE(stats.gpuBudgetBytes, qint64(0));
     QCOMPARE(stats.gpuGatedLiveBytes, qint64(0));

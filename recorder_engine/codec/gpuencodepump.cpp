@@ -15,10 +15,9 @@ constexpr int kFenceTimeoutMs = 100;
 constexpr size_t kInvalidJobIndex = std::numeric_limits<size_t>::max();
 } // namespace
 
-GpuEncodePump::GpuEncodePump(NativeVideoEncoder* encoder, std::shared_ptr<GpuFence> fence,
-                             int maxQueue, std::mutex* encoderMutex)
-    : m_encoder(encoder), m_encoderMutex(encoderMutex), m_fence(std::move(fence)),
-      m_maxQueue(maxQueue > 0 ? maxQueue : 1), m_slotCapacity(static_cast<size_t>(m_maxQueue) + 1),
+GpuEncodePump::GpuEncodePump(NativeVideoEncoder* encoder, int maxQueue, std::mutex* encoderMutex)
+    : m_encoder(encoder), m_encoderMutex(encoderMutex), m_maxQueue(maxQueue > 0 ? maxQueue : 1),
+      m_slotCapacity(static_cast<size_t>(m_maxQueue) + 1),
       m_jobs(std::make_unique<Job[]>(m_slotCapacity)),
       m_queue(std::make_unique<size_t[]>(static_cast<size_t>(m_maxQueue))) {}
 
@@ -92,8 +91,17 @@ size_t GpuEncodePump::dequeueJobLocked() {
     return index;
 }
 
-bool GpuEncodePump::submit(FrameHandle frame, uint64_t fenceValue, int64_t ptsTicks,
-                           ColorMetadata color, JobCallbacks callbacks) {
+bool GpuEncodePump::submit(FrameHandle frame, int64_t ptsTicks, ColorMetadata color,
+                           JobCallbacks callbacks) {
+    const IFrameData* frameData = frame.data();
+    const GpuFrameSynchronization synchronization =
+        frameData ? frameData->gpuSynchronization() : GpuFrameSynchronization{};
+    if (!frameData || !frameData->isGpuBacked() || !synchronization.isExact()) {
+        m_drops.fetch_add(1, std::memory_order_acq_rel);
+        if (callbacks.onFailure) callbacks.onFailure(callbacks.context, callbacks.id);
+        if (callbacks.onFinished) callbacks.onFinished(callbacks.context, callbacks.id);
+        return false;
+    }
     JobCallbacks rejectedCallbacks;
     bool rejected = false;
     {
@@ -119,7 +127,7 @@ bool GpuEncodePump::submit(FrameHandle frame, uint64_t fenceValue, int64_t ptsTi
             } else {
                 Job& job = m_jobs[index];
                 job.frame = std::move(frame);
-                job.fenceValue = fenceValue;
+                job.synchronization = synchronization;
                 job.ptsTicks = ptsTicks;
                 job.color = color;
                 job.callbacks = callbacks;
@@ -152,18 +160,16 @@ void GpuEncodePump::run() {
         }
         Job& job = m_jobs[jobIndex];
 
-        const IFrameData* frameData = job.frame.data();
-        std::shared_ptr<GpuFence> fence = frameData ? frameData->gpuFence() : nullptr;
-        if (!fence) fence = m_fence;
-
         // FENCE-BEFORE-ENCODE: never read a surface the producer is still writing.
-        if (fence && !fence->wait(job.fenceValue, kFenceTimeoutMs)) {
+        if (job.synchronization.value != 0 &&
+            !job.synchronization.fence->wait(job.synchronization.value, kFenceTimeoutMs)) {
             failJob(job.callbacks);
             std::lock_guard<std::mutex> lock(m_mutex);
             releaseJobSlotLocked(jobIndex);
             continue;
         }
 
+        const IFrameData* frameData = job.frame.data();
         GpuSurface* surface = frameData ? frameData->gpuSurface() : nullptr;
         if (!surface || !m_encoder) {
             failJob(job.callbacks);

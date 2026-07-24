@@ -4,7 +4,9 @@
 #include <QtTest>
 
 #include "playback/output/asyncgpureadbacksink.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/framehandle.h"
 #include "playback/output/iotargets/decklinksink.h"
@@ -14,6 +16,8 @@
 #include <atomic>
 
 namespace {
+
+constexpr uintptr_t kTestDeviceDomainId = 0x1234u;
 
 class FakeDeckLinkBackend final : public IDeckLinkSenderBackend {
 public:
@@ -45,16 +49,29 @@ public:
 
 class FakeGpuSurface final : public GpuSurface {
 public:
+    FakeGpuSurface()
+        : m_authorityEpoch(GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()) {
+        retainUntilFenceRetired(1);
+    }
     GpuSurfaceDesc desc() const override {
         return {.format = FramePixelFormat::Nv12, .width = 64, .height = 48};
     }
     bool isValid() const override { return true; }
+    GpuSurfaceCompatibility compatibility() const override {
+        return {kTestDeviceDomainId, m_authorityEpoch};
+    }
     void* nativeHandle() const override { return reinterpret_cast<void*>(quintptr(0x1)); }
-    uint64_t pendingFenceValue() const override { return 1; }
+
+private:
+    uint64_t m_authorityEpoch = 0;
 };
 
 class ReadyFence final : public GpuFence {
 public:
+    ReadyFence()
+        : GpuFence(kTestDeviceDomainId,
+                   GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()) {}
+
     uint64_t signal() override { return 1; }
     bool wait(uint64_t value, int) override { return value <= 1; }
     uint64_t completedValue() const override { return 1; }
@@ -69,6 +86,7 @@ public:
     }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_fence; }
+    GpuFrameSynchronization gpuSynchronization() const override { return {m_fence, 1, true}; }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
     int readbackCount() const { return readCount.load(std::memory_order_acquire); }
 
@@ -91,6 +109,7 @@ OutputBusFrame presentableGpuFrame(
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 64;
     meta.key.height = 48;
+    meta.gpuGeneration = GpuGenerationCounter::instance().current();
 
     OutputBusFrame frame;
     frame.bus = OutputBusId::pgm();

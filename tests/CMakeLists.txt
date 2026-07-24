@@ -26,16 +26,256 @@ function(olr_expect_compile_failure name source)
         message(FATAL_ERROR
             "Forbidden GPU capability probe ${name} compiled successfully:\n${compile_output}")
     endif()
+    foreach(expected_diagnostic IN LISTS ARGN)
+        if(NOT compile_output MATCHES "${expected_diagnostic}")
+            message(FATAL_ERROR
+                "Forbidden GPU capability probe ${name} failed without expected diagnostic "
+                "'${expected_diagnostic}':\n${compile_output}")
+        endif()
+    endforeach()
 endfunction()
 
-olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp)
-olr_expect_compile_failure(gpu_lease_raw_access lease_raw_access.cpp)
+function(olr_add_compile_control name source expectation)
+    set(target "${name}_compile_control")
+    add_library(${target} STATIC EXCLUDE_FROM_ALL
+        "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/${source}")
+    target_include_directories(${target} PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(${target} PRIVATE Qt6::Core)
+
+    set(control_args
+        "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DTARGET=${target}"
+        "-DCONFIG=$<CONFIG>")
+    if(expectation STREQUAL "PASS")
+        list(APPEND control_args "-DEXPECT_COMPILE=TRUE")
+    elseif(expectation STREQUAL "BASE_PROTECTED_FAILURE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_CLASS=GpuSurface"
+            "-DEXPECTED_MEMBER=nativeHandle"
+            "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "DERIVED_PROTECTED_FAILURE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_CLASS=DerivedSurface"
+            "-DEXPECTED_MEMBER=nativeHandle"
+            "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "REJECT_UNRELATED_FAILURE")
+        list(APPEND control_args
+            "-DVERIFY_REJECTION=TRUE"
+            "-DEXPECTED_MEMBER=nativeHandle"
+            "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "WITH_READ_VOID")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=withRead"
+            "-DEXPECTED_ACCESS=callback.must.return.void")
+    elseif(expectation STREQUAL "SYNC_READ_PRIVATE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_CLASS=GpuSyncReadScope"
+            "-DEXPECTED_MEMBER=read"
+            "-DEXPECTED_ACCESS=[Pp]rivate")
+    elseif(expectation STREQUAL "SYNC_COMPLETE_PRIVATE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_CLASS=GpuSyncReadScope"
+            "-DEXPECTED_MEMBER=complete"
+            "-DEXPECTED_ACCESS=[Pp]rivate")
+    else()
+        message(FATAL_ERROR "Unknown compile-control expectation: ${expectation}")
+    endif()
+
+    add_test(NAME ${name}
+        COMMAND ${CMAKE_COMMAND} ${control_args}
+            -P "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/run_compile_control.cmake")
+    set_tests_properties(${name} PROPERTIES LABELS "gpu-capability;ci")
+endfunction()
+
+function(olr_add_gpu_submission_compile_control name source expectation)
+    set(target "${name}_compile_control")
+    add_library(${target} STATIC EXCLUDE_FROM_ALL
+        "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/${source}")
+    target_include_directories(${target} PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(${target} PRIVATE Qt6::Core)
+
+    set(control_args
+        "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DTARGET=${target}"
+        "-DCONFIG=$<CONFIG>")
+    target_compile_definitions(${target} PRIVATE ${ARGN})
+    if(expectation STREQUAL "PASS")
+        list(APPEND control_args "-DEXPECT_COMPILE=TRUE")
+    elseif(expectation STREQUAL "NO_TRACK")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=track"
+            "-DEXPECTED_ACCESS=(private|no.member|has.no.member)")
+    elseif(expectation STREQUAL "OWNER_REQUIRED")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=submit"
+            "-DEXPECTED_ACCESS=(no.matching|candidate.expects|requires)")
+    elseif(expectation STREQUAL "REGISTRY_PAIRING")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=registerRetire"
+            "-DEXPECTED_ACCESS=(no.member|has.no.member|not.a.member|has.not.been.declared|undeclared)")
+    elseif(expectation STREQUAL "VIEW_UNWRAP")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=nativeHandle"
+            "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "PACK_OWNERS_PRIVATE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=owners"
+            "-DEXPECTED_ACCESS=[Pp]rivate")
+    elseif(expectation STREQUAL "SCOPED_VIEW_REQUIRED")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=submit"
+            "-DEXPECTED_ACCESS=(not.invocable|static.assert|GpuScopedNativeView)")
+    elseif(expectation STREQUAL "SCOPED_VIEW_ESCAPE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_CLASS=GpuScopedNativeSurface"
+            "-DEXPECTED_MEMBER=GpuScopedNativeSurface"
+            "-DEXPECTED_ACCESS=(deleted|private)")
+    elseif(expectation STREQUAL "RAW_READBACK")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_CLASS=GpuScopedNativeSurface"
+            "-DEXPECTED_MEMBER=importAndReadback"
+            "-DEXPECTED_ACCESS=(cannot.convert|no.viable.conversion|no.matching)")
+    elseif(expectation STREQUAL "TOKEN_CONSTRUCTION")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=DeadDeviceToken"
+            "-DEXPECTED_ACCESS=[Pp]rivate")
+    elseif(expectation STREQUAL "DIRECT_ABANDON")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=abandonAllNoWait"
+            "-DEXPECTED_ACCESS=(cannot.convert|no.matching|candidate)")
+    else()
+        message(FATAL_ERROR "Unknown GPU submission compile-control expectation: ${expectation}")
+    endif()
+
+    add_test(NAME ${name}
+        COMMAND ${CMAKE_COMMAND} ${control_args}
+            -P "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/run_compile_control.cmake")
+    set_tests_properties(${name} PROPERTIES LABELS "gpu-capability;ci")
+endfunction()
+
+olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp
+    "GpuSurface" "nativeHandle" "[Pp]rotected")
+olr_add_compile_control(gpu_native_handle_access
+    native_handle_access.cpp BASE_PROTECTED_FAILURE)
+olr_add_compile_control(gpu_native_handle_access_pass native_handle_access_pass.cpp PASS)
+olr_expect_compile_failure(gpu_native_handle_derived_access
+    native_handle_derived_access.cpp "DerivedSurface" "nativeHandle" "[Pp]rotected")
+olr_add_compile_control(gpu_native_handle_derived_access
+    native_handle_derived_access.cpp DERIVED_PROTECTED_FAILURE)
+olr_add_compile_control(gpu_native_handle_derived_access_pass
+    native_handle_derived_access_pass.cpp PASS)
+olr_add_compile_control(gpu_native_handle_access_unrelated_error_rejected
+    unrelated_compile_error.cpp REJECT_UNRELATED_FAILURE)
+olr_expect_compile_failure(gpu_withread_return_raw withread_return_raw.cpp)
+olr_expect_compile_failure(gpu_withread_return_integer withread_return_integer.cpp)
+olr_expect_compile_failure(gpu_withread_return_wrapper withread_return_wrapper.cpp)
+olr_add_compile_control(gpu_withread_return_raw
+    withread_return_raw.cpp WITH_READ_VOID)
+olr_add_compile_control(gpu_withread_return_integer
+    withread_return_integer.cpp WITH_READ_VOID)
+olr_add_compile_control(gpu_withread_return_wrapper
+    withread_return_wrapper.cpp WITH_READ_VOID)
+olr_add_compile_control(gpu_sync_scope_read_private
+    sync_scope_read_private.cpp SYNC_READ_PRIVATE)
+olr_add_compile_control(gpu_sync_scope_complete_private
+    sync_scope_complete_private.cpp SYNC_COMPLETE_PRIVATE)
+olr_add_gpu_submission_compile_control(gpu_op_track_access gpu_op_track_access.cpp NO_TRACK)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_without_owner gpu_submit_without_owner.cpp OWNER_REQUIRED)
+olr_add_gpu_submission_compile_control(
+    gpu_registry_pairing gpu_registry_pairing.cpp REGISTRY_PAIRING)
+olr_add_gpu_submission_compile_control(
+    gpu_submission_view_unwrap gpu_submission_view_unwrap.cpp VIEW_UNWRAP)
+olr_add_gpu_submission_compile_control(
+    gpu_surface_pack_owner_access gpu_surface_pack_owner_access.cpp PACK_OWNERS_PRIVATE)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_zero_arg_adapter gpu_submit_zero_arg_adapter.cpp SCOPED_VIEW_REQUIRED)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_wrong_view_cardinality gpu_submit_wrong_view_cardinality.cpp SCOPED_VIEW_REQUIRED)
+olr_add_gpu_submission_compile_control(
+    gpu_scoped_native_escape gpu_scoped_native_escape.cpp SCOPED_VIEW_ESCAPE)
+olr_add_gpu_submission_compile_control(
+    gpu_scoped_native_auto_escape gpu_scoped_native_auto_escape.cpp SCOPED_VIEW_ESCAPE)
+olr_add_gpu_submission_compile_control(
+    gpu_scoped_native_heap_escape gpu_scoped_native_heap_escape.cpp SCOPED_VIEW_ESCAPE)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_by_value_view gpu_submit_by_value_view.cpp SCOPED_VIEW_REQUIRED)
+olr_add_gpu_submission_compile_control(
+    gpu_raw_readback_access gpu_raw_readback_access.cpp RAW_READBACK)
+olr_add_gpu_submission_compile_control(
+    gpu_token_construction gpu_token_abandon.cpp TOKEN_CONSTRUCTION
+    OLR_NEGCOMPILE_TOKEN_CONSTRUCTION=1)
+olr_add_gpu_submission_compile_control(
+    gpu_token_direct_abandon gpu_token_abandon.cpp DIRECT_ABANDON
+    OLR_NEGCOMPILE_DIRECT_ABANDON=1)
+olr_add_gpu_submission_compile_control(
+    gpu_submission_pass gpu_submission_pass.cpp PASS)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_stub_adapter_pass gpu_submit_stub_adapter_pass.cpp PASS)
+if(WIN32)
+    olr_add_gpu_submission_compile_control(
+        gpu_submit_d3d11_adapter_pass gpu_submit_d3d11_adapter_pass.cpp PASS
+        OLR_GPU_PIPELINE_BUILD=1)
+endif()
+if(APPLE)
+    olr_add_gpu_submission_compile_control(
+        gpu_submit_metal_adapter_pass gpu_submit_metal_adapter_pass.mm PASS
+        OLR_GPU_PIPELINE_BUILD=1)
+endif()
+set_tests_properties(
+    gpu_submission_pass
+    PROPERTIES DEPENDS "gpu_submission_view_unwrap;gpu_submit_without_owner;gpu_registry_pairing;gpu_token_construction;gpu_token_direct_abandon")
+set_tests_properties(
+    gpu_submit_stub_adapter_pass
+    PROPERTIES DEPENDS gpu_submit_without_owner)
+if(WIN32)
+    set_tests_properties(gpu_submit_d3d11_adapter_pass PROPERTIES DEPENDS gpu_submit_without_owner)
+endif()
+if(APPLE)
+    set_tests_properties(gpu_submit_metal_adapter_pass PROPERTIES DEPENDS gpu_submit_without_owner)
+endif()
+set_tests_properties(
+    gpu_native_handle_access_pass
+    gpu_native_handle_access_unrelated_error_rejected
+    PROPERTIES
+    DEPENDS gpu_native_handle_access)
+set_tests_properties(gpu_native_handle_derived_access_pass PROPERTIES
+    DEPENDS gpu_native_handle_derived_access)
+
 olr_expect_compile_failure(gpu_lease_move lease_move.cpp)
-olr_expect_compile_failure(gpu_lease_return_reference lease_return_reference.cpp)
-olr_expect_compile_failure(gpu_lease_return_pointer lease_return_pointer.cpp)
 olr_expect_compile_failure(gpu_backing_authority_spoof backing_authority_spoof.cpp)
-olr_expect_compile_failure(gpu_token_mint token_mint.cpp)
 olr_expect_compile_failure(gpu_token_authority_spoof token_authority_spoof.cpp)
+
+add_executable(gpu_lease_release_probe
+    "${CMAKE_SOURCE_DIR}/tests/gpu/gpu_lease_release_probe.cpp")
+target_include_directories(gpu_lease_release_probe PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(gpu_lease_release_probe PRIVATE Qt6::Core)
+# The probe observes the acquire and discharge halves of GpuSyncReadScope
+# separately, which production code cannot: it needs the test-only authority.
+target_compile_definitions(gpu_lease_release_probe PRIVATE QT_NO_DEBUG OLR_UNIT_TEST=1)
+add_test(NAME gpu_lease_release_probe COMMAND gpu_lease_release_probe)
+set_tests_properties(gpu_lease_release_probe PROPERTIES LABELS "gpu-capability;ci")
+add_test(NAME gpu_compile_pass_diagnostic_fixtures
+    COMMAND ${CMAKE_COMMAND}
+        -DVERIFY_DIAGNOSTIC_FIXTURES=TRUE
+        -P "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/run_compile_control.cmake")
+set_tests_properties(gpu_compile_pass_diagnostic_fixtures PROPERTIES
+    LABELS "gpu-capability;ci")
 if(WIN32)
     olr_expect_compile_failure(gpu_d3d11_texture_access d3d11_texture_access.cpp)
     olr_expect_compile_failure(gpu_d3d11_device_access d3d11_device_access.cpp)
@@ -105,6 +345,10 @@ if(WIN32)
 endif()
 
 include("${CMAKE_SOURCE_DIR}/tests/cmake/OlrWindowsTestRuntime.cmake")
+if(WIN32)
+    get_property(_olr_existing_tests DIRECTORY PROPERTY TESTS)
+    olr_apply_windows_test_runtime(${_olr_existing_tests})
+endif()
 
 # --- Lightweight engine sources used by fast unit tests ---------------------
 qt_add_library(olr_test_core STATIC
@@ -343,6 +587,7 @@ if(NOT OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuopscope.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurecoverycoordinator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp")
 endif()
 
@@ -353,6 +598,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpubudget.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurecoverycoordinator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuseekprefetch.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurfaceallocator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
@@ -389,6 +635,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpubudget.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurecoverycoordinator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuseekprefetch.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurfaceallocator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
@@ -830,7 +1077,18 @@ set_tests_properties(transport_epoch_mutation_meta_f2_broken_baseline PROPERTIES
     LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 if(WIN32)
-    add_test(NAME windows_test_runtime_audit
+    olr_add_ctest(NAME windows_test_runtime_legacy_fallback
+        COMMAND "${CMAKE_COMMAND}"
+            -DOLR_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DPROBE_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/legacy_runtime_probe
+            -DCMAKE_COMMAND_PATH=${CMAKE_COMMAND}
+            -DCTEST_COMMAND_PATH=${CMAKE_CTEST_COMMAND}
+            -DPROBE_GENERATOR=${CMAKE_GENERATOR}
+            -P "${CMAKE_SOURCE_DIR}/tests/cmake/run_windows_test_runtime_legacy_probe.cmake")
+    set_tests_properties(windows_test_runtime_legacy_fallback PROPERTIES
+        LABELS "formal;ci" TIMEOUT 60)
+
+    olr_add_ctest(NAME windows_test_runtime_audit
         COMMAND "${CMAKE_COMMAND}"
             -DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
             -DQT_RUNTIME_DIR=$<TARGET_FILE_DIR:Qt6::Core>

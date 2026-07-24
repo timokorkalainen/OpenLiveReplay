@@ -32,5 +32,5 @@ void TestSinkGpuCapability::decklinkIsGpuNative() {
     QCOMPARE(gpuCapabilityFor(OutputTargetKind::DeckLinkIpSt2110), SinkGpuCapability::GpuNative);
 }
 
-QTEST_MAIN(TestSinkGpuCapability)
+QTEST_GUILESS_MAIN(TestSinkGpuCapability)
 #include "tst_sinkgpucapability.moc"

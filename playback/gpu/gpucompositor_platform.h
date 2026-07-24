@@ -2,11 +2,14 @@
 #define OLR_GPUCOMPOSITOR_PLATFORM_H
 
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/framehandle.h"
 
 #include <rhi/qrhi.h>
 
 #include <memory>
+
+class GpuRhiContext;
 
 namespace gpucompositor {
 
@@ -23,13 +26,15 @@ public:
     virtual QRhiTexture::NativeTexture chromaNativeTexture() const = 0;
 };
 
-std::shared_ptr<GpuSurface> makeInputNv12Surface(const FrameHandle& frame);
-std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int width, int height);
+std::shared_ptr<GpuSurface> makeInputNv12Surface(const FrameHandle& frame,
+                                                 const std::shared_ptr<GpuRhiContext>& rhi);
+std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int width, int height,
+                                                   const std::shared_ptr<GpuRhiContext>& rhi);
 bool supportsNativeOutputSurfaces();
 std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi* rhi,
-                                                     const std::shared_ptr<GpuSurface>& surface);
+                                                     const GpuScopedNativeSurface& surface);
 std::unique_ptr<ImportedRgbaRenderTarget>
-importRgbaRenderTarget(QRhi* rhi, const std::shared_ptr<GpuSurface>& surface);
+importRgbaRenderTarget(QRhi* rhi, const GpuScopedNativeSurface& surface);
 
 } // namespace gpucompositor
 

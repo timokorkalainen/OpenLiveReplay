@@ -10,6 +10,7 @@
 #include "playback/output/formatcanon.h"
 
 #include <QList>
+#include <QScopeGuard>
 #include <QThread>
 #include <QtGlobal>
 
@@ -23,6 +24,7 @@
 #include <rhi/qrhi_platform.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -35,6 +37,13 @@
 // Reached only from the FrameOpDeviceLost / isDeviceLost() branches below, so no
 // other TU can construct a DeadDeviceToken from the Apple backend.
 namespace {
+
+uintptr_t metalDeviceDomainId(QRhi* rhi) {
+    const auto* handles =
+        rhi ? static_cast<const QRhiMetalNativeHandles*>(rhi->nativeHandles()) : nullptr;
+    id<MTLCommandQueue> queue = handles ? static_cast<id<MTLCommandQueue>>(handles->cmdQueue) : nil;
+    return gpuMetalDeviceDomainId((__bridge void*)(queue ? queue.device : nil));
+}
 
 qsizetype planeBytes(int stride, int rows) {
     return static_cast<qsizetype>(stride) * static_cast<qsizetype>(rows);
@@ -259,7 +268,70 @@ CpuPlanes yuv420pFromNv12Readbacks(const QRhiReadbackResult& yReadback,
     return out;
 }
 
-CpuPlanes readbackRgba8WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDesc& desc) {
+class AppleReadbackBatchGuard final {
+public:
+    explicit AppleReadbackBatchGuard(QRhiResourceUpdateBatch* batch) noexcept : m_batch(batch) {}
+    ~AppleReadbackBatchGuard() noexcept {
+        try {
+            if (m_batch) m_batch->release();
+        } catch (...) {
+            // Cleanup is best-effort in a noexcept guard.
+            static_cast<void>(0);
+        }
+    }
+
+    AppleReadbackBatchGuard(const AppleReadbackBatchGuard&) = delete;
+    AppleReadbackBatchGuard& operator=(const AppleReadbackBatchGuard&) = delete;
+
+    explicit operator bool() const noexcept { return m_batch != nullptr; }
+    QRhiResourceUpdateBatch* get() const noexcept { return m_batch; }
+    QRhiResourceUpdateBatch* take() noexcept {
+        QRhiResourceUpdateBatch* batch = m_batch;
+        m_batch = nullptr;
+        return batch;
+    }
+
+private:
+    QRhiResourceUpdateBatch* m_batch = nullptr;
+};
+
+class AppleReadbackFrameGuard final {
+public:
+    AppleReadbackFrameGuard(QRhi* rhi, GpuSubmitOutcome& outcome) noexcept
+        : m_rhi(rhi), m_outcome(outcome) {}
+    ~AppleReadbackFrameGuard() noexcept {
+        if (!m_frameOpen || !m_rhi) return;
+        m_outcome = GpuSubmitOutcome::Submitted;
+        try {
+            if (m_rhi->endOffscreenFrame() != QRhi::FrameOpSuccess)
+                m_outcome = GpuSubmitOutcome::SubmittedWithError;
+        } catch (...) {
+            m_outcome = GpuSubmitOutcome::SubmittedWithError;
+        }
+    }
+
+    AppleReadbackFrameGuard(const AppleReadbackFrameGuard&) = delete;
+    AppleReadbackFrameGuard& operator=(const AppleReadbackFrameGuard&) = delete;
+
+    QRhi::FrameOpResult end() {
+        m_outcome = GpuSubmitOutcome::Submitted;
+        // QRhi may throw after accepting the frame end. Never retry that
+        // ambiguous boundary from the destructor.
+        m_frameOpen = false;
+        const QRhi::FrameOpResult result = m_rhi->endOffscreenFrame();
+        if (result != QRhi::FrameOpSuccess) m_outcome = GpuSubmitOutcome::SubmittedWithError;
+        return result;
+    }
+
+private:
+    QRhi* m_rhi = nullptr;
+    GpuSubmitOutcome& m_outcome;
+    bool m_frameOpen = true;
+};
+
+CpuPlanes readbackRgba8WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDesc& desc,
+                               GpuSubmitOutcome& outcome) {
+    outcome = GpuSubmitOutcome::NotSubmitted;
     CpuPlanes out;
     if (!rhi || !pb || desc.format != FramePixelFormat::Rgba8 || desc.width <= 0 ||
         desc.height <= 0) {
@@ -268,70 +340,56 @@ CpuPlanes readbackRgba8WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceD
 
     CVMetalTextureCacheRef cache = makeTextureCache(rhi);
     if (!cache) return out;
+    const auto releaseCache = qScopeGuard([&] { CFRelease(cache); });
 
     CFDictionaryRef readAttrs = makeMetalTextureAttributes(MTLTextureUsageShaderRead);
-    if (!readAttrs) {
-        CFRelease(cache);
-        return out;
-    }
+    if (!readAttrs) return out;
+    const auto releaseReadAttrs = qScopeGuard([&] { CFRelease(readAttrs); });
 
     CVMetalTextureRef cvTexture = nullptr;
     const CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(
         kCFAllocatorDefault, cache, pb, readAttrs, MTLPixelFormatBGRA8Unorm, desc.width,
         desc.height, 0, &cvTexture);
-    CFRelease(readAttrs);
-    if (rc != kCVReturnSuccess || !cvTexture) {
-        CFRelease(cache);
-        return out;
-    }
+    if (rc != kCVReturnSuccess || !cvTexture) return out;
+    const auto releaseTexture = qScopeGuard([&] { CFRelease(cvTexture); });
 
     id<MTLTexture> metalTexture = CVMetalTextureGetTexture(cvTexture);
-    if (!metalTexture) {
-        CFRelease(cvTexture);
-        CFRelease(cache);
-        return out;
-    }
+    if (!metalTexture) return out;
 
     std::unique_ptr<QRhiTexture> texture(rhi->newTexture(
         QRhiTexture::BGRA8, QSize(desc.width, desc.height), 1, QRhiTexture::UsedAsTransferSource));
-    if (!texture) {
-        CFRelease(cvTexture);
-        CFRelease(cache);
-        return out;
-    }
+    if (!texture) return out;
 
     const QRhiTexture::NativeTexture nativeTexture{
         quint64(reinterpret_cast<uintptr_t>((__bridge void*)metalTexture)), 0};
-    if (!texture->createFrom(nativeTexture)) {
-        CFRelease(cvTexture);
-        CFRelease(cache);
-        return out;
-    }
+    if (!texture->createFrom(nativeTexture)) return out;
 
     QRhiCommandBuffer* cb = nullptr;
-    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess || !cb) {
-        CFRelease(cvTexture);
-        CFRelease(cache);
-        return out;
-    }
+    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess) return out;
+    AppleReadbackFrameGuard frameGuard(rhi, outcome);
+    if (!cb) return out;
 
     QRhiReadbackResult readback;
-    QRhiResourceUpdateBatch* batch = rhi->nextResourceUpdateBatch();
-    if (batch) {
-        batch->readBackTexture(QRhiReadbackDescription(texture.get()), &readback);
-        cb->resourceUpdate(batch);
+    AppleReadbackBatchGuard batchGuard(rhi->nextResourceUpdateBatch());
+    if (batchGuard) {
+        batchGuard.get()->readBackTexture(QRhiReadbackDescription(texture.get()), &readback);
+        cb->resourceUpdate(batchGuard.take());
     }
-    const QRhi::FrameOpResult end = rhi->endOffscreenFrame();
-    if (end == QRhi::FrameOpSuccess && rhi->finish() == QRhi::FrameOpSuccess) {
-        out = rgba8FromReadback(readback, desc);
+    const QRhi::FrameOpResult end = frameGuard.end();
+    if (end == QRhi::FrameOpSuccess) {
+        if (rhi->finish() == QRhi::FrameOpSuccess) {
+            out = rgba8FromReadback(readback, desc);
+        } else {
+            outcome = GpuSubmitOutcome::SubmittedWithError;
+        }
     }
 
-    CFRelease(cvTexture);
-    CFRelease(cache);
     return out;
 }
 
-CpuPlanes readbackNv12WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDesc& desc) {
+CpuPlanes readbackNv12WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDesc& desc,
+                              GpuSubmitOutcome& outcome) {
+    outcome = GpuSubmitOutcome::NotSubmitted;
     CpuPlanes out;
     if (!rhi || !pb || desc.format != FramePixelFormat::Nv12 || desc.width <= 0 ||
         desc.height <= 0) {
@@ -340,22 +398,18 @@ CpuPlanes readbackNv12WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDe
 
     CVMetalTextureCacheRef cache = makeTextureCache(rhi);
     if (!cache) return out;
+    const auto releaseCache = qScopeGuard([&] { CFRelease(cache); });
 
     CFDictionaryRef readAttrs = makeMetalTextureAttributes(MTLTextureUsageShaderRead);
-    if (!readAttrs) {
-        CFRelease(cache);
-        return out;
-    }
+    if (!readAttrs) return out;
+    const auto releaseReadAttrs = qScopeGuard([&] { CFRelease(readAttrs); });
 
     CVMetalTextureRef luma = nullptr;
     CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb,
                                                             readAttrs, MTLPixelFormatR8Unorm,
                                                             desc.width, desc.height, 0, &luma);
-    if (rc != kCVReturnSuccess || !luma) {
-        CFRelease(readAttrs);
-        CFRelease(cache);
-        return out;
-    }
+    if (rc != kCVReturnSuccess || !luma) return out;
+    const auto releaseLuma = qScopeGuard([&] { CFRelease(luma); });
 
     const int chromaW = (desc.width + 1) / 2;
     const int chromaH = (desc.height + 1) / 2;
@@ -363,69 +417,48 @@ CpuPlanes readbackNv12WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDe
     rc = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, readAttrs,
                                                    MTLPixelFormatRG8Unorm, chromaW, chromaH, 1,
                                                    &chroma);
-    CFRelease(readAttrs);
-    if (rc != kCVReturnSuccess || !chroma) {
-        CFRelease(luma);
-        CFRelease(cache);
-        return out;
-    }
+    if (rc != kCVReturnSuccess || !chroma) return out;
+    const auto releaseChroma = qScopeGuard([&] { CFRelease(chroma); });
 
     id<MTLTexture> lumaTexture = CVMetalTextureGetTexture(luma);
     id<MTLTexture> chromaTexture = CVMetalTextureGetTexture(chroma);
-    if (!lumaTexture || !chromaTexture) {
-        CFRelease(chroma);
-        CFRelease(luma);
-        CFRelease(cache);
-        return out;
-    }
+    if (!lumaTexture || !chromaTexture) return out;
 
     std::unique_ptr<QRhiTexture> yTex(rhi->newTexture(
         QRhiTexture::R8, QSize(desc.width, desc.height), 1, QRhiTexture::UsedAsTransferSource));
     std::unique_ptr<QRhiTexture> uvTex(rhi->newTexture(QRhiTexture::RG8, QSize(chromaW, chromaH), 1,
                                                        QRhiTexture::UsedAsTransferSource));
-    if (!yTex || !uvTex) {
-        CFRelease(chroma);
-        CFRelease(luma);
-        CFRelease(cache);
-        return out;
-    }
+    if (!yTex || !uvTex) return out;
 
     const QRhiTexture::NativeTexture yNative{
         quint64(reinterpret_cast<uintptr_t>((__bridge void*)lumaTexture)), 0};
     const QRhiTexture::NativeTexture uvNative{
         quint64(reinterpret_cast<uintptr_t>((__bridge void*)chromaTexture)), 0};
-    if (!yTex->createFrom(yNative) || !uvTex->createFrom(uvNative)) {
-        CFRelease(chroma);
-        CFRelease(luma);
-        CFRelease(cache);
-        return out;
-    }
+    if (!yTex->createFrom(yNative) || !uvTex->createFrom(uvNative)) return out;
 
     QRhiCommandBuffer* cb = nullptr;
-    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess || !cb) {
-        CFRelease(chroma);
-        CFRelease(luma);
-        CFRelease(cache);
-        return out;
-    }
+    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess) return out;
+    AppleReadbackFrameGuard frameGuard(rhi, outcome);
+    if (!cb) return out;
 
     QRhiReadbackResult yReadback;
     QRhiReadbackResult uvReadback;
-    QRhiResourceUpdateBatch* batch = rhi->nextResourceUpdateBatch();
-    if (batch) {
-        batch->readBackTexture(QRhiReadbackDescription(yTex.get()), &yReadback);
-        batch->readBackTexture(QRhiReadbackDescription(uvTex.get()), &uvReadback);
-        cb->resourceUpdate(batch);
+    AppleReadbackBatchGuard batchGuard(rhi->nextResourceUpdateBatch());
+    if (batchGuard) {
+        batchGuard.get()->readBackTexture(QRhiReadbackDescription(yTex.get()), &yReadback);
+        batchGuard.get()->readBackTexture(QRhiReadbackDescription(uvTex.get()), &uvReadback);
+        cb->resourceUpdate(batchGuard.take());
     }
 
-    const QRhi::FrameOpResult end = rhi->endOffscreenFrame();
-    if (end == QRhi::FrameOpSuccess && rhi->finish() == QRhi::FrameOpSuccess) {
-        out = yuv420pFromNv12Readbacks(yReadback, uvReadback, desc);
+    const QRhi::FrameOpResult end = frameGuard.end();
+    if (end == QRhi::FrameOpSuccess) {
+        if (rhi->finish() == QRhi::FrameOpSuccess) {
+            out = yuv420pFromNv12Readbacks(yReadback, uvReadback, desc);
+        } else {
+            outcome = GpuSubmitOutcome::SubmittedWithError;
+        }
     }
 
-    CFRelease(chroma);
-    CFRelease(luma);
-    CFRelease(cache);
     return out;
 }
 
@@ -434,6 +467,8 @@ CpuPlanes readbackNv12WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDe
 // GpuRhiContext::presentOnMainThread for any present/UIKit interaction.
 class GpuRenderThread final : public QThread {
 public:
+    enum class InvokeResult { Rejected, Completed, Failed, TimedOut };
+
     explicit GpuRenderThread(QRhi::Implementation backend) : m_backend(backend) {}
 
     QRhi* rhi = nullptr;
@@ -461,18 +496,20 @@ public:
         m_cond.notify_all();
 
         while (true) {
-            std::function<void()> job;
+            QueuedJob job;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_cond.wait(lock, [&] { return !m_jobs.isEmpty() || m_stop; });
                 if (m_stop && m_jobs.isEmpty()) break;
                 job = m_jobs.takeFirst();
             }
-            job();
+            job.run();
         }
 
-        delete rhi;
-        rhi = nullptr;
+        if (!m_abandonCleanup.load(std::memory_order_acquire)) {
+            delete rhi;
+            rhi = nullptr;
+        }
     }
 
     bool waitReady() {
@@ -481,22 +518,115 @@ public:
         return rhi != nullptr;
     }
 
-    bool invoke(std::function<void()> job) {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (m_stop) return false;
-
-        bool done = false;
-        m_jobs.append([&] {
-            job();
-            {
-                std::lock_guard<std::mutex> doneLock(m_mutex);
-                done = true;
+    InvokeResult invokeFor(std::function<void()> job, int timeoutMs,
+                           std::function<void()> completion = {}) {
+        auto finish = [](const std::function<void()>& callback) noexcept {
+            try {
+                if (callback) callback();
+            } catch (...) {
+                static_cast<void>(0);
             }
-            m_cond.notify_all();
-        });
+        };
+        if (QThread::currentThread() == this) {
+            try {
+                job();
+                finish(completion);
+                return InvokeResult::Completed;
+            } catch (...) {
+                finish(completion);
+                return InvokeResult::Failed;
+            }
+        }
+        const auto state = std::make_shared<InvokeState>();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stop) return InvokeResult::Rejected;
+            m_jobs.append({[state, job = std::move(job), completion, finish] {
+                               bool succeeded = false;
+                               try {
+                                   job();
+                                   succeeded = true;
+                               } catch (...) {
+                               }
+                               finish(completion);
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state->mutex);
+                                   state->succeeded = succeeded;
+                                   state->done = true;
+                               }
+                               state->finished.notify_all();
+                           },
+                           [state, completion, finish] {
+                               finish(completion);
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state->mutex);
+                                   state->done = true;
+                                   state->succeeded = false;
+                               }
+                               state->finished.notify_all();
+                           }});
+        }
         m_cond.notify_all();
-        m_cond.wait(lock, [&] { return done; });
-        return true;
+        std::unique_lock<std::mutex> doneLock(state->mutex);
+        try {
+            if (timeoutMs < 0) {
+                state->finished.wait(doneLock, [state] { return state->done; });
+            } else if (!state->finished.wait_for(doneLock, std::chrono::milliseconds(timeoutMs),
+                                                 [state] { return state->done; })) {
+                return InvokeResult::TimedOut;
+            }
+        } catch (...) {
+            // The queue owns the value-captured job. Its eventual completion
+            // still clears the per-context pending bit.
+            return InvokeResult::TimedOut;
+        }
+        return state->succeeded ? InvokeResult::Completed : InvokeResult::Failed;
+    }
+
+    bool invoke(std::function<void()> job) {
+        if (QThread::currentThread() == this) {
+            try {
+                job();
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+        InvokeState state;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stop) return false;
+            m_jobs.append({[&state, &job] {
+                               bool succeeded = false;
+                               try {
+                                   job();
+                                   succeeded = true;
+                               } catch (...) {
+                               }
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state.mutex);
+                                   state.succeeded = succeeded;
+                                   state.done = true;
+                                   state.finished.notify_all();
+                               }
+                           },
+                           [&state] {
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state.mutex);
+                                   state.done = true;
+                                   state.succeeded = false;
+                                   state.finished.notify_all();
+                               }
+                           }});
+        }
+        m_cond.notify_all();
+        try {
+            std::unique_lock<std::mutex> doneLock(state.mutex);
+            state.finished.wait(doneLock, [&state] { return state.done; });
+        } catch (...) {
+            std::terminate();
+        }
+        return state.succeeded;
     }
 
     void requestStop() {
@@ -507,11 +637,37 @@ public:
         m_cond.notify_all();
     }
 
+    void quarantine() {
+        QList<QueuedJob> cancelled;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_abandonCleanup.store(true, std::memory_order_release);
+            m_stop = true;
+            cancelled.swap(m_jobs);
+        }
+        for (QueuedJob& job : cancelled)
+            if (job.cancel) job.cancel();
+        m_cond.notify_all();
+    }
+
 private:
+    struct InvokeState {
+        std::mutex mutex;
+        std::condition_variable finished;
+        bool done = false;
+        bool succeeded = false;
+    };
+
+    struct QueuedJob {
+        std::function<void()> run;
+        std::function<void()> cancel;
+    };
+
     QRhi::Implementation m_backend = QRhi::Null;
     std::mutex m_mutex;
     std::condition_variable m_cond;
-    QList<std::function<void()>> m_jobs;
+    QList<QueuedJob> m_jobs;
+    std::atomic<bool> m_abandonCleanup{false};
     bool m_ready = false;
     bool m_stop = false;
 };
@@ -526,18 +682,40 @@ public:
     QRhi::Implementation backend = QRhi::Null;
     bool valid = false;
     uint64_t deviceAuthorityEpoch = 0;
+    std::atomic<bool> metalCommandQueueBound{false};
     std::atomic<bool> deviceLost{false};
+    std::atomic<bool> deviceLossPollPending{false};
 #ifdef OLR_UNIT_TEST
     std::atomic<int> rhiReadbacks{0};
 #endif
 };
 
-GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
+GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl,
+                             std::function<std::shared_ptr<GpuFence>()> readbackFenceFactory,
+                             std::shared_ptr<std::atomic<int>> injectedFactoryCalls)
+    : m_impl(std::move(impl)) {
+    try {
+#ifdef OLR_UNIT_TEST
+        ++m_readbackFenceInitializationAttemptsForTest;
+        m_injectedReadbackFenceFactoryCallsForTest = std::move(injectedFactoryCalls);
+#else
+        (void)injectedFactoryCalls;
+#endif
+        m_readbackFence = readbackFenceFactory ? readbackFenceFactory() : createFence();
+    } catch (...) {
+    }
+}
 
 GpuRhiContext::~GpuRhiContext() {
     if (!m_impl) return;
-    m_impl->thread.requestStop();
-    m_impl->thread.wait();
+    std::unique_ptr<Impl> retiring = std::move(m_impl);
+    retiring->thread.requestStop();
+    if (retiring->thread.wait(100)) return;
+    // A wedged Metal/QRhi call cannot be joined under a teardown/quarantine
+    // lock. Cancel pending invokes, leave the running carrier valid, and retain
+    // the Impl for process lifetime just as the Windows backend does.
+    retiring->thread.quarantine();
+    static_cast<void>(retiring.release());
 }
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
@@ -575,6 +753,25 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createInvalidForTest() {
     return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::make_unique<Impl>(QRhi::Null)));
 }
 
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createReadbackFenceFailureForTest() {
+    auto impl = std::make_unique<Impl>(QRhi::Null);
+    impl->deviceAuthorityEpoch = GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
+    impl->thread.start();
+    impl->valid = impl->thread.waitReady();
+    if (!impl->valid) {
+        impl->thread.requestStop();
+        impl->thread.wait();
+        return nullptr;
+    }
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    auto failingFactory = [calls] {
+        calls->fetch_add(1, std::memory_order_acq_rel);
+        return std::shared_ptr<GpuFence>{};
+    };
+    return std::shared_ptr<GpuRhiContext>(
+        new GpuRhiContext(std::move(impl), std::move(failingFactory), std::move(calls)));
+}
+
 int GpuRhiContext::rhiReadbackCountForTest() const {
     return m_impl ? m_impl->rhiReadbacks.load(std::memory_order_acquire) : 0;
 }
@@ -588,8 +785,17 @@ bool GpuRhiContext::isNullBackend() const {
     return m_impl && m_impl->backend == QRhi::Null;
 }
 
+GpuSurfaceCompatibility GpuRhiContext::surfaceCompatibility() const noexcept {
+    if (!isGpuBacked() || !m_impl || m_impl->backend != QRhi::Metal ||
+        !m_impl->metalCommandQueueBound || !m_readbackFence)
+        return {};
+    const GpuFenceIdentity identity = m_readbackFence->identity();
+    return {identity.deviceDomainId, identity.authorityEpoch};
+}
+
 bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) const {
-    if (!m_impl || !m_impl->valid || !job) return false;
+    const auto keepAlive = weak_from_this().lock();
+    if (!keepAlive || !m_impl || !m_impl->valid || !job) return false;
     return m_impl->thread.invoke([&] { job(m_impl->thread.rhi); });
 }
 
@@ -613,106 +819,129 @@ bool GpuRhiContext::deviceLost() const {
     return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
 }
 
+bool GpuRhiContext::deviceLossPollPending() const noexcept {
+    return m_impl && m_impl->deviceLossPollPending.load(std::memory_order_acquire);
+}
+
+bool GpuRhiContext::pollDeviceLoss() const {
+#ifdef OLR_UNIT_TEST
+    m_deviceLossPollCountForTest.fetch_add(1, std::memory_order_relaxed);
+#endif
+    if (!m_impl || !m_impl->valid) return false;
+    if (m_impl->deviceLost.load(std::memory_order_acquire)) return true;
+    bool expected = false;
+    if (!m_impl->deviceLossPollPending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return m_impl->deviceLost.load(std::memory_order_acquire);
+    }
+    constexpr int kDeviceLossPollTimeoutMs = 50;
+    Impl* const impl = m_impl.get();
+    const uint64_t authority = m_impl->deviceAuthorityEpoch;
+    GpuRenderThread::InvokeResult invoked = GpuRenderThread::InvokeResult::Rejected;
+    try {
+        invoked = impl->thread.invokeFor(
+            [impl, authority] {
+                QRhi* rhi = impl->thread.rhi;
+                if (!rhi || !rhi->isDeviceLost()) return;
+                if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, authority,
+                        metalDeviceDomainId(rhi)) != 0)
+                    impl->deviceLost.store(true, std::memory_order_release);
+            },
+            kDeviceLossPollTimeoutMs,
+            [impl] { impl->deviceLossPollPending.store(false, std::memory_order_release); });
+    } catch (...) {
+        impl->deviceLossPollPending.store(false, std::memory_order_release);
+        return false;
+    }
+    if (invoked == GpuRenderThread::InvokeResult::Rejected)
+        impl->deviceLossPollPending.store(false, std::memory_order_release);
+    return impl->deviceLost.load(std::memory_order_acquire);
+}
+
 void GpuRhiContext::injectDeviceLostForTest() {
     if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
 }
 
-CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& surface,
-                                           FramePixelFormat target) {
-    CpuPlanes result;
-    if (!m_impl || !m_impl->valid) {
-        return result;
-    }
-    if (m_impl->deviceLost.load(std::memory_order_acquire)) {
-        GpuDeviceLossMonitor::instance().recordLoss();
-        return result;
-    }
-    if (!surface || !surface->isValid()) {
-        return result;
-    }
-    const GpuSurfaceDesc desc = surface->desc();
-
-    CVPixelBufferRef pb = retainApplePixelBufferWrapper(surface);
-    if (!pb) return result;
-
-    const uint64_t deviceAuthorityEpoch = m_impl->deviceAuthorityEpoch;
-    const bool invoked = m_impl->thread.invoke([&] {
-        QRhi* rhi = m_impl->thread.rhi;
-        if (rhi) {
-            QRhiCommandBuffer* cb = nullptr;
-            const QRhi::FrameOpResult begin = rhi->beginOffscreenFrame(&cb);
-            if (begin == QRhi::FrameOpSuccess) {
-                const QRhi::FrameOpResult end = rhi->endOffscreenFrame();
-                if (end == QRhi::FrameOpDeviceLost || rhi->isDeviceLost()) {
-                    // LOCK RULE: this render-thread poll touches no m_bufferMutex;
-                    // callers observe deviceLost() and degrade/rebuild outside it.
-                    // Driver-authoritative loss: mint the provenance-bound token so
-                    // the worker's recovery frees held surfaces without waiting on
-                    // the dead device's fences.
-                    GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
-                    m_impl->deviceLost.store(true, std::memory_order_release);
-                    result = CpuPlanes{};
-                    return;
-                }
-            } else {
-                if (begin == QRhi::FrameOpDeviceLost || rhi->isDeviceLost()) {
-                    // LOCK RULE: this render-thread poll touches no m_bufferMutex.
-                    GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
-                    m_impl->deviceLost.store(true, std::memory_order_release);
-                }
-                result = CpuPlanes{};
-                return;
-            }
-        }
-        if (desc.format == FramePixelFormat::Rgba8 && target == FramePixelFormat::Rgba8) {
-            result = readbackRgba8WithRhi(rhi, pb, desc);
-            if (result.isValid()) {
+GpuReadbackResult GpuRhiContext::importAndReadback(const GpuScopedNativeSurface& surface,
+                                                   FramePixelFormat target) noexcept {
 #ifdef OLR_UNIT_TEST
-                m_impl->rhiReadbacks.fetch_add(1, std::memory_order_acq_rel);
+    void* testHandle = surface.nativeHandle();
+    m_lastReadbackHadNativeHandleForTest.store(testHandle != nullptr, std::memory_order_release);
+    m_lastReadbackSubresourceForTest.store(surface.nativeSubresource(), std::memory_order_release);
+    if (const auto injected = injectedReadbackForTest()) return *injected;
 #endif
-                return;
-            }
-            if (rhi && rhi->isDeviceLost()) {
-                GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                    DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
-                m_impl->deviceLost.store(true, std::memory_order_release);
-                result = CpuPlanes{};
-                return;
-            }
+    void* handle = surface.nativeHandle();
+    if (!surface.valid() || !handle) return {};
+    GpuReadbackResult result;
+    try {
+        if (!m_impl || !m_impl->valid) return result;
+        if (m_impl->deviceLost.load(std::memory_order_acquire)) {
+            GpuDeviceLossMonitor::instance().recordLoss();
+            return result;
         }
-        if (desc.format == FramePixelFormat::Nv12) {
-            if (target == FramePixelFormat::Yuv420p || target == FramePixelFormat::Nv12) {
-                CpuPlanes yuv = readbackNv12WithRhi(rhi, pb, desc);
-                if (yuv.isValid()) {
+        if (!surface.valid()) return result;
+        const GpuSurfaceDesc desc = surface.desc();
+
+        CVPixelBufferRef pb = retainApplePixelBufferWrapper(surface);
+        if (!pb) return result;
+        const auto releasePixelBuffer = qScopeGuard([&] { CVPixelBufferRelease(pb); });
+
+        const uint64_t deviceAuthorityEpoch = m_impl->deviceAuthorityEpoch;
+        const bool invoked = m_impl->thread.invoke([&] {
+            result = gpuReadbackDetail::invoke([&](GpuSubmitOutcome& outcome) -> CpuPlanes {
+                QRhi* rhi = m_impl->thread.rhi;
+                CpuPlanes planes;
+                if (desc.format == FramePixelFormat::Rgba8 && target == FramePixelFormat::Rgba8) {
+                    planes = readbackRgba8WithRhi(rhi, pb, desc, outcome);
+                    if (planes.isValid()) {
 #ifdef OLR_UNIT_TEST
-                    m_impl->rhiReadbacks.fetch_add(1, std::memory_order_acq_rel);
+                        m_impl->rhiReadbacks.fetch_add(1, std::memory_order_acq_rel);
 #endif
-                    result =
-                        target == FramePixelFormat::Yuv420p ? yuv : formatcanon::yuv420pToNv12(yuv);
-                    if (result.isValid()) return;
+                        return planes;
+                    }
+                }
+                if (desc.format == FramePixelFormat::Nv12 &&
+                    (target == FramePixelFormat::Yuv420p || target == FramePixelFormat::Nv12)) {
+                    CpuPlanes yuv = readbackNv12WithRhi(rhi, pb, desc, outcome);
+                    if (yuv.isValid()) {
+#ifdef OLR_UNIT_TEST
+                        m_impl->rhiReadbacks.fetch_add(1, std::memory_order_acq_rel);
+#endif
+                        planes = target == FramePixelFormat::Yuv420p
+                                     ? yuv
+                                     : formatcanon::yuv420pToNv12(yuv);
+                        if (planes.isValid()) return planes;
+                    }
                 }
                 if (rhi && rhi->isDeviceLost()) {
-                    GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
-                    m_impl->deviceLost.store(true, std::memory_order_release);
-                    result = CpuPlanes{};
-                    return;
+                    if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                            DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch,
+                            metalDeviceDomainId(rhi)) != 0)
+                        m_impl->deviceLost.store(true, std::memory_order_release);
+                    return {};
                 }
-                if (target == FramePixelFormat::Yuv420p) {
-                    result = lockDownloadNv12ToYuv420p(pb);
-                } else {
-                    result = formatcanon::yuv420pToNv12(lockDownloadNv12ToYuv420p(pb));
+                // A CPU fallback after a pre-submit RHI exit remains NotSubmitted.
+                // If the driver accepted work, preserve Submitted/SubmittedWithError.
+                if (desc.format == FramePixelFormat::Nv12 &&
+                    (target == FramePixelFormat::Yuv420p || target == FramePixelFormat::Nv12)) {
+                    if (target == FramePixelFormat::Yuv420p) {
+                        planes = lockDownloadNv12ToYuv420p(pb);
+                    } else {
+                        planes = formatcanon::yuv420pToNv12(lockDownloadNv12ToYuv420p(pb));
+                    }
+                } else if (desc.format == FramePixelFormat::Rgba8 &&
+                           target == FramePixelFormat::Rgba8) {
+                    planes = lockDownloadRgba8(pb);
                 }
-            }
-        } else if (desc.format == FramePixelFormat::Rgba8 && target == FramePixelFormat::Rgba8) {
-            result = lockDownloadRgba8(pb);
-        }
-    });
-    CVPixelBufferRelease(pb);
-    if (!invoked) return CpuPlanes{};
-    return result;
+                return planes;
+            });
+        });
+        if (!invoked) return GpuReadbackResult::fromException(result.outcome);
+        return result;
+    } catch (...) {
+        return GpuReadbackResult::fromException(result.outcome);
+    }
 }
 
 std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
@@ -725,7 +954,9 @@ std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
         if (!rhi) return;
         const auto* nativeHandles =
             static_cast<const QRhiMetalNativeHandles*>(rhi->nativeHandles());
-        fence = nativeHandles ? makeMetalGpuFence(nativeHandles->cmdQueue) : nullptr;
+        if (!nativeHandles || !nativeHandles->cmdQueue) return;
+        fence = makeMetalGpuFence(nativeHandles->cmdQueue, m_impl->deviceAuthorityEpoch);
+        if (fence) m_impl->metalCommandQueueBound = true;
     });
     return invoked ? fence : nullptr;
 }

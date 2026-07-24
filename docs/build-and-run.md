@@ -1,5 +1,9 @@
 # Build and Run
 
+The opt-in, destructive Windows hardware removal test is documented separately in
+[Windows real GPU fault lane](testing/windows-gpu-fault-lane.md). It is never enabled by ordinary
+build or test commands.
+
 This guide covers the common developer paths for OpenLiveReplay: VS Code,
 terminal desktop builds, tests, and iOS device builds.
 

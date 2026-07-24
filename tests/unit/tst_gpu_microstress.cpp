@@ -6,6 +6,7 @@
 #ifdef __APPLE__
 #include "playback/gpu/appleiosurface.h"
 #include "playback/gpu/gpuframedata.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpurhicontext.h"
 #endif
 
@@ -27,7 +28,7 @@ void TestGpuMicrostress::evictWhileRenderDoesNotFreeInUseSurface() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend");
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, rhi->surfaceCompatibility());
     QVERIFY(surface != nullptr);
     std::weak_ptr<GpuSurface> weakSurface = surface;
 
@@ -64,7 +65,12 @@ void TestGpuMicrostress::evictWhileRenderDoesNotFreeInUseSurface() {
     QVERIFY(!weakSurface.expired());
 
     consumerHandle = FrameHandle();
-    QVERIFY(weakSurface.expired());
+    GpuRetireRegistry retireRegistry;
+    auto surfaceRetired = [&] {
+        retireRegistry.drainCompleted();
+        return weakSurface.expired();
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(surfaceRetired(), 5000);
 }
 #endif
 

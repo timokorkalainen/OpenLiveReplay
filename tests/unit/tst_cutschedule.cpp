@@ -55,5 +55,5 @@ void TestCutSchedule::playheadAccountsForOvershoot() {
     QCOMPARE(CutSchedule::playheadAfterCut(2000, 104, 103, 0.0), qint64(2000));
 }
 
-QTEST_MAIN(TestCutSchedule)
+QTEST_GUILESS_MAIN(TestCutSchedule)
 #include "tst_cutschedule.moc"

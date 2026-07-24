@@ -2724,6 +2724,8 @@ QVariantMap UIManager::previewOutputState() const {
     state.insert(QStringLiteral("readbackDrops"), stats.readbackDrops);
     state.insert(QStringLiteral("fenceWaitStalls"), stats.fenceWaitStalls);
     state.insert(QStringLiteral("gpuOomDegrades"), stats.gpuOomDegrades);
+    state.insert(QStringLiteral("gpuSubmissionRefusalDegrades"),
+                 stats.gpuSubmissionRefusalDegrades);
     QVariantMap worker;
     worker.insert(QStringLiteral("decodedVideoFrames"), workerCounters.decodedVideoFrames);
     worker.insert(QStringLiteral("stagingVideoFramesDecoded"),

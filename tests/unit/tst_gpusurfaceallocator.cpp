@@ -6,7 +6,10 @@
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpubudget.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/gpu/gpusurfaceallocator.h"
@@ -25,30 +28,52 @@ private slots:
     void headroomMintsChargedGpuHandle();
     void customFactoryReceivesBudgetCharge();
     void customTagPropagatesToBudgetCharge();
+    void degradedInvalidReadbackDoesNotSubmit();
+    void degradedPreSubmitExceptionDoesNotSubmit();
+    void degradedPostSubmitExceptionRetainsAndRecordsFailure();
+    void submissionRefusalDegradesWithoutCountingOom();
 };
 
 namespace {
 
 class TestSurface final : public GpuSurface {
 public:
+    explicit TestSurface(GpuSurfaceCompatibility compatibility = {})
+        : m_compatibility(compatibility) {}
+
     GpuSurfaceDesc desc() const override { return GpuSurfaceDesc{FramePixelFormat::Nv12, 64, 48}; }
     bool isValid() const override { return true; }
+    GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
     void* nativeHandle() const override { return nullptr; }
-    void retainUntilFenceRetired(uint64_t fenceValue) override { m_pendingFence = fenceValue; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
 
 private:
-    uint64_t m_pendingFence = 0;
+    GpuSurfaceCompatibility m_compatibility;
 };
 
 class TestFence final : public GpuFence {
 public:
-    uint64_t signal() override { return ++m_value; }
-    bool wait(uint64_t value, int) override { return m_value >= value; }
-    uint64_t completedValue() const override { return m_value; }
+    TestFence(uintptr_t deviceDomainId = 0, uint64_t authorityEpoch = 0)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
+
+    uint64_t signal() override {
+        ++m_signalCalls;
+        return ++m_value;
+    }
+    bool wait(uint64_t value, int) override {
+        m_lastWait = value;
+        return m_completed >= value;
+    }
+    uint64_t completedValue() const override { return m_completed; }
+    int signalCalls() const { return m_signalCalls; }
+    uint64_t lastSignaledValue() const { return m_value; }
+    uint64_t lastWaitValue() const { return m_lastWait; }
+    void complete(uint64_t value) { m_completed = value; }
 
 private:
     uint64_t m_value = 0;
+    uint64_t m_completed = 0;
+    uint64_t m_lastWait = 0;
+    int m_signalCalls = 0;
 };
 
 class ZeroByteSurface final : public GpuSurface {
@@ -76,6 +101,28 @@ std::shared_ptr<GpuRhiContext> testRhi() {
     auto rhi = GpuRhiContext::createNullForTest();
     if (!rhi) rhi = GpuRhiContext::createWarpForTest();
     return rhi;
+}
+
+void configureDeniedGpuBudget() {
+    GpuBudgetConfig config;
+    config.aggregateDecodeWindow = 0;
+    config.feedCount = 1;
+    config.stagingWindowPerFeed = 0;
+    config.activeBusCount = 0;
+    config.readbackRingDepth = 0;
+    config.width = 64;
+    config.height = 48;
+    GpuBudget::instance().reset();
+    GpuBudget::instance().configure(config);
+}
+
+FrameMetadata testFrameMetadata() {
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 48;
+    meta.gpuGeneration = GpuGenerationCounter::instance().current();
+    return meta;
 }
 
 } // namespace
@@ -333,8 +380,13 @@ void TestGpuSurfaceAllocator::headroomMintsChargedGpuHandle() {
     b.reset();
     b.configure(c);
 
-    auto surface = std::make_shared<TestSurface>();
-    auto renderFence = std::make_shared<TestFence>();
+    constexpr uintptr_t deviceDomain = 0xA110C;
+    constexpr uint64_t authorityEpoch = 1;
+    auto surface =
+        std::make_shared<TestSurface>(GpuSurfaceCompatibility{deviceDomain, authorityEpoch});
+    auto renderFence = std::make_shared<TestFence>(deviceDomain, authorityEpoch);
+    GpuRetireRegistry retireRegistry;
+    const qsizetype pendingBefore = retireRegistry.diagnostics().pendingRetains;
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 64;
@@ -344,8 +396,17 @@ void TestGpuSurfaceAllocator::headroomMintsChargedGpuHandle() {
     QVERIFY(!r.handle.isNull());
     QVERIFY(r.handle.isGpuBacked());
     QVERIFY(!r.degradedToCpu);
-    QVERIFY(surface->pendingFenceValue() > uint64_t(0));
+    QVERIFY(renderFence->lastSignaledValue() > uint64_t(0));
+    const auto* frameData = dynamic_cast<const GpuFrameData*>(r.handle.data());
+    QVERIFY(frameData != nullptr);
+    QVERIFY(!frameData->waitForPendingFence(0));
+    QCOMPARE(renderFence->lastWaitValue(), renderFence->lastSignaledValue());
+    QCOMPARE(retireRegistry.diagnostics().pendingRetains, pendingBefore + 1);
     QVERIFY(b.liveBytes() > 0);
+    renderFence->complete(renderFence->lastSignaledValue());
+    QVERIFY(frameData->waitForPendingFence(0));
+    retireRegistry.drainCompleted();
+    QCOMPARE(retireRegistry.diagnostics().pendingRetains, pendingBefore);
 }
 
 void TestGpuSurfaceAllocator::customFactoryReceivesBudgetCharge() {
@@ -422,6 +483,176 @@ void TestGpuSurfaceAllocator::customTagPropagatesToBudgetCharge() {
     QCOMPARE(observedTag, GpuBudgetTag::ReadbackRing);
     QCOMPARE(b.liveBytes(GpuBudgetTag::ReadbackRing), gpuSurfaceBytes(*surface));
     QCOMPARE(b.gatedLiveBytes(), gpuSurfaceBytes(*surface));
+}
+
+void TestGpuSurfaceAllocator::degradedInvalidReadbackDoesNotSubmit() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    configureDeniedGpuBudget();
+
+    const GpuSurfaceCompatibility compatibility{0xA110C, monitor.currentDeviceAuthorityForTest()};
+    auto surface = std::make_shared<TestSurface>(compatibility);
+    std::weak_ptr<GpuSurface> weakSurface = surface;
+    auto contextFence =
+        std::make_shared<TestFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
+    auto callerFence =
+        std::make_shared<TestFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
+    auto rhi = GpuRhiContext::createReadbackForTest(
+        GpuReadbackTestBehavior::InvalidBeforeSubmission, contextFence);
+    QVERIFY(rhi != nullptr);
+    QVERIFY(rhi->isValid());
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    const uint64_t lossCountBefore = monitor.lossCount();
+
+    const GpuMintResult result =
+        mintGpuOrDegrade(surface, rhi, testFrameMetadata(), callerFence, [surface, rhi] {
+            return submitGpuReadback(rhi, surface, FramePixelFormat::Yuv420p).planes;
+        });
+    surface.reset();
+
+    QVERIFY(result.degradedToCpu);
+    QCOMPARE(contextFence->signalCalls(), 0);
+    QCOMPARE(callerFence->signalCalls(), 0);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QVERIFY(weakSurface.expired());
+    QVERIFY(!monitor.isLost());
+    QCOMPARE(monitor.lossCount(), lossCountBefore);
+}
+
+void TestGpuSurfaceAllocator::degradedPreSubmitExceptionDoesNotSubmit() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    configureDeniedGpuBudget();
+
+    const GpuSurfaceCompatibility compatibility{0xA110C, monitor.currentDeviceAuthorityForTest()};
+    auto surface = std::make_shared<TestSurface>(compatibility);
+    std::weak_ptr<GpuSurface> weakSurface = surface;
+    auto contextFence =
+        std::make_shared<TestFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
+    auto callerFence =
+        std::make_shared<TestFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
+    auto rhi = GpuRhiContext::createReadbackForTest(GpuReadbackTestBehavior::ThrowBeforeSubmission,
+                                                    contextFence);
+    QVERIFY(rhi != nullptr);
+    QVERIFY(rhi->isValid());
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    const uint64_t lossCountBefore = monitor.lossCount();
+
+    const GpuMintResult result =
+        mintGpuOrDegrade(surface, rhi, testFrameMetadata(), callerFence, [surface, rhi] {
+            return submitGpuReadback(rhi, surface, FramePixelFormat::Yuv420p).planes;
+        });
+    surface.reset();
+
+    QVERIFY(result.degradedToCpu);
+    QCOMPARE(contextFence->signalCalls(), 0);
+    QCOMPARE(callerFence->signalCalls(), 0);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QVERIFY(weakSurface.expired());
+    QVERIFY(!monitor.isLost());
+    QCOMPARE(monitor.lossCount(), lossCountBefore);
+}
+
+void TestGpuSurfaceAllocator::degradedPostSubmitExceptionRetainsAndRecordsFailure() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    configureDeniedGpuBudget();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
+
+    const GpuSurfaceCompatibility compatibility{0xA110C, monitor.currentDeviceAuthorityForTest()};
+    auto surface = std::make_shared<TestSurface>(compatibility);
+    std::weak_ptr<GpuSurface> weakSurface = surface;
+    auto contextFence =
+        std::make_shared<TestFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
+    auto callerFence =
+        std::make_shared<TestFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
+    auto rhi = GpuRhiContext::createReadbackForTest(GpuReadbackTestBehavior::ThrowAfterSubmission,
+                                                    contextFence);
+    QVERIFY(rhi != nullptr);
+    QVERIFY(rhi->isValid());
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    const uint64_t lossCountBefore = monitor.lossCount();
+
+    const GpuMintResult result =
+        mintGpuOrDegrade(surface, rhi, testFrameMetadata(), callerFence, [surface, rhi] {
+            return submitGpuReadback(rhi, surface, FramePixelFormat::Yuv420p).planes;
+        });
+    surface.reset();
+
+    QVERIFY(result.degradedToCpu);
+    QCOMPARE(contextFence->signalCalls(), 1);
+    QCOMPARE(callerFence->signalCalls(), 0);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QVERIFY(!weakSurface.expired());
+    QVERIFY(monitor.isLost());
+    QCOMPARE(monitor.lossCount(), lossCountBefore + 1);
+
+    contextFence->complete(1);
+    registry.drainCompleted();
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QVERIFY(weakSurface.expired());
+    QVERIFY(monitor.unregisterRecoveryParticipant(participant).has_value());
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+// A refused submission is a fence/device-authority failure, not memory pressure.
+// The degrade itself is correct — handing out a surface whose retirement was never
+// registered is a use-after-free — but booking it to the OOM counter tells the
+// operator VRAM is exhausted while the real fault is the device. The refusal must
+// land on its own counter and leave the OOM counter alone.
+void TestGpuSurfaceAllocator::submissionRefusalDegradesWithoutCountingOom() {
+    auto rhi = testRhi();
+    if (!rhi) QSKIP("no test RHI backend on this host");
+
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+
+    GpuBudgetConfig c;
+    c.aggregateDecodeWindow = 8;
+    c.feedCount = 1;
+    c.stagingWindowPerFeed = 0;
+    c.activeBusCount = 0;
+    c.readbackRingDepth = 0;
+    c.width = 64;
+    c.height = 48;
+    auto& b = GpuBudget::instance();
+    b.reset();
+    b.configure(c);
+
+    const GpuSurfaceCompatibility compatibility{0xA110C, monitor.currentDeviceAuthorityForTest()};
+    auto surface = std::make_shared<TestSurface>(compatibility);
+    auto renderFence =
+        std::make_shared<TestFence>(compatibility.deviceDomainId, compatibility.authorityEpoch);
+
+    // The loss latch makes GpuOpScope refuse the retained submission outright, so
+    // the factory has no registered retirement to hand a GPU handle out against.
+    monitor.recordLoss();
+
+    const GpuMintResult r = mintGpuOrDegrade(surface, rhi, testFrameMetadata(), renderFence,
+                                             [] { return solidPlanes(64, 48); });
+
+    QVERIFY(r.degradedToCpu);
+    QVERIFY(r.handle.isPresentable());
+    QVERIFY(!r.handle.isGpuBacked());
+    QVERIFY(!r.handle.metadata().key.isPlaceholder);
+    QCOMPARE(renderFence->signalCalls(), 0);
+    QCOMPARE(b.oomDegradeCount(), qint64(0));
+    QCOMPARE(b.submissionRefusalDegradeCount(), qint64(1));
+    QCOMPARE(b.snapshot().submissionRefusalDegrades, qint64(1));
+    QCOMPARE(b.snapshot().oomDegrades, qint64(0));
+    QCOMPARE(b.liveBytes(), qint64(0));
+
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
 }
 
 QTEST_GUILESS_MAIN(TestGpuSurfaceAllocator)

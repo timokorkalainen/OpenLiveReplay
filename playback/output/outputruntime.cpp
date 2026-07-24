@@ -157,6 +157,7 @@ void OutputRuntime::recordGpuBudget(const GpuBudgetSnapshot& snapshot) {
     m_gpuBudgetBytes = qMax<qint64>(0, snapshot.budgetBytes);
     m_gpuGatedLiveBytes = qMax<qint64>(0, snapshot.gatedLiveBytes);
     m_gpuOomDegrades = qMax<qint64>(0, snapshot.oomDegrades);
+    m_gpuSubmissionRefusalDegrades = qMax<qint64>(0, snapshot.submissionRefusalDegrades);
     m_gpuBudgetReportOnly = snapshot.reportOnly;
     for (int i = 0; i < kOutputGpuBudgetTagCount; ++i)
         m_gpuLiveBytesByTag[i] = qMax<qint64>(0, snapshot.liveBytesByTag[i]);
@@ -192,15 +193,17 @@ OutputRuntime::dispatchImmediateWithReport(const OutputDispatchRequest& request)
     bool immediateRegistered = false;
     auto clearImmediateRequestLocked = [&]() {
         if (!immediateRegistered) return;
-        if (m_immediateDispatchRequests > 0) --m_immediateDispatchRequests;
+        m_immediateDispatchRequests.fetch_sub(1, std::memory_order_acq_rel);
         immediateRegistered = false;
         m_dispatchIdle.wakeAll();
     };
 
+    m_immediateDispatchRequests.fetch_add(1, std::memory_order_acq_rel);
+    m_immediateDispatchGeneration.fetch_add(1, std::memory_order_acq_rel);
+    immediateRegistered = true;
+
     {
         QMutexLocker locker(&m_mutex);
-        ++m_immediateDispatchRequests;
-        immediateRegistered = true;
         m_dispatchIdle.wakeAll();
         waitForDispatchIdleLocked();
         while (m_reconfiguring && !m_stopRequested)
@@ -302,6 +305,10 @@ int OutputRuntime::playEpochResetCountForTest() const {
     return m_playEpochResetCountForTest;
 }
 
+bool OutputRuntime::immediateDispatchPendingForTest() const {
+    return m_immediateDispatchRequests.load(std::memory_order_acquire) > 0;
+}
+
 OutputRuntime::PlayEpochStateForTest OutputRuntime::playEpochStateForTest() const {
     QMutexLocker locker(&m_mutex);
     return PlayEpochStateForTest{m_configGeneration, m_pendingPlayEpochReset,
@@ -357,6 +364,10 @@ OutputRuntimeSnapshot OutputRuntime::snapshot() const {
 }
 
 OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
+    const quint64 immediateGenerationAtEntry =
+        m_immediateDispatchGeneration.load(std::memory_order_acquire);
+    const bool immediatePendingAtEntry =
+        m_immediateDispatchRequests.load(std::memory_order_acquire) > 0;
     qint64 elapsedNs = 0;
     {
         QMutexLocker locker(&m_mutex);
@@ -375,7 +386,11 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             while (m_reconfiguring && !m_stopRequested)
                 m_dispatchIdle.wait(&m_mutex);
             if (m_stopRequested) break;
-            if (m_immediateDispatchRequests > 0) return statsLocked();
+            if (immediatePendingAtEntry ||
+                m_immediateDispatchRequests.load(std::memory_order_acquire) > 0 ||
+                m_immediateDispatchGeneration.load(std::memory_order_acquire) !=
+                    immediateGenerationAtEntry)
+                return statsLocked();
             const FrameRate rate = m_dispatcher.frameRate();
             frameIndex = m_dispatcher.nextOutputFrameIndex();
             scheduledNs = frameIndexToNsCeil(rate, frameIndex);
@@ -393,7 +408,11 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             while (m_reconfiguring && !m_stopRequested)
                 m_dispatchIdle.wait(&m_mutex);
             if (m_stopRequested) break;
-            if (m_immediateDispatchRequests > 0) return statsLocked();
+            if (immediatePendingAtEntry ||
+                m_immediateDispatchRequests.load(std::memory_order_acquire) > 0 ||
+                m_immediateDispatchGeneration.load(std::memory_order_acquire) !=
+                    immediateGenerationAtEntry)
+                return statsLocked();
             if (m_configGeneration != configGeneration) continue;
             if (m_dispatcher.nextOutputFrameIndex() != frameIndex) continue;
             m_dispatchActive = true;
@@ -452,6 +471,7 @@ OutputDispatchStats OutputRuntime::withRuntimeCountersLocked(OutputDispatchStats
     stats.gpuBudgetReportOnly = m_gpuBudgetReportOnly;
     stats.gpuLiveBytesByTag = m_gpuLiveBytesByTag;
     stats.gpuOomDegrades = m_gpuOomDegrades;
+    stats.gpuSubmissionRefusalDegrades = m_gpuSubmissionRefusalDegrades;
     stats.gpuDeviceLossEvents = m_gpuDeviceLossEvents.load(std::memory_order_acquire);
     return stats;
 }

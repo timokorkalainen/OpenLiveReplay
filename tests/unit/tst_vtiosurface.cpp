@@ -97,6 +97,9 @@ bool TestVtIOSurface::buildGreyIdrAccessUnit(CompressedAccessUnit* unit, int w, 
 }
 
 void TestVtIOSurface::decodedBufferIsIOSurfaceBacked() {
+#if !defined(Q_OS_MACOS)
+    QSKIP("VideoToolbox IOSurface backing is a macOS-only probe");
+#else
     const NativeVideoDecodeCapabilities caps = queryNativeVideoDecodeCapabilities();
     if (!caps.h264) QSKIP("no VideoToolbox H.264 decode on this platform");
 
@@ -119,9 +122,13 @@ void TestVtIOSurface::decodedBufferIsIOSurfaceBacked() {
     QCOMPARE(frames, 1);
     QVERIFY2(decoder.lastDecodedWasIOSurfaceBacked(),
              "VT decode session did not produce an IOSurface-backed CVPixelBuffer");
+#endif
 }
 
 void TestVtIOSurface::reconfigCostIsBounded() {
+#if !defined(Q_OS_MACOS)
+    QSKIP("VideoToolbox reconfiguration is a macOS-only probe");
+#else
     const NativeVideoDecodeCapabilities caps = queryNativeVideoDecodeCapabilities();
     if (!caps.h264) QSKIP("no VideoToolbox H.264 decode on this platform");
 
@@ -148,6 +155,7 @@ void TestVtIOSurface::reconfigCostIsBounded() {
     const double medianMs = samples.at(samples.size() / 2) / 1.0e6;
     qInfo("P0.1 reconfig median (decode incl. session recreate): %.3f ms", medianMs);
     QVERIFY2(medianMs < 100.0, "VT reconfig wildly over budget (>100 ms)");
+#endif
 }
 
 QTEST_GUILESS_MAIN(TestVtIOSurface)

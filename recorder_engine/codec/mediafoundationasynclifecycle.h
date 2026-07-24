@@ -23,11 +23,65 @@ enum class MfAsyncFinalizeResult {
     ShutdownFailed,
 };
 
+enum class MfAsyncShutdownStatus {
+    Initiated,
+    Completed,
+    Failed,
+};
+
+enum class MfAsyncShutdownResult {
+    Complete,
+    ShutdownFailed,
+    StatusFailed,
+    TimedOut,
+};
+
+enum class MfAsyncResourceDisposition {
+    Release,
+    Retain,
+};
+
 struct MfAsyncAbortResult {
     bool flushSucceeded = false;
     bool endStreamingSucceeded = false;
     bool shutdownSucceeded = false;
 };
+
+constexpr MfAsyncResourceDisposition
+mfAsyncResourceDisposition(MfAsyncShutdownResult result) noexcept {
+    return result == MfAsyncShutdownResult::Complete ? MfAsyncResourceDisposition::Release
+                                                     : MfAsyncResourceDisposition::Retain;
+}
+
+template <typename... RetainResource>
+void retainMfAsyncResourcesIfIncomplete(MfAsyncShutdownResult result,
+                                        RetainResource... retainResource) {
+    if (mfAsyncResourceDisposition(result) == MfAsyncResourceDisposition::Release) {
+        return;
+    }
+    (retainResource(), ...);
+}
+
+template <typename Shutdown, typename PollStatus, typename DeadlineExpired, typename Wait>
+MfAsyncShutdownResult completeMfAsyncShutdown(Shutdown shutdown, PollStatus pollStatus,
+                                              DeadlineExpired deadlineExpired, Wait wait) {
+    if (!shutdown()) {
+        return MfAsyncShutdownResult::ShutdownFailed;
+    }
+
+    while (!deadlineExpired()) {
+        switch (pollStatus()) {
+        case MfAsyncShutdownStatus::Completed:
+            return MfAsyncShutdownResult::Complete;
+        case MfAsyncShutdownStatus::Failed:
+            return MfAsyncShutdownResult::StatusFailed;
+        case MfAsyncShutdownStatus::Initiated:
+            wait();
+            break;
+        }
+    }
+    return MfAsyncShutdownResult::TimedOut;
+}
 
 template <typename ProcessMessage, typename Shutdown>
 MfAsyncAbortResult abortMfAsyncTransform(ProcessMessage processMessage, Shutdown shutdown) {

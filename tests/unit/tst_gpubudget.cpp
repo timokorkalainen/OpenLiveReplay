@@ -40,6 +40,7 @@ private slots:
     void chargeOnlyTagsDoNotConsumeGate();
     void perTagSnapshotTracksClasses();
     void reportOnlyDoesNotDisableGatedCharges();
+    void degradeCountersAreIndependentAndResettable();
 };
 
 void TestGpuBudget::surfaceBytesIsNv12() {
@@ -283,6 +284,34 @@ void TestGpuBudget::reportOnlyDoesNotDisableGatedCharges() {
     QCOMPARE(b.gatedLiveBytes(), qint64(0));
 
     qunsetenv("OLR_LEDGER_REPORT_ONLY");
+}
+
+// Memory pressure and a refused submission are separate faults with separate
+// operator responses, so they never share a counter: noting one must leave the
+// other untouched, and both must survive into the snapshot and clear on reset.
+void TestGpuBudget::degradeCountersAreIndependentAndResettable() {
+    auto& b = GpuBudget::instance();
+    b.reset();
+    QCOMPARE(b.oomDegradeCount(), qint64(0));
+    QCOMPARE(b.submissionRefusalDegradeCount(), qint64(0));
+
+    b.noteOomDegrade();
+    QCOMPARE(b.oomDegradeCount(), qint64(1));
+    QCOMPARE(b.submissionRefusalDegradeCount(), qint64(0));
+
+    b.noteSubmissionRefusalDegrade();
+    b.noteSubmissionRefusalDegrade();
+    QCOMPARE(b.oomDegradeCount(), qint64(1));
+    QCOMPARE(b.submissionRefusalDegradeCount(), qint64(2));
+
+    const GpuBudgetSnapshot snapshot = b.snapshot();
+    QCOMPARE(snapshot.oomDegrades, qint64(1));
+    QCOMPARE(snapshot.submissionRefusalDegrades, qint64(2));
+
+    b.reset();
+    QCOMPARE(b.oomDegradeCount(), qint64(0));
+    QCOMPARE(b.submissionRefusalDegradeCount(), qint64(0));
+    QCOMPARE(b.snapshot().submissionRefusalDegrades, qint64(0));
 }
 
 QTEST_GUILESS_MAIN(TestGpuBudget)

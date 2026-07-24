@@ -20,12 +20,18 @@ void TestGpuDeviceLostResume::rebuildResumesUnderBumpedGeneration() {
     preLoss.metadata().gpuGeneration = mintedGeneration;
     QVERIFY(!preLoss.isStaleForGeneration(GpuGenerationCounter::instance().current()));
 
-    monitor.recordLoss();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
+    const uint64_t lossGeneration = monitor.recordLoss();
     QVERIFY(monitor.isLost());
     QVERIFY(preLoss.isStaleForGeneration(GpuGenerationCounter::instance().current()));
 
-    monitor.clearForRebuild();
+    QVERIFY(monitor.acknowledgeRecoveryCleanup(participant, lossGeneration));
+    const GpuRecoveryTicket ticket = monitor.beginRebuild(participant);
+    QVERIFY(ticket.isValid());
+    QVERIFY(monitor.clearForRebuild(ticket));
     QVERIFY(!monitor.isLost());
+    QVERIFY(monitor.unregisterRecoveryParticipant(participant).has_value());
     const uint64_t resumeGeneration = GpuGenerationCounter::instance().current();
     FrameHandle postRebuild = solidYuv420pHandle(16, 16, 16, 128, 128);
     postRebuild.metadata().gpuGeneration = resumeGeneration;

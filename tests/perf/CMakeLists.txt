@@ -1,3 +1,16 @@
+if(OLR_GPU_PIPELINE)
+    qt_add_executable(tst_gpuretireregistry_perf tst_gpuretireregistry_perf.cpp)
+    target_compile_definitions(tst_gpuretireregistry_perf
+        PRIVATE OLR_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_link_libraries(tst_gpuretireregistry_perf
+        PRIVATE Qt6::Test olr_test_gpu olr_warnings olr_sanitize)
+    add_test(NAME tst_gpuretireregistry_perf COMMAND tst_gpuretireregistry_perf)
+    set_tests_properties(tst_gpuretireregistry_perf PROPERTIES LABELS "perf;gpu")
+
+    get_property(_olr_perf_tests DIRECTORY PROPERTY TESTS)
+    olr_apply_windows_test_runtime(${_olr_perf_tests})
+endif()
+
 qt_add_executable(tst_transportcommit_perf tst_transportcommit_perf.cpp)
 target_link_libraries(tst_transportcommit_perf PRIVATE
     Qt6::Test olr_test_playback olr_warnings olr_sanitize)

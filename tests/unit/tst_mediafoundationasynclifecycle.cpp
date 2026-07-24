@@ -12,6 +12,8 @@ private slots:
     void finalizeDrainsOutputToCompletion();
     void finalizeStopsOnMessageFailure();
     void finalizeReportsEventFailureAndTimeout();
+    void shutdownPollsUntilCompleted();
+    void incompleteShutdownRetainsResources();
 };
 
 void TestMediaFoundationAsyncLifecycle::abortFlushesAndShutsDownWithoutDrain() {
@@ -136,6 +138,66 @@ void TestMediaFoundationAsyncLifecycle::finalizeReportsEventFailureAndTimeout() 
                  [] { return true; }, 3),
              MfAsyncFinalizeResult::TimedOut);
     QCOMPARE(boundedPolls, 3);
+}
+
+void TestMediaFoundationAsyncLifecycle::shutdownPollsUntilCompleted() {
+    int shutdownCalls = 0;
+    int statusPolls = 0;
+    int waits = 0;
+
+    const MfAsyncShutdownResult result = completeMfAsyncShutdown(
+        [&] {
+            ++shutdownCalls;
+            return true;
+        },
+        [&] {
+            ++statusPolls;
+            return statusPolls < 3 ? MfAsyncShutdownStatus::Initiated
+                                   : MfAsyncShutdownStatus::Completed;
+        },
+        [] { return false; }, [&] { ++waits; });
+
+    QCOMPARE(result, MfAsyncShutdownResult::Complete);
+    QCOMPARE(shutdownCalls, 1);
+    QCOMPARE(statusPolls, 3);
+    QCOMPARE(waits, 2);
+    QCOMPARE(mfAsyncResourceDisposition(result), MfAsyncResourceDisposition::Release);
+}
+
+void TestMediaFoundationAsyncLifecycle::incompleteShutdownRetainsResources() {
+    int statusPolls = 0;
+    const MfAsyncShutdownResult timedOut =
+        completeMfAsyncShutdown([] { return true; },
+                                [&] {
+                                    ++statusPolls;
+                                    return MfAsyncShutdownStatus::Initiated;
+                                },
+                                [&] { return statusPolls == 3; }, [] {});
+
+    QCOMPARE(timedOut, MfAsyncShutdownResult::TimedOut);
+    QCOMPARE(statusPolls, 3);
+    QCOMPARE(mfAsyncResourceDisposition(timedOut), MfAsyncResourceDisposition::Retain);
+    int retainedResources = 0;
+    retainMfAsyncResourcesIfIncomplete(
+        timedOut, [&] { ++retainedResources; }, [&] { ++retainedResources; },
+        [&] { ++retainedResources; }, [&] { ++retainedResources; });
+    QCOMPARE(retainedResources, 4);
+
+    const MfAsyncShutdownResult statusFailed =
+        completeMfAsyncShutdown([] { return true; }, [] { return MfAsyncShutdownStatus::Failed; },
+                                [] { return false; }, [] {});
+    QCOMPARE(statusFailed, MfAsyncShutdownResult::StatusFailed);
+    QCOMPARE(mfAsyncResourceDisposition(statusFailed), MfAsyncResourceDisposition::Retain);
+
+    const MfAsyncShutdownResult shutdownFailed = completeMfAsyncShutdown(
+        [] { return false; }, [] { return MfAsyncShutdownStatus::Completed; }, [] { return false; },
+        [] {});
+    QCOMPARE(shutdownFailed, MfAsyncShutdownResult::ShutdownFailed);
+    QCOMPARE(mfAsyncResourceDisposition(shutdownFailed), MfAsyncResourceDisposition::Retain);
+
+    retainMfAsyncResourcesIfIncomplete(MfAsyncShutdownResult::Complete,
+                                       [&] { ++retainedResources; });
+    QCOMPARE(retainedResources, 4);
 }
 
 QTEST_GUILESS_MAIN(TestMediaFoundationAsyncLifecycle)

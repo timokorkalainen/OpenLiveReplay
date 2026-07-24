@@ -43,6 +43,14 @@ public:
                     EvictedVideoFrames* evictedFrames = nullptr);
     void clear(EvictedVideoFrames* evictedFrames = nullptr);
 
+    // Allocation-free inspection used only by bounded teardown recovery.
+    template <typename Visitor>
+    void forEachVideoFrame(Visitor&& visitor) const {
+        for (const QVector<FrameHandle>& feed : m_video)
+            for (const FrameHandle& frame : feed)
+                visitor(frame);
+    }
+
 private:
     QVector<QVector<FrameHandle>> m_video;
     QVector<QVector<MediaAudioFrame>> m_audio;
