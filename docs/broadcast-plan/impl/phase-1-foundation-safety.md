@@ -168,6 +168,24 @@
 - Scope-enable -Werror on Windows with '-Wno-error=null-dereference' (isolate the Qt qhash.h generated-loader false positive noted at ci.yml:487-489) so first-party warnings gate
 - Investigate running tst_nativevideodecoder via WARP/software MFT instead of skipping it (ci.yml:521-527)
 
+### `rel-gpu-surface-lifetime` — Type-enforced GPU surface lifetime + device-loss recovery with driver-authoritative provenance
+**Size:** L  ·  **Dependencies:** none
+
+**Test-first steps**
+1. RED — add the failing negative-compile tests named by the acceptance criteria: direct `GpuSurface::nativeHandle()` access, `GpuSyncReadScope::read()`/`complete()` outside `withRead()`, and a no-wait free without a `DeadDeviceToken` must each fail to compile with the expected diagnostic, paired with a `_pass` control that must still compile.
+2. RED — add the retirement mutation lane (`gpu_retirement_mutation_*`) so a quarantined retirement that is never reclaimed on a live device is caught.
+3. GREEN — make the raw native handle reachable only through a lease whose scope discharges the retirement obligation, and gate the no-wait free on driver-authoritative device-removed provenance.
+4. REFACTOR + commit (one logical commit per slice; keep the diff inside the declared Files list).
+
+**Files (verified at plan time)**
+- Lifetime core in `playback/gpu/`: the handle/lease/scope types (`gpusurface.h`, `gpusurfacelease.h`, `gpusubmission.h`, `gpuopscope.{h,cpp}`), the retirement machinery (`gpuretireregistry.*`, `gpuframeretirequeue.*`, `gpureadbackretainer.*`), and device-loss recovery (`gpudevicelossmonitor.*`, `gpurecoverycoordinator.*`).
+- Backend adapters behind those types: `gpurhicontext*` and `gpufence*` (Apple/Windows/stub), `gpusurfaceallocator.*`, `gpubudget.*`, `gpucompositor*`, `gpuframedata.*`, `applegpusurface_apple.mm`, `appleiosurface.h`, `vtkeepsurfaceimporter_apple.mm`.
+- Windows D3D11 backing and the import edge: `playback/output/win/d3d11gpusurface.*` and `wingpuimportedge*`.
+- Consumers migrated onto the lease API: `playback/output/` (`asyncgpureadbacksink.cpp`, `framehandle.*`, `outputbusengine.cpp`, `outputframecache.h`, `outputruntime.*`, `iotargets/decklinksink.cpp`) and `playback/playbackworker.*`.
+- Encode/ingest edges that hand surfaces across a device boundary: `recorder_engine/codec/` (`gpuencodepump.*`, `mediafoundationasynclifecycle.h`, the MediaFoundation/VideoToolbox encoders) and `recorder_engine/ingest/` (`ingestsession.h`, `nativevideodecoder*`, the native RTMP/SRT sessions) plus `recorder_engine/streamworker.*`.
+- Enforcement tests: `tests/gpu/negcompile/**` (the failing-diagnostic cases and their compiling `_pass` controls, driven by `run_compile_control.cmake`), `tests/gpu/gpu_lease_release_probe.cpp`, `tests/gpu/gpusyncreadscopetestauthority.h`, `tests/mutations/gpu_retirement_mutations.cmake`, the `tests/unit/tst_gpu*` suites and their device-loss siblings, and `tests/perf/tst_gpuretireregistry_perf.cpp`.
+- Build/CI wiring and docs: root `CMakeLists.txt`, `tests/CMakeLists.txt` and the `tests/*/CMakeLists.txt` it adds, the Windows test-runtime helpers under `tests/cmake/`, `AGENTS.md`, `docs/build-and-run.md`, `docs/hardest-technical-challenges.md`, and the GPU-lifetime plan/spec docs under `docs/superpowers/`.
+
 ### `rel-output-autorecover` — Output device-loss auto-recovery state machine (closes outputdispatcher.cpp:251)
 **Size:** M  ·  **Dependencies:** `rel-telemetry-bus`
 

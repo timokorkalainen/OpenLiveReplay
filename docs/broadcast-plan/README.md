@@ -126,6 +126,7 @@ in a phase file (the audit enforces the bijection). Statuses live in
 | `qe-flake-observability` | 1 | S | Flake detection, JUnit ingestion, quarantine |
 | `qe-qml-lint-format-full` | 1 | S | Lint and format all 32/33 QML files; enforce qmlformat |
 | `qe-windows-ctest-lane` | 1 | M | Promote Windows from build-only to a real unit + native-ingest e2e test lane; wire iOS into CI |
+| `rel-gpu-surface-lifetime` | 1 | L | Type-enforced GPU surface lifetime + device-loss recovery with driver-authoritative provenance |
 | `rel-output-autorecover` | 1 | M | Output device-loss auto-recovery state machine (closes outputdispatcher.cpp:251) |
 | `rel-telemetry-bus` | 1 | M | Structured ops telemetry bus + loopback-only /healthz + /metrics + rotating log |
 | `sec-amf0-extract-fuzz` | 1 | M | Extract the AMF0 scanner to a pure module and fuzz it; add AAC/ADTS and control-JSON fuzz targets |
@@ -231,7 +232,7 @@ user-visible improvement.
 
 | # | Phase | Initiatives | Plan |
 |---|-------|:-----------:|------|
-| 1 | [Foundation & Safety](./phase-1-foundation-safety.md) | 22 | [impl](./impl/phase-1-foundation-safety.md) |
+| 1 | [Foundation & Safety](./phase-1-foundation-safety.md) | 23 | [impl](./impl/phase-1-foundation-safety.md) |
 | 2 | [Extensible Core & Real-Time Backbone](./phase-2-extensible-core.md) | 18 | [impl](./impl/phase-2-extensible-core.md) |
 | 3 | [Pristine Image & Slow-Motion Chain](./phase-3-image-chain.md) | 17 | [impl](./impl/phase-3-image-chain.md) |
 | 4 | [LSM-Class Operator Experience & Control-Room UX](./phase-4-operator-ux.md) | 27 | [impl](./impl/phase-4-operator-ux.md) |
