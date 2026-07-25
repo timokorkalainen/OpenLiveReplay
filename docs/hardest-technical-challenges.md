@@ -11,7 +11,7 @@ faith.
 |---|-----------|-------------|--------|
 | 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Bounded interleaving model + source/compiled mutation gates + blocked-sink latency gate | **Gated: fixed protocol holds over 523 states aggregated across 11 scenario graphs; all 10 model mutations refute; compiled reset-removal control is killed** |
 | 2 | Rate-agnostic timecode alignment with a proven phase-error bound | Falsifier + exact-rational bound sweep + drop-in C++ module | **Ran: shipped code RED (−5000 ms on aligned cameras); replacement 0 violations / 3,969 cells, zero slack** |
-| 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + contained real-TDR worker-recovery lane | **Implemented: handle gate, epoch-bound loss authority, real fence/TDR evidence, production worker recovery** |
+| 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + contained real-TDR worker-recovery lane | **Implemented: handle gate + epoch-bound loss authority + production worker recovery, compile-fail falsifiability (mutation b); real-TDR evidence *tooling* ships but the destructive lane is unprovisioned and mutation (a) is deferred (no ASan/debug-layer)** |
 
 ---
 
@@ -663,8 +663,18 @@ WARP/Null, mirroring the QSKIP-on-no-RHI pattern at
    - *(a)* route the injected-loss overload to `abandonAllNoWait` (bypassing
      the token) → on a **live** device the abandoned surfaces are still
      GPU-referenced; the debug layer + ASan flag the use-after-free.
+     **Status: not implemented.** As shipped, `abandonAllNoWait` takes a
+     `GpuValidatedDeadDomains` that only the monitor can construct, so the
+     bypass is not authorable as a runtime mutation — the type system precludes
+     it rather than a test catching it. Separately, the destructive child
+     creates its device without `D3D11_CREATE_DEVICE_DEBUG` and the workflow
+     builds `RelWithDebInfo` with no ASan, so even a hand-forced live-device
+     UAF would go uninstrumented. This half of falsifiability is deferred until
+     a debug-layer/ASan destructive lane exists on a provisioned runner.
    - *(b)* delete the lease at one migrated op site → **fails to compile**
      (the negative-compile test in CI demonstrates the same for new sites).
+     **Status: implemented** — the diagnostic-checked negative-compile controls
+     in the lifetime PR are the realized form of this mutation.
 
 ### How to apply
 
