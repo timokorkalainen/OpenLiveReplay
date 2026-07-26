@@ -1,5 +1,13 @@
 # Independent merge-readiness review — Challenge 3 GPU surface-lifetime salvage
 
+> **Update (2026-07-27): the fault lane (175b) was descoped by maintainer decision.**
+> Testing catastrophic GPU faults (a destructive real-TDR run) is out of scope for
+> this iteration, so `feat/gpu-fault-lane` is dropped and the `WinGpuFaultWorkerOracle`
+> production friend hook removed from `playbackworker.h`. The scorecard rows below for
+> the fault lane / mutation (a) / real-TDR evidence therefore read as **descoped**, not
+> merely deferred. No production capability is affected: device-loss recovery ships in
+> 175a and runs on real device loss. The review of 175a stands unchanged.
+
 **Date:** 2026-07-25
 **Reviewed:** `feat/gpu-lifetime-recovery` @ `ec6cbe30` (175a) + `feat/gpu-fault-lane` @ `a3100e02` (175b),
 the by-path re-cut of the closed PR #175, stacked on the unchanged #173/#174.

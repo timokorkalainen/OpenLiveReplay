@@ -11,7 +11,7 @@ faith.
 |---|-----------|-------------|--------|
 | 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Bounded interleaving model + source/compiled mutation gates + blocked-sink latency gate | **Gated: fixed protocol holds over 523 states aggregated across 11 scenario graphs; all 10 model mutations refute; compiled reset-removal control is killed** |
 | 2 | Rate-agnostic timecode alignment with a proven phase-error bound | Falsifier + exact-rational bound sweep + drop-in C++ module | **Ran: shipped code RED (−5000 ms on aligned cameras); replacement 0 violations / 3,969 cells, zero slack** |
-| 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + contained real-TDR worker-recovery lane | **Implemented: handle gate + epoch-bound loss authority + production worker recovery, compile-fail falsifiability (mutation b); real-TDR evidence *tooling* ships but the destructive lane is unprovisioned and mutation (a) is deferred (no ASan/debug-layer)** |
+| 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + production device-loss recovery | **Part 1 complete: handle gate + epoch-bound loss authority + production worker recovery + compile-fail falsifiability (mutation b). Part 2 (destructive real-TDR fault harness) descoped by maintainer decision — testing catastrophic GPU faults is out of scope for this iteration; the production recovery path ships and runs on real device loss, but it is not exercised by a destructive lane** |
 
 ---
 
@@ -627,6 +627,18 @@ reachable only with driver-authoritative provenance — while keeping the token
 itself unforgeable and unexported. No fence wait is added to the real path.
 
 ### Solution part 2 — real-backend fault harness (falsifiability)
+
+> **Status: descoped (not delivered).** Testing catastrophic GPU faults — a real
+> driver TDR / device removal — was ruled out of scope for this iteration by the
+> maintainer. The design below is retained as the intended approach should that
+> change, but no destructive fault lane ships. Note this descopes only the
+> *falsifiability harness*, not the recovery itself: the production device-loss
+> recovery path (Part 1's token/epoch machinery, quarantine reclamation, and the
+> worker recovery orchestration) ships and runs on genuine device loss; it is
+> simply not exercised by a destructive test lane. Mutation (b) — the
+> compile-fail falsifier — is delivered via the negative-compile controls;
+> mutation (a) would require an ASan/debug-layer destructive build on a
+> provisioned real-GPU runner, which is the deferred work.
 
 Opt-in Windows CI lane (`OLR_GPU_FAULT_LANE=1`, mirroring the
 `OLR_PREPUSH_FULL` / `SKIP_*` convention; `SKIP` cleanly when the adapter is
