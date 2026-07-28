@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/win/d3d11gpusurface.h"
 #include "playback/output/win/d3dfence.h"
 #include "recorder_engine/ingest/nativeframecopy.h"
@@ -169,7 +170,10 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
     QCOMPARE(int(surface->desc().format), int(FramePixelFormat::Nv12));
     QCOMPARE(surface->desc().width, 1280);
     QCOMPARE(surface->desc().height, 720);
-    QCOMPARE(surface->nativeHandle(), static_cast<void*>(texture.Get()));
+    GpuSyncReadScope scope;
+    auto lease = scope.read(surface);
+    QCOMPARE(lease.nativeHandle(), static_cast<void*>(texture.Get()));
+    scope.complete();
 
     surface->retainUntilFenceRetired(5);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(5));

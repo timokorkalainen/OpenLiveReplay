@@ -27,7 +27,6 @@ public:
                               qint64(m_width) * qint64(m_height) * 3 / 2};
     }
     bool isValid() const override { return m_texture != nullptr; }
-    void* nativeHandle() const override { return m_texture.Get(); }
 
     ID3D11Texture2D* texture() const { return m_texture.Get(); }
     UINT subresource() const { return m_subresource; }
@@ -39,6 +38,11 @@ public:
     }
 
     static void setForceAllocFailureForTest(bool force);
+
+protected:
+    // Lease-gated, mirroring the base (gpusurface.h). Kept protected on the
+    // derived type too so a D3D11GpuSurface* cannot re-widen handle access.
+    void* nativeHandle() const override { return m_texture.Get(); }
 
 private:
     D3D11GpuSurface() = default;

@@ -297,16 +297,17 @@ else()
             "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/win/d3d11gpusurface.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
-        if(NOT OLR_GPU_PIPELINE)
-            target_sources(olr_test_playback PRIVATE
-                "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp")
-        endif()
         target_link_libraries(olr_test_playback
             PRIVATE mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32)
     else()
         target_sources(olr_test_playback PRIVATE
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp")
     endif()
+endif()
+
+if(NOT OLR_GPU_PIPELINE)
+    target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp")
 endif()
 
 if(OLR_GPU_PIPELINE)

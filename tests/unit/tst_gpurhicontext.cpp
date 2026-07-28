@@ -5,6 +5,7 @@
 
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/framepixelformat.h"
 #ifdef __APPLE__
 #include "playback/gpu/appleiosurface.h"
@@ -56,13 +57,19 @@ std::shared_ptr<GpuRhiContext> testContext() {
 #ifdef __APPLE__
 bool fillRgbaSurfaceBgra(const std::shared_ptr<GpuSurface>& surface) {
     if (!surface) return false;
-    auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
-    if (!ioSurface) return false;
+    GpuSyncReadScope scope;
+    auto lease = scope.read(surface);
+    auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
+    if (!ioSurface) {
+        scope.complete();
+        return false;
+    }
 
     CVPixelBufferRef pb = nullptr;
-    if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb) !=
-            kCVReturnSuccess ||
-        !pb) {
+    const CVReturn rc =
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb);
+    scope.complete();
+    if (rc != kCVReturnSuccess || !pb) {
         return false;
     }
 
@@ -89,13 +96,19 @@ bool fillRgbaSurfaceBgra(const std::shared_ptr<GpuSurface>& surface) {
 
 bool fillNv12Surface(const std::shared_ptr<GpuSurface>& surface) {
     if (!surface) return false;
-    auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
-    if (!ioSurface) return false;
+    GpuSyncReadScope scope;
+    auto lease = scope.read(surface);
+    auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
+    if (!ioSurface) {
+        scope.complete();
+        return false;
+    }
 
     CVPixelBufferRef pb = nullptr;
-    if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb) !=
-            kCVReturnSuccess ||
-        !pb) {
+    const CVReturn rc =
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb);
+    scope.complete();
+    if (rc != kCVReturnSuccess || !pb) {
         return false;
     }
 

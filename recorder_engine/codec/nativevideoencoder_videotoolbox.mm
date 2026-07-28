@@ -2,6 +2,7 @@
 #include "recorder_engine/codec/avcc.h"
 #include "recorder_engine/codec/colorvui.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 
 #ifdef __APPLE__
 
@@ -422,19 +423,27 @@ public:
             if (error) *error = QStringLiteral("encodeSurface: null/invalid surface");
             return false;
         }
-        auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+        // Synchronous handle access via the header-only lease (this TU does not link
+        // playback/gpu): the submit below hands VideoToolbox its own retained
+        // CVPixelBuffer, so the IOSurface backing outlives this call independently.
+        GpuSyncReadScope readScope;
+        const GpuReadLease lease = readScope.read(surface);
+        auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
         if (!ioSurface) {
+            readScope.complete();
             if (error) *error = QStringLiteral("encodeSurface: surface is not IOSurface-backed");
             return false;
         }
         const GpuSurfaceDesc desc = surface->desc();
         if (desc.format != FramePixelFormat::Nv12) {
+            readScope.complete();
             if (error) *error = QStringLiteral("encodeSurface: expected NV12 surface");
             return false;
         }
         if (desc.width > 0 && desc.height > 0 &&
             (desc.width != int(IOSurfaceGetWidth(ioSurface)) ||
              desc.height != int(IOSurfaceGetHeight(ioSurface)))) {
+            readScope.complete();
             if (error) *error = QStringLiteral("encodeSurface: descriptor/native size mismatch");
             return false;
         }
@@ -443,6 +452,7 @@ public:
         const CVReturn rc =
             CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb);
         if (rc != kCVReturnSuccess || !pb) {
+            readScope.complete();
             if (error) {
                 *error = QStringLiteral("CVPixelBufferCreateWithIOSurface failed (%1)").arg(rc);
             }
@@ -451,6 +461,7 @@ public:
         attachColorMetadata(pb, vuiColorCodePointsFor(color));
         const bool ok = encodePixelBuffer(pb, ptsTicks, onPacket, error);
         CVPixelBufferRelease(pb);
+        readScope.complete();
         return ok;
     }
 

@@ -3,6 +3,7 @@
 #ifdef __APPLE__
 
 #include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/formatcanon.h"
 
 #include <CoreVideo/CoreVideo.h>
@@ -182,10 +183,6 @@ public:
 
     bool isValid() const override { return m_pixelBuffer != nullptr && nativeHandle() != nullptr; }
 
-    void* nativeHandle() const override {
-        return m_pixelBuffer ? CVPixelBufferGetIOSurface(m_pixelBuffer) : nullptr;
-    }
-
     void retainUntilFenceRetired(uint64_t fenceValue) override {
         uint64_t previous = m_pendingFence.load(std::memory_order_acquire);
         while (fenceValue > previous && !m_pendingFence.compare_exchange_weak(
@@ -195,6 +192,13 @@ public:
 
     uint64_t pendingFenceValue() const override {
         return m_pendingFence.load(std::memory_order_acquire);
+    }
+
+protected:
+    // Lease-gated, mirroring the base (gpusurface.h). Kept protected on the
+    // derived type too so an AppleGpuSurface* cannot re-widen handle access.
+    void* nativeHandle() const override {
+        return m_pixelBuffer ? CVPixelBufferGetIOSurface(m_pixelBuffer) : nullptr;
     }
 
 private:
@@ -276,13 +280,21 @@ CpuPlanes readAppleSurfaceToCpu(const std::shared_ptr<GpuSurface>& surface, Fram
                                 ColorMetadata color) {
     if (!surface || !surface->isValid()) return CpuPlanes{};
     const GpuSurfaceDesc desc = surface->desc();
-    auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
-    if (!ioSurface) return CpuPlanes{};
+    // Synchronous handle access: the CPU download below completes before we return,
+    // and the IOSurface is kept alive by the CVPixelBuffer wrapper for its duration.
+    GpuSyncReadScope readScope;
+    const GpuReadLease lease = readScope.read(surface);
+    auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
+    if (!ioSurface) {
+        readScope.complete();
+        return CpuPlanes{};
+    }
 
     CVPixelBufferRef pb = nullptr;
     if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb) !=
             kCVReturnSuccess ||
         !pb) {
+        readScope.complete();
         return CpuPlanes{};
     }
 
@@ -306,6 +318,7 @@ CpuPlanes readAppleSurfaceToCpu(const std::shared_ptr<GpuSurface>& surface, Fram
     }
 
     CVPixelBufferRelease(pb);
+    readScope.complete();
     return result;
 }
 
