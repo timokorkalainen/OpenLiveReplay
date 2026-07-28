@@ -29,13 +29,36 @@ uint64_t GpuDeviceLossMonitor::recordLoss() {
     return generation;
 }
 
-void GpuDeviceLossMonitor::markRealDeviceLoss(const DeadDeviceToken& token) {
+uint64_t GpuDeviceLossMonitor::captureDeviceAuthorityEpoch() const {
     std::lock_guard<std::mutex> lock(m_epochMutex);
-    if (!m_lost.load(std::memory_order_acquire) ||
-        token.observedGeneration() != m_lossGeneration.load(std::memory_order_acquire)) {
-        return;
+    return m_deviceAuthorityEpoch;
+}
+
+uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance provenance,
+                                                     uint64_t deviceAuthorityEpoch) {
+    std::lock_guard<std::mutex> lock(m_epochMutex);
+    if (deviceAuthorityEpoch != m_deviceAuthorityEpoch) return 0;
+    if (m_lost.load(std::memory_order_acquire)) {
+        const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
+        if (m_realLossToken.has_value()) return generation;
+        m_realLossToken = DeadDeviceToken(provenance, generation);
+        return generation;
     }
-    if (!m_realLossToken.has_value()) m_realLossToken = token; // first writer wins in-epoch
+
+    const uint64_t generation = GpuGenerationCounter::instance().bump();
+    m_lossGeneration.store(generation, std::memory_order_release);
+    m_realLossToken = DeadDeviceToken(provenance, generation);
+    m_lossCount.fetch_add(1, std::memory_order_acq_rel);
+    m_undrained.fetch_add(1, std::memory_order_acq_rel);
+    m_lost.store(true, std::memory_order_release);
+    return generation;
+}
+
+uint64_t GpuDeviceLossMonitor::recordSubmissionFailure() {
+    // Submission/fence failure requires a rebuild, but is not proof that the
+    // driver declared the device dead. Keep this epoch tokenless so recovery
+    // uses bounded waits rather than the no-wait dead-device release path.
+    return recordLoss();
 }
 
 std::optional<DeadDeviceToken> GpuDeviceLossMonitor::realLossToken() const {
@@ -52,8 +75,18 @@ bool GpuDeviceLossMonitor::consumeLossEvent() {
     return pending > 0;
 }
 
+void GpuDeviceLossMonitor::beginRebuild() {
+    std::lock_guard<std::mutex> lock(m_epochMutex);
+    if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
+    m_rebuildInProgress = true;
+}
+
 void GpuDeviceLossMonitor::clearForRebuild() {
     std::lock_guard<std::mutex> lock(m_epochMutex);
+    // Preserve compatibility with direct clear callers while allowing production
+    // rebuilds to mint replacement-device authority between begin and commit.
+    if (!m_rebuildInProgress && ++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
+    m_rebuildInProgress = false;
     m_lost.store(false, std::memory_order_release);
     m_lossGeneration.store(0, std::memory_order_release);
     m_realLossToken.reset();
@@ -61,6 +94,8 @@ void GpuDeviceLossMonitor::clearForRebuild() {
 
 void GpuDeviceLossMonitor::reset() {
     std::lock_guard<std::mutex> lock(m_epochMutex);
+    if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
+    m_rebuildInProgress = false;
     m_lost.store(false, std::memory_order_release);
     m_lossCount.store(0, std::memory_order_release);
     m_undrained.store(0, std::memory_order_release);

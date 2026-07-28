@@ -8,6 +8,20 @@
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpugeneration.h"
 
+#include <thread>
+
+#ifdef OLR_UNIT_TEST
+struct GpuDeviceLossMonitorTestAuthority {
+    static uint64_t capture() {
+        return GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
+    }
+    static uint64_t publish(uint64_t deviceAuthorityEpoch = capture()) {
+        return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
+    }
+};
+#endif
+
 class TestDeviceLossMonitor : public QObject {
     Q_OBJECT
 private slots:
@@ -15,8 +29,11 @@ private slots:
     void recordLossIsIdempotentUntilRebuildClearsLatch();
     void consumeLossEventDrainsWithoutClearingLatch();
     void clearForRebuildClearsLatchKeepsGeneration();
-    void delayedRealLossMarkCannotCrossEpochBoundary();
-    void realLossMarkRejectsMismatchedGeneration();
+    void tokenlessLossUpgradesFromSameDeviceProof();
+    void tokenlessLossStaysTokenlessWithoutDriverProof();
+    void realLossPublicationIsAtomicWithEpoch();
+    void stalePublicationAfterClearIsRejected();
+    void rebuildAuthorityRejectsOldDeviceAcceptsReplacement();
     void resetReturnsToPristine();
 };
 
@@ -73,57 +90,76 @@ void TestDeviceLossMonitor::clearForRebuildClearsLatchKeepsGeneration() {
              genAfterLoss); // dead surfaces stay stale
 }
 
-void TestDeviceLossMonitor::delayedRealLossMarkCannotCrossEpochBoundary() {
-#if defined(_WIN32) || defined(__APPLE__)
+void TestDeviceLossMonitor::tokenlessLossUpgradesFromSameDeviceProof() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
-    const uint64_t generation = m.recordLoss();
-#ifdef _WIN32
-    const DeadDeviceToken token = mintDeadDeviceTokenFromDxgi(-1, generation);
-#else
-    const DeadDeviceToken token = mintDeadDeviceTokenFromFrameOp(generation);
-#endif
-
-    m.clearForRebuild();
-    m.markRealDeviceLoss(token);
-
-    QVERIFY(!m.isLost());
+    GpuGenerationCounter::instance().resetForTest();
+    const uint64_t deviceAuthorityEpoch = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t lossGeneration = m.recordSubmissionFailure();
     QVERIFY(!m.realLossToken().has_value());
 
-    const uint64_t resetGeneration = m.recordLoss();
-#ifdef _WIN32
-    const DeadDeviceToken resetToken = mintDeadDeviceTokenFromDxgi(-1, resetGeneration);
-#else
-    const DeadDeviceToken resetToken = mintDeadDeviceTokenFromFrameOp(resetGeneration);
-#endif
-    m.reset();
-    m.markRealDeviceLoss(resetToken);
-
-    QVERIFY(!m.isLost());
-    QVERIFY(!m.realLossToken().has_value());
-#else
-    QSKIP("driver-authoritative token mints are backend-local");
-#endif
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(deviceAuthorityEpoch), lossGeneration);
+    const auto token = m.realLossToken();
+    QVERIFY(token.has_value());
+    QCOMPARE(token->observedGeneration(), lossGeneration);
+    QCOMPARE(m.lossCount(), uint64_t(1));
 }
 
-void TestDeviceLossMonitor::realLossMarkRejectsMismatchedGeneration() {
-#if defined(_WIN32) || defined(__APPLE__)
+void TestDeviceLossMonitor::tokenlessLossStaysTokenlessWithoutDriverProof() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
-    const uint64_t generation = m.recordLoss();
-#ifdef _WIN32
-    const DeadDeviceToken token = mintDeadDeviceTokenFromDxgi(-1, generation + 1);
-#else
-    const DeadDeviceToken token = mintDeadDeviceTokenFromFrameOp(generation + 1);
-#endif
-
-    m.markRealDeviceLoss(token);
-
-    QVERIFY(m.isLost());
+    m.recordLoss();
     QVERIFY(!m.realLossToken().has_value());
-#else
-    QSKIP("driver-authoritative token mints are backend-local");
-#endif
+
+    m.clearForRebuild();
+    QVERIFY(!m.isLost());
+    QVERIFY(!m.realLossToken().has_value());
+
+    m.recordLoss();
+    QVERIFY(!m.realLossToken().has_value());
+    m.reset();
+    QVERIFY(!m.isLost());
+    QVERIFY(!m.realLossToken().has_value());
+}
+
+void TestDeviceLossMonitor::realLossPublicationIsAtomicWithEpoch() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish();
+
+    QVERIFY(monitor.isLost());
+    const auto token = monitor.realLossToken();
+    QVERIFY(token.has_value());
+    QCOMPARE(token->observedGeneration(), generation);
+}
+
+void TestDeviceLossMonitor::stalePublicationAfterClearIsRejected() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    const uint64_t oldDeviceAuthorityEpoch = GpuDeviceLossMonitorTestAuthority::capture();
+    monitor.recordLoss();
+    monitor.clearForRebuild();
+
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(oldDeviceAuthorityEpoch), uint64_t(0));
+    QVERIFY(!monitor.isLost());
+    QVERIFY(!monitor.realLossToken().has_value());
+}
+
+void TestDeviceLossMonitor::rebuildAuthorityRejectsOldDeviceAcceptsReplacement() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t oldAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    monitor.recordLoss();
+
+    monitor.beginRebuild();
+    const uint64_t replacementAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    QVERIFY(replacementAuthority != oldAuthority);
+    monitor.clearForRebuild();
+
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(oldAuthority), uint64_t(0));
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(replacementAuthority) != 0);
+    QVERIFY(monitor.realLossToken().has_value());
 }
 
 void TestDeviceLossMonitor::resetReturnsToPristine() {

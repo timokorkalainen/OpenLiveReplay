@@ -4,6 +4,7 @@
 
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpusurfacelease.h"
 
 #include <QList>
@@ -29,11 +30,6 @@ using Microsoft::WRL::ComPtr;
 // anonymous-namespace copy would be a different, non-friend function. Reached only
 // from the driver-authoritative GetDeviceRemovedReason() failure branch below, so no
 // other TU can construct a DeadDeviceToken from Windows.
-DeadDeviceToken mintDeadDeviceTokenFromDxgi(long failedHr, uint64_t gen) {
-    (void) failedHr; // provenance is the guarantee; the specific HRESULT is diagnostic
-    return DeadDeviceToken(DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, gen);
-}
-
 namespace {
 
 enum class D3DDeviceKind { Hardware, Warp };
@@ -156,6 +152,7 @@ public:
 
     D3DRenderThread thread;
     bool valid = false;
+    uint64_t deviceAuthorityEpoch = 0;
     std::atomic<bool> deviceLost{false};
 };
 
@@ -169,6 +166,7 @@ GpuRhiContext::~GpuRhiContext() {
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
     auto impl = std::make_unique<Impl>(D3DDeviceKind::Hardware);
+    impl->deviceAuthorityEpoch = GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
     impl->thread.start();
     impl->valid = impl->thread.waitReady();
     if (!impl->valid) {
@@ -185,6 +183,7 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createNullForTest() {
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::createWarpForTest() {
     auto impl = std::make_unique<Impl>(D3DDeviceKind::Warp);
+    impl->deviceAuthorityEpoch = GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
     impl->thread.start();
     impl->valid = impl->thread.waitReady();
     if (!impl->valid) {
@@ -240,6 +239,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
         return CpuPlanes{};
     }
 
+    const uint64_t deviceAuthorityEpoch = m_impl->deviceAuthorityEpoch;
     {
         const bool invoked = m_impl->thread.invoke([&] {
             QRhi* rhi = m_impl->thread.rhi;
@@ -251,13 +251,12 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
             const HRESULT removedReason = device ? device->GetDeviceRemovedReason() : HRESULT(S_OK);
             if (device && FAILED(removedReason)) {
                 // LOCK RULE: D3D11 removed-device polling touches no m_bufferMutex.
-                m_impl->deviceLost.store(true, std::memory_order_release);
                 // Driver-authoritative loss: mint the provenance-bound token and hand
                 // it to the loss latch so the worker's recovery can free held surfaces
                 // WITHOUT waiting on the (now dead) fences.
-                const uint64_t gen = GpuDeviceLossMonitor::instance().recordLoss();
-                GpuDeviceLossMonitor::instance().markRealDeviceLoss(
-                    mintDeadDeviceTokenFromDxgi(static_cast<long>(removedReason), gen));
+                GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                    DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
+                m_impl->deviceLost.store(true, std::memory_order_release);
             }
         });
         (void) invoked;

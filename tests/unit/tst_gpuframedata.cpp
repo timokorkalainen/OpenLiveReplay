@@ -5,7 +5,7 @@
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpuframeretirequeue.h"
-#include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
@@ -102,20 +102,20 @@ void TestGpuFrameData::gpuBackedReportsSurface() {
 }
 
 void TestGpuFrameData::completedReadbackRetainReleasesImmediately() {
-    gpuDrainCompletedReadbackRetains();
+    GpuRetireRegistry{}.drainCompleted();
 
     auto fence = std::make_shared<DeferredFence>();
     fence->complete(1);
     auto surface = std::make_shared<TestSurface>();
     std::weak_ptr<GpuSurface> weakSurface = surface;
 
-    gpuRetainSurfaceUntilFenceRetired(surface, fence, 1);
+    GpuRetireRegistry{}.registerRetire(surface, fence, 1);
     surface.reset();
 
     QVERIFY2(weakSurface.expired(),
              "already-completed readback fences must not leave a surface retained until a later "
              "opportunistic drain");
-    QCOMPARE(gpuPendingReadbackRetainCount(), qsizetype(0));
+    QCOMPARE(GpuRetireRegistry{}.pendingRetainCount(), qsizetype(0));
 }
 
 void TestGpuFrameData::waitForPendingFenceUsesProducerFence() {
@@ -402,10 +402,10 @@ void TestGpuFrameData::readbackRetainsSurfaceWhenEvictionSawNoPendingFence() {
     QVERIFY(!weakSurface.expired());
     handle = FrameHandle();
     QVERIFY(!weakSurface.expired());
-    QVERIFY(gpuPendingReadbackRetainCount() >= 1);
+    QVERIFY(GpuRetireRegistry{}.pendingRetainCount() >= 1);
 
     renderFence->complete(1);
-    gpuDrainCompletedReadbackRetains();
+    GpuRetireRegistry{}.drainCompleted();
     QVERIFY(weakSurface.expired());
 }
 #endif

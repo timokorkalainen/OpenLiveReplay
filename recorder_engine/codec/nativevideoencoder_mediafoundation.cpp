@@ -4,6 +4,7 @@
 #include "recorder_engine/codec/mediafoundationasynclifecycle.h"
 #include "recorder_engine/codec/mediafoundationh264policy.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/win/d3d11gpusurface.h"
 #include "recorder_engine/mediafoundationruntime.h"
 
@@ -996,29 +997,40 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
         return false;
     }
 
-    auto* d3dSurface = dynamic_cast<D3D11GpuSurface*>(surface);
-    if (!d3dSurface || !d3dSurface->texture()) {
-        if (error) {
-            *error = QStringLiteral("Media Foundation encodeSurface requires a D3D11 texture");
-        }
-        return false;
-    }
-    if (!configureD3DManagerForSurface(d3dSurface->device(), error)) return false;
-
     ComPtr<IMFMediaBuffer> buffer;
-    HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), d3dSurface->texture(),
-                                           d3dSurface->subresource(), FALSE, &buffer);
-    if (FAILED(hr)) {
-        if (error) {
-            *error = hrMessage(
-                QStringLiteral("Media Foundation DXGI surface buffer creation failed"), hr);
+    GpuSyncReadScope readScope;
+    const GpuReadLease lease = readScope.read(surface);
+    const bool wrapped = [&] {
+        const std::shared_ptr<void> retained = lease.retainNativeHandle();
+        auto* texture = static_cast<ID3D11Texture2D*>(retained.get());
+        if (!texture) {
+            if (error) {
+                *error = QStringLiteral("Media Foundation encodeSurface requires a D3D11 texture");
+            }
+            return false;
         }
-        return false;
-    }
+        ComPtr<ID3D11Device> device;
+        texture->GetDevice(&device);
+        if (!configureD3DManagerForSurface(device.Get(), error)) {
+            return false;
+        }
+
+        const HRESULT wrapHr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture,
+                                                         lease.nativeSubresource(), FALSE, &buffer);
+        if (FAILED(wrapHr)) {
+            if (error) {
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation DXGI surface buffer creation failed"), wrapHr);
+            }
+            return false;
+        }
+        return true;
+    }();
+    if (!wrapped) return false;
 
     const LONGLONG stampedTime = m_nextSampleTime;
     ComPtr<IMFSample> createdSample;
-    hr = MFCreateSample(&createdSample);
+    HRESULT hr = MFCreateSample(&createdSample);
     if (SUCCEEDED(hr)) {
         hr = createdSample->AddBuffer(buffer.Get());
     }

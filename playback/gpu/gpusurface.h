@@ -6,8 +6,10 @@
 #include <QtGlobal>
 
 #include <cstdint>
+#include <memory>
 
 class GpuReadLease;
+class GpuFence;
 
 struct GpuSurfaceDesc {
     FramePixelFormat format = FramePixelFormat::Nv12;
@@ -49,8 +51,14 @@ protected:
     // destruction discharges the retire obligation. A new op site that tries
     // surface->nativeHandle() directly no longer compiles (negative-compile test).
     friend class GpuReadLease;
+    friend class GpuFence;
     // IOSurfaceRef on Apple, ID3D11Texture2D* on Windows.
     virtual void* nativeHandle() const = 0;
+    // Backend implementations may return an independently owned reference for
+    // synchronous interop. Unlike nativeHandle(), this object can safely outlive
+    // the lease callback because its deleter releases the platform reference.
+    virtual std::shared_ptr<void> retainNativeHandle() const { return {}; }
+    virtual uint32_t nativeSubresource() const { return 0; }
 };
 
 #endif // OLR_GPUSURFACE_H

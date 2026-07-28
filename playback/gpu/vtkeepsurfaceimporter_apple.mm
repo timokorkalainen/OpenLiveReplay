@@ -6,7 +6,8 @@
 #include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpufence.h"
-#include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpuopscope.h"
+#include "playback/gpu/gpuretireregistry.h"
 
 #include <utility>
 
@@ -34,11 +35,10 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
     if (meta.key.width <= 0) meta.key.width = desc.width;
     if (meta.key.height <= 0) meta.key.height = desc.height;
     if (renderFence) {
-        const uint64_t fenceValue = renderFence->signal();
-        if (fenceValue != 0) {
-            surface->retainUntilFenceRetired(fenceValue);
-            gpuRetainSurfaceUntilFenceRetired(surface, renderFence, fenceValue);
-        }
+        GpuRetireRegistry registry;
+        GpuOpScope operation(renderFence, registry);
+        operation.track(surface);
+        if (!operation.submit([] { return GpuSubmitOutcome::Submitted; })) return FrameHandle{};
     }
     return makeGpuFrameHandle(surface, std::move(rhi), std::move(meta), std::move(renderFence),
                               std::move(*charge));

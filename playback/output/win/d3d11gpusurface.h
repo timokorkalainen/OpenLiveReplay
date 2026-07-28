@@ -28,21 +28,30 @@ public:
     }
     bool isValid() const override { return m_texture != nullptr; }
 
-    ID3D11Texture2D* texture() const { return m_texture.Get(); }
-    UINT subresource() const { return m_subresource; }
-    ID3D11Device* device() const { return m_device.Get(); }
-
     void retainUntilFenceRetired(uint64_t fenceValue) override;
     uint64_t pendingFenceValue() const override {
         return m_pendingFence.load(std::memory_order_acquire);
     }
 
     static void setForceAllocFailureForTest(bool force);
+#ifdef OLR_UNIT_TEST
+    bool aliasesTextureForTest(ID3D11Texture2D* texture) const {
+        return m_texture.Get() == texture;
+    }
+#endif
 
 protected:
     // Lease-gated, mirroring the base (gpusurface.h). Kept protected on the
     // derived type too so a D3D11GpuSurface* cannot re-widen handle access.
     void* nativeHandle() const override { return m_texture.Get(); }
+    std::shared_ptr<void> retainNativeHandle() const override {
+        ID3D11Texture2D* texture = m_texture.Get();
+        if (!texture) return {};
+        texture->AddRef();
+        return std::shared_ptr<void>(
+            texture, [](void* value) { static_cast<ID3D11Texture2D*>(value)->Release(); });
+    }
+    uint32_t nativeSubresource() const override { return m_subresource; }
 
 private:
     D3D11GpuSurface() = default;

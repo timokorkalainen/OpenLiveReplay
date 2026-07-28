@@ -49,6 +49,9 @@ public:
                                          int width, int height,
                                          std::shared_ptr<GpuFence> renderFence = nullptr);
     std::shared_ptr<D3D11GpuSurface> tryImportSurface(void* mfSampleOpaque, int width, int height);
+    static std::shared_ptr<GpuFence>
+    createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& surface);
+    std::shared_ptr<GpuFence> createFence() const;
     bool isAvailable() const;
     bool deviceLost() const;
 
@@ -56,21 +59,26 @@ public:
     static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                  FrameMetadata meta,
                                                  std::shared_ptr<GpuFence> renderFence = nullptr,
-                                                 GpuBudgetCharge charge = {});
+                                                 GpuBudgetCharge charge = {},
+                                                 uint64_t* submittedFenceValue = nullptr);
 #else
     static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                  FrameMetadata meta,
-                                                 std::shared_ptr<GpuFence> renderFence = nullptr);
+                                                 std::shared_ptr<GpuFence> renderFence = nullptr,
+                                                 uint64_t* submittedFenceValue = nullptr);
 #endif
 #ifdef _WIN32
     void setImportTapForTest(std::function<void(const FrameHandle&)> tap);
-    void* d3d11Device() const;
+    bool acceptsD3D11DeviceForTest(void* device) const;
     bool decodeOneForTest(Microsoft::WRL::ComPtr<ID3D11Device> device,
                           Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12, int width, int height);
 #endif
 
 private:
     WinGpuImportEdge();
+#ifdef _WIN32
+    static uint64_t publishDeviceRemovedForMonitor(HRESULT reason, uint64_t deviceAuthorityEpoch);
+#endif
 
     struct Impl;
     std::unique_ptr<Impl> m_impl;

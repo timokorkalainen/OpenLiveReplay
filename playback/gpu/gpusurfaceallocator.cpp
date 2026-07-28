@@ -3,8 +3,9 @@
 #include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpupipelineconfig.h"
-#include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
 
@@ -98,11 +99,11 @@ GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface,
         [rhi = std::move(rhi), renderFence = std::move(renderFence)](
             std::shared_ptr<GpuSurface> s, FrameMetadata m, GpuBudgetCharge charge) mutable {
             if (s && renderFence) {
-                const uint64_t fenceValue = renderFence->signal();
-                if (fenceValue != 0) {
-                    s->retainUntilFenceRetired(fenceValue);
-                    gpuRetainSurfaceUntilFenceRetired(s, renderFence, fenceValue);
-                }
+                GpuRetireRegistry registry;
+                GpuOpScope operation(renderFence, registry);
+                operation.track(s);
+                if (!operation.submit([] { return GpuSubmitOutcome::Submitted; }))
+                    return FrameHandle{};
             }
             return makeGpuFrameHandle(std::move(s), std::move(rhi), m, std::move(renderFence),
                                       std::move(charge));

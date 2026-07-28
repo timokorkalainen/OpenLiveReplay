@@ -4,9 +4,10 @@
 #include "playback/gpu/appleiosurface.h"
 #endif
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpudevicelossmonitor.h"
-#include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/output/formatcanon.h"
 
 #include <QMutexLocker>
@@ -107,8 +108,10 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
         m_readCount.fetch_add(1, std::memory_order_acq_rel);
         gpuRecordFrameReadToCpuReadback();
         if (m_renderFence && surface) {
-            const uint64_t fenceValue = m_renderFence->signal();
-            gpuRetainSurfaceUntilFenceRetired(surface, m_renderFence, fenceValue);
+            GpuRetireRegistry registry;
+            GpuOpScope operation(m_renderFence, registry);
+            operation.track(surface);
+            (void) operation.submit([] { return GpuSubmitOutcome::Submitted; });
         }
         QMutexLocker locker(&m_cacheMutex);
         const auto cached = m_cpuCache.constFind(int(target));

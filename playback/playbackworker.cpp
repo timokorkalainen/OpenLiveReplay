@@ -22,7 +22,7 @@
 #include "playback/gpu/iosmemoryheadroom.h"
 #include "playback/gpu/iosgpupolicy.h"
 #include "playback/gpu/gpupipelineconfig.h"
-#include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpuseekprefetch.h"
 #include "playback/gpu/gpusurfacelease.h"
@@ -1693,9 +1693,9 @@ void PlaybackWorker::handleGpuDeviceLoss() {
     {
         constexpr int kDeviceLossReadbackDrainMs = 100; // bounded; live-device fences advance
         if (const auto deadToken = GpuDeviceLossMonitor::instance().realLossToken())
-            gpuAbandonAllReadbackRetains(*deadToken);
+            GpuRetireRegistry{}.abandonAllNoWait(*deadToken);
         else
-            gpuDrainReadbackRetainsWithBoundedWait(kDeviceLossReadbackDrainMs);
+            GpuRetireRegistry{}.drainWithBoundedWait(kDeviceLossReadbackDrainMs);
     }
 
     // LOCK RULE: this method is entered from the worker decode thread with no
@@ -2044,6 +2044,10 @@ bool PlaybackWorker::rebuildGpuSpine() {
     if (!gpuPipelineEnabled()) return false;
     if (gpuLifecycleSuspended()) return false;
 
+    // Revoke every old backend's loss-mint authority before a replacement can be
+    // created. A failed rebuild keeps the loss latch set; a later retry begins a
+    // fresh authority epoch again.
+    GpuDeviceLossMonitor::instance().beginRebuild();
     auto rhi = GpuRhiContext::create();
     if (!rhi || !rhi->isValid() || rhi->deviceLost()) return false;
 
@@ -2495,7 +2499,7 @@ void PlaybackWorker::collectEvictedGpuFrameLocked(const FrameHandle& frame) {
 }
 
 void PlaybackWorker::drainEvictedGpuFrames() {
-    gpuDrainCompletedReadbackRetains();
+    GpuRetireRegistry{}.drainCompleted();
 
     GpuFrameRetireQueue local;
     {
@@ -2517,11 +2521,11 @@ void PlaybackWorker::drainEvictedGpuFrames() {
         QMutexLocker bufferLocker(&m_bufferMutex);
         m_gpuFrameRetireQueue.append(std::move(local));
     }
-    gpuDrainCompletedReadbackRetains();
+    GpuRetireRegistry{}.drainCompleted();
 }
 
 void PlaybackWorker::forceDrainEvictedGpuFrames() {
-    gpuDrainCompletedReadbackRetains();
+    GpuRetireRegistry{}.drainCompleted();
 
     constexpr int kForceRetireFenceWaitTimeoutMs = 10;
     constexpr int kMaxForceRetireFenceWaitsPerPass = 1;
@@ -2554,7 +2558,7 @@ void PlaybackWorker::forceDrainEvictedGpuFrames() {
         }
     }
 
-    gpuDrainCompletedReadbackRetains();
+    GpuRetireRegistry{}.drainCompleted();
 }
 
 void PlaybackWorker::recordFenceWaitStall() {
@@ -2562,14 +2566,13 @@ void PlaybackWorker::recordFenceWaitStall() {
     if (m_outputRuntime) m_outputRuntime->incrementFenceWaitStalls();
 }
 
-bool PlaybackWorker::ensureWindowsGpuImportFencesReadyForDecode(void* d3d11Device) {
+bool PlaybackWorker::ensureWindowsGpuImportFencesReadyForDecode() {
 #if defined(_WIN32)
-    if (!d3d11Device) return false;
-    if (!m_renderFence) m_renderFence = makeD3D11GpuFence(d3d11Device);
-    if (!m_stagingFence) m_stagingFence = makeD3D11GpuFence(d3d11Device);
+    if (!m_winGpuImportEdge) return false;
+    if (!m_renderFence) m_renderFence = m_winGpuImportEdge->createFence();
+    if (!m_stagingFence) m_stagingFence = m_winGpuImportEdge->createFence();
     return m_renderFence && m_stagingFence;
 #else
-    Q_UNUSED(d3d11Device);
     return false;
 #endif
 }
@@ -2967,7 +2970,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                             collectEvictedGpuFrameForCommit(evicted);
                     };
                 auto drainEvictedGpuFramesForCommit = [&]() {
-                    gpuDrainCompletedReadbackRetains();
+                    GpuRetireRegistry{}.drainCompleted();
                     if (!retireQueueForCommit) return;
 
                     GpuFrameRetireQueue local;
@@ -2991,7 +2994,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         QMutexLocker bufferLocker(bufferMutex);
                         retireQueueForCommit->append(std::move(local));
                     }
-                    gpuDrainCompletedReadbackRetains();
+                    GpuRetireRegistry{}.drainCompleted();
                 };
 #endif
                 auto commitMediaFrame = [&](FrameHandle mediaFrame, int64_t framePtsMs) -> bool {
@@ -3127,8 +3130,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         m_winGpuImportTried = true;
                     }
                     if (m_winGpuImportEdge && m_winGpuImportEdge->isAvailable()) {
-                        const bool fencesReady = ensureWindowsGpuImportFencesReadyForDecode(
-                            m_winGpuImportEdge->d3d11Device());
+                        const bool fencesReady = ensureWindowsGpuImportFencesReadyForDecode();
                         if (!fencesReady) {
                             m_winGpuImportEdge.reset();
                         } else if (allowNativeGpuDecodeForCurrentPacket(packetPtsMs())) {
