@@ -52,5 +52,5 @@ void TestSharedCacheSlot::concurrentPublishYieldsConsistentSnapshot() {
     writer.join();
 }
 
-QTEST_MAIN(TestSharedCacheSlot)
+QTEST_GUILESS_MAIN(TestSharedCacheSlot)
 #include "tst_sharedcacheslot.moc"

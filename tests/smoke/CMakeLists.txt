@@ -88,3 +88,6 @@ add_test(NAME desktop_packaging_policy_unit
     COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/test_desktop_packaging_policy.py")
 set_tests_properties(desktop_packaging_policy_unit PROPERTIES LABELS "smoke;ci" TIMEOUT 30)
+
+get_property(_olr_smoke_tests DIRECTORY PROPERTY TESTS)
+olr_apply_windows_test_runtime(${_olr_smoke_tests})

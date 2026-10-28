@@ -310,7 +310,8 @@ void TestOutputBusEngine::pgmReusesAlreadyGpuBackedOutputSizedSource() {
     FrameMetadata sourceMeta = cpuSource.metadata();
     sourceMeta.gpuGeneration = GpuGenerationCounter::instance().current();
     sourceMeta.decodedSequence = 17;
-    FrameHandle source = makeGpuFrameHandle(sourceSurface, rhi, sourceMeta, sourceFence);
+    FrameHandle source = makeGpuFrameHandle(sourceSurface, rhi, sourceMeta, sourceFence,
+                                            sourceFenceValue, GpuBudgetCharge{});
     QVERIFY(source.isGpuBacked());
 
     OutputFrameCache cache(1, 4, 4);

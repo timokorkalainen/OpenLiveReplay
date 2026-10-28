@@ -1,12 +1,16 @@
 #include "playback/output/iotargets/decklinksink.h"
 
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/iotargets/sinkcapabilityprobe.h"
 
 #include <QElapsedTimer>
 #include <QMutexLocker>
 
+#include <functional>
+#include <optional>
 #include <utility>
 
 namespace {
@@ -22,17 +26,60 @@ bool hasValidNativeGpuSurface(const FrameHandle& frame) {
     return surface && surface->isValid() && surface->hasNativeBacking();
 }
 
-bool waitForNativeGpuProducer(const FrameHandle& frame) {
+bool hasCurrentNativeGpuAuthority(const FrameHandle& frame,
+                                  const GpuSurfaceCompatibility& compatibility) {
+    const uint64_t frameGeneration = frame.metadata().gpuGeneration;
+    if (frameGeneration == 0) return false;
+
+    const GpuDeviceLossMonitor& lossMonitor = GpuDeviceLossMonitor::instance();
+    return !lossMonitor.isLost() &&
+           lossMonitor.isCurrentDeviceAuthority(compatibility.authorityEpoch) &&
+           frameGeneration == GpuGenerationCounter::instance().current();
+}
+
+struct NativeGpuProducerEvidence {
+    GpuSurface* surface = nullptr;
+    GpuSurfaceCompatibility compatibility;
+};
+
+enum class NativeGpuProducerStatus { Ready, Invalid, WaitTimedOut };
+
+NativeGpuProducerStatus waitForNativeGpuProducer(const FrameHandle& frame,
+                                                 NativeGpuProducerEvidence& evidence) {
     const IFrameData* data = frame.data();
     GpuSurface* surface = data ? data->gpuSurface() : nullptr;
-    if (!surface) return false;
+    if (!surface) return NativeGpuProducerStatus::Invalid;
 
-    const std::shared_ptr<GpuFence> fence = data->gpuFence();
-    if (!fence) return false;
+    const GpuFrameSynchronization synchronization = data->gpuSynchronization();
+    if (!synchronization.isExact()) return NativeGpuProducerStatus::Invalid;
+    const GpuSurfaceCompatibility compatibility = surface->compatibility();
+    if (compatibility.deviceDomainId == 0 || compatibility.authorityEpoch == 0)
+        return NativeGpuProducerStatus::Invalid;
+    if (!hasCurrentNativeGpuAuthority(frame, compatibility))
+        return NativeGpuProducerStatus::Invalid;
+    if (synchronization.value != 0) {
+        const GpuFenceIdentity fenceIdentity = synchronization.fence->identity();
+        if (fenceIdentity.instanceId == 0 ||
+            fenceIdentity.deviceDomainId != compatibility.deviceDomainId ||
+            fenceIdentity.authorityEpoch != compatibility.authorityEpoch)
+            return NativeGpuProducerStatus::Invalid;
+        if (!synchronization.fence->wait(synchronization.value, kGpuSubmitFenceTimeoutMs))
+            return NativeGpuProducerStatus::WaitTimedOut;
+    }
+    evidence = {surface, compatibility};
+    return NativeGpuProducerStatus::Ready;
+}
 
-    const uint64_t pendingFenceValue = surface->pendingFenceValue();
-    if (pendingFenceValue == 0) return false;
-    return fence->wait(pendingFenceValue, kGpuSubmitFenceTimeoutMs);
+template <typename SubmitFn>
+std::optional<bool> submitWithCurrentNativeGpuAuthority(const FrameHandle& frame,
+                                                        const NativeGpuProducerEvidence& evidence,
+                                                        SubmitFn&& submit) {
+    const GpuSurfaceCompatibility finalCompatibility = evidence.surface->compatibility();
+    if (finalCompatibility.deviceDomainId != evidence.compatibility.deviceDomainId ||
+        finalCompatibility.authorityEpoch != evidence.compatibility.authorityEpoch ||
+        !hasCurrentNativeGpuAuthority(frame, finalCompatibility))
+        return std::nullopt;
+    return std::invoke(std::forward<SubmitFn>(submit));
 }
 
 QByteArray st2110EssenceForFrame(const OutputBusFrame& frame) {
@@ -140,25 +187,50 @@ bool DeckLinkOutputSink::submit(const OutputBusFrame& frame) {
         m_message = QStringLiteral("DeckLink GPU-native frame lacks a valid native GPU surface");
         return false;
     }
-    if (useGpuSubmission && !waitForNativeGpuProducer(frame.video)) {
+    NativeGpuProducerEvidence producerEvidence;
+    const NativeGpuProducerStatus producerStatus =
+        useGpuSubmission ? waitForNativeGpuProducer(frame.video, producerEvidence)
+                         : NativeGpuProducerStatus::Ready;
+    if (producerStatus != NativeGpuProducerStatus::Ready) {
         QMutexLocker locker(&m_statusMutex);
         ++m_sendFailures;
         m_lastSubmitDurationNs = timer.nsecsElapsed();
         m_lastFrameDelivered = false;
         m_state = DeckLinkOutputState::SendFailed;
-        m_message = QStringLiteral("DeckLink GPU frame producer fence did not retire");
+        m_message =
+            producerStatus == NativeGpuProducerStatus::WaitTimedOut
+                ? QStringLiteral("DeckLink GPU producer fence wait timed out")
+                : QStringLiteral("DeckLink GPU frame synchronization or authority is invalid");
         return false;
     }
     OutputBusFrame scheduledFrame = frame;
     const bool isSt2110 = m_kind == OutputTargetKind::DeckLinkIpSt2110;
-    const bool ok =
-        isSt2110
-            ? (useGpuSubmission ? m_backend->scheduleGpuSt2110Frame(std::move(scheduledFrame),
-                                                                    st2110FrameFor(frame, m_rate))
-                                : m_backend->scheduleSt2110Frame(std::move(scheduledFrame),
-                                                                 st2110FrameFor(frame, m_rate)))
-            : (useGpuSubmission ? m_backend->scheduleGpuFrame(std::move(scheduledFrame))
-                                : m_backend->scheduleFrame(std::move(scheduledFrame)));
+    St2110VideoFrame scheduledSt2110Frame;
+    if (isSt2110) scheduledSt2110Frame = st2110FrameFor(frame, m_rate);
+
+    bool ok = false;
+    if (useGpuSubmission) {
+        const std::optional<bool> result =
+            submitWithCurrentNativeGpuAuthority(frame.video, producerEvidence, [&] {
+                return isSt2110 ? m_backend->scheduleGpuSt2110Frame(std::move(scheduledFrame),
+                                                                    std::move(scheduledSt2110Frame))
+                                : m_backend->scheduleGpuFrame(std::move(scheduledFrame));
+            });
+        if (!result) {
+            QMutexLocker locker(&m_statusMutex);
+            ++m_sendFailures;
+            m_lastSubmitDurationNs = timer.nsecsElapsed();
+            m_lastFrameDelivered = false;
+            m_state = DeckLinkOutputState::SendFailed;
+            m_message = QStringLiteral("DeckLink GPU frame authority changed before submission");
+            return false;
+        }
+        ok = *result;
+    } else {
+        ok = isSt2110 ? m_backend->scheduleSt2110Frame(std::move(scheduledFrame),
+                                                       std::move(scheduledSt2110Frame))
+                      : m_backend->scheduleFrame(std::move(scheduledFrame));
+    }
     {
         QMutexLocker locker(&m_statusMutex);
         m_lastSubmitDurationNs = timer.nsecsElapsed();

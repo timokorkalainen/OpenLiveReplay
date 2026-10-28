@@ -998,21 +998,20 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
     }
 
     ComPtr<IMFMediaBuffer> buffer;
+    bool wrapped = false;
     GpuSyncReadScope readScope;
-    const GpuReadLease lease = readScope.read(surface);
-    const bool wrapped = [&] {
-        const std::shared_ptr<void> retained = lease.retainNativeHandle();
-        auto* texture = static_cast<ID3D11Texture2D*>(retained.get());
+    readScope.withRead(surface, [&](const GpuReadLease& lease) {
+        auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
         if (!texture) {
             if (error) {
                 *error = QStringLiteral("Media Foundation encodeSurface requires a D3D11 texture");
             }
-            return false;
+            return;
         }
         ComPtr<ID3D11Device> device;
         texture->GetDevice(&device);
         if (!configureD3DManagerForSurface(device.Get(), error)) {
-            return false;
+            return;
         }
 
         const HRESULT wrapHr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture,
@@ -1022,10 +1021,10 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
                 *error = hrMessage(
                     QStringLiteral("Media Foundation DXGI surface buffer creation failed"), wrapHr);
             }
-            return false;
+            return;
         }
-        return true;
-    }();
+        wrapped = true;
+    });
     if (!wrapped) return false;
 
     const LONGLONG stampedTime = m_nextSampleTime;

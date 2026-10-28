@@ -1176,7 +1176,6 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
                     decodedFrame.timecodeEvidence = evidence->timecodeEvidence;
                 }
                 decodedFrame.gpuFrame = std::move(gpuFrame);
-                decodedFrame.gpuFenceValue = imported.fenceValue;
                 decodedFrame.gpuCarrierSessionIdentity = imported.carrierSessionIdentity;
                 decodedFrame.gpuCarrierEpoch = imported.carrierEpoch;
                 m_callbacks.onVideoFrame(std::move(decodedFrame));

@@ -110,6 +110,10 @@ struct OutputDispatchStats {
     qint64 readbackDrops = 0;
     qint64 fenceWaitStalls = 0;
     qint64 gpuOomDegrades = 0;
+    // Degrades where a fence/device authority refused the submission rather than
+    // memory pressure. Reported alongside gpuOomDegrades so a device-loss window
+    // is never shown to the operator as VRAM exhaustion.
+    qint64 gpuSubmissionRefusalDegrades = 0;
     qint64 gpuDeviceLossEvents = 0;
     qint64 gpuReadbacks = 0;
     qint64 uniqueGpuReadbackSurfaces = 0;

@@ -59,6 +59,7 @@ public:
     };
     std::shared_ptr<GpuRhiContext> gpuRhiContextForTest() const;
     int playEpochResetCountForTest() const;
+    bool immediateDispatchPendingForTest() const;
     PlayEpochStateForTest playEpochStateForTest() const;
     bool waitForImmediateDispatchRequestsForTest(int requests, int timeoutMs) const;
 #endif
@@ -101,7 +102,8 @@ private:
     bool m_dispatchActive = false;
     Qt::HANDLE m_dispatchThreadId = nullptr;
     bool m_reconfiguring = false;
-    int m_immediateDispatchRequests = 0;
+    std::atomic<int> m_immediateDispatchRequests{0};
+    std::atomic<quint64> m_immediateDispatchGeneration{0};
     quint64 m_configGeneration = 0;
     bool m_hasPendingEndpoints = false;
     QList<OutputEndpoint> m_pendingEndpoints;
@@ -118,6 +120,7 @@ private:
     qint64 m_gpuBudgetBytes = 0;
     qint64 m_gpuGatedLiveBytes = 0;
     qint64 m_gpuOomDegrades = 0;
+    qint64 m_gpuSubmissionRefusalDegrades = 0;
     bool m_gpuBudgetReportOnly = false;
     std::array<qint64, kOutputGpuBudgetTagCount> m_gpuLiveBytesByTag{};
     std::atomic<qint64> m_gpuDeviceLossEvents{0};

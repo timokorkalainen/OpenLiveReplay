@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Layouts
 import QtTest
 import "../../ui/components"
 import OlrTheme
@@ -121,39 +120,26 @@ TestCase {
         compare(Math.round(rewind.width), compactDock.compactShuttleWidth)
     }
 
-    function findTextByValue(item, value) {
-        if (!item) return null
-        try {
-            if (item.text === value) return item
-        } catch (e) {
-        }
-
-        var kids = item.children || []
-        for (var i = 0; i < kids.length; ++i) {
-            var found = findTextByValue(kids[i], value)
-            if (found) return found
-        }
-        return null
-    }
-
     function test_timeReadoutsKeepStableWidthWhenValuesChange() {
         mockUi.playbackTimecode = "00:00:09:01"
         mockUi.recordedDurationMs = 9000
-        wait(0)
 
-        var playhead = findTextByValue(wideDock, "00:00:09:01")
-        var duration = findTextByValue(wideDock, "9000")
+        var playhead = findChild(wideDock, "transportPlayheadTimecode")
+        var duration = findChild(wideDock, "transportDurationTimecode")
         verify(playhead !== null)
         verify(duration !== null)
-        var playheadWidth = playhead.width
-        var durationWidth = duration.width
+        tryCompare(playhead, "text", "00:00:09:01")
+        tryCompare(duration, "text", "9000")
+        tryCompare(playhead, "width", wideDock.timeReadoutWidth)
+        tryCompare(duration, "width", wideDock.timeReadoutWidth)
 
         mockUi.playbackTimecode = "11:11:11:11"
         mockUi.recordedDurationMs = 8888888
-        wait(0)
 
-        compare(playhead.width, playheadWidth)
-        compare(duration.width, durationWidth)
+        tryCompare(playhead, "text", "11:11:11:11")
+        tryCompare(duration, "text", "8888888")
+        tryCompare(playhead, "width", wideDock.timeReadoutWidth)
+        tryCompare(duration, "width", wideDock.timeReadoutWidth)
         compare(playhead.font.family, Theme.fontMono)
         compare(duration.font.family, Theme.fontMono)
     }

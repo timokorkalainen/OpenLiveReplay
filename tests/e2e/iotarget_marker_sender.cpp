@@ -6,6 +6,7 @@
 
 #include "playback/gpu/gpusurface.h"
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/output/asyncgpureadbacksink.h"
 #include "playback/output/framehandle.h"
 #include "playback/output/iotargets/ajasink.h"
@@ -19,6 +20,9 @@
 #include <utility>
 
 namespace {
+
+constexpr uintptr_t kMarkerDeviceDomainId = 0x4f4c5201u;
+constexpr uint64_t kMarkerAuthorityEpoch = 1;
 
 struct TargetConfig {
     QString cliKind;
@@ -48,17 +52,19 @@ public:
 
     GpuSurfaceDesc desc() const override { return m_desc; }
     bool isValid() const override { return m_desc.width > 0 && m_desc.height > 0; }
+    GpuSurfaceCompatibility compatibility() const override {
+        return {kMarkerDeviceDomainId, kMarkerAuthorityEpoch};
+    }
     void* nativeHandle() const override { return const_cast<MarkerGpuSurface*>(this); }
-    void retainUntilFenceRetired(uint64_t fenceValue) override { m_pendingFence = fenceValue; }
-    uint64_t pendingFenceValue() const override { return m_pendingFence; }
 
 private:
     GpuSurfaceDesc m_desc;
-    uint64_t m_pendingFence = 0;
 };
 
 class ReadyFence final : public GpuFence {
 public:
+    ReadyFence() : GpuFence(kMarkerDeviceDomainId, kMarkerAuthorityEpoch) {}
+
     uint64_t signal() override { return 1; }
     bool wait(uint64_t value, int) override { return value <= 1; }
     uint64_t completedValue() const override { return 1; }
@@ -79,6 +85,7 @@ public:
     CpuPlanes cachedCpuPlanes(FramePixelFormat target) const override { return readToCpu(target); }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_fence; }
+    GpuFrameSynchronization gpuSynchronization() const override { return {m_fence, 1, true}; }
     FramePixelFormat nativeFormat() const override {
         return m_surface ? m_surface->desc().format : m_planes.format;
     }
@@ -244,7 +251,7 @@ OutputBusFrame markerBusFrame(const NdiOutputMarkerConfig& cfg, FrameRate rate, 
     frame.sampledPlayheadMs = ptsMs;
     frame.programmeTimecode100ns = ptsMs * 10000;
     if (gpuBacked) {
-        meta.gpuGeneration = 1;
+        meta.gpuGeneration = GpuGenerationCounter::instance().current();
         auto surface = std::make_shared<MarkerGpuSurface>(cfg.width, cfg.height, planes.format);
         frame.video = FrameHandle(
             std::make_shared<MarkerGpuFrameData>(std::move(planes), std::move(surface)), meta);

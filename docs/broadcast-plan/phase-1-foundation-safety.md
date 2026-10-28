@@ -109,6 +109,16 @@ Nothing above is credible until the gate that enforces it is fail-closed and the
   - [ ] windows-latest runs the full deterministic unit label green (not 4 tests)
   - [ ] A Windows native-ingest record e2e produces a demuxable MKV in CI
 
+### `rel-gpu-surface-lifetime` — Type-enforced GPU surface lifetime + device-loss recovery with driver-authoritative provenance
+- **Size:** L
+- **Dependencies:** none
+- **Definition:** Type-enforced GPU surface lifetime — the raw native handle is reachable only through a lease whose scope discharges the retirement obligation — plus device-loss recovery whose no-wait free requires driver-authoritative provenance.
+- **Acceptance criteria:**
+  - [ ] Direct `GpuSurface::nativeHandle()` access fails to compile with a protected-access diagnostic, while the lease-scoped control still compiles (negative-compile tests `gpu_native_handle_access`, `gpu_native_handle_derived_access` and their `_pass` controls).
+  - [ ] `GpuSyncReadScope::read()`/`complete()` are unreachable outside `withRead()` (`gpu_sync_scope_read_private`, `gpu_sync_scope_complete_private`).
+  - [ ] The no-wait free path is reachable only with a `DeadDeviceToken` minted from a driver device-removed report (`gpu_token_construction`, `gpu_token_direct_abandon`).
+  - [ ] A quarantined retirement is reclaimed on a live device once its completion barrier retires (`gpu_retirement_mutation_quarantine_reclaim`).
+
 ### `rel-output-autorecover` — Output device-loss auto-recovery state machine (closes outputdispatcher.cpp:251)
 - **Size:** M
 - **Dependencies:** `rel-telemetry-bus`

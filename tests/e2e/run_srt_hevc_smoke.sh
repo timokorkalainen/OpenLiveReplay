@@ -14,12 +14,21 @@ HARNESS="${1:?record_harness executable path required}"
 SRT_PORT="${2:-23501}"
 UDP_PORT=$((SRT_PORT + 1))
 SECONDS_TO_RECORD="${OLR_E2E_CLIP_SECONDS:-6}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
-command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 0; }
-command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
+# Keep the preflight-approved HEVC-capable development tools even after adding
+# the controlled app runtime directories needed by record_harness on Windows.
+HEVC_FFMPEG="$(command -v ffmpeg || true)"
+HEVC_FFPROBE="$(command -v ffprobe || true)"
+# shellcheck source=tool_env.sh
+. "$HERE/tool_env.sh"
+olr_prepend_built_tool_paths
+
+[ -n "$HEVC_FFMPEG" ] || { echo "SKIP: ffmpeg not found";  exit 0; }
+[ -n "$HEVC_FFPROBE" ] || { echo "SKIP: ffprobe not found"; exit 0; }
 command -v srt-live-transmit >/dev/null || { echo "SKIP: srt-live-transmit not found (brew install srt)"; exit 0; }
 
-ENCODERS="$(ffmpeg -hide_banner -encoders 2>/dev/null)"
+ENCODERS="$("$HEVC_FFMPEG" -hide_banner -encoders 2>/dev/null)"
 if printf '%s\n' "$ENCODERS" | grep -q ' libx265 '; then
     VCODEC_ARGS=(-c:v libx265 -preset ultrafast -x265-params keyint=30:min-keyint=30:scenecut=0 -pix_fmt yuv420p -b:v 4M)
 else
@@ -48,7 +57,7 @@ echo "[srt-e2e] srt_port=$SRT_PORT udp_port=$UDP_PORT"
 echo "[srt-e2e] hevc_encoder=${VCODEC_ARGS[1]}"
 
 # 1. SRT listener carrying flash/beep MPEG-TS: ffmpeg(UDP) -> srt-live-transmit(SRT listener).
-ffmpeg -hide_banner -loglevel error -re \
+"$HEVC_FFMPEG" -hide_banner -loglevel error -re \
     -f lavfi -i "testsrc2=size=640x480:rate=30" \
     -f lavfi -i "sine=frequency=1000:sample_rate=48000" -ac 2 \
     "${VCODEC_ARGS[@]}" \
@@ -74,7 +83,7 @@ if [ $RC -ne 0 ] || [ -z "$OUT_MKV" ] || [ ! -s "$OUT_MKV" ]; then
 fi
 
 # 3. Assert the MKV is valid (same checks as run_record_e2e.sh).
-scalar() { ffprobe -v error "$@" -of default=noprint_wrappers=1:nokey=1 "$OUT_MKV" | head -n1; }
+scalar() { "$HEVC_FFPROBE" -v error "$@" -of default=noprint_wrappers=1:nokey=1 "$OUT_MKV" | head -n1; }
 V_PACKETS="$(scalar -select_streams v:0 -count_packets -show_entries stream=nb_read_packets)"
 A_CHANNELS="$(scalar -select_streams a:0 -show_entries stream=channels)"
 echo "[srt-e2e] video_packets=${V_PACKETS:-?} audio_channels=${A_CHANNELS:-?}"
@@ -92,13 +101,22 @@ fi
 # stream sent — NOT silence. record_harness writes blue-fill video + SILENCE when
 # no source connects, so this is what actually proves SRT content was ingested
 # (and is what makes the SRT-less brew build fail this test).
-RMS="$(ffmpeg -hide_banner -nostats -i "$OUT_MKV" -map 0:a:0 \
+RMS="$("$HEVC_FFMPEG" -hide_banner -nostats -i "$OUT_MKV" -map 0:a:0 \
        -af astats=metadata=1:measure_overall=RMS_level -f null - 2>&1 \
        | awk -F': ' '/Overall/{o=1} o && /RMS level dB/{print $2; exit}')"
 echo "[srt-e2e] audio_rms_db=${RMS:-?}"
 # Silence reports "-inf" or a very low dB; the 1 kHz tone is around -20..-25 dB.
 if [ -z "${RMS:-}" ] || [ "${RMS:-}" = "-inf" ] || ! awk -v r="${RMS:-}" 'BEGIN{exit !(r+0 > -60)}'; then
     echo "FAIL: recorded audio is silence/unmeasurable (rms=${RMS:-none} dB) — SRT stream content was NOT ingested (blue-fill/no-source path)"; fail=1
+fi
+
+UNIQUE_FRAME_HASHES="$("$HEVC_FFMPEG" -hide_banner -loglevel error -i "$OUT_MKV" -map 0:v:0 \
+    -vf "scale=64:64,format=gray" -frames:v 90 -f framemd5 - 2>/dev/null \
+    | awk -F, '/^[0-9]/{gsub(/ /, "", $NF); seen[$NF]=1}
+               END{print length(seen)}')"
+echo "[srt-e2e] unique_frame_hashes=${UNIQUE_FRAME_HASHES:-?}"
+if ! is_num "${UNIQUE_FRAME_HASHES:-}" || [ "${UNIQUE_FRAME_HASHES%.*}" -lt 2 ]; then
+    echo "FAIL: decoded HEVC video appears static or empty (unique_frame_hashes=${UNIQUE_FRAME_HASHES:-none})"; fail=1
 fi
 
 [ $fail -ne 0 ] && exit 1

@@ -6,6 +6,7 @@
 #include <QThread>
 
 #include "playback/gpu/gpudevicelossmonitor.h"
+#include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/iosgpulifecyclesink.h"
@@ -36,14 +37,18 @@ void TestIosGpuLifecycle::init() {
 }
 
 void TestIosGpuLifecycle::backgroundBumpsGenerationAndSuspends() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    const uint64_t participant = monitor.registerRecoveryParticipant();
+    QVERIFY(participant != 0);
     DefaultIosGpuLifecycleSink sink;
     const uint64_t before = GpuGenerationCounter::instance().current();
     QVERIFY(!sink.isSuspended());
     sink.onEnterBackground();
     QVERIFY(sink.isSuspended());
-    QVERIFY(GpuDeviceLossMonitor::instance().isLost());
+    QVERIFY(monitor.isLost());
     QVERIFY(GpuGenerationCounter::instance().current() > before);
     QCOMPARE(sink.generationAtLastBackground(), GpuGenerationCounter::instance().current());
+    QVERIFY(monitor.unregisterRecoveryParticipant(participant).has_value());
 }
 
 void TestIosGpuLifecycle::foregroundClearsSuspend() {
@@ -89,6 +94,7 @@ void TestIosGpuLifecycle::sinkRegistryRoundTrips() {
 
 void TestIosGpuLifecycle::presentBlockRunsOnceOnHost() {
     auto ctx = GpuRhiContext::createNullForTest();
+    if (!ctx) ctx = GpuRhiContext::createWarpForTest();
 #ifdef Q_OS_WIN
     if (!ctx) ctx = GpuRhiContext::createInvalidForTest();
 #endif
@@ -111,9 +117,9 @@ void TestIosGpuLifecycle::offscreenMetalRenderProducesPlanes() {
     auto ctx = GpuRhiContext::create();
     if (!ctx) QSKIP("no Metal device on this host; on-device render validation is manual");
 
-    auto surface = makeAppleNv12Surface(64, 48);
+    auto surface = makeAppleNv12Surface(64, 48, ctx->surfaceCompatibility());
     QVERIFY(surface != nullptr);
-    const CpuPlanes planes = ctx->importAndReadback(surface, FramePixelFormat::Yuv420p);
+    const CpuPlanes planes = submitGpuReadback(ctx, surface, FramePixelFormat::Yuv420p).planes;
     QCOMPARE(planes.format, FramePixelFormat::Yuv420p);
     QCOMPARE(planes.width, 64);
     QCOMPARE(planes.height, 48);

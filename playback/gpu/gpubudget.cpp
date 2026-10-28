@@ -57,6 +57,7 @@ qint64 g_budgetBytes = 0;
 qint64 g_liveBytes = 0;
 qint64 g_gatedLiveBytes = 0;
 qint64 g_oomDegrades = 0;
+qint64 g_submissionRefusalDegrades = 0;
 qint64 g_mintedBytesSinceLastSample = 0;
 std::array<qint64, kGpuBudgetTagCount> g_liveBytesByTag{};
 
@@ -216,6 +217,16 @@ void GpuBudget::noteOomDegrade() {
     ++g_oomDegrades;
 }
 
+qint64 GpuBudget::submissionRefusalDegradeCount() const {
+    QMutexLocker locker(&g_mutex);
+    return g_submissionRefusalDegrades;
+}
+
+void GpuBudget::noteSubmissionRefusalDegrade() {
+    QMutexLocker locker(&g_mutex);
+    ++g_submissionRefusalDegrades;
+}
+
 GpuBudgetSnapshot GpuBudget::snapshot() const {
     QMutexLocker locker(&g_mutex);
     GpuBudgetSnapshot snapshot;
@@ -223,6 +234,7 @@ GpuBudgetSnapshot GpuBudget::snapshot() const {
     snapshot.liveBytes = g_liveBytes;
     snapshot.gatedLiveBytes = g_gatedLiveBytes;
     snapshot.oomDegrades = g_oomDegrades;
+    snapshot.submissionRefusalDegrades = g_submissionRefusalDegrades;
     snapshot.reportOnly = reportOnlyEnabled();
     snapshot.liveBytesByTag = g_liveBytesByTag;
     return snapshot;
@@ -233,6 +245,7 @@ void GpuBudget::reset() {
     g_liveBytes = 0;
     g_gatedLiveBytes = 0;
     g_oomDegrades = 0;
+    g_submissionRefusalDegrades = 0;
     g_mintedBytesSinceLastSample = 0;
     g_liveBytesByTag.fill(0);
 }

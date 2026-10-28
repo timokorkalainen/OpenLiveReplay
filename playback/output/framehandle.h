@@ -56,6 +56,16 @@ struct CpuPlanes {
 class GpuSurface;
 class GpuFence;
 
+struct GpuFrameSynchronization {
+    std::shared_ptr<GpuFence> fence;
+    uint64_t value = 0;
+    bool exact = false;
+
+    bool isExact() const noexcept {
+        return exact && ((value == 0 && !fence) || (value != 0 && fence));
+    }
+};
+
 class IFrameData {
 public:
     virtual ~IFrameData();
@@ -66,6 +76,7 @@ public:
     virtual CpuPlanes cachedCpuPlanes(FramePixelFormat target) const;
     virtual GpuSurface* gpuSurface() const = 0;
     virtual std::shared_ptr<GpuFence> gpuFence() const;
+    virtual GpuFrameSynchronization gpuSynchronization() const;
     virtual FramePixelFormat nativeFormat() const = 0;
 };
 

@@ -53,21 +53,38 @@ public:
     }
 
     bool invoke(std::function<void()> job) {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (m_stop) return false;
-
-        bool done = false;
-        m_jobs.append([&] {
-            job();
-            {
-                std::lock_guard<std::mutex> doneLock(m_mutex);
-                done = true;
+        if (QThread::currentThread() == this) {
+            try {
+                job();
+                return true;
+            } catch (...) {
+                return false;
             }
+        }
+        try {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_stop) return false;
+
+            bool done = false;
+            bool succeeded = false;
+            m_jobs.append([&] {
+                try {
+                    job();
+                    succeeded = true;
+                } catch (...) {
+                }
+                {
+                    std::lock_guard<std::mutex> doneLock(m_mutex);
+                    done = true;
+                }
+                m_cond.notify_all();
+            });
             m_cond.notify_all();
-        });
-        m_cond.notify_all();
-        m_cond.wait(lock, [&] { return done; });
-        return true;
+            m_cond.wait(lock, [&] { return done; });
+            return succeeded;
+        } catch (...) {
+            std::terminate();
+        }
     }
 
     void requestStop() {
@@ -95,7 +112,21 @@ public:
     std::atomic<bool> deviceLost{false};
 };
 
-GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
+GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl,
+                             std::function<std::shared_ptr<GpuFence>()> readbackFenceFactory,
+                             std::shared_ptr<std::atomic<int>> injectedFactoryCalls)
+    : m_impl(std::move(impl)) {
+    try {
+#ifdef OLR_UNIT_TEST
+        ++m_readbackFenceInitializationAttemptsForTest;
+        m_injectedReadbackFenceFactoryCallsForTest = std::move(injectedFactoryCalls);
+#else
+        (void) injectedFactoryCalls;
+#endif
+        m_readbackFence = readbackFenceFactory ? readbackFenceFactory() : createFence();
+    } catch (...) {
+    }
+}
 
 GpuRhiContext::~GpuRhiContext() {
     if (!m_impl) return;
@@ -128,6 +159,24 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createInvalidForTest() {
     return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::make_unique<Impl>()));
 }
 
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createReadbackFenceFailureForTest() {
+    auto impl = std::make_unique<Impl>();
+    impl->thread.start();
+    impl->valid = impl->thread.waitReady();
+    if (!impl->valid) {
+        impl->thread.requestStop();
+        impl->thread.wait();
+        return nullptr;
+    }
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    auto failingFactory = [calls] {
+        calls->fetch_add(1, std::memory_order_acq_rel);
+        return std::shared_ptr<GpuFence>{};
+    };
+    return std::shared_ptr<GpuRhiContext>(
+        new GpuRhiContext(std::move(impl), std::move(failingFactory), std::move(calls)));
+}
+
 int GpuRhiContext::rhiReadbackCountForTest() const {
     return 0;
 }
@@ -142,7 +191,8 @@ bool GpuRhiContext::isNullBackend() const {
 }
 
 bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) const {
-    if (!m_impl || !m_impl->valid || !job) return false;
+    const auto keepAlive = weak_from_this().lock();
+    if (!keepAlive || !m_impl || !m_impl->valid || !job) return false;
     return m_impl->thread.invoke([&] { job(m_impl->thread.rhi); });
 }
 
@@ -154,23 +204,45 @@ bool GpuRhiContext::deviceLost() const {
     return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
 }
 
+bool GpuRhiContext::deviceLossPollPending() const noexcept {
+    return false;
+}
+
+bool GpuRhiContext::pollDeviceLoss() const {
+#ifdef OLR_UNIT_TEST
+    m_deviceLossPollCountForTest.fetch_add(1, std::memory_order_relaxed);
+#endif
+    return deviceLost();
+}
+
 void GpuRhiContext::injectDeviceLostForTest() {
     if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
 }
 
-CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, FramePixelFormat) {
-    if (!m_impl || !m_impl->valid) {
-        return CpuPlanes{};
+GpuReadbackResult GpuRhiContext::importAndReadback(const GpuScopedNativeSurface& surface,
+                                                   FramePixelFormat) noexcept {
+#ifdef OLR_UNIT_TEST
+    void* testHandle = surface.nativeHandle();
+    m_lastReadbackHadNativeHandleForTest.store(testHandle != nullptr, std::memory_order_release);
+    m_lastReadbackSubresourceForTest.store(surface.nativeSubresource(), std::memory_order_release);
+    if (const auto injected = injectedReadbackForTest()) return *injected;
+#endif
+    void* handle = surface.nativeHandle();
+    if (!surface.valid() || !handle) return {};
+    try {
+        if (!m_impl || !m_impl->valid) return {};
+        if (m_impl->deviceLost.load(std::memory_order_acquire)) {
+            GpuDeviceLossMonitor::instance().recordLoss();
+        }
+        return {};
+    } catch (...) {
+        // This backend never submits readback work.
+        return {};
     }
-    if (m_impl->deviceLost.load(std::memory_order_acquire)) {
-        GpuDeviceLossMonitor::instance().recordLoss();
-        return CpuPlanes{};
-    }
-    return CpuPlanes{};
 }
 
 std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
-    return GpuFence::create();
+    return isValid() ? GpuFence::create() : nullptr;
 }
 
 #endif // !__APPLE__

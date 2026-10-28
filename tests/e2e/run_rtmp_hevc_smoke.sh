@@ -5,10 +5,16 @@ HARNESS="${1:?record_harness executable path required}"
 RTMP_PORT="${2:-23770}"
 SECONDS_TO_RECORD="${OLR_E2E_CLIP_SECONDS:-4}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# Preserve the preflight-approved HEVC-capable tools before rtmp_lib adds the
+# controlled app runtime directories (whose redistributable FFmpeg omits x265).
+HEVC_FFMPEG="$(command -v ffmpeg || true)"
+HEVC_FFPROBE="$(command -v ffprobe || true)"
 # shellcheck source=rtmp_lib.sh
 . "$HERE/rtmp_lib.sh"
 
 rtmp_require_tools
+[ -n "$HEVC_FFMPEG" ] || { echo "SKIP: HEVC-capable ffmpeg not found"; exit 77; }
+[ -n "$HEVC_FFPROBE" ] || { echo "SKIP: matching ffprobe not found"; exit 77; }
 
 WORKDIR="$(mktemp -d)"
 PIDS=()
@@ -27,7 +33,7 @@ HARNESS_ERR="$WORKDIR/harness.err"
 generate_hevc() {
     local codec="$1"
     shift
-    ffmpeg -hide_banner -loglevel error \
+    "$HEVC_FFMPEG" -hide_banner -loglevel error \
         -f lavfi -i "testsrc2=size=640x480:rate=30" \
         -t "$SECONDS_TO_RECORD" -an -pix_fmt yuv420p \
         -c:v "$codec" "$@" \
@@ -48,7 +54,7 @@ fi
 
 is_num() { case "${1:-}" in '' | *[!0-9.-]*) return 1 ;; *) return 0 ;; esac; }
 
-SOURCE_PACKETS="$(ffprobe -v error -count_packets -show_entries stream=nb_read_packets \
+SOURCE_PACKETS="$("$HEVC_FFPROBE" -v error -count_packets -show_entries stream=nb_read_packets \
     -of default=noprint_wrappers=1:nokey=1 "$HEVC" | head -n1)"
 if ! is_num "${SOURCE_PACKETS:-}"; then
     echo "FAIL: could not count generated HEVC source packets"
@@ -75,6 +81,7 @@ fi
 URL="$(rtmp_url "$RTMP_PORT")"
 "$HARNESS" --url "$URL" --name olr_rtmp_hevc_smoke --outdir "$WORKDIR" \
     --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 \
+    --qt-log-stderr \
     >"$HARNESS_OUT" 2>"$HARNESS_ERR"
 RC=$?
 
@@ -93,7 +100,7 @@ if ! grep -q "hvc1" "$HARNESS_ERR"; then
 fi
 
 if [ "$fail" -eq 0 ]; then
-    V_PACKETS="$(ffprobe -v error -select_streams v:0 -count_packets \
+    V_PACKETS="$("$HEVC_FFPROBE" -v error -select_streams v:0 -count_packets \
         -show_entries stream=nb_read_packets -of default=noprint_wrappers=1:nokey=1 \
         "$OUT_MKV" | head -n1)"
     echo "[rtmp-hevc-e2e] source_packets=${SOURCE_PACKETS:-?} output_packets=${V_PACKETS:-?}"
@@ -107,7 +114,7 @@ if [ "$fail" -eq 0 ]; then
         fail=1
     fi
 
-    UNIQUE_FRAME_HASHES="$(ffmpeg -hide_banner -loglevel error -i "$OUT_MKV" -map 0:v:0 \
+    UNIQUE_FRAME_HASHES="$("$HEVC_FFMPEG" -hide_banner -loglevel error -i "$OUT_MKV" -map 0:v:0 \
         -vf "scale=64:64,format=gray" -frames:v 90 -f framemd5 - 2>/dev/null \
         | awk -F, '/^[0-9]/{gsub(/ /, "", $NF); seen[$NF]=1}
                    END{print length(seen)}')"

@@ -8,6 +8,9 @@
 #include "playback/gpu/gpusurfacelease.h"
 
 #include <QList>
+#ifdef OLR_UNIT_TEST
+#include <QSemaphore>
+#endif
 #include <QThread>
 #include <rhi/qrhi.h>
 #include <rhi/qrhi_platform.h>
@@ -16,6 +19,7 @@
 #include <d3d10_1.h>
 #include <d3d11.h>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -32,7 +36,18 @@ using Microsoft::WRL::ComPtr;
 // other TU can construct a DeadDeviceToken from Windows.
 namespace {
 
+#ifdef OLR_UNIT_TEST
+std::atomic<uint64_t> quarantinedContextCount{0};
+#endif
+
 enum class D3DDeviceKind { Hardware, Warp };
+
+uintptr_t deviceDomainId(ID3D11Device* device) {
+    ComPtr<IUnknown> identity;
+    return device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&identity)))
+               ? reinterpret_cast<uintptr_t>(identity.Get())
+               : 0;
+}
 
 bool createD3D11Device(D3DDeviceKind kind, ComPtr<ID3D11Device>* device,
                        ComPtr<ID3D11DeviceContext>* context) {
@@ -62,6 +77,8 @@ bool createD3D11Device(D3DDeviceKind kind, ComPtr<ID3D11Device>* device,
 
 class D3DRenderThread final : public QThread {
 public:
+    enum class InvokeResult { Rejected, Completed, Failed, TimedOut };
+
     explicit D3DRenderThread(D3DDeviceKind kind) : m_kind(kind) {}
 
     QRhi* rhi = nullptr;
@@ -85,20 +102,22 @@ public:
         m_cond.notify_all();
 
         while (true) {
-            std::function<void()> job;
+            QueuedJob job;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_cond.wait(lock, [&] { return !m_jobs.isEmpty() || m_stop; });
                 if (m_stop && m_jobs.isEmpty()) break;
                 job = m_jobs.takeFirst();
             }
-            job();
+            job.run();
         }
 
-        delete rhi;
-        rhi = nullptr;
-        m_context.Reset();
-        m_device.Reset();
+        if (!m_abandonCleanup.load(std::memory_order_acquire)) {
+            delete rhi;
+            rhi = nullptr;
+            m_context.Reset();
+            m_device.Reset();
+        }
     }
 
     bool waitReady() {
@@ -107,21 +126,124 @@ public:
         return rhi != nullptr;
     }
 
-    bool invoke(std::function<void()> job) {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (m_stop) return false;
-
-        bool done = false;
-        m_jobs.append([&] {
-            job();
-            {
-                std::lock_guard<std::mutex> doneLock(m_mutex);
-                done = true;
+    InvokeResult invokeFor(std::function<void()> job, int timeoutMs,
+                           std::function<void()> completion = {}) {
+        auto finish = [](const std::function<void()>& callback) noexcept {
+            try {
+                if (callback) callback();
+            } catch (...) {
+                static_cast<void>(0);
             }
-            m_cond.notify_all();
-        });
+        };
+        if (QThread::currentThread() == this) {
+            try {
+                job();
+                finish(completion);
+                return InvokeResult::Completed;
+            } catch (...) {
+                finish(completion);
+                return InvokeResult::Failed;
+            }
+        }
+        const auto state = std::make_shared<InvokeState>();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stop) return InvokeResult::Rejected;
+            m_jobs.append({[state, job = std::move(job), completion, finish] {
+                               bool succeeded = false;
+                               try {
+                                   job();
+                                   succeeded = true;
+                               } catch (...) {
+                               }
+                               finish(completion);
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state->mutex);
+                                   state->succeeded = succeeded;
+                                   state->done = true;
+                               }
+                               state->finished.notify_all();
+                           },
+                           [state, completion, finish] {
+                               finish(completion);
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state->mutex);
+                                   state->done = true;
+                                   state->succeeded = false;
+                               }
+                               state->finished.notify_all();
+                           }});
+        }
         m_cond.notify_all();
-        m_cond.wait(lock, [&] { return done; });
+        std::unique_lock<std::mutex> doneLock(state->mutex);
+        try {
+            if (timeoutMs < 0) {
+                state->finished.wait(doneLock, [&] { return state->done; });
+            } else if (!state->finished.wait_for(doneLock, std::chrono::milliseconds(timeoutMs),
+                                                 [&] { return state->done; })) {
+                return InvokeResult::TimedOut;
+            }
+        } catch (...) {
+            // The queue owns the value-captured job and completion callback.
+            return InvokeResult::TimedOut;
+        }
+        return state->succeeded ? InvokeResult::Completed : InvokeResult::Failed;
+    }
+
+    bool invoke(std::function<void()> job) {
+        if (QThread::currentThread() == this) {
+            try {
+                job();
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+        InvokeState state;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stop) return false;
+            m_jobs.append({[&state, &job] {
+                               bool succeeded = false;
+                               try {
+                                   job();
+                                   succeeded = true;
+                               } catch (...) {
+                               }
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state.mutex);
+                                   state.succeeded = succeeded;
+                                   state.done = true;
+                                   state.finished.notify_all();
+                               }
+                           },
+                           [&state] {
+                               {
+                                   std::lock_guard<std::mutex> doneLock(state.mutex);
+                                   state.done = true;
+                                   state.succeeded = false;
+                                   state.finished.notify_all();
+                               }
+                           }});
+        }
+        m_cond.notify_all();
+        try {
+            std::unique_lock<std::mutex> doneLock(state.mutex);
+            state.finished.wait(doneLock, [&state] { return state.done; });
+        } catch (...) {
+            std::terminate();
+        }
+        return state.succeeded;
+    }
+
+    bool enqueue(std::function<void()> job) {
+        if (!job) return false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stop) return false;
+            m_jobs.append({std::move(job), {}});
+        }
+        m_cond.notify_all();
         return true;
     }
 
@@ -133,13 +255,39 @@ public:
         m_cond.notify_all();
     }
 
+    void quarantine() {
+        QList<QueuedJob> cancelled;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_abandonCleanup.store(true, std::memory_order_release);
+            m_stop = true;
+            cancelled.swap(m_jobs);
+        }
+        for (QueuedJob& job : cancelled)
+            if (job.cancel) job.cancel();
+        m_cond.notify_all();
+    }
+
 private:
+    struct InvokeState {
+        std::mutex mutex;
+        std::condition_variable finished;
+        bool done = false;
+        bool succeeded = false;
+    };
+
+    struct QueuedJob {
+        std::function<void()> run;
+        std::function<void()> cancel;
+    };
+
     D3DDeviceKind m_kind = D3DDeviceKind::Hardware;
     ComPtr<ID3D11Device> m_device;
     ComPtr<ID3D11DeviceContext> m_context;
     std::mutex m_mutex;
     std::condition_variable m_cond;
-    QList<std::function<void()>> m_jobs;
+    QList<QueuedJob> m_jobs;
+    std::atomic<bool> m_abandonCleanup{false};
     bool m_ready = false;
     bool m_stop = false;
 };
@@ -154,14 +302,44 @@ public:
     bool valid = false;
     uint64_t deviceAuthorityEpoch = 0;
     std::atomic<bool> deviceLost{false};
+    std::atomic<bool> deviceLossPollPending{false};
+#ifdef OLR_UNIT_TEST
+    std::atomic<bool> pollOnlyDeviceLost{false};
+    std::atomic<int> deviceLossPollExecutions{0};
+#endif
 };
 
-GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
+GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl,
+                             std::function<std::shared_ptr<GpuFence>()> readbackFenceFactory,
+                             std::shared_ptr<std::atomic<int>> injectedFactoryCalls)
+    : m_impl(std::move(impl)) {
+    try {
+#ifdef OLR_UNIT_TEST
+        ++m_readbackFenceInitializationAttemptsForTest;
+        m_injectedReadbackFenceFactoryCallsForTest = std::move(injectedFactoryCalls);
+#else
+        (void) injectedFactoryCalls;
+#endif
+        m_readbackFence = readbackFenceFactory ? readbackFenceFactory() : createFence();
+    } catch (...) {
+    }
+}
 
 GpuRhiContext::~GpuRhiContext() {
     if (!m_impl) return;
-    m_impl->thread.requestStop();
-    m_impl->thread.wait();
+    std::unique_ptr<Impl> retiring = std::move(m_impl);
+    retiring->thread.requestStop();
+    if (retiring->thread.wait(100)) return;
+    // A wedged driver call cannot be joined safely within the recovery deadline.
+    // Quarantine this bounded cold-path carrier for process lifetime: pending
+    // invokes are cancelled and the render thread skips Qt/COM destruction if it
+    // eventually returns, avoiding wrong-affinity cleanup or post-QCoreApplication
+    // teardown. The alternative would be destroying a live QThread.
+    retiring->thread.quarantine();
+#ifdef OLR_UNIT_TEST
+    quarantinedContextCount.fetch_add(1, std::memory_order_acq_rel);
+#endif
+    (void) retiring.release();
 }
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
@@ -200,8 +378,50 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createInvalidForTest() {
         new GpuRhiContext(std::make_unique<Impl>(D3DDeviceKind::Warp)));
 }
 
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createReadbackFenceFailureForTest() {
+    auto impl = std::make_unique<Impl>(D3DDeviceKind::Warp);
+    impl->deviceAuthorityEpoch = GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
+    impl->thread.start();
+    impl->valid = impl->thread.waitReady();
+    if (!impl->valid) {
+        impl->thread.requestStop();
+        impl->thread.wait();
+        return nullptr;
+    }
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    auto failingFactory = [calls] {
+        calls->fetch_add(1, std::memory_order_acq_rel);
+        return std::shared_ptr<GpuFence>{};
+    };
+    return std::shared_ptr<GpuRhiContext>(
+        new GpuRhiContext(std::move(impl), std::move(failingFactory), std::move(calls)));
+}
+
 int GpuRhiContext::rhiReadbackCountForTest() const {
     return 0;
+}
+
+bool GpuRhiContext::queueBlockingRenderJobForTest(const std::shared_ptr<QSemaphore>& entered,
+                                                  const std::shared_ptr<QSemaphore>& release,
+                                                  const std::shared_ptr<QSemaphore>& exited) {
+    if (!m_impl || !m_impl->valid || !entered || !release || !exited) return false;
+    return m_impl->thread.enqueue([entered, release, exited] {
+        entered->release();
+        release->acquire();
+        exited->release();
+    });
+}
+
+int GpuRhiContext::deviceLossPollExecutionCountForTest() const noexcept {
+    return m_impl ? m_impl->deviceLossPollExecutions.load(std::memory_order_acquire) : 0;
+}
+
+uint64_t GpuRhiContext::quarantinedContextCountForTest() {
+    return quarantinedContextCount.load(std::memory_order_acquire);
+}
+
+void GpuRhiContext::injectPollOnlyDeviceLostForTest() {
+    if (m_impl) m_impl->pollOnlyDeviceLost.store(true, std::memory_order_release);
 }
 #endif
 
@@ -214,7 +434,8 @@ bool GpuRhiContext::isNullBackend() const {
 }
 
 bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) const {
-    if (!m_impl || !m_impl->valid || !job) return false;
+    const auto keepAlive = weak_from_this().lock();
+    if (!keepAlive || !m_impl || !m_impl->valid || !job) return false;
     return m_impl->thread.invoke([&] { job(m_impl->thread.rhi); });
 }
 
@@ -226,21 +447,80 @@ bool GpuRhiContext::deviceLost() const {
     return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
 }
 
+bool GpuRhiContext::deviceLossPollPending() const noexcept {
+    return m_impl && m_impl->deviceLossPollPending.load(std::memory_order_acquire);
+}
+
+bool GpuRhiContext::pollDeviceLoss() const {
+#ifdef OLR_UNIT_TEST
+    m_deviceLossPollCountForTest.fetch_add(1, std::memory_order_relaxed);
+#endif
+    if (!m_impl || !m_impl->valid) return false;
+    if (m_impl->deviceLost.load(std::memory_order_acquire)) return true;
+    bool expected = false;
+    if (!m_impl->deviceLossPollPending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return m_impl->deviceLost.load(std::memory_order_acquire);
+    }
+    const uint64_t authority = m_impl->deviceAuthorityEpoch;
+    Impl* const impl = m_impl.get();
+    D3DRenderThread::InvokeResult polled = D3DRenderThread::InvokeResult::Rejected;
+    try {
+        polled = impl->thread.invokeFor(
+            [impl, authority] {
+#ifdef OLR_UNIT_TEST
+                impl->deviceLossPollExecutions.fetch_add(1, std::memory_order_acq_rel);
+#endif
+                QRhi* rhi = impl->thread.rhi;
+                const auto* handles =
+                    rhi ? static_cast<const QRhiD3D11NativeHandles*>(rhi->nativeHandles())
+                        : nullptr;
+                auto* device = handles ? static_cast<ID3D11Device*>(handles->dev) : nullptr;
+                const HRESULT reason = device ? device->GetDeviceRemovedReason() : HRESULT(S_OK);
+#ifdef OLR_UNIT_TEST
+                const bool injected =
+                    impl->pollOnlyDeviceLost.exchange(false, std::memory_order_acq_rel);
+#else
+                constexpr bool injected = false;
+#endif
+                if (!device || (!FAILED(reason) && !injected)) return;
+                if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                        DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, authority,
+                        deviceDomainId(device)) != 0)
+                    impl->deviceLost.store(true, std::memory_order_release);
+            },
+            50, [impl] { impl->deviceLossPollPending.store(false, std::memory_order_release); });
+    } catch (...) {
+        impl->deviceLossPollPending.store(false, std::memory_order_release);
+        return false;
+    }
+    if (polled == D3DRenderThread::InvokeResult::Rejected)
+        impl->deviceLossPollPending.store(false, std::memory_order_release);
+    return impl->deviceLost.load(std::memory_order_acquire);
+}
+
 void GpuRhiContext::injectDeviceLostForTest() {
     if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
 }
 
-CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, FramePixelFormat) {
-    if (!m_impl || !m_impl->valid) {
-        return CpuPlanes{};
-    }
-    if (m_impl->deviceLost.load(std::memory_order_acquire)) {
-        GpuDeviceLossMonitor::instance().recordLoss();
-        return CpuPlanes{};
-    }
+GpuReadbackResult GpuRhiContext::importAndReadback(const GpuScopedNativeSurface& surface,
+                                                   FramePixelFormat) noexcept {
+#ifdef OLR_UNIT_TEST
+    void* testHandle = surface.nativeHandle();
+    m_lastReadbackHadNativeHandleForTest.store(testHandle != nullptr, std::memory_order_release);
+    m_lastReadbackSubresourceForTest.store(surface.nativeSubresource(), std::memory_order_release);
+    if (const auto injected = injectedReadbackForTest()) return *injected;
+#endif
+    void* handle = surface.nativeHandle();
+    if (!surface.valid() || !handle) return {};
+    try {
+        if (!m_impl || !m_impl->valid) return {};
+        if (m_impl->deviceLost.load(std::memory_order_acquire)) {
+            GpuDeviceLossMonitor::instance().recordLoss();
+            return {};
+        }
 
-    const uint64_t deviceAuthorityEpoch = m_impl->deviceAuthorityEpoch;
-    {
+        const uint64_t deviceAuthorityEpoch = m_impl->deviceAuthorityEpoch;
         const bool invoked = m_impl->thread.invoke([&] {
             QRhi* rhi = m_impl->thread.rhi;
             if (!rhi) return;
@@ -254,14 +534,18 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
                 // Driver-authoritative loss: mint the provenance-bound token and hand
                 // it to the loss latch so the worker's recovery can free held surfaces
                 // WITHOUT waiting on the (now dead) fences.
-                GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                    DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
-                m_impl->deviceLost.store(true, std::memory_order_release);
+                if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                        DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch,
+                        deviceDomainId(device)) != 0)
+                    m_impl->deviceLost.store(true, std::memory_order_release);
             }
         });
         (void) invoked;
+        return {};
+    } catch (...) {
+        // This backend only polls device status; it never submits readback work.
+        return {};
     }
-    return CpuPlanes{};
 }
 
 std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
@@ -273,9 +557,30 @@ std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
         if (!rhi) return;
         const auto* nativeHandles =
             static_cast<const QRhiD3D11NativeHandles*>(rhi->nativeHandles());
-        fence = nativeHandles ? makeD3D11GpuFence(nativeHandles->dev) : nullptr;
+        fence = nativeHandles ? makeD3D11GpuFence(nativeHandles->dev, m_impl->deviceAuthorityEpoch)
+                              : nullptr;
     });
     return invoked ? fence : nullptr;
 }
+
+#ifdef OLR_UNIT_TEST
+uint64_t GpuRhiContext::captureD3D11RemovalAuthorityForTest() {
+    return GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
+}
+
+D3D11RemovalObservationForTest
+GpuRhiContext::observeD3D11RemovalForTest(void* opaqueDevice, uint64_t deviceAuthorityEpoch) {
+    auto* device = static_cast<ID3D11Device*>(opaqueDevice);
+    if (!device) return {};
+    const HRESULT reason = device->GetDeviceRemovedReason();
+    uint64_t generation = 0;
+    if (FAILED(reason)) {
+        generation = GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch,
+            deviceDomainId(device));
+    }
+    return D3D11RemovalObservationForTest{int64_t(reason), generation};
+}
+#endif
 
 #endif // _WIN32

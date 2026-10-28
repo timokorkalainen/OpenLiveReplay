@@ -33,6 +33,10 @@ struct GpuBudgetSnapshot {
     qint64 liveBytes = 0;
     qint64 gatedLiveBytes = 0;
     qint64 oomDegrades = 0;
+    // Degrades caused by a fence/device authority refusing to register the
+    // retirement, not by memory pressure. Kept separate so a device-loss window
+    // is never reported to the operator as VRAM exhaustion.
+    qint64 submissionRefusalDegrades = 0;
     bool reportOnly = false;
     std::array<qint64, kGpuBudgetTagCount> liveBytesByTag{};
 };
@@ -106,6 +110,8 @@ public:
     void credit(qint64 bytes, GpuBudgetTag tag = GpuBudgetTag::DecodeWindow);
     qint64 oomDegradeCount() const;
     void noteOomDegrade();
+    qint64 submissionRefusalDegradeCount() const;
+    void noteSubmissionRefusalDegrade();
     GpuBudgetSnapshot snapshot() const;
     void reset();
 

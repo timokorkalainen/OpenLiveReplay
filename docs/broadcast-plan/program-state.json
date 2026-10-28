@@ -71,6 +71,12 @@
     "pr": null,
     "evidence": null
   },
+  "rel-gpu-surface-lifetime": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
   "rel-output-autorecover": {
     "phase": 1,
     "status": "discovery",

@@ -134,5 +134,5 @@ void TestCommitGate::legacyMediaVideoFrameTypeIsRetired() {
              "MediaVideoFrame must stay retired; use FrameHandle plus MediaVideoFrameView");
 }
 
-QTEST_MAIN(TestCommitGate)
+QTEST_GUILESS_MAIN(TestCommitGate)
 #include "tst_commitgate.moc"
