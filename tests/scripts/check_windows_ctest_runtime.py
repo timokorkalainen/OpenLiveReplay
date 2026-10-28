@@ -13,6 +13,17 @@ import subprocess
 import tempfile
 
 
+QML_STYLE_TESTS = (
+    "tst_olrstyle",
+    "tst_statusstrip_onair",
+    "tst_pgmstage_mapping",
+    "tst_rundownrail_drag",
+    "tst_scrubtimeline",
+    "tst_transportdock_layout",
+    "tst_sourcelistpanel_layout",
+)
+
+
 def read_cmake_cache(path: Path) -> dict[str, str]:
     """Return typed entries from a CMake cache without evaluating them."""
     entries: dict[str, str] = {}
@@ -51,7 +62,7 @@ def normalize_path(value: str | Path) -> str:
 
 
 def configured_runtime(
-    cache: dict[str, str], qt_runtime_dir: Path, qt_plugin_dir: Path
+    cache: dict[str, str], qt_runtime_dir: Path, qt_plugin_dir: Path, qt_qml_dir: Path
 ) -> tuple[tuple[Path, ...], Path, Path]:
     compiler = Path(require_cache_value(cache, "CMAKE_CXX_COMPILER"))
     if not compiler.is_file():
@@ -73,7 +84,7 @@ def configured_runtime(
         require_directory("SRT libraries", srt_root / "lib"),
     )
     plugins = require_directory("Qt plugins", qt_plugin_dir)
-    qml = require_directory("Qt QML imports", qt_runtime_dir.parent / "qml")
+    qml = require_directory("Qt QML imports", qt_qml_dir)
     return runtime_dirs, plugins, qml
 
 
@@ -141,6 +152,7 @@ def check_registration(
     runtime_dirs: tuple[Path, ...],
     plugins: Path,
     qml: Path,
+    project_qml: Path,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="olr-ctest-registration-") as temporary:
         discovery_build = Path(temporary) / "build"
@@ -151,7 +163,7 @@ def check_registration(
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
 
-        for test_name in ("tst_muxer", "tst_qml_codecsettings", "tst_olrstyle"):
+        for test_name in ("tst_muxer", "tst_qml_codecsettings", *QML_STYLE_TESTS):
             result = subprocess.run(
                 [
                     str(ctest),
@@ -199,6 +211,11 @@ def check_registration(
                     f"{test_name} registered QT_QPA_PLATFORM is not exactly offscreen"
                 )
             for variable in ("QML_IMPORT_PATH", "QML2_IMPORT_PATH"):
+                expected_qml = (
+                    (project_qml, qml)
+                    if test_name in QML_STYLE_TESTS
+                    else (qml,)
+                )
                 if modifications.get(variable):
                     actual = tuple(
                         Path(value) for value in reversed(modifications[variable])
@@ -206,13 +223,13 @@ def check_registration(
                     require_path_prefix(
                         f"{test_name} registered {variable} modification",
                         os.pathsep.join(str(path) for path in actual),
-                        (qml,),
+                        expected_qml,
                     )
                 else:
                     require_path_prefix(
                         f"{test_name} registered {variable}",
                         environment.get(variable, ""),
-                        (qml,),
+                        expected_qml,
                     )
 
 
@@ -716,21 +733,31 @@ def main() -> int:
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--qt-runtime-dir", type=Path)
     parser.add_argument("--qt-plugin-dir", type=Path)
+    parser.add_argument("--qt-qml-dir", type=Path)
+    parser.add_argument("--project-qml-dir", type=Path)
     args = parser.parse_args()
 
     if args.source_root is not None:
         check_source_policy(args.source_root.resolve())
         return 0
-    if args.build_dir is None or args.qt_runtime_dir is None or args.qt_plugin_dir is None:
+    if (
+        args.build_dir is None
+        or args.qt_runtime_dir is None
+        or args.qt_plugin_dir is None
+        or args.qt_qml_dir is None
+        or args.project_qml_dir is None
+    ):
         parser.error(
-            "runtime mode requires --build-dir, --qt-runtime-dir, and --qt-plugin-dir"
+            "runtime mode requires --build-dir, --qt-runtime-dir, "
+            "--qt-plugin-dir, --qt-qml-dir, and --project-qml-dir"
         )
 
     build_dir = require_directory("CMake build", args.build_dir)
     cache = read_cmake_cache(build_dir / "CMakeCache.txt")
     runtime_dirs, plugins, qml = configured_runtime(
-        cache, args.qt_runtime_dir, args.qt_plugin_dir
+        cache, args.qt_runtime_dir, args.qt_plugin_dir, args.qt_qml_dir
     )
+    project_qml = require_directory("project QML imports", args.project_qml_dir)
     ctest_value = cache.get("CMAKE_CTEST_COMMAND", "").strip()
     ctest = (
         Path(ctest_value)
@@ -741,7 +768,9 @@ def main() -> int:
         raise SystemExit(f"CTest executable does not exist: {ctest}")
 
     check_effective_environment(runtime_dirs, plugins, qml)
-    check_registration(ctest, build_dir, runtime_dirs, plugins, qml)
+    check_registration(
+        ctest, build_dir, runtime_dirs, plugins, qml, project_qml
+    )
     return 0
 
 

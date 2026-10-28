@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,11 +25,131 @@ def load_module():
 
 
 class WindowsRuntimePolicyTests(unittest.TestCase):
+    def test_configured_runtime_uses_explicit_qml_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            compiler = root / "compiler" / "bin" / "g++.exe"
+            qt_runtime = root / "runtime-layout" / "qt" / "bin"
+            plugins = root / "plugin-layout"
+            qml = root / "separate-qml-layout"
+            ffmpeg = root / "runtime-layout" / "ffmpeg"
+            srt = root / "runtime-layout" / "srt"
+            compiler.parent.mkdir(parents=True)
+            compiler.write_bytes(b"compiler")
+            for directory in (
+                qt_runtime,
+                plugins,
+                qml,
+                ffmpeg / "bin",
+                ffmpeg / "lib",
+                srt / "bin",
+                srt / "lib",
+            ):
+                directory.mkdir(parents=True)
+
+            runtime_dirs, selected_plugins, selected_qml = (
+                self.policy.configured_runtime(
+                    {
+                        "CMAKE_CXX_COMPILER": str(compiler),
+                        "OLR_FFMPEG_ROOT": str(ffmpeg),
+                        "OLR_SRT_ROOT": str(srt),
+                    },
+                    qt_runtime,
+                    plugins,
+                    qml,
+                )
+            )
+
+            self.assertEqual(runtime_dirs[1], qt_runtime.resolve())
+            self.assertEqual(selected_plugins, plugins.resolve())
+            self.assertEqual(selected_qml, qml.resolve())
+            self.assertFalse((qt_runtime.parent / "qml").exists())
+
+    def test_qmllint_rebinds_to_current_qt_prefix_on_every_configure(self) -> None:
+        smoke_cmake = (
+            MODULE_PATH.parents[1] / "smoke" / "CMakeLists.txt"
+        ).read_text(encoding="utf-8")
+        self.assertRegex(
+            smoke_cmake,
+            r"unset\(OLR_QMLLINT CACHE\)\s*"
+            r"find_program\(OLR_QMLLINT NAMES qmllint "
+            r"HINTS \"\$\{_qt_prefix\}/bin\" NO_DEFAULT_PATH\)",
+        )
+
+    def test_rtmidi_no_tests_subbuild_emits_closed_empty_ctest_graph(self) -> None:
+        root_cmake = (MODULE_PATH.parents[2] / "CMakeLists.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            root_cmake,
+            r"set\(RTMIDI_BUILD_TESTING OFF CACHE BOOL \"\" FORCE\)"
+            r"[\s\S]*FetchContent_MakeAvailable\(rtmidi\)"
+            r"[\s\S]*file\(WRITE "
+            r"\"\$\{rtmidi_BINARY_DIR\}/CTestTestfile\.cmake\"",
+        )
+        self.assertIn(
+            "Intentionally empty: RTMIDI_BUILD_TESTING=OFF.", root_cmake
+        )
+        for relative in ("ui/theme", "ui/style"):
+            self.assertIn(
+                f'file(WRITE "${{CMAKE_BINARY_DIR}}/{relative}/CTestTestfile.cmake"',
+                root_cmake,
+            )
+        self.assertIn("Intentionally empty: QML library has no tests.", root_cmake)
+
     def test_windows_runtime_declares_cmake_322_minimum(self) -> None:
         helper = MODULE_PATH.parents[2] / "cmake" / "OlrTestRuntime.cmake"
         text = helper.read_text(encoding="utf-8")
         self.assertRegex(text, r"CMAKE_VERSION\s+VERSION_LESS\s+3\.22")
         self.assertRegex(text, r"FATAL_ERROR[\s\S]*3\.22")
+
+    def test_windows_runtime_prepends_qt_qml_without_replacing_test_imports(
+        self,
+    ) -> None:
+        helper = MODULE_PATH.parents[2] / "cmake" / "OlrTestRuntime.cmake"
+        text = helper.read_text(encoding="utf-8")
+
+        self.assertIn(
+            '"QML_IMPORT_PATH=path_list_prepend:${_olr_qml_dir}"', text
+        )
+        self.assertIn(
+            '"QML2_IMPORT_PATH=path_list_prepend:${_olr_qml_dir}"', text
+        )
+        self.assertNotRegex(
+            text,
+            r'ENVIRONMENT\s+"QML2?_IMPORT_PATH=',
+        )
+
+    def test_qmlstyle_tests_register_project_qml_import_root(self) -> None:
+        qmlstyle = (
+            MODULE_PATH.parents[2] / "tests" / "qmlstyle" / "CMakeLists.txt"
+        ).read_text(encoding="utf-8")
+        windows_block = re.search(
+            r"if\(WIN32\)([\s\S]*?)endif\(\)", qmlstyle
+        )
+        self.assertIsNotNone(windows_block)
+        block = windows_block.group(1)
+
+        self.assertIn(
+            '"QML_IMPORT_PATH=path_list_prepend:${CMAKE_BINARY_DIR}/qml"',
+            block,
+        )
+        self.assertIn(
+            '"QML2_IMPORT_PATH=path_list_prepend:${CMAKE_BINARY_DIR}/qml"',
+            block,
+        )
+        for test_name in self.policy.QML_STYLE_TESTS:
+            self.assertIn(test_name, block)
+
+    def test_runtime_contract_declares_project_qml_import_root(self) -> None:
+        smoke = (
+            MODULE_PATH.parents[2] / "tests" / "smoke" / "CMakeLists.txt"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            '--project-qml-dir "${CMAKE_BINARY_DIR}/qml"',
+            smoke,
+        )
 
     def test_registration_check_preserves_enclosing_ctest_logs(self) -> None:
         ctest_value = shutil.which("ctest")
@@ -49,36 +170,58 @@ class WindowsRuntimePolicyTests(unittest.TestCase):
             for path in runtime_dirs:
                 path.mkdir(parents=True)
             plugins = build / "plugins"
-            qml = build / "qml"
+            qml = build / "qt-qml"
+            project_qml = build / "qml"
             plugins.mkdir()
             qml.mkdir()
-            modifications = [
+            project_qml.mkdir()
+            base_modifications = [
                 f"PATH=path_list_prepend:{path.as_posix()}"
                 for path in reversed(runtime_dirs)
             ]
-            modifications.extend(
+            base_modifications.extend(
                 (
                     f"QML_IMPORT_PATH=path_list_prepend:{qml.as_posix()}",
                     f"QML2_IMPORT_PATH=path_list_prepend:{qml.as_posix()}",
                 )
             )
-            tests = ("tst_muxer", "tst_qml_codecsettings", "tst_olrstyle")
-            lines = [f'add_test({name} "missing-{name}.exe")' for name in tests]
-            lines.append(
-                "set_tests_properties("
-                + " ".join(tests)
-                + ' PROPERTIES ENVIRONMENT "QT_PLUGIN_PATH='
-                + plugins.as_posix()
-                + ';QT_QPA_PLATFORM=offscreen" ENVIRONMENT_MODIFICATION "'
-                + ";".join(modifications)
-                + '")'
+            tests = (
+                "tst_muxer",
+                "tst_qml_codecsettings",
+                *self.policy.QML_STYLE_TESTS,
             )
+            lines = [f'add_test({name} "missing-{name}.exe")' for name in tests]
+            for test_name in tests:
+                modifications = list(base_modifications)
+                if test_name in self.policy.QML_STYLE_TESTS:
+                    modifications.extend(
+                        (
+                            "QML_IMPORT_PATH=path_list_prepend:"
+                            + project_qml.as_posix(),
+                            "QML2_IMPORT_PATH=path_list_prepend:"
+                            + project_qml.as_posix(),
+                        )
+                    )
+                lines.append(
+                    "set_tests_properties("
+                    + test_name
+                    + ' PROPERTIES ENVIRONMENT "QT_PLUGIN_PATH='
+                    + plugins.as_posix()
+                    + ';QT_QPA_PLATFORM=offscreen" ENVIRONMENT_MODIFICATION "'
+                    + ";".join(modifications)
+                    + '")'
+                )
             (build / "CTestTestfile.cmake").write_text(
                 "\n".join(lines) + "\n", encoding="utf-8"
             )
 
             self.policy.check_registration(
-                Path(ctest_value), build, runtime_dirs, plugins, qml
+                Path(ctest_value),
+                build,
+                runtime_dirs,
+                plugins,
+                qml,
+                project_qml,
             )
 
             self.assertEqual(

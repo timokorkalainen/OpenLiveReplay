@@ -103,7 +103,8 @@ sleep 1.0 # let the producer + SRT listener come up before the caller connects
 URL="$(srt_caller_url "$SRT_PORT")"
 # shellcheck disable=SC2086 # FPS_EXTRA/CODEC_EXTRA are intentionally word-split (may be empty).
 HARNESS_OUT="$("$HARNESS" --url "$URL" --name "olr_e2e_${MODE}" --outdir "$WORKDIR" \
-    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 $FPS_EXTRA $CODEC_EXTRA)"
+    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 \
+    --qt-log-stderr $FPS_EXTRA $CODEC_EXTRA)"
 HARNESS_RC=$?
 
 if [ $HARNESS_RC -ne 0 ]; then

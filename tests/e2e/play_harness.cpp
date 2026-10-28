@@ -439,7 +439,9 @@ int main(int argc, char** argv) {
     PlaybackWorker worker(providers, &transport, &audio);
     worker.openFile(file);
     worker.setActiveAudioView(0); // route audio for view 0
-    if (isFrameOracleScenario(scen)) {
+    // These scenarios assert per-feed output identities, so register the feed preview
+    // endpoints explicitly. PlaybackWorker keeps them disabled unless a UI/harness asks.
+    if (isFrameOracleScenario(scen) || scen == QStringLiteral("livegrow")) {
         worker.setFeedPreviewProvidersEnabled(true);
     }
     if (isFrameOracleScenario(scen)) {

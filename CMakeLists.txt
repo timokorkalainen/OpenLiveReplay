@@ -120,6 +120,11 @@ FetchContent_Declare(
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(rtmidi)
+# The parent test graph records every configured subdirectory even when the
+# dependency deliberately builds no tests. Keep that edge closed and explicit
+# so guarded CTest preparation never has to infer a missing graph node.
+file(WRITE "${rtmidi_BINARY_DIR}/CTestTestfile.cmake"
+    "# Intentionally empty: RTMIDI_BUILD_TESTING=OFF.\n")
 
 # Qt location: explicit configuration always wins. Only when nothing points at a
 # Qt kit do we auto-detect the standard installer / Homebrew locations, so a
@@ -174,6 +179,12 @@ set(QT_QML_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml")
 # app so they are on the QML import path when Main.qml is processed).
 add_subdirectory(ui/theme)
 add_subdirectory(ui/style)
+# These library-only directories are represented in the parent CTest graph
+# after testing is enabled later. Materialize their intentional empty nodes.
+file(WRITE "${CMAKE_BINARY_DIR}/ui/theme/CTestTestfile.cmake"
+    "# Intentionally empty: QML library has no tests.\n")
+file(WRITE "${CMAKE_BINARY_DIR}/ui/style/CTestTestfile.cmake"
+    "# Intentionally empty: QML library has no tests.\n")
 
 # 2. Create the Executable Target FIRST
 qt_add_executable(OpenLiveReplay main.cpp)

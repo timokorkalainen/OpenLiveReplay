@@ -1,19 +1,23 @@
 // Headless output-bus soak: drives a real OutputRuntime against a static synthetic
 // OutputFrameCache through alternating play/pause segments and verifies, via a
-// ContinuitySink, that the produced output stream stays frame- and audio-continuous and
-// holds cadence over wall-clock time. Rung 1 of the output-stability ladder: it exercises
+// ContinuitySink, that previews suppress paused cadence while an external PGM output stays
+// frame- and audio-continuous over wall-clock time. Rung 1 of the output-stability ladder:
+// it exercises
 // the OutputRuntime/dispatcher/engine/memo/identity/rational-audio code, NOT real decode,
 // real sinks, or an external consumer (that is the rung-5 NDI-receiver lane).
 //
 // Env: OLR_SOAK_SECONDS (default 120), OLR_SOAK_FPS_NUM/OLR_SOAK_FPS_DEN (default 30000/1001),
 //      OLR_SOAK_FEEDS (default 2).
-// Output (stdout), one line each. `repeated` is the dispatcher's identity-skip count for the
-// bus (frozen/duplicate payloads dropped before the sink); `indexGaps` is the sink's raw
-// index-jump count (== skips, diagnostic only). The driver gates on frames + repeated ==
-// ticks (every tick delivered or skipped-as-duplicate) and repeated > 0 (pause exercised):
+// Output (stdout), one line each. `repeated` is the dispatcher's repeated-payload count for
+// the target; `indexGaps` records intentionally suppressed preview ticks. The driver requires
+// paused previews to have gaps and an external PGM output to submit every tick with repeated
+// payloads during the paused segments:
 //   SOAK bus=feed frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=.. ticks=..
+//        playingTicks=.. pausedTicks=..
 //   SOAK bus=multiview frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=.. ticks=..
+//        playingTicks=.. pausedTicks=..
 //   SOAK bus=pgm frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=.. ticks=..
+//        playingTicks=.. pausedTicks=..
 //   RUNTIME deadlineMisses=.. catchUpCapHits=.. maxLatenessNs=.. ticks=..
 #include <QByteArray>
 #include <QCoreApplication>
@@ -37,7 +41,8 @@ int envIntOr(const char* key, int def) {
 // OutputRuntime thread; the accessors are read only AFTER stopRuntime() has joined it.
 class ContinuitySink final : public IOutputSink {
 public:
-    explicit ContinuitySink(OutputTargetKind kind) : m_kind(kind) {}
+    explicit ContinuitySink(OutputTargetKind kind, bool continuousCadence = false)
+        : m_kind(kind), m_continuousCadence(continuousCadence) {}
 
     OutputTargetKind kind() const override { return m_kind; }
     bool start(const OutputTargetAssignment&, FrameRate) override {
@@ -46,15 +51,24 @@ public:
     }
     void stop() override { m_active = false; }
     bool isActive() const override { return m_active; }
+    bool needsContinuousCadence() const override { return m_continuousCadence; }
 
     bool submit(const OutputBusFrame& frame) override {
-        if (m_hasLastIndex && frame.outputFrameIndex != m_lastIndex + 1) m_indexGaps++;
+        const bool hasIndexGap = m_hasLastIndex && frame.outputFrameIndex != m_lastIndex + 1;
+        if (hasIndexGap) {
+            m_indexGaps++;
+            // Qt previews intentionally receive no PausedPgmCadence ticks. Their audio
+            // timeline resumes at the new output index, so a suppressed interval starts a
+            // new continuity region rather than constituting an audio seam.
+            m_haveAudioBaseline = false;
+        }
         m_lastIndex = frame.outputFrameIndex;
         m_hasLastIndex = true;
 
         // Audio tiling is only meaningful between consecutive playing (non-silent) frames.
         // A pause emits silent audio and resets the baseline; resume re-establishes it.
         if (frame.identity.audioSilent) {
+            m_silentFrames++;
             m_haveAudioBaseline = false;
         } else {
             const qint64 start = frame.audio.startSample;
@@ -74,11 +88,13 @@ public:
     qint64 frames() const { return m_frames; }
     qint64 indexGaps() const { return m_indexGaps; }
     qint64 audioSeams() const { return m_audioSeams; }
+    qint64 silentFrames() const { return m_silentFrames; }
     qint64 placeholders() const { return m_placeholders; }
     qint64 repeated() const { return m_repeated; }
 
 private:
     OutputTargetKind m_kind;
+    bool m_continuousCadence = false;
     bool m_active = false;
     bool m_hasLastIndex = false;
     qint64 m_lastIndex = 0;
@@ -86,6 +102,7 @@ private:
     bool m_haveAudioBaseline = false;
     qint64 m_expectedNextStart = 0;
     qint64 m_audioSeams = 0;
+    qint64 m_silentFrames = 0;
     qint64 m_placeholders = 0;
     bool m_hasLastIdentity = false;
     OutputFrameIdentity m_lastIdentity;
@@ -160,7 +177,7 @@ int main(int argc, char** argv) {
 
     ContinuitySink feedSink(OutputTargetKind::QtPreview);
     ContinuitySink multiviewSink(OutputTargetKind::QtPreview);
-    ContinuitySink pgmSink(OutputTargetKind::QtPreview);
+    ContinuitySink pgmSink(OutputTargetKind::Ndi, true);
 
     OutputTargetAssignment feedAssignment;
     feedAssignment.id = QStringLiteral("soak-feed");
@@ -174,13 +191,12 @@ int main(int argc, char** argv) {
     multiviewAssignment.kind = OutputTargetKind::QtPreview;
     multiviewAssignment.enabled = true;
 
-    // The program (PGM) bus renders the selected feed full-frame; the snapshot provider pins
-    // selectedFeedIndex=0, so PGM soaks renderPgm -> dispatch -> identity-skip the same way feed
-    // and multiview do, over the same play/pause schedule.
+    // The program (PGM) bus models a cadence-sensitive external output. Unlike Qt previews,
+    // it must receive every PausedPgmCadence tick while holding the last payload.
     OutputTargetAssignment pgmAssignment;
     pgmAssignment.id = QStringLiteral("soak-pgm");
     pgmAssignment.sourceBus = OutputBusId::pgm();
-    pgmAssignment.kind = OutputTargetKind::QtPreview;
+    pgmAssignment.kind = OutputTargetKind::Ndi;
     pgmAssignment.enabled = true;
 
     runtime.setEndpoints({{feedAssignment, &feedSink},
@@ -200,21 +216,23 @@ int main(int argc, char** argv) {
     runtime.stopRuntime(); // joins the runtime thread; sink accessors are safe afterward
 
     const OutputDispatchStats stats = runtime.stats();
-    // Identity-skip is on by default (OutputDispatcher::m_identitySkip): the dispatcher
-    // drops byte-identical consecutive submits before the sink ever sees them, so the
-    // dedup/pause signal lives in the dispatcher stats, not the sink. A paused freeze
-    // shows up as the target's repeatedPayloadFrames, and each skip makes the sink's next
-    // outputFrameIndex jump (so the sink's raw indexGaps == the number of skips, by
-    // construction — it is a diagnostic here, not a gate). The real continuity invariant
-    // is "every tick is either delivered or skipped-as-duplicate": frames + repeated ==
-    // ticks, with repeated > 0 proving the pause segments were actually exercised.
-    auto report = [&stats](const char* bus, const QString& targetId, const ContinuitySink& s) {
+    // PausedPgmCadence omits preview endpoints but submits held frames to external PGM
+    // endpoints. Preview index gaps therefore prove suppression, while PGM repeated payloads
+    // prove that the cadence-sensitive target stayed active through the pause segments.
+    // The external PGM sink receives every actually-dispatched tick. Its silent-audio
+    // frames are the paused cadence ticks; its non-silent frames are the playing ticks.
+    // Deriving the split here avoids counting a snapshot abandoned by stopRuntime().
+    const qint64 observedPausedTicks = pgmSink.silentFrames();
+    const qint64 observedPlayingTicks = pgmSink.frames() - observedPausedTicks;
+    auto report = [&stats, observedPlayingTicks, observedPausedTicks](
+                      const char* bus, const QString& targetId, const ContinuitySink& s) {
         const OutputTargetDispatchStats t = stats.targets.value(targetId);
         printf("SOAK bus=%s frames=%lld indexGaps=%lld audioSeams=%lld placeholders=%lld "
-               "repeated=%lld ticks=%lld\n",
+               "repeated=%lld ticks=%lld playingTicks=%lld pausedTicks=%lld\n",
                bus, (long long) s.frames(), (long long) s.indexGaps(), (long long) s.audioSeams(),
                (long long) s.placeholders(), (long long) t.repeatedPayloadFrames,
-               (long long) stats.ticks);
+               (long long) stats.ticks, (long long) observedPlayingTicks,
+               (long long) observedPausedTicks);
     };
     report("feed", feedAssignment.id, feedSink);
     report("multiview", multiviewAssignment.id, multiviewSink);

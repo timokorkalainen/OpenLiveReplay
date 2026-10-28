@@ -8,7 +8,8 @@
 include("${CMAKE_SOURCE_DIR}/cmake/OlrTestRuntime.cmake")
 
 get_filename_component(_qt_prefix "${Qt6_DIR}/../../.." ABSOLUTE)
-find_program(OLR_QMLLINT NAMES qmllint HINTS "${_qt_prefix}/bin")
+unset(OLR_QMLLINT CACHE)
+find_program(OLR_QMLLINT NAMES qmllint HINTS "${_qt_prefix}/bin" NO_DEFAULT_PATH)
 
 if(OLR_QMLLINT)
     add_test(NAME qml_smoke COMMAND "${OLR_QMLLINT}"
@@ -73,7 +74,9 @@ if(WIN32)
             "${CMAKE_SOURCE_DIR}/tests/scripts/check_windows_ctest_runtime.py"
             --build-dir "${CMAKE_BINARY_DIR}"
             --qt-runtime-dir "$<TARGET_FILE_DIR:Qt6::Core>"
-            --qt-plugin-dir "$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
+            --qt-plugin-dir "$<TARGET_FILE_DIR:Qt6::Core>/../plugins"
+            --qt-qml-dir "$<TARGET_FILE_DIR:Qt6::Core>/../qml"
+            --project-qml-dir "${CMAKE_BINARY_DIR}/qml")
     set_tests_properties(windows_ctest_runtime_contract PROPERTIES
         LABELS "smoke;ci"
         TIMEOUT 30)

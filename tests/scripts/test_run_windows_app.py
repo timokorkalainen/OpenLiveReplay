@@ -15,7 +15,10 @@ import unittest
 from unittest import mock
 
 from tools import windows_runtime_cache
-from tests.scripts.test_run_ctest import _write_manifest_pe_fixture
+from tests.scripts.test_run_ctest import (
+    _write_manifest_pe_fixture,
+    find_real_windows_build,
+)
 
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "run_windows_app.py"
@@ -180,6 +183,48 @@ class RunWindowsAppTests(unittest.TestCase):
             )
         self.assertEqual(env["unrelated"], "preserved")
         self.assertNotIn("hostile", "\n".join(env.values()))
+
+    def test_runtime_scrubs_interpreter_and_qt_injection_environment(self) -> None:
+        removed = (
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONBREAKPOINT",
+            "PYTHONWARNINGS",
+            "BASH_ENV",
+            "BASH_LOADABLES_PATH",
+            "BASH_FUNC_ATTACK%%",
+            "ENV",
+            "QT_OPENGL_DLL",
+            "QT_OPENGL_BUGLIST",
+            "QT_QUICK_CONTROLS_CONF",
+            "QT_QUICK_CONTROLS_IMAGINE_PATH",
+            "QT_STYLE_OVERRIDE",
+            "QT_QPA_PLATFORM",
+            "QT_QPA_PLATFORMTHEME",
+            "QT_QPA_GENERIC_PLUGINS",
+            "QT_QPA_FONTDIR",
+            "QT_QUICK_CONTROLS_STYLE",
+            "QT_QUICK_CONTROLS_FALLBACK_STYLE",
+            "QT_VIRTUALKEYBOARD_LAYOUT_PATH",
+            "QTWEBENGINEPROCESS_PATH",
+            "QTWEBENGINE_DICTIONARIES_PATH",
+            "QTWEBENGINE_LOCALES_PATH",
+        )
+        inherited = {
+            name.swapcase(): str(self.workspace / f"hostile-{index}")
+            for index, name in enumerate(removed)
+        }
+        inherited["BASH_FUNC_injected%%"] = "() { C:/attacker.exe; }"
+        inherited["unrelated"] = "preserved"
+
+        env = self.launcher.prepare_windows_app_runtime(
+            self.build, self.app, inherited
+        )
+
+        folded = {name.casefold() for name in env}
+        self.assertTrue({name.casefold() for name in removed}.isdisjoint(folded))
+        self.assertNotIn("bash_func_injected%%", folded)
+        self.assertEqual(env["unrelated"], "preserved")
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_runtime_stages_qml_for_external_launch_lease(self) -> None:
@@ -406,34 +451,72 @@ class RunWindowsAppTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "requires a built Windows app")
     def test_real_built_app_snapshot_has_absolute_size_time_budgets(self) -> None:
         project_source = Path(__file__).resolve().parents[2]
-        candidates: list[tuple[float, Path, Path]] = []
-        for app in project_source.glob("build*/**/OpenLiveReplay.exe"):
-            for build in (app.parent, *app.parents):
-                cache = build / "CMakeCache.txt"
-                if cache.is_file():
-                    candidates.append((app.stat().st_mtime, build, app))
-                    break
-                if build == project_source:
-                    break
-        if not candidates:
-            self.fail("actual built OpenLiveReplay.exe with CMakeCache.txt is required")
-        _modified, build, app = max(candidates)
+        build, app = find_real_windows_build(project_source)
+        cache_parent = Path(tempfile.mkdtemp(prefix="olr-real-app-cache-"))
+        self.addCleanup(shutil.rmtree, cache_parent, True)
+        cache_root = cache_parent / "cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
 
-        started = time.perf_counter()
-        with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
-            self.launcher.prepare_windows_app_runtime(
+        with self.launcher.runtime_guard.RuntimeAuditLease(cache_root) as cold:
+            started = time.perf_counter()
+            cold_env = self.launcher.prepare_windows_app_runtime(
                 build,
                 app,
                 {"SystemRoot": os.environ.get("SystemRoot", "C:/Windows")},
-                audit_lease=lease,
+                audit_lease=cold,
             )
-            elapsed = time.perf_counter() - started
-            self.assertEqual(lease.launch_executable.read_bytes(), app.read_bytes())
-            # Debug builds contain an ~86 MiB executable; this absolute ceiling
-            # still rejects restaging the verified adjacent Qt runtime peers.
-            self.assertLess(lease.staged_byte_count, 240 << 20)
-            self.assertLess(lease.staged_file_count, 1900)
-        self.assertLess(elapsed, 30.0)
+            cold_elapsed = time.perf_counter() - started
+            self.assertEqual(cold.launch_executable.read_bytes(), app.read_bytes())
+            self.assertLessEqual(cold_elapsed, 30.0)
+            self.assertLessEqual(cold.staged_byte_count, 256 << 20)
+            self.assertLessEqual(cold.staged_file_count, 2048)
+            self.assertGreater(cold.cache_miss_count, 0)
+
+            plugins = Path(cold_env["QT_PLUGIN_PATH"])
+            qml = Path(cold_env["QML_IMPORT_PATH"])
+            qml_asset_directories = tuple(
+                path for path in qml.rglob("*") if path.is_dir()
+            )
+            self.assertTrue(qml_asset_directories)
+            mutation_namespaces = {
+                plugins / "imageformats",
+                plugins / "multimedia",
+                qml_asset_directories[0],
+                cold.launch_executable.parent,
+                cold.launch_runtime_directory,
+                *cold.launch_runtime_directories,
+            }
+            for directory in mutation_namespaces:
+                with self.subTest(namespace=directory):
+                    if directory.is_dir():
+                        with self.assertRaises(OSError):
+                            (
+                                directory / f"late-task8-{time.time_ns()}.dll"
+                            ).write_bytes(b"late")
+                    else:
+                        with self.assertRaises(OSError):
+                            directory.mkdir(parents=True)
+
+        with self.launcher.runtime_guard.RuntimeAuditLease(cache_root) as warm:
+            started = time.perf_counter()
+            warm_env = self.launcher.prepare_windows_app_runtime(
+                build,
+                app,
+                {"SystemRoot": os.environ.get("SystemRoot", "C:/Windows")},
+                audit_lease=warm,
+            )
+            warm_elapsed = time.perf_counter() - started
+            self.assertEqual(warm_env, cold_env)
+            self.assertLessEqual(warm_elapsed, 5.0)
+            self.assertGreater(warm.cache_hit_count, 0)
+            self.assertEqual(
+                (
+                    warm.cache_miss_count,
+                    warm.payload_written_file_count,
+                    warm.payload_written_byte_count,
+                ),
+                (0, 0, 0),
+            )
 
     def test_cache_rejects_duplicate_wrong_type_and_relative_roots(self) -> None:
         cache = self.build / "CMakeCache.txt"

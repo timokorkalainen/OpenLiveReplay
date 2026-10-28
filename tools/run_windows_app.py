@@ -281,6 +281,8 @@ def prepare_windows_app_runtime(
                 "QML_IMPORT_PATH": str(launch_qml),
                 "QML2_IMPORT_PATH": str(launch_qml),
             },
+            removed=runtime_guard.WINDOWS_RUNTIME_INJECTION_ENVIRONMENT_VARIABLES,
+            removed_prefixes=("BASH_FUNC_",),
         )
         return env
     finally:

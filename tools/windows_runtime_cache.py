@@ -3035,19 +3035,24 @@ def _materialize_layout(
                     with target.open("wb") as output:
                         shutil.copyfileobj(resolved.stream, output, 1024 * 1024)
                     resolved.stream.seek(0)
-                    payload = target.read_bytes()
+                    payload_size = resolved.size
+                    payload_digest = resolved.sha256
                     source_final_path: Optional[str] = _normalized_held_final_path(
                         resolved.final_path
                     )
                 elif isinstance(entry, bytes):
                     payload = entry
                     target.write_bytes(payload)
+                    payload_size = len(payload)
+                    payload_digest = hashlib.sha256(payload).hexdigest()
                     source_final_path = None
                 else:
                     payload = rendered_entries[_normalized_destination(destination)]
                     target.write_bytes(payload)
+                    payload_size = len(payload)
+                    payload_digest = hashlib.sha256(payload).hexdigest()
                     source_final_path = None
-                payload_bytes += len(payload)
+                payload_bytes += payload_size
                 if payload_bytes > byte_limit:
                     raise RuntimeError(
                         f"runtime cache byte limit exceeded: {payload_bytes} > {byte_limit}"
@@ -3055,8 +3060,8 @@ def _materialize_layout(
                 record: dict[str, object] = {
                     "destination": destination.as_posix(),
                     "kind": _entry_kind(entry),
-                    "size": len(payload),
-                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size": payload_size,
+                    "sha256": payload_digest,
                 }
                 if source_final_path is not None:
                     record["source_final_path"] = source_final_path

@@ -111,6 +111,10 @@ if(WIN32)
             tst_transportdock_layout
             tst_sourcelistpanel_layout)
         add_dependencies(${_olr_qmlstyle_test} OlrThemeplugin OlrStyleplugin)
+        set_property(TEST ${_olr_qmlstyle_test} APPEND PROPERTY
+            ENVIRONMENT_MODIFICATION
+            "QML_IMPORT_PATH=path_list_prepend:${CMAKE_BINARY_DIR}/qml"
+            "QML2_IMPORT_PATH=path_list_prepend:${CMAKE_BINARY_DIR}/qml")
     endforeach()
 endif()
 

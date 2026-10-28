@@ -1396,6 +1396,43 @@ class PublicationTests(unittest.TestCase):
             (lease.layout / "resolved-once.dll").read_bytes(), b"resolved"
         )
 
+    def test_cold_publication_does_not_reread_held_payload_before_validation(
+        self,
+    ) -> None:
+        source = self.held_file("single-read.bin", b"held payload")
+        original_read_bytes = Path.read_bytes
+        staging_reads: list[Path] = []
+
+        def record_read_bytes(path: Path) -> bytes:
+            if (
+                path.name == "single-read.bin"
+                and self.cache.staging in path.parents
+            ):
+                staging_reads.append(path)
+            return original_read_bytes(path)
+
+        with (
+            mock.patch.object(Path, "read_bytes", new=record_read_bytes),
+            mock.patch.object(
+                runtime_cache,
+                "_validate_object_contents",
+                wraps=runtime_cache._validate_object_contents,
+            ) as validate,
+        ):
+            lease = self.remember(
+                self.cache.materialize(
+                    "single-read",
+                    ((Path("single-read.bin"), source),),
+                    context={},
+                )
+            )
+
+        self.assertEqual(len(staging_reads), 1)
+        self.assertGreaterEqual(validate.call_count, 2)
+        self.assertEqual(
+            (lease.layout / "single-read.bin").read_bytes(), b"held payload"
+        )
+
     def test_case_only_destination_and_layout_spelling_reuses_stored_spelling(self) -> None:
         source = self.held_file("tool.exe", b"tool")
         first = self.publish_and_close(

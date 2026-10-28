@@ -83,5 +83,9 @@ function(olr_configure_windows_test_runtime)
                 ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:${runtime_dir}")
         endforeach()
+        set_property(TEST "${test_name}" APPEND PROPERTY
+            ENVIRONMENT_MODIFICATION
+            "QML_IMPORT_PATH=path_list_prepend:${_olr_qml_dir}"
+            "QML2_IMPORT_PATH=path_list_prepend:${_olr_qml_dir}")
     endforeach()
 endfunction()

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import struct
+import tempfile
 import time
 import uuid
 from typing import BinaryIO, Callable, NamedTuple
@@ -28,6 +29,8 @@ from tools.windows_runtime_cache import (
     WindowsRuntimeCache,
     _draining_map,
     _parallel_executor,
+    _set_path_acl,
+    _set_tree_acl,
 )
 
 
@@ -122,15 +125,57 @@ def _current_user_sid() -> str:
         kernel32.CloseHandle(token)
 
 
+WINDOWS_RUNTIME_INJECTION_ENVIRONMENT_VARIABLES = frozenset(
+    {
+        "BASH_ENV",
+        "BASH_LOADABLES_PATH",
+        "CMAKE_CONFIG_DIR",
+        "CTEST_PARALLEL_LEVEL",
+        "CTEST_USE_INSTRUMENTATION",
+        "CTEST_USE_VERBOSE_INSTRUMENTATION",
+        "ENV",
+        "PYTHONHOME",
+        "PYTHONBREAKPOINT",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONPLATLIBDIR",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "PYTHONWARNINGS",
+        "QT_OPENGL_BUGLIST",
+        "QT_OPENGL_DLL",
+        "QT_QPA_FONTDIR",
+        "QT_QPA_GENERIC_PLUGINS",
+        "QT_QPA_PLATFORM",
+        "QT_QPA_PLATFORMTHEME",
+        "QT_QUICK_CONTROLS_CONF",
+        "QT_QUICK_CONTROLS_FALLBACK_STYLE",
+        "QT_QUICK_CONTROLS_IMAGINE_PATH",
+        "QT_QUICK_CONTROLS_STYLE",
+        "QT_STYLE_OVERRIDE",
+        "QT_VIRTUALKEYBOARD_LAYOUT_PATH",
+        "QTWEBENGINE_DICTIONARIES_PATH",
+        "QTWEBENGINE_LOCALES_PATH",
+        "QTWEBENGINEPROCESS_PATH",
+    }
+)
+
+
 def replace_environment_case_insensitively(
-    inherited: Mapping[str, str], replacements: Mapping[str, str]
+    inherited: Mapping[str, str],
+    replacements: Mapping[str, str],
+    *,
+    removed: Sequence[str] = (),
+    removed_prefixes: Sequence[str] = (),
 ) -> dict[str, str]:
     """Replace controlled Windows variables without case-variant duplicates."""
-    controlled = {key.casefold() for key in replacements}
+    controlled = {key.casefold() for key in (*replacements, *removed)}
+    controlled_prefixes = tuple(prefix.casefold() for prefix in removed_prefixes)
     environment = {
         key: value
         for key, value in inherited.items()
         if key.casefold() not in controlled
+        and not key.casefold().startswith(controlled_prefixes)
     }
     environment.update(replacements)
     return environment
@@ -259,7 +304,9 @@ class RuntimeAuditLease:
     ) -> None:
         self._streams: dict[Path, BinaryIO] = {}
         self._canonical_files: dict[Path, Path] = {}
+        self._held_source_descriptors: dict[Path, HeldSource] = {}
         self._directory_handles: dict[Path, tuple[object, Path]] = {}
+        self._write_denied_directory_handles: list[object] = []
         self._cache_root = cache_root
         self._cache_limits = cache_limits
         self._cache_clock = cache_clock
@@ -267,7 +314,11 @@ class RuntimeAuditLease:
         self._cache: WindowsRuntimeCache | None = None
         self._cached_layout_leases: list[CachedLayoutLease] = []
         self._cached_layout_by_path: dict[str, CachedLayoutLease] = {}
+        self._temporary_directories: list[tempfile.TemporaryDirectory[str]] = []
         self.launch_build_directory: Path | None = None
+        self.launch_ctest_graph_files: tuple[Path, ...] = ()
+        self.launch_ctest_arguments: tuple[str, ...] | None = None
+        self.launch_cmake_config_directory: Path | None = None
         self.launch_source_directory: Path | None = None
         self.launch_runtime_directory: Path | None = None
         self.launch_runtime_directories: tuple[Path, ...] = ()
@@ -368,6 +419,16 @@ class RuntimeAuditLease:
         source = path.absolute()
         stream = self.hold(source)
         stat_result = os.fstat(stream.fileno())
+        if int(stat_result.st_nlink) != 1:
+            raise RuntimeError(
+                f"runtime cache source has a file alias (hard link): {source}"
+            )
+        memoized = self._held_source_descriptors.get(source)
+        if memoized is not None:
+            self._validate_held_source_descriptor(
+                source, stream, stat_result, memoized
+            )
+            return memoized
         stream.seek(0)
         digest = hashlib.sha256()
         try:
@@ -378,7 +439,7 @@ class RuntimeAuditLease:
                 digest.update(payload)
         finally:
             stream.seek(0)
-        return HeldSource(
+        descriptor = HeldSource(
             source=source,
             final_path=self._canonical_files[source],
             device=int(stat_result.st_dev),
@@ -387,6 +448,78 @@ class RuntimeAuditLease:
             sha256=digest.hexdigest(),
             stream=stream,
         )
+        self._held_source_descriptors[source] = descriptor
+        return descriptor
+
+    def _validate_held_source_descriptor(
+        self,
+        source: Path,
+        stream: BinaryIO,
+        stat_result: os.stat_result,
+        descriptor: HeldSource,
+    ) -> None:
+        if descriptor.stream is not stream:
+            raise RuntimeError(
+                f"memoized held source stream mismatch: {source}"
+            )
+        expected = (
+            source,
+            self._canonical_files[source],
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+        )
+        actual = (
+            descriptor.source,
+            descriptor.final_path,
+            descriptor.device,
+            descriptor.inode,
+            descriptor.size,
+        )
+        if actual != expected:
+            raise RuntimeError(
+                f"memoized held source metadata mismatch: {source}"
+            )
+
+    def _read_and_describe_held_text(self, path: Path) -> str:
+        source = path.absolute()
+        stream = self.hold(source)
+        position = stream.tell()
+        try:
+            stream.seek(0)
+            payload = stream.read()
+        finally:
+            stream.seek(position)
+        stat_result = os.fstat(stream.fileno())
+        if int(stat_result.st_nlink) != 1:
+            raise RuntimeError(
+                f"runtime cache source has a file alias (hard link): {source}"
+            )
+        if len(payload) != int(stat_result.st_size):
+            raise RuntimeError(
+                f"memoized held source metadata mismatch: {source}"
+            )
+        descriptor = HeldSource(
+            source=source,
+            final_path=self._canonical_files[source],
+            device=int(stat_result.st_dev),
+            inode=int(stat_result.st_ino),
+            size=int(stat_result.st_size),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            stream=stream,
+        )
+        memoized = self._held_source_descriptors.get(source)
+        if memoized is not None:
+            self._validate_held_source_descriptor(
+                source, stream, stat_result, memoized
+            )
+            if memoized.sha256 != descriptor.sha256:
+                raise RuntimeError(
+                    f"memoized held source digest mismatch: {source}"
+                )
+        else:
+            self._held_source_descriptors[source] = descriptor
+        return payload.decode("utf-8", errors="replace")
 
     def _describe_held_sources(self, paths: Sequence[Path]) -> dict[Path, HeldSource]:
         unique = tuple(dict.fromkeys(path.absolute() for path in paths))
@@ -446,6 +579,8 @@ class RuntimeAuditLease:
         excluded_canonical = tuple(Path(os.path.abspath(path)) for path in excluded)
 
         def is_excluded(path: Path) -> bool:
+            if not excluded_canonical:
+                return False
             absolute = Path(os.path.abspath(path))
             return any(
                 absolute == item or _is_relative_to(absolute, item)
@@ -458,7 +593,7 @@ class RuntimeAuditLease:
             else None
         )
         names = {name.casefold() for name in included_names}
-        entries: list[tuple[Path, HeldSource]] = []
+        source_entries: list[tuple[Path, Path]] = []
         total_size = 0
         for current_text, directory_names, file_names in os.walk(source):
             current = Path(current_text)
@@ -491,7 +626,7 @@ class RuntimeAuditLease:
                     raise RuntimeError(
                         f"protected tree contains unsupported entry: {entry}"
                     )
-                if len(entries) >= entry_limit:
+                if len(source_entries) >= entry_limit:
                     raise RuntimeError(
                         "runtime cache entry limit exceeded: "
                         f"more than {entry_limit} entries"
@@ -503,16 +638,22 @@ class RuntimeAuditLease:
                         "runtime cache byte limit exceeded: "
                         f"{total_size} > {byte_limit}"
                     )
-                descriptor = self._runtime_cache().describe_source(entry)
-                final = descriptor.final_path
-                if not _is_relative_to(final, source) or os.path.normcase(
-                    str(entry)
-                ) != os.path.normcase(str(final)):
-                    raise RuntimeError(
-                        "runtime QML tree contains a reparse alias: "
-                        f"{entry} -> {final}"
-                    )
-                entries.append((entry.relative_to(source), descriptor))
+                source_entries.append((entry.relative_to(source), entry))
+        descriptors = self._describe_held_sources(
+            tuple(entry for _relative, entry in source_entries)
+        )
+        entries: list[tuple[Path, HeldSource]] = []
+        for relative, entry in source_entries:
+            descriptor = descriptors[entry.absolute()]
+            final = descriptor.final_path
+            if not _is_relative_to(final, source) or os.path.normcase(
+                str(entry)
+            ) != os.path.normcase(str(final)):
+                raise RuntimeError(
+                    "runtime QML tree contains a reparse alias: "
+                    f"{entry} -> {final}"
+                )
+            entries.append((relative, descriptor))
         entries.sort(key=lambda pair: str(pair[0]).casefold())
 
         context: dict[str, JsonValue] = {
@@ -536,6 +677,226 @@ class RuntimeAuditLease:
             byte_limit=byte_limit,
         )
         return self._record_cached_layout(lease)
+
+    def create_ctest_controller(self) -> Path:
+        """Create a private writable CTest controller around held immutable graphs."""
+        if os.name != "nt":
+            if self.launch_build_directory is None:
+                raise RuntimeError("controlled CTest launch has no staged build")
+            return self.launch_build_directory
+        staged_build = self.launch_build_directory
+        if staged_build is None or not self.launch_ctest_graph_files:
+            raise RuntimeError("controlled CTest launch has no staged graph files")
+
+        temporary = tempfile.TemporaryDirectory(
+            prefix="ctest-controller-",
+            dir=self._runtime_cache().staging,
+        )
+        self._temporary_directories.append(temporary)
+        lexical_root = Path(temporary.name).absolute()
+        controller = self.canonical_directory(lexical_root)
+        if os.path.normcase(str(controller)) != os.path.normcase(str(lexical_root)):
+            raise RuntimeError(
+                f"CTest controller is a reparse alias: {lexical_root} -> {controller}"
+            )
+
+        seen: set[str] = set()
+        graph_directories = {controller}
+        graph_files: list[Path] = []
+        for relative in self.launch_ctest_graph_files:
+            if relative.is_absolute() or not relative.parts or any(
+                part in ("", ".", "..") for part in relative.parts
+            ):
+                raise RuntimeError(f"invalid CTest controller graph path: {relative}")
+            identity = os.path.normcase(str(relative))
+            if identity in seen:
+                raise RuntimeError(f"duplicate CTest controller graph path: {relative}")
+            seen.add(identity)
+
+            source = staged_build / relative
+            source_final = self.canonical_file(source)
+            if os.path.normcase(str(source)) != os.path.normcase(str(source_final)):
+                raise RuntimeError(
+                    f"staged CTest graph is a reparse alias: {source} -> {source_final}"
+                )
+            parent = controller
+            for part in relative.parts[:-1]:
+                parent /= part
+                parent.mkdir(exist_ok=True)
+                parent_final = self.canonical_directory(parent)
+                graph_directories.add(parent)
+                if os.path.normcase(str(parent)) != os.path.normcase(
+                    str(parent_final)
+                ):
+                    raise RuntimeError(
+                        f"CTest controller directory is a reparse alias: "
+                        f"{parent} -> {parent_final}"
+                    )
+
+            source_descriptor = self._describe_held_source(source)
+            source_stream = source_descriptor.stream
+            position = source_stream.tell()
+            destination = controller / relative
+            destination_key = destination.absolute()
+            output = self._create_read_write_locked(destination)
+            self._streams[destination_key] = output
+            destination_final = self._final_path_from_stream(
+                output, destination_key
+            )
+            self._canonical_files[destination_key] = destination_final
+            if os.path.normcase(str(destination)) != os.path.normcase(
+                str(destination_final)
+            ):
+                raise RuntimeError(
+                    f"CTest controller graph is a reparse alias: "
+                    f"{destination} -> {destination_final}"
+                )
+            try:
+                source_stream.seek(0)
+                while True:
+                    payload = source_stream.read(1024 * 1024)
+                    if not payload:
+                        break
+                    output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            finally:
+                source_stream.seek(position)
+            self._before_ctest_graph_hold(source, destination)
+            destination_descriptor = self._describe_held_source(destination)
+            source_descriptor = self._describe_held_source(source)
+            if (
+                destination_descriptor.size != source_descriptor.size
+                or destination_descriptor.sha256 != source_descriptor.sha256
+            ):
+                raise RuntimeError(
+                    "CTest controller graph changed while staging: "
+                    f"{source} -> {destination}"
+                )
+            graph_files.append(destination)
+
+        testing = controller / "Testing"
+        testing.mkdir(exist_ok=False)
+        temporary_logs = testing / "Temporary"
+        temporary_logs.mkdir(exist_ok=False)
+        cmake_config = controller / "cmake-config"
+        cmake_config.mkdir(exist_ok=False)
+        graph_directories.add(cmake_config)
+        for directory in (testing, temporary_logs):
+            directory_final = self.canonical_directory(directory)
+            if os.path.normcase(str(directory)) != os.path.normcase(
+                str(directory_final)
+            ):
+                raise RuntimeError(
+                    f"CTest controller log directory is a reparse alias: "
+                    f"{directory} -> {directory_final}"
+                )
+
+        self._before_ctest_controller_seal(controller)
+        for graph_directory in sorted(
+            graph_directories,
+            key=lambda path: (-len(path.parts), str(path).casefold()),
+        ):
+            owner, final = self._open_directory_locked(
+                graph_directory, deny_write=True
+            )
+            self._write_denied_directory_handles.append(owner)
+            if os.path.normcase(str(graph_directory)) != os.path.normcase(
+                str(final)
+            ):
+                raise RuntimeError(
+                    f"CTest controller directory is a reparse alias: "
+                    f"{graph_directory} -> {final}"
+                )
+
+        sid = _current_user_sid()
+        for directory in (testing, temporary_logs):
+            _set_path_acl(directory, sid, "PRIVATE")
+        for graph_file in graph_files:
+            _set_path_acl(graph_file, sid, "RX")
+        for graph_directory in sorted(
+            graph_directories,
+            key=lambda path: (-len(path.parts), str(path).casefold()),
+        ):
+            _set_path_acl(graph_directory, sid, "RX")
+        self._verify_ctest_controller_entries(
+            controller,
+            graph_directories | {testing, temporary_logs},
+            set(graph_files),
+        )
+        self.launch_cmake_config_directory = cmake_config
+        return controller
+
+    def _before_ctest_controller_seal(self, _controller: Path) -> None:
+        """Test seam immediately before the controller namespace is sealed."""
+
+    def _before_ctest_graph_hold(
+        self, _source: Path, _destination: Path
+    ) -> None:
+        """Test seam after copying a graph and before its immutable hold."""
+
+    @staticmethod
+    def _verify_ctest_controller_entries(
+        controller: Path,
+        expected_directories: set[Path],
+        expected_files: set[Path],
+    ) -> None:
+        def key(path: Path) -> str:
+            return os.path.normcase(str(path.relative_to(controller)))
+
+        expected_directory_keys = {
+            key(path) for path in expected_directories if path != controller
+        }
+        expected_file_keys = {key(path) for path in expected_files}
+        actual_directories: dict[str, Path] = {}
+        actual_files: dict[str, Path] = {}
+        pending = [controller]
+        while pending:
+            current = pending.pop()
+            with os.scandir(current) as scan:
+                entries = sorted(scan, key=lambda entry: entry.name.casefold())
+            for entry in entries:
+                path = Path(entry.path)
+                stat_result = entry.stat(follow_symlinks=False)
+                is_reparse = bool(
+                    getattr(stat_result, "st_file_attributes", 0) & 0x00000400
+                )
+                if entry.is_symlink() or is_reparse:
+                    raise RuntimeError(
+                        f"unexpected CTest controller reparse entry: {path}"
+                    )
+                identity = key(path)
+                if entry.is_dir(follow_symlinks=False):
+                    if identity in actual_directories:
+                        raise RuntimeError(
+                            f"unexpected duplicate CTest controller entry: {path}"
+                        )
+                    actual_directories[identity] = path
+                    pending.append(path)
+                elif entry.is_file(follow_symlinks=False):
+                    if identity in actual_files:
+                        raise RuntimeError(
+                            f"unexpected duplicate CTest controller entry: {path}"
+                        )
+                    actual_files[identity] = path
+                else:
+                    raise RuntimeError(
+                        f"unexpected CTest controller entry type: {path}"
+                    )
+
+        extra = sorted(
+            (set(actual_directories) - expected_directory_keys)
+            | (set(actual_files) - expected_file_keys)
+        )
+        missing = sorted(
+            (expected_directory_keys - set(actual_directories))
+            | (expected_file_keys - set(actual_files))
+        )
+        if extra or missing:
+            raise RuntimeError(
+                "unexpected CTest controller entries: "
+                f"extra={extra!r}, missing={missing!r}"
+            )
 
     def stage_readonly_layout(
         self,
@@ -639,18 +1000,30 @@ class RuntimeAuditLease:
 
     def close(self) -> None:
         streams = tuple(reversed(tuple(self._streams.values())))
+        write_denied_directory_handles = tuple(
+            reversed(tuple(self._write_denied_directory_handles))
+        )
         directory_handles = tuple(
             reversed(tuple(owner for owner, _path in self._directory_handles.values()))
         )
         cached_layouts = tuple(reversed(tuple(self._cached_layout_leases)))
+        temporary_directories = tuple(
+            reversed(tuple(self._temporary_directories))
+        )
         cache = self._cache
         self._streams.clear()
         self._canonical_files.clear()
+        self._held_source_descriptors.clear()
         self._directory_handles.clear()
+        self._write_denied_directory_handles.clear()
         self._cached_layout_leases.clear()
         self._cached_layout_by_path.clear()
+        self._temporary_directories.clear()
         self._cache = None
         self.launch_build_directory = None
+        self.launch_ctest_graph_files = ()
+        self.launch_ctest_arguments = None
+        self.launch_cmake_config_directory = None
         self.launch_source_directory = None
         self.launch_runtime_directory = None
         self.launch_runtime_directories = ()
@@ -668,9 +1041,24 @@ class RuntimeAuditLease:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+        for owner in write_denied_directory_handles:
+            try:
+                owner.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         for owner in directory_handles:
             try:
                 owner.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        for temporary in temporary_directories:
+            try:
+                root = Path(temporary.name)
+                if root.exists():
+                    _set_tree_acl(root, _current_user_sid(), "DELETE")
+                temporary.cleanup()
             except BaseException as error:
                 if first_error is None:
                     first_error = error
@@ -714,6 +1102,36 @@ class RuntimeAuditLease:
         return os.fdopen(descriptor, "rb", closefd=True)
 
     @staticmethod
+    def _create_read_write_locked(path: Path) -> BinaryIO:
+        if os.name != "nt":
+            return path.open("x+b")
+
+        import msvcrt
+
+        kernel32 = _runtime_kernel32()
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+            0x00000001,  # FILE_SHARE_READ: deny mutation/replacement/delete
+            None,
+            1,  # CREATE_NEW
+            0x08000000,  # FILE_FLAG_SEQUENTIAL_SCAN
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if handle == invalid_handle:
+            error = ctypes.get_last_error()
+            raise OSError(error, f"cannot create held CTest graph {path}")
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                int(handle), os.O_RDWR | getattr(os, "O_BINARY", 0)
+            )
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+        return os.fdopen(descriptor, "r+b", closefd=True)
+
+    @staticmethod
     def _strip_extended_prefix(value: str) -> Path:
         if value.startswith("\\\\?\\UNC\\"):
             value = "\\\\" + value[8:]
@@ -745,12 +1163,19 @@ class RuntimeAuditLease:
         return cls._strip_extended_prefix(buffer.value)
 
     @classmethod
-    def _open_directory_locked(cls, path: Path) -> tuple[object, Path]:
+    def _open_directory_locked(
+        cls, path: Path, *, deny_write: bool = False
+    ) -> tuple[object, Path]:
         kernel32 = _runtime_kernel32()
+        desired_access = 0x00000080  # FILE_READ_ATTRIBUTES
+        share_mode = 0x00000001 | 0x00000002  # share read/write
+        if deny_write:
+            desired_access |= 0x00000001  # FILE_LIST_DIRECTORY
+            share_mode = 0x00000001  # share read only: deny write/delete
         handle = kernel32.CreateFileW(
             str(path),
-            0x00000080,  # FILE_READ_ATTRIBUTES
-            0x00000001 | 0x00000002,  # share read/write, deny delete/retarget
+            desired_access,
+            share_mode,
             None,
             3,
             0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
@@ -1320,13 +1745,16 @@ def qt_qml_closure(
         "linux_build", "macos_build", "venv", "windows_build",
     }
 
-    def imports_from(path: Path) -> set[str]:
+    def imports_from(path: Path, *, held: bool = False) -> set[str]:
         if path.suffix.casefold() not in (".qml", ".js", ".mjs") and (
             path.name.casefold() != "qmldir"
         ):
             return set()
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            if held and lease is not None:
+                text = lease._read_and_describe_held_text(path)
+            else:
+                text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return set()
         found = set(_QML_IMPORT.findall(text))
@@ -1437,7 +1865,7 @@ def qt_qml_closure(
                 elif child_entry.is_file(follow_symlinks=False):
                     canonical_child = held_file(child)
                     selected.add(canonical_child)
-                    pending.update(imports_from(canonical_child))
+                    pending.update(imports_from(canonical_child, held=True))
                 else:
                     raise RuntimeError(
                         f"Qt QML closure contains an invalid entry: {child}"
@@ -1452,13 +1880,12 @@ class CMakeArgumentOccurrence(NamedTuple):
     style: str
 
 
-def _cmake_command_argument_occurrences(
-    text: str, command_name: str
-) -> tuple[tuple[int, tuple[CMakeArgumentOccurrence, ...]], ...]:
-    """Parse literal arguments from generated CMake commands."""
-    text = _strip_cmake_comments(text)
-    commands: list[tuple[int, tuple[CMakeArgumentOccurrence, ...]]] = []
-    starts: list[int] = []
+def _scan_cmake_command_starts(
+    text: str, command_names: tuple[str, ...]
+) -> tuple[tuple[int, str], ...]:
+    """Find selected command argument starts in one masked lexical scan."""
+    selected = {name.casefold(): name for name in command_names}
+    starts: list[tuple[int, str]] = []
     scan = 0
     while scan < len(text):
         if text[scan] == '"':
@@ -1484,79 +1911,90 @@ def _cmake_command_argument_occurrences(
             after = scan + len(name)
             while after < len(text) and text[after].isspace():
                 after += 1
-            if name.casefold() == command_name.casefold() and (
-                after < len(text) and text[after] == "("
-            ):
-                starts.append(after + 1)
+            selected_name = selected.get(name.casefold())
+            if selected_name is not None and after < len(text) and text[after] == "(":
+                starts.append((after + 1, selected_name))
             scan += len(name)
             continue
         scan += 1
+    return tuple(starts)
 
-    for command_start in starts:
-        index = command_start
-        arguments: list[CMakeArgumentOccurrence] = []
-        while index < len(text):
-            while index < len(text) and text[index].isspace():
-                index += 1
-            if index >= len(text) or text[index] == ")":
-                break
-            if text[index] == '"':
-                token_start = index
-                index += 1
-                value: list[str] = []
-                while index < len(text):
-                    character = text[index]
-                    if character == '"':
-                        index += 1
-                        break
-                    if character == "\\" and index + 1 < len(text):
-                        index += 1
-                        value.append(text[index])
-                    else:
-                        value.append(character)
+
+def _parse_cmake_command_arguments(
+    text: str, command_start: int, command_name: str
+) -> tuple[CMakeArgumentOccurrence, ...]:
+    index = command_start
+    arguments: list[CMakeArgumentOccurrence] = []
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text) or text[index] == ")":
+            break
+        if text[index] == '"':
+            token_start = index
+            index += 1
+            value: list[str] = []
+            while index < len(text):
+                character = text[index]
+                if character == '"':
                     index += 1
+                    break
+                if character == "\\" and index + 1 < len(text):
+                    index += 1
+                    value.append(text[index])
                 else:
-                    raise ValueError(
-                        f"unterminated quoted {command_name} argument"
-                    )
-                arguments.append(CMakeArgumentOccurrence(
-                    "".join(value), token_start, index, "quoted"
-                ))
-                continue
-            bracket = re.match(r"\[(=*)\[", text[index:])
-            if bracket:
-                opening = bracket.group(0)
-                closing = "]" + bracket.group(1) + "]"
-                value_start = index + len(opening)
-                value_end = text.find(closing, value_start)
-                if value_end < 0:
-                    raise ValueError(
-                        f"unterminated bracket {command_name} argument"
-                    )
-                index = value_end + len(closing)
-                arguments.append(CMakeArgumentOccurrence(
+                    value.append(character)
+                index += 1
+            else:
+                raise ValueError(f"unterminated quoted {command_name} argument")
+            arguments.append(
+                CMakeArgumentOccurrence("".join(value), token_start, index, "quoted")
+            )
+            continue
+        bracket = re.match(r"\[(=*)\[", text[index:])
+        if bracket:
+            opening = bracket.group(0)
+            closing = "]" + bracket.group(1) + "]"
+            value_start = index + len(opening)
+            value_end = text.find(closing, value_start)
+            if value_end < 0:
+                raise ValueError(f"unterminated bracket {command_name} argument")
+            index = value_end + len(closing)
+            arguments.append(
+                CMakeArgumentOccurrence(
                     text[value_start:value_end],
                     value_start - len(opening),
                     index,
                     "bracket",
-                ))
-                continue
-            value_start = index
-            while (
-                index < len(text)
-                and not text[index].isspace()
-                and text[index] != ")"
-            ):
-                index += 1
-            arguments.append(CMakeArgumentOccurrence(
-                text[value_start:index], value_start, index, "bare"
-            ))
-        else:
-            raise ValueError(f"unterminated {command_name} command")
-        if index >= len(text) or text[index] != ")":
-            raise ValueError(f"unterminated {command_name} command")
-        commands.append((command_start, tuple(arguments)))
-    return tuple(commands)
+                )
+            )
+            continue
+        value_start = index
+        while (
+            index < len(text)
+            and not text[index].isspace()
+            and text[index] != ")"
+        ):
+            index += 1
+        arguments.append(
+            CMakeArgumentOccurrence(text[value_start:index], value_start, index, "bare")
+        )
+    else:
+        raise ValueError(f"unterminated {command_name} command")
+    if index >= len(text) or text[index] != ")":
+        raise ValueError(f"unterminated {command_name} command")
+    return tuple(arguments)
+
+
+def _cmake_command_argument_occurrences(
+    text: str, command_name: str
+) -> tuple[tuple[int, tuple[CMakeArgumentOccurrence, ...]], ...]:
+    """Parse literal arguments from generated CMake commands."""
+    masked = _strip_cmake_comments(text)
+    return tuple(
+        (start, _parse_cmake_command_arguments(masked, start, name))
+        for start, name in _scan_cmake_command_starts(masked, (command_name,))
+    )
 
 
 def _cmake_command_arguments_with_positions(
@@ -1575,22 +2013,22 @@ def _cmake_commands_in_order(
 ) -> tuple[
     tuple[str, tuple[str, ...], tuple[CMakeArgumentOccurrence, ...]], ...
 ]:
-    commands = [
+    masked = _strip_cmake_comments(text)
+    commands = (
         (
-            position,
             command_name,
             tuple(argument.value for argument in occurrences),
             occurrences,
         )
-        for command_name in command_names
-        for position, occurrences in _cmake_command_argument_occurrences(
-            text, command_name
+        for position, command_name in _scan_cmake_command_starts(
+            masked, command_names
         )
-    ]
-    commands.sort(key=lambda command: command[0])
+        for occurrences in (
+            _parse_cmake_command_arguments(masked, position, command_name),
+        )
+    )
     return tuple(
-        (name, arguments, occurrences)
-        for _position, name, arguments, occurrences in commands
+        (name, arguments, occurrences) for name, arguments, occurrences in commands
     )
 
 
@@ -1856,11 +2294,10 @@ def discover_ctest_graph(
                 inputs.append(canonical)
             active_inputs.add(canonical)
             try:
-                stream = active.hold(lexical)
+                descriptor = active._describe_held_source(lexical)
+                stream = descriptor.stream
                 stream.seek(0)
-                text = _strip_cmake_comments(
-                    stream.read().decode("utf-8", errors="replace")
-                )
+                text = stream.read().decode("utf-8", errors="replace")
                 commands = _cmake_commands_in_order(
                     text,
                     (
@@ -2162,6 +2599,21 @@ def validate_ctest_runtime_properties(
             for root in approved
         )
 
+    def path_shaped(value: str) -> bool:
+        normalized = value.replace("\\", "/")
+        candidate = Path(value)
+        suffix = Path(normalized).suffix.removeprefix(".")
+        return (
+            candidate.is_absolute()
+            or bool(candidate.anchor)
+            or bool(candidate.drive)
+            or normalized.startswith(("/", ".", "~"))
+            or "/" in normalized
+            or any(part in (".", "..") for part in normalized.split("/"))
+            or bool(suffix and any(character.isalpha() for character in suffix))
+            or bool(re.search(r"%[^%]+%|\$(?:\{[^}]+\}|[A-Za-z_]\w*)", value))
+        )
+
     for test in graph.tests:
         for assignment in test.environment:
             name, separator, value = assignment.partition("=")
@@ -2194,6 +2646,11 @@ def validate_ctest_runtime_properties(
             if folded == "qtest_function_timeout" and value.isdigit():
                 continue
             if folded.startswith("olr_") and "\0" not in value:
+                if path_shaped(value):
+                    raise RuntimeError(
+                        f"CTest ENVIRONMENT for {test.name} has unapproved "
+                        f"path-bearing variable {name}: {value}"
+                    )
                 continue
             raise RuntimeError(
                 f"CTest ENVIRONMENT for {test.name} has unapproved variable {name}"

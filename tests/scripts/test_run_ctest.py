@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
 from pathlib import Path
@@ -190,6 +191,61 @@ def _write_manifest_pe_fixture(
     path.write_bytes(contents)
 
 
+def find_real_windows_build(project_source: Path) -> tuple[Path, Path]:
+    """Return the newest complete Windows build owned by this exact worktree."""
+    project_source = project_source.resolve()
+    candidates: dict[tuple[str, str], tuple[int, Path, Path]] = {}
+    for app in project_source.glob("build*/**/OpenLiveReplay.exe"):
+        if not app.is_file():
+            continue
+        for build in app.parents:
+            if build == project_source:
+                break
+            cache = build / "CMakeCache.txt"
+            graph = build / "CTestTestfile.cmake"
+            if not cache.is_file() or not graph.is_file():
+                continue
+            try:
+                entries = windows_runtime_guard.parse_cmake_cache(cache)
+                home_entry = entries.get("CMAKE_HOME_DIRECTORY")
+                if home_entry is None:
+                    continue
+                cache_home = Path(home_entry.value)
+                if not cache_home.is_absolute() or cache_home.resolve() != project_source:
+                    continue
+            except (OSError, ValueError):
+                continue
+            resolved_build = build.resolve()
+            resolved_app = app.resolve()
+            if (
+                not resolved_build.is_relative_to(project_source)
+                or not resolved_app.is_relative_to(resolved_build)
+            ):
+                continue
+            identity = (
+                os.path.normcase(str(resolved_build)),
+                os.path.normcase(str(resolved_app)),
+            )
+            candidates[identity] = (
+                max(
+                    cache.stat().st_mtime_ns,
+                    graph.stat().st_mtime_ns,
+                    app.stat().st_mtime_ns,
+                ),
+                build,
+                app,
+            )
+            break
+    if not candidates:
+        raise AssertionError(
+            "actual built OpenLiveReplay.exe with CMakeCache.txt, "
+            "CTestTestfile.cmake, and CMAKE_HOME_DIRECTORY bound to the "
+            "current project source is required"
+        )
+    _modified, build, app = max(candidates.values(), key=lambda item: item[0])
+    return build, app
+
+
 class RunCtestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -233,6 +289,55 @@ class RunCtestTests(unittest.TestCase):
         }
         self.write_cache()
 
+    def test_direct_script_bootstrap_imports_from_outside_repository(self) -> None:
+        launcher = Path(__file__).resolve().parents[2] / "tools" / "run_ctest.py"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import runpy; runpy.run_path(" + repr(str(launcher)) + ")",
+            ],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+
+    def test_package_import_preserves_sys_path_and_single_tool_identities(self) -> None:
+        project_root = Path(__file__).resolve().parents[2]
+        probe = (
+            "import sys\n"
+            "before = tuple(sys.path)\n"
+            "import tools.run_ctest\n"
+            "assert tuple(sys.path) == before, (before, tuple(sys.path))\n"
+            "assert 'windows_job' not in sys.modules\n"
+            "assert 'windows_runtime_guard' not in sys.modules\n"
+            "assert 'windows_runtime_cache' not in sys.modules\n"
+            "assert 'tools.windows_job' in sys.modules\n"
+            "assert 'tools.windows_runtime_guard' in sys.modules\n"
+            "assert 'tools.windows_runtime_cache' in sys.modules\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+
     def write_cache(self) -> None:
         cache_types = {
             "CMAKE_CXX_COMPILER": "FILEPATH",
@@ -263,6 +368,45 @@ class RunCtestTests(unittest.TestCase):
             "\n".join(commands) + "\n", encoding="utf-8"
         )
         return tuple(executables)
+
+    def test_real_build_finder_binds_cache_home_to_current_worktree(self) -> None:
+        project = self.root / "finder-project"
+        project.mkdir()
+
+        def make_build(name: str, home: Path, timestamp: int) -> tuple[Path, Path]:
+            build = project / name
+            build.mkdir()
+            app = build / "OpenLiveReplay.exe"
+            app.write_bytes(name.encode())
+            cache = build / "CMakeCache.txt"
+            cache.write_text(
+                f"CMAKE_HOME_DIRECTORY:INTERNAL={home.resolve()}\n",
+                encoding="utf-8",
+            )
+            graph = build / "CTestTestfile.cmake"
+            graph.write_text("", encoding="utf-8")
+            for path in (app, cache, graph):
+                os.utime(path, ns=(timestamp, timestamp))
+            return build, app
+
+        expected = make_build("build-current", project, 1_000_000_000)
+        make_build("build-newer-wrong-home", self.root / "other-source", 2_000_000_000)
+
+        self.assertEqual(find_real_windows_build(project), expected)
+
+    def test_real_build_finder_rejects_only_wrong_worktree_candidates(self) -> None:
+        project = self.root / "finder-wrong-only"
+        build = project / "build-tests"
+        build.mkdir(parents=True)
+        (build / "OpenLiveReplay.exe").write_bytes(b"wrong")
+        (build / "CTestTestfile.cmake").write_text("", encoding="utf-8")
+        (build / "CMakeCache.txt").write_text(
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={(self.root / 'other').resolve()}\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(AssertionError, "current project source"):
+            find_real_windows_build(project)
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
     def test_ctest_warm_cache_and_every_executable_has_protected_qt_conf(self) -> None:
@@ -359,6 +503,52 @@ class RunCtestTests(unittest.TestCase):
                 self.build_dir, {}, audit_lease=changed, ctest_args=arguments
             )
             self.assertGreater(changed.cache_miss_count, 0)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_graph_rewrite_prepares_high_cardinality_path_table_once(self) -> None:
+        (executable,) = self.write_cacheable_ctest_graph("unit")
+        environment = ";".join(
+            f"OLR_QT_BIN={(self.qt_root / 'bin').as_posix()}"
+            for _index in range(128)
+        )
+        graph = self.build_dir / "CTestTestfile.cmake"
+        graph.write_text(
+            f'add_test([=[unit]=] "{executable.as_posix()}")\n'
+            f'set_tests_properties([=[unit]=] PROPERTIES ENVIRONMENT '
+            f'{run_ctest._cmake_bracket(environment)})\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "prepared-replacements-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        prepared_sizes: list[int] = []
+        original_prepare = run_ctest._prepare_path_replacements
+
+        def record_prepare(replacements):
+            materialized = tuple(replacements)
+            prepared_sizes.append(len(materialized))
+            return original_prepare(materialized)
+
+        with (
+            mock.patch.object(
+                run_ctest,
+                "_prepare_path_replacements",
+                side_effect=record_prepare,
+            ),
+            RuntimeAuditLease(cache_root) as lease,
+        ):
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^unit$"),
+            )
+            rewritten = (
+                lease.launch_build_directory / "CTestTestfile.cmake"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(sum(size > 8 for size in prepared_sizes), 1)
+        self.assertNotIn((self.qt_root / "bin").as_posix(), rewritten)
+        self.assertEqual(rewritten.count("OLR_QT_BIN="), 128)
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
     def test_ctest_selection_and_source_snapshot_keys_are_stable_and_exact(self) -> None:
@@ -487,6 +677,189 @@ class RunCtestTests(unittest.TestCase):
         )
         shutil.rmtree(cache_root)
 
+    def assert_directory_rejects_late_insertion(self, directory: Path) -> None:
+        if directory.is_dir():
+            with self.assertRaises(OSError, msg=str(directory)):
+                (directory / f"late-task8-{time.time_ns()}.dll").write_bytes(
+                    b"late"
+                )
+        else:
+            with self.assertRaises(OSError, msg=str(directory)):
+                directory.mkdir(parents=True)
+
+    def real_build(self) -> tuple[Path, Path]:
+        return find_real_windows_build(Path(__file__).resolve().parents[2])
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_real_source_aliases_are_rejected_before_process_creation(self) -> None:
+        executable = self.build_dir / "tst_alias.exe"
+        _write_manifest_pe_fixture(executable)
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[control]=] "{executable.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        control_cache = self.root / "source-alias-control-cache"
+        self.addCleanup(self.remove_test_runtime_cache, control_cache)
+        with RuntimeAuditLease(control_cache) as lease:
+            with mock.patch("tools.run_ctest.run_process_tree") as launch:
+                run_ctest.prepare_windows_runtime(
+                    self.build_dir, {}, audit_lease=lease
+                )
+            launch.assert_not_called()
+
+        graph = self.build_dir / "CTestTestfile.cmake"
+        graph_alias = self.root / "CTestTestfile-hardlink.cmake"
+        os.link(graph, graph_alias)
+        graph_cache = self.root / "graph-alias-rejection-cache"
+        self.addCleanup(self.remove_test_runtime_cache, graph_cache)
+        with (
+            RuntimeAuditLease(graph_cache) as lease,
+            self.assertRaisesRegex(RuntimeError, "alias|hard.?link"),
+        ):
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+        graph_alias.unlink()
+
+        file_alias = self.build_dir / "tst_alias-hardlink.exe"
+        os.link(executable, file_alias)
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[hardlink-source]=] "{file_alias.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        alias_cache = self.root / "source-alias-rejection-cache"
+        self.addCleanup(self.remove_test_runtime_cache, alias_cache)
+        with (
+            self.assertRaisesRegex(RuntimeError, "alias|hard.?link"),
+            RuntimeAuditLease(alias_cache) as lease,
+        ):
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+
+        real_plugins = self.qt_root / "real-plugins"
+        real_plugins.mkdir()
+        plugin_alias = self.qt_root / "plugins" / "aliased"
+        self.make_junction(plugin_alias, real_plugins)
+        with (
+            mock.patch("tools.run_ctest.run_process_tree") as launch,
+            self.assertRaisesRegex(RuntimeError, "reparse alias"),
+        ):
+            run_ctest.prepare_windows_runtime(self.build_dir, {})
+        launch.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "requires a built Windows app")
+    def test_real_focused_prepare_has_absolute_cold_warm_budgets(self) -> None:
+        build, _app = self.real_build()
+        cache_parent = Path(tempfile.mkdtemp(prefix="olr-real-focused-cache-"))
+        self.addCleanup(shutil.rmtree, cache_parent, True)
+        cache_root = cache_parent / "cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        arguments = ("-R", "^tst_timecode$")
+
+        with RuntimeAuditLease(cache_root) as cold:
+            started = time.perf_counter()
+            run_ctest.prepare_windows_runtime(
+                build, {}, audit_lease=cold, ctest_args=arguments
+            )
+            cold_elapsed = time.perf_counter() - started
+            self.assertLessEqual(cold_elapsed, 30.0)
+            self.assertLessEqual(cold.staged_byte_count, 256 << 20)
+            self.assertLessEqual(cold.staged_file_count, 4096)
+            self.assertGreater(cold.cache_miss_count, 0)
+
+        with RuntimeAuditLease(cache_root) as warm:
+            started = time.perf_counter()
+            run_ctest.prepare_windows_runtime(
+                build, {}, audit_lease=warm, ctest_args=arguments
+            )
+            warm_elapsed = time.perf_counter() - started
+            self.assertLessEqual(warm_elapsed, 5.0)
+            self.assertGreater(warm.cache_hit_count, 0)
+            self.assertEqual(
+                (
+                    warm.cache_miss_count,
+                    warm.payload_written_file_count,
+                    warm.payload_written_byte_count,
+                ),
+                (0, 0, 0),
+            )
+
+    @unittest.skipUnless(os.name == "nt", "requires a built Windows app")
+    def test_real_full_prepare_has_absolute_cold_warm_budgets(self) -> None:
+        build, _app = self.real_build()
+        cache_parent = Path(tempfile.mkdtemp(prefix="olr-real-full-cache-"))
+        self.addCleanup(shutil.rmtree, cache_parent, True)
+        cache_root = cache_parent / "cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with RuntimeAuditLease(cache_root) as cold:
+            started = time.perf_counter()
+            env, _ctest = run_ctest.prepare_windows_runtime(
+                build, {}, audit_lease=cold, ctest_args=()
+            )
+            cold_elapsed = time.perf_counter() - started
+            self.assertLessEqual(cold_elapsed, 120.0)
+            self.assertLessEqual(cold.staged_byte_count, 2 << 30)
+            self.assertLessEqual(cold.staged_file_count, 16384)
+            self.assertGreater(cold.cache_miss_count, 0)
+
+            graph_files = tuple(
+                cold.launch_build_directory.rglob("CTestTestfile.cmake")
+            )
+            self.assertGreater(len(graph_files), 1)
+            rewritten = "\n".join(
+                graph.read_text(encoding="utf-8") for graph in graph_files
+            )
+            external_python = {
+                Path(value).parent
+                for value in re.findall(r'"([^\"]+python(?:w)?\.exe)"', rewritten, re.I)
+            }
+            external_qt_tools = {
+                Path(value).parent
+                for value in re.findall(r'"([^\"]+qmllint\.exe)"', rewritten, re.I)
+            }
+            self.assertTrue(external_python)
+            self.assertTrue(external_qt_tools)
+
+            plugins = Path(env["QT_PLUGIN_PATH"])
+            qml = Path(env["QML_IMPORT_PATH"])
+            qml_asset_directories = tuple(
+                path for path in qml.rglob("*") if path.is_dir()
+            )
+            self.assertTrue(qml_asset_directories)
+            mutation_namespaces = {
+                plugins / "imageformats",
+                plugins / "multimedia",
+                qml_asset_directories[0],
+                cold.launch_build_directory,
+                cold.launch_runtime_directory,
+                *cold.launch_runtime_directories,
+                *(graph.parent for graph in graph_files),
+                *external_python,
+                *external_qt_tools,
+            }
+            for directory in mutation_namespaces:
+                with self.subTest(namespace=directory):
+                    self.assert_directory_rejects_late_insertion(directory)
+
+        with RuntimeAuditLease(cache_root) as warm:
+            started = time.perf_counter()
+            run_ctest.prepare_windows_runtime(
+                build, {}, audit_lease=warm, ctest_args=()
+            )
+            warm_elapsed = time.perf_counter() - started
+            self.assertLessEqual(warm_elapsed, 8.0)
+            self.assertGreater(warm.cache_hit_count, 0)
+            self.assertEqual(
+                (
+                    warm.cache_miss_count,
+                    warm.payload_written_file_count,
+                    warm.payload_written_byte_count,
+                ),
+                (0, 0, 0),
+            )
+
     def test_find_build_directory_accepts_split_test_dir(self):
         cwd = self.root / "working"
         actual = run_ctest.find_build_directory(
@@ -513,6 +886,34 @@ class RunCtestTests(unittest.TestCase):
         )
 
         self.assertEqual(actual, (self.root / "third").resolve())
+
+    def test_find_build_directory_respects_official_option_value_arity(self):
+        arguments = [
+            "-R",
+            "--test-dir",
+            "-L",
+            "unit",
+            "--test-output-truncation",
+            "--test-dir=not-an-option.txt",
+        ]
+
+        self.assertEqual(
+            run_ctest.find_build_directory(arguments, self.root),
+            self.root.resolve(),
+        )
+
+    def test_find_build_directory_does_not_reinterpret_repeat_value_as_test_dir(self):
+        arguments = [
+            "--repeat-until-fail",
+            "--test-dir",
+            "-L",
+            "unit",
+        ]
+
+        self.assertEqual(
+            run_ctest.find_build_directory(arguments, self.root),
+            self.root.resolve(),
+        )
 
     def test_find_build_directory_rejects_missing_values(self):
         for args in (["--test-dir"], ["--test-dir="]):
@@ -943,6 +1344,67 @@ class RunCtestTests(unittest.TestCase):
 
         run_ctest.prepare_windows_runtime(self.build_dir, {})
 
+    def test_cmake_command_set_is_masked_and_lexically_scanned_once(self) -> None:
+        command_names = ("add_test", "set_tests_properties", "subdirs")
+        lines = [
+            "# add_test(commented)",
+            '"add_test(quoted)"',
+            "[=[subdirs(bracketed)]=]",
+            "myadd_test(not-an-identifier-match)",
+        ]
+        expected_names: list[str] = []
+        for index in range(128):
+            if index % 2:
+                lines.append(
+                    f"SeT_TeStS_PrOpErTiEs(test-{index:03d} PROPERTIES "
+                    "WORKING_DIRECTORY work)"
+                )
+                expected_names.append("set_tests_properties")
+            else:
+                lines.append(f"AdD_TeSt(test-{index:03d} tst.exe)")
+                expected_names.append("add_test")
+        text = "\n".join(lines) + "\n"
+        mask_calls = 0
+        scan_calls = 0
+        original_mask = windows_runtime_guard._strip_cmake_comments
+        original_scan = windows_runtime_guard._scan_cmake_command_starts
+
+        def count_mask(value: str) -> str:
+            nonlocal mask_calls
+            mask_calls += 1
+            return original_mask(value)
+
+        def count_scan(value: str, names: tuple[str, ...]):
+            nonlocal scan_calls
+            scan_calls += 1
+            return original_scan(value, names)
+
+        with (
+            mock.patch.object(
+                windows_runtime_guard,
+                "_strip_cmake_comments",
+                side_effect=count_mask,
+            ),
+            mock.patch.object(
+                windows_runtime_guard,
+                "_scan_cmake_command_starts",
+                side_effect=count_scan,
+            ),
+        ):
+            commands = windows_runtime_guard._cmake_commands_in_order(
+                text, command_names
+            )
+
+        self.assertEqual(mask_calls, 1)
+        self.assertEqual(scan_calls, 1)
+        self.assertEqual(
+            [name for name, _arguments, _occurrences in commands], expected_names
+        )
+        self.assertEqual(
+            [arguments[0] for _name, arguments, _occurrences in commands],
+            [f"test-{index:03d}" for index in range(128)],
+        )
+
     @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
     def test_ctest_graph_rejects_reparse_alias_edges(self) -> None:
         real = self.build_dir / "real-tests"
@@ -1031,7 +1493,7 @@ class RunCtestTests(unittest.TestCase):
         replacement = workdir / "replacement.dll"
         replacement.write_bytes(b"replacement")
         (self.build_dir / "CTestTestfile.cmake").write_text(
-            'add_test([=[workdir]=] "tst_workdir.exe")\n'
+            f'add_test([=[workdir]=] "{executable.as_posix()}")\n'
             'set_tests_properties([=[workdir]=] PROPERTIES '
             'WORKING_DIRECTORY [=[runtime-workdir]=])\n',
             encoding="utf-8",
@@ -1396,6 +1858,102 @@ class RunCtestTests(unittest.TestCase):
         self.assertIn((required / "Required.qml").resolve(), selected)
         self.assertNotIn(optional_file.resolve(), selected)
 
+    def test_qml_closure_parses_qt_modules_from_restored_held_streams(self) -> None:
+        source = self.root / "qml-held-source"
+        source.mkdir()
+        (source / "Main.qml").write_text(
+            "import Qt.HeldRoot\nItem {}\n", encoding="utf-8"
+        )
+        qml_root = self.qt_root / "qml"
+        module = qml_root / "Qt" / "HeldRoot"
+        module.mkdir(parents=True)
+        qmldir = module / "qmldir"
+        qmldir.write_text("depends Qt.HeldRequired\n", encoding="utf-8")
+        required = qml_root / "Qt" / "HeldRequired"
+        required.mkdir(parents=True)
+        required_file = required / "Required.qml"
+        required_file.write_text("Item {}\n", encoding="utf-8")
+
+        original_read_text = Path.read_text
+
+        def reject_qt_module_reopen(path: Path, *args, **kwargs) -> str:
+            if path.is_relative_to(qml_root):
+                raise AssertionError(f"Qt module path was reopened: {path}")
+            return original_read_text(path, *args, **kwargs)
+
+        cache_root = self.root / "qml-held-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        with RuntimeAuditLease(cache_root) as lease:
+            held_qmldir = lease.hold(qmldir)
+            held_qmldir.seek(3)
+            with mock.patch.object(Path, "read_text", reject_qt_module_reopen):
+                selected = windows_runtime_guard.qt_qml_closure(
+                    qml_root, (source,), lease=lease
+                )
+            self.assertEqual(held_qmldir.tell(), 3)
+            with mock.patch.object(
+                windows_runtime_guard,
+                "hashlib",
+                SimpleNamespace(
+                    sha256=mock.Mock(
+                        side_effect=AssertionError("held QML text was read twice")
+                    )
+                ),
+            ):
+                lease.stage_readonly_layout(
+                    "held-qml",
+                    {
+                        path.relative_to(qml_root): path
+                        for path in selected
+                    },
+                    context={"policy": "held-qml-test-v1"},
+                )
+
+        self.assertIn(required_file.resolve(), selected)
+
+    def test_qml_descriptor_memo_rejects_stale_metadata_and_stream(self) -> None:
+        source = self.root / "qml-memo-source.qml"
+        source.write_text("import Memo\n", encoding="utf-8")
+        qml_root = self.qt_root / "qml"
+        module = qml_root / "Memo"
+        module.mkdir(parents=True)
+        module_file = module / "Memo.qml"
+        module_file.write_text("Item {}\n", encoding="utf-8")
+        other_file = self.root / "memo-other.qml"
+        other_file.write_text("different\n", encoding="utf-8")
+
+        with RuntimeAuditLease() as lease:
+            windows_runtime_guard.qt_qml_closure(
+                qml_root, (source,), lease=lease
+            )
+            key = module_file.absolute()
+            descriptor = lease._held_source_descriptors[key]
+            stale = windows_runtime_cache.HeldSource(
+                source=descriptor.source,
+                final_path=descriptor.final_path,
+                device=descriptor.device,
+                inode=descriptor.inode,
+                size=descriptor.size + 1,
+                sha256=descriptor.sha256,
+                stream=descriptor.stream,
+            )
+            lease._held_source_descriptors[key] = stale
+            with self.assertRaisesRegex(RuntimeError, "metadata mismatch"):
+                lease._describe_held_source(module_file)
+
+            different_stream = lease.hold(other_file)
+            lease._held_source_descriptors[key] = windows_runtime_cache.HeldSource(
+                source=descriptor.source,
+                final_path=descriptor.final_path,
+                device=descriptor.device,
+                inode=descriptor.inode,
+                size=descriptor.size,
+                sha256=descriptor.sha256,
+                stream=different_stream,
+            )
+            with self.assertRaisesRegex(RuntimeError, "stream mismatch"):
+                lease._describe_held_source(module_file)
+
     @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
     def test_qml_closure_holds_final_paths_against_junction_swap(self) -> None:
         qml_root = self.root / "qml-race"
@@ -1738,6 +2296,89 @@ class RunCtestTests(unittest.TestCase):
         self.assertEqual(env["unrelated"], "preserved")
         self.assertNotIn("hostile", "\n".join(env.values()))
 
+    def test_windows_runtime_scrubs_interpreter_and_qt_injection_environment(self):
+        removed = (
+            "CMAKE_CONFIG_DIR",
+            "CTEST_PARALLEL_LEVEL",
+            "CTEST_USE_INSTRUMENTATION",
+            "CTEST_USE_VERBOSE_INSTRUMENTATION",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONBREAKPOINT",
+            "PYTHONWARNINGS",
+            "BASH_ENV",
+            "BASH_LOADABLES_PATH",
+            "BASH_FUNC_ATTACK%%",
+            "ENV",
+            "QT_OPENGL_DLL",
+            "QT_OPENGL_BUGLIST",
+            "QT_QUICK_CONTROLS_CONF",
+            "QT_QUICK_CONTROLS_IMAGINE_PATH",
+            "QT_STYLE_OVERRIDE",
+            "QT_QPA_PLATFORMTHEME",
+            "QT_QPA_GENERIC_PLUGINS",
+            "QT_QPA_FONTDIR",
+            "QT_QUICK_CONTROLS_STYLE",
+            "QT_QUICK_CONTROLS_FALLBACK_STYLE",
+            "QT_VIRTUALKEYBOARD_LAYOUT_PATH",
+            "QTWEBENGINEPROCESS_PATH",
+            "QTWEBENGINE_DICTIONARIES_PATH",
+            "QTWEBENGINE_LOCALES_PATH",
+        )
+        inherited = {
+            name.swapcase(): str(self.root / f"hostile-{index}")
+            for index, name in enumerate(removed)
+        }
+        inherited["BASH_FUNC_injected%%"] = "() { C:/attacker.exe; }"
+        inherited["unrelated"] = "preserved"
+
+        env, _ = run_ctest.prepare_windows_runtime(self.build_dir, inherited)
+
+        folded = {name.casefold() for name in env}
+        self.assertTrue({name.casefold() for name in removed}.isdisjoint(folded))
+        self.assertNotIn("bash_func_injected%%", folded)
+        self.assertEqual(env["unrelated"], "preserved")
+
+    def test_ctest_unknown_olr_environment_preserves_scalars_but_rejects_paths(self):
+        executable = self.build_dir / "tst_environment.exe"
+        _write_manifest_pe_fixture(executable)
+        scalar_values = ("1", "ON", "multiview", "12.5", "ndi")
+        scalar_environment = ";".join(
+            f"OLR_SCALAR_{index}={value}"
+            for index, value in enumerate(scalar_values)
+        )
+        graph = self.build_dir / "CTestTestfile.cmake"
+        graph.write_text(
+            f'add_test([=[environment]=] "{executable.as_posix()}")\n'
+            'set_tests_properties([=[environment]=] PROPERTIES '
+            f'ENVIRONMENT "{scalar_environment}")\n',
+            encoding="utf-8",
+        )
+        run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+        for value in (
+            "C:/mutable/input.dat",
+            "../mutable-input",
+            "relative/input.dat",
+            "mutable-input.cfg",
+            ".env",
+            "%TEMP%",
+            "$HOME",
+            "${HOME}",
+            "~",
+        ):
+            with self.subTest(value=value):
+                graph.write_text(
+                    f'add_test([=[environment]=] "{executable.as_posix()}")\n'
+                    'set_tests_properties([=[environment]=] PROPERTIES '
+                    f'ENVIRONMENT "OLR_UNKNOWN={value}")\n',
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, r"OLR_UNKNOWN.*path|path.*OLR_UNKNOWN"
+                ):
+                    run_ctest.prepare_windows_runtime(self.build_dir, {})
+
     def test_windows_runtime_requires_embedded_manifests_for_selected_processes(self):
         with mock.patch(
             "tools.run_ctest.reject_runtime_dll_shadowing"
@@ -1857,20 +2498,13 @@ class RunCtestTests(unittest.TestCase):
             encoding="utf-8",
         )
         component.write_text("import QtQuick\nItem {}\n", encoding="utf-8")
-        source_fixture = self.root / "fixtures" / "input.dat"
-        source_fixture.parent.mkdir()
-        source_fixture.write_bytes(b"source-fixture")
-        build_fixture = self.build_dir / "fixtures" / "generated.dat"
-        build_fixture.parent.mkdir()
-        build_fixture.write_bytes(b"build-fixture")
         executable = self.build_dir / "tst_snapshot.exe"
         _write_manifest_pe_fixture(executable)
         graph = self.build_dir / "CTestTestfile.cmake"
         graph.write_text(
             f'add_test([=[snapshot]=] "{executable.as_posix()}" '
             f'"-input" "../{qml_input.relative_to(self.root).as_posix()}" '
-            f'"--source-fixture" "{source_fixture.as_posix()}" '
-            f'"--build-fixture" "{build_fixture.as_posix()}")\n',
+            '"--label" "source-fixture")\n',
             encoding="utf-8",
         )
 
@@ -1889,8 +2523,7 @@ class RunCtestTests(unittest.TestCase):
                 staged_source / "ui" / "components" / component.name
             )
             self.assertIn(staged_input.as_posix(), staged_text)
-            self.assertIn(source_fixture.as_posix(), staged_text)
-            self.assertIn(build_fixture.as_posix(), staged_text)
+            self.assertIn("source-fixture", staged_text)
             self.assertEqual(
                 staged_component.read_text(encoding="utf-8"),
                 "import QtQuick\nItem {}\n",
@@ -2011,13 +2644,13 @@ class RunCtestTests(unittest.TestCase):
             self.assertIn(support, closure.call_args.args[0])
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
-    def test_external_launch_rewrites_relative_executable_but_preserves_workdir(self):
+    def test_external_launch_rewrites_relative_executable_and_stages_workdir(self):
         working = self.build_dir / "relative-workdir"
         working.mkdir()
         executable = working / "tst_relative_staged.exe"
         _write_manifest_pe_fixture(executable)
         (self.build_dir / "CTestTestfile.cmake").write_text(
-            'add_test([=[relative-staged]=] "tst_relative_staged.exe")\n'
+            'add_test([=[relative-staged]=] "tst_relative_staged.exe" "future")\n'
             'set_tests_properties([=[relative-staged]=] PROPERTIES '
             'WORKING_DIRECTORY [=[relative-workdir]=])\n',
             encoding="utf-8",
@@ -2033,8 +2666,14 @@ class RunCtestTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn(staged_executable.as_posix(), graph)
-            self.assertIn("# Controlled launch preserves", graph)
-            self.assertIn(str(working), graph)
+            staged_working = staged_build / working.relative_to(self.build_dir)
+            self.assertIn("# Controlled launch uses immutable", graph)
+            self.assertIn(staged_working.as_posix(), graph)
+            self.assertNotIn(working.as_posix(), graph)
+            (working / "future").write_bytes(b"late mutable input")
+            self.assertFalse((staged_working / "future").exists())
+            with self.assertRaises(OSError):
+                (staged_working / "future").write_bytes(b"late staged input")
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_external_wrapper_keeps_protected_install_relative_resources(self):
@@ -2068,6 +2707,98 @@ class RunCtestTests(unittest.TestCase):
             )
             with self.assertRaises(OSError):
                 (command.parent / "late.dll").write_bytes(b"poison")
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_git_bash_wrapper_stages_real_usr_bin_family(self):
+        git_root = self.root / "Git"
+        wrapper = git_root / "bin" / "bash.exe"
+        real_bash = git_root / "usr" / "bin" / "bash.exe"
+        msys_runtime = git_root / "usr" / "bin" / "msys-2.0.dll"
+        shell_tool = git_root / "usr" / "bin" / "sed.exe"
+        unrelated = git_root / "mingw64" / "bin" / "unused.exe"
+        for executable in (wrapper, real_bash, shell_tool, unrelated):
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            _write_manifest_pe_fixture(executable)
+        msys_runtime.write_bytes(b"msys runtime")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[shell]=] "{wrapper.as_posix()}")\n',
+            encoding="utf-8",
+        )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            graph = (
+                lease.launch_build_directory / "CTestTestfile.cmake"
+            ).read_text(encoding="utf-8")
+            staged_wrapper = Path(
+                re.search(r'add_test\([^\n]+"([^"]+bash\.exe)"', graph).group(1)
+            )
+            staged_root = staged_wrapper.parent.parent
+
+            self.assertEqual(staged_wrapper.relative_to(staged_root), Path("bin/bash.exe"))
+            self.assertEqual(
+                (staged_root / "usr" / "bin" / "bash.exe").read_bytes(),
+                real_bash.read_bytes(),
+            )
+            self.assertEqual(
+                (staged_root / "usr" / "bin" / "msys-2.0.dll").read_bytes(),
+                msys_runtime.read_bytes(),
+            )
+            self.assertEqual(
+                (staged_root / "usr" / "bin" / "sed.exe").read_bytes(),
+                shell_tool.read_bytes(),
+            )
+            self.assertFalse(
+                (staged_root / "mingw64" / "bin" / unrelated.name).exists()
+            )
+            self.assertEqual(
+                (
+                    staged_root
+                    / "mingw64"
+                    / "bin"
+                    / ".olr-runtime-root"
+                ).read_bytes(),
+                b"",
+            )
+            self.assert_directory_rejects_late_insertion(
+                staged_root / "usr" / "bin"
+            )
+            self.assert_directory_rejects_late_insertion(
+                staged_root / "mingw64" / "bin"
+            )
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_tree_closure_enforces_budgets_during_held_traversal(self):
+        tree = self.root / "bounded-tree"
+        tree.mkdir()
+        for name in ("one.dat", "two.dat", "three.dat"):
+            (tree / name).write_bytes(b"12")
+
+        with RuntimeAuditLease() as lease:
+            with self.assertRaisesRegex(
+                RuntimeError, "external tool closure entry limit exceeded"
+            ):
+                run_ctest._tree_closure_files(
+                    tree,
+                    tree,
+                    lease=lease,
+                    entry_limit=2,
+                    byte_limit=1024,
+                )
+
+        with RuntimeAuditLease() as lease:
+            with self.assertRaisesRegex(
+                RuntimeError, "external tool closure byte limit exceeded"
+            ):
+                run_ctest._tree_closure_files(
+                    tree,
+                    tree,
+                    lease=lease,
+                    entry_limit=10,
+                    byte_limit=3,
+                )
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_literal_ctest_selectors_bound_snapshot_to_safe_superset(self):
@@ -2108,16 +2839,300 @@ class RunCtestTests(unittest.TestCase):
             self.assertTrue((staged / unit.name).is_file())
             self.assertTrue((staged / e2e.name).is_file())
 
-        with RuntimeAuditLease() as lease:
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_selected_missing_command_executable_fails_before_late_creation(self):
+        future = self.root / "outside" / "future.exe"
+        future.parent.mkdir()
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[late]=] "{future.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "missing-command-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with (
+            RuntimeAuditLease(cache_root) as lease,
+            self.assertRaisesRegex(
+                RuntimeError, r"late.*existing.*executable|executable.*late"
+            ),
+        ):
             run_ctest.prepare_windows_runtime(
                 self.build_dir,
                 {},
                 audit_lease=lease,
-                ctest_args=("--rerun-failed", "-R", "^selected$"),
+                ctest_args=("-R", "^late$"),
             )
-            staged = lease.launch_build_directory
-            self.assertTrue((staged / unit.name).is_file())
-            self.assertTrue((staged / e2e.name).is_file())
+
+        future.write_bytes(b"late mutable executable")
+        self.assertTrue(future.is_file())
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_outer_ctest_input_files_are_staged_and_arguments_rewritten(self):
+        self.write_cacheable_ctest_graph("unit")
+        inputs = {
+            "tests-from": b"unit\n",
+            "exclude-from": b"excluded\n",
+            "resource": b'{"version":{"major":1,"minor":0},"local":[]}',
+            "information": b"1,1,1\n",
+        }
+        paths: dict[str, Path] = {}
+        for name, payload in inputs.items():
+            path = self.root / "ctest-inputs" / f"{name}.txt"
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(payload)
+            paths[name] = path
+        caller_args = (
+            "--tests-from-file",
+            str(paths["tests-from"]),
+            f'--tests-from-file={paths["tests-from"]}',
+            "--exclude-from-file",
+            str(paths["exclude-from"]),
+            f'--exclude-from-file={paths["exclude-from"]}',
+            "--resource-spec-file",
+            str(paths["resource"]),
+            f'--resource-spec-file={paths["resource"]}',
+            "-I",
+            str(paths["information"]),
+            f'--tests-information={paths["information"]}',
+            "--test-dir",
+            str(self.build_dir),
+            "--output-on-failure",
+        )
+        cache_root = self.root / "outer-ctest-input-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with RuntimeAuditLease(cache_root) as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=caller_args,
+            )
+            rewritten = lease.launch_ctest_arguments
+            self.assertNotIn("--test-dir", rewritten)
+            self.assertNotIn(str(self.build_dir), rewritten)
+            self.assertIn("--output-on-failure", rewritten)
+            rendered = "\n".join(rewritten)
+            for name, source in paths.items():
+                self.assertNotIn(str(source), rendered, name)
+                staged_paths = tuple(
+                    Path(value.partition("=")[2] if "=" in value else value)
+                    for value in rewritten
+                    if value.endswith(source.name)
+                )
+                self.assertGreaterEqual(len(staged_paths), 2, name)
+                for staged in staged_paths:
+                    self.assertEqual(staged.read_bytes(), inputs[name])
+                    with self.assertRaises(OSError):
+                        staged.write_bytes(b"late mutation")
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_outer_ctest_parser_respects_official_option_value_arity(self):
+        arguments = (
+            "-R",
+            "--tests-from-file",
+            "-L",
+            "--test-dir",
+            "--test-output-size-passed",
+            "--resource-spec-file",
+            "--test-output-size-failed",
+            "--exclude-from-file",
+        )
+
+        with RuntimeAuditLease() as lease:
+            self.assertEqual(
+                run_ctest._stage_controlled_ctest_arguments(arguments, lease),
+                arguments,
+            )
+
+    def test_outer_ctest_parser_consumes_new_official_option_values(self):
+        arguments = (
+            "--presets-file",
+            "--test-dir",
+            "--repeat-until-fail",
+            "--test-dir",
+            "--submit-index",
+            "--test-dir",
+            "--collect-instrumentation",
+            "--test-dir",
+            "-L",
+            "unit",
+        )
+
+        parsed = run_ctest._parse_ctest_arguments(arguments)
+
+        self.assertEqual(
+            tuple((argument.option, argument.values) for argument in parsed),
+            (
+                ("--presets-file", ("--test-dir",)),
+                ("--repeat-until-fail", ("--test-dir",)),
+                ("--submit-index", ("--test-dir",)),
+                ("--collect-instrumentation", ("--test-dir",)),
+                ("-L", ("unit",)),
+            ),
+        )
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_outer_ctest_repeat_until_fail_remains_test_mode(self):
+        arguments = ("--repeat-until-fail", "7", "-L", "unit")
+
+        with RuntimeAuditLease() as lease:
+            self.assertEqual(
+                run_ctest._stage_controlled_ctest_arguments(arguments, lease),
+                arguments,
+            )
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_outer_ctest_repeat_policy_is_bounded_and_until_fail_only(self):
+        cap = run_ctest._CTEST_REPEAT_CAP
+        accepted = (
+            ("--repeat", "until-fail:1"),
+            (f"--repeat=until-fail:{cap}",),
+            ("--repeat-until-fail", "7"),
+            (f"--repeat-until-fail={cap}",),
+        )
+        rejected = (
+            ("--repeat", "until-pass:1"),
+            ("--repeat", "after-timeout:1"),
+            ("--repeat", "until-fail:0"),
+            ("--repeat", "until-fail:not-a-number"),
+            ("--repeat", f"until-fail:{cap + 1}"),
+            ("--repeat-until-fail", "0"),
+            ("--repeat-until-fail", "not-a-number"),
+            ("--repeat-until-fail", str(cap + 1)),
+        )
+
+        for arguments in accepted:
+            with self.subTest(accepted=arguments), RuntimeAuditLease() as lease:
+                self.assertEqual(
+                    run_ctest._stage_controlled_ctest_arguments(arguments, lease),
+                    arguments,
+                )
+        for arguments in rejected:
+            with self.subTest(rejected=arguments), RuntimeAuditLease() as lease:
+                with self.assertRaisesRegex(RuntimeError, "repeat.*bounded|until-fail"):
+                    run_ctest._stage_controlled_ctest_arguments(arguments, lease)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_outer_ctest_parallel_policy_requires_bounded_positive_value(self):
+        cap = run_ctest._CTEST_PARALLEL_CAP
+        accepted = (
+            ("-j", "1"),
+            (f"-j{cap}",),
+            ("-j=1",),
+            ("--parallel", str(cap)),
+            ("--parallel=1",),
+        )
+        rejected = (
+            ("-j",),
+            ("--parallel",),
+            ("-j0",),
+            ("-j=0",),
+            ("--parallel", "0"),
+            ("--parallel=not-a-number",),
+            (f"-j{cap + 1}",),
+            ("--parallel", str(cap + 1)),
+        )
+
+        for arguments in accepted:
+            with self.subTest(accepted=arguments), RuntimeAuditLease() as lease:
+                self.assertEqual(
+                    run_ctest._stage_controlled_ctest_arguments(arguments, lease),
+                    arguments,
+                )
+        for arguments in rejected:
+            with self.subTest(rejected=arguments), RuntimeAuditLease() as lease:
+                with self.assertRaisesRegex(RuntimeError, "parallel.*bounded|positive"):
+                    run_ctest._stage_controlled_ctest_arguments(arguments, lease)
+
+    def test_outer_ctest_output_files_are_rejected_before_child_launch(self):
+        cases = (
+            ("--output-log", str(self.root / "ctest.log")),
+            (f"--output-log={self.root / 'ctest.log'}",),
+            ("--output-junit", str(self.root / "ctest.xml")),
+            (f"--output-junit={self.root / 'ctest.xml'}",),
+            ("-O", str(self.root / "short.log")),
+            (f"-O{self.root / 'attached.log'}",),
+            (f"-O={self.root / 'equal.log'}",),
+        )
+
+        for arguments in cases:
+            with self.subTest(arguments=arguments), mock.patch.object(
+                run_ctest, "run_process_tree"
+            ) as run:
+                with self.assertRaisesRegex(RuntimeError, "unsupported.*CTest.*option"):
+                    run_ctest.main(
+                        ["--test-dir", str(self.build_dir), *arguments]
+                    )
+                run.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_outer_ctest_equal_short_information_file_preserves_spelling(self):
+        information = self.root / "indices.txt"
+        information.write_text("1,1,1\n", encoding="utf-8")
+
+        with RuntimeAuditLease() as lease:
+            rewritten = run_ctest._stage_controlled_ctest_arguments(
+                (f"-I={information}",), lease
+            )
+            self.assertEqual(len(rewritten), 1)
+            self.assertTrue(rewritten[0].startswith("-I="))
+            staged = Path(rewritten[0][3:])
+            self.assertEqual(staged.read_text(encoding="utf-8"), "1,1,1\n")
+            with self.assertRaises(OSError):
+                staged.write_text("late", encoding="utf-8")
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_outer_ctest_missing_input_files_fail_before_child_launch(self):
+        self.write_cacheable_ctest_graph("unit")
+        missing = self.root / "future-ctest-input.txt"
+        cases = (
+            ("--tests-from-file", str(missing)),
+            (f"--exclude-from-file={missing}",),
+            ("--resource-spec-file", str(missing)),
+            ("-I", str(missing)),
+        )
+
+        for arguments in cases:
+            with self.subTest(arguments=arguments), mock.patch.object(
+                run_ctest, "run_process_tree"
+            ) as run:
+                with self.assertRaisesRegex(
+                    RuntimeError, r"input file does not exist"
+                ):
+                    run_ctest.main(["--test-dir", str(self.build_dir), *arguments])
+                run.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_outer_ctest_unsupported_modes_fail_before_child_launch(self):
+        self.write_cacheable_ctest_graph("unit")
+        script = self.root / "dashboard.cmake"
+        script.write_text("# dashboard\n", encoding="utf-8")
+        cases = (
+            ("rerun", ("--rerun-failed",)),
+            ("dashboard", ("-D", "Experimental")),
+            ("script", ("-S", str(script))),
+            ("preset", ("--preset", "ci")),
+            ("build-and-test", ("--build-and-test", "source", "build")),
+            ("overwrite", ("--overwrite", "Site:STRING=hostile")),
+            ("passthrough", ("--", "--test-dir", str(self.build_dir))),
+            ("presets-file", ("--presets-file", "external.json")),
+            ("submit-index", ("--submit-index", "1")),
+            (
+                "collect-instrumentation",
+                ("--collect-instrumentation", "instrumentation"),
+            ),
+        )
+
+        for label, arguments in cases:
+            with self.subTest(label=label), mock.patch.object(
+                run_ctest, "run_process_tree"
+            ) as run:
+                with self.assertRaisesRegex(
+                    RuntimeError, r"unsupported.*CTest.*option|immutable"
+                ):
+                    run_ctest.main(["--test-dir", str(self.build_dir), *arguments])
+                run.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_fixture_properties_disable_narrow_snapshot_optimization(self):
@@ -2184,12 +3199,11 @@ class RunCtestTests(unittest.TestCase):
         mixed = tuple(
             str(path).swapcase().replace("\\", "/") for path in runtime_dirs
         )
-        near_prefix = f"--output={runtime_dirs[1].as_posix()}-artifacts/result"
         modifications = ";".join(
             f"PATH=path_list_prepend:{path}" for path in reversed(mixed)
         )
         (self.build_dir / "CTestTestfile.cmake").write_text(
-            f'add_test([=[identity]=] "{executable.as_posix()}" "{near_prefix}")\n'
+            f'add_test([=[identity]=] "{executable.as_posix()}" "opaque-output")\n'
             'set_tests_properties([=[identity]=] PROPERTIES '
             f'ENVIRONMENT_MODIFICATION "{modifications}")\n',
             encoding="utf-8",
@@ -2202,7 +3216,7 @@ class RunCtestTests(unittest.TestCase):
             graph = (lease.launch_build_directory / "CTestTestfile.cmake").read_text(
                 encoding="utf-8"
             )
-            self.assertIn(near_prefix, graph)
+            self.assertIn("opaque-output", graph)
             for staged_runtime in lease.launch_runtime_directories:
                 self.assertIn(staged_runtime.as_posix(), graph)
 
@@ -2226,7 +3240,7 @@ class RunCtestTests(unittest.TestCase):
             literal = identity.as_posix()
             commands.append(
                 f'add_test([=[ordinary-{index}]=] "{executable.as_posix()}" '
-                f'{render(literal)})'
+                f'{render(f"opaque-token-{index}")})'
             )
             commands.append(f'add_subdirectory({render(literal)})')
         (self.build_dir / "CTestTestfile.cmake").write_text(
@@ -2241,7 +3255,7 @@ class RunCtestTests(unittest.TestCase):
             graph = (staged / "CTestTestfile.cmake").read_text(encoding="utf-8")
             for identity in identities:
                 staged_identity = staged / identity.relative_to(self.build_dir)
-                self.assertEqual(graph.count(identity.as_posix()), 1)
+                self.assertNotIn(identity.as_posix(), graph)
                 self.assertEqual(graph.count(staged_identity.as_posix()), 1)
 
     def test_fixture_selector_flags_disable_narrow_selection_without_fixture_properties(self):
@@ -2269,9 +3283,83 @@ class RunCtestTests(unittest.TestCase):
         for control in controls:
             with self.subTest(control=control):
                 selected = run_ctest._selected_test_records(
-                    graph, ("-R", "^unit$", *control)
+                    graph,
+                    run_ctest._parse_ctest_arguments(
+                        ("-R", "^unit$", *control)
+                    ),
                 )
                 self.assertEqual({test.name for test in selected}, {"unit", "other"})
+
+    def test_selected_tests_share_parser_for_option_looking_output_value(self):
+        unit = self.build_dir / "selector-unit.exe"
+        other = self.build_dir / "selector-other.exe"
+        unit.write_bytes(b"unit")
+        other.write_bytes(b"other")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[unit]=] "{unit.as_posix()}")\n'
+            f'add_test([=[other]=] "{other.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        graph = windows_runtime_guard.discover_ctest_graph(self.build_dir)
+        parsed = run_ctest._parse_ctest_arguments(
+            ("--output-log", "-R", "--tests-regex", "^unit$")
+        )
+
+        selected = run_ctest._selected_test_records(graph, parsed)
+
+        self.assertEqual({test.name for test in selected}, {"unit"})
+
+    def test_unknown_ctest_option_disables_exact_selection_optimization(self):
+        unit = self.build_dir / "unknown-selector-unit.exe"
+        other = self.build_dir / "unknown-selector-other.exe"
+        unit.write_bytes(b"unit")
+        other.write_bytes(b"other")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[unit]=] "{unit.as_posix()}")\n'
+            f'add_test([=[other]=] "{other.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        graph = windows_runtime_guard.discover_ctest_graph(self.build_dir)
+        parsed = run_ctest._parse_ctest_arguments(
+            ("--future-positive-selector", "selection.txt", "-R", "^unit$")
+        )
+
+        selected = run_ctest._selected_test_records(graph, parsed)
+
+        self.assertEqual({test.name for test in selected}, {"unit", "other"})
+
+    def test_rendered_command_invariant_rejects_mutable_or_unstaged_executable(self):
+        selected_name = "unit"
+        original = self.build_dir / "unit.exe"
+        staged = self.root / "protected-cache" / "unit.exe"
+        outside = self.root / "unstaged" / "helper.exe"
+
+        def graph_with(executable: Path) -> SimpleNamespace:
+            return SimpleNamespace(
+                tests=(
+                    SimpleNamespace(
+                        name=selected_name,
+                        executable_arguments=((str(executable), executable, None),),
+                    ),
+                )
+            )
+
+        run_ctest._validate_rendered_test_commands(
+            graph_with(staged),
+            frozenset({selected_name}),
+            self.build_dir,
+            frozenset({staged}),
+        )
+        for executable in (original, outside):
+            with self.subTest(executable=executable), self.assertRaisesRegex(
+                RuntimeError, "original build|unstaged external"
+            ):
+                run_ctest._validate_rendered_test_commands(
+                    graph_with(executable),
+                    frozenset({selected_name}),
+                    self.build_dir,
+                    frozenset({staged}),
+                )
 
     def test_quicktest_inputs_are_keyed_by_add_test_occurrence(self) -> None:
         first_scope = self.build_dir / "quick-first"
@@ -2321,6 +3409,13 @@ class RunCtestTests(unittest.TestCase):
     def test_qt_bin_tool_does_not_snapshot_the_entire_install_prefix(self):
         tool = self.qt_root / "bin" / "qmllint.exe"
         _write_manifest_pe_fixture(tool)
+        (self.qt_root / "bin" / "avcodec-61.dll").write_bytes(b"qt-tool-ffmpeg")
+        unused_qt = self.qt_root / "bin" / "Qt6UnusedForQmllint.dll"
+        with unused_qt.open("wb") as stream:
+            stream.truncate(32 << 20)
+        (self.ffmpeg_root / "bin" / "avcodec-62.dll").write_bytes(
+            b"application-ffmpeg"
+        )
         noise = self.qt_root / "Docs" / "Qt-oversized"
         noise.mkdir(parents=True)
         for index in range(512):
@@ -2343,12 +3438,747 @@ class RunCtestTests(unittest.TestCase):
                 if Path(value) != tool
             )
             self.assertTrue(staged_tool.is_file())
+            self.assertEqual(
+                (staged_tool.parent / "avcodec-61.dll").read_bytes(),
+                b"qt-tool-ffmpeg",
+            )
+            self.assertFalse((staged_tool.parent / unused_qt.name).exists())
             rendered = (staged_tool.parent / "qt.conf").read_text(encoding="utf-8")
             self.assertIn(Path(env["QT_PLUGIN_PATH"]).as_posix(), rendered)
             self.assertIn(Path(env["QML_IMPORT_PATH"]).as_posix(), rendered)
             self.assertFalse(
                 (staged_tool.parent.parent / "Docs" / "Qt-oversized").exists()
             )
+
+    def test_qmllint_arguments_use_only_staged_build_qt_and_source_paths(self):
+        tool = self.qt_root / "bin" / "qmllint.exe"
+        _write_manifest_pe_fixture(tool)
+        lint_plugin = (
+            self.qt_root / "plugins" / "qmllint" / "quicklintplugin.dll"
+        )
+        lint_plugin.parent.mkdir(parents=True)
+        lint_plugin.write_bytes(b"quick lint plugin")
+        build_qml = self.build_dir / "qml"
+        build_qml.mkdir()
+        (build_qml / "BuildModule.qmltypes").write_text(
+            "build module\n", encoding="utf-8"
+        )
+        source_qml = self.root / "ui" / "Main.qml"
+        source_qml.parent.mkdir()
+        source_qml.write_text("import QtQuick\nItem {}\n", encoding="utf-8")
+        graph = self.build_dir / "CTestTestfile.cmake"
+        graph.write_text(
+            f'add_test([=[qml-smoke]=] "{tool.as_posix()}" '
+            f'"-I" "{build_qml.as_posix()}" "-I" '
+            f'"{(self.qt_root / "qml").as_posix()}" '
+            f'"--Quick.layout-positioning" "error" '
+            f'"{source_qml.as_posix()}" "--literal-mode")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "qml-argument-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with RuntimeAuditLease(cache_root) as lease:
+            env, _ctest = run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            rewritten = (
+                lease.launch_build_directory / "CTestTestfile.cmake"
+            ).read_text(encoding="utf-8")
+            arguments = tuple(Path(value) for value in re.findall(r'"([^"]+)"', rewritten))
+
+            self.assertNotIn(build_qml.as_posix(), rewritten)
+            self.assertNotIn((self.qt_root / "qml").as_posix(), rewritten)
+            self.assertNotIn(source_qml.as_posix(), rewritten)
+            staged_build_qml = next(path for path in arguments if path.name == "qml")
+            staged_source = next(path for path in arguments if path.name == "Main.qml")
+            self.assertIn(Path(env["QML_IMPORT_PATH"]), arguments)
+            self.assertEqual(
+                (staged_build_qml / "BuildModule.qmltypes").read_text(encoding="utf-8"),
+                "build module\n",
+            )
+            self.assertEqual(staged_source.read_bytes(), source_qml.read_bytes())
+            self.assertEqual(
+                (
+                    Path(env["QT_PLUGIN_PATH"])
+                    / "qmllint"
+                    / lint_plugin.name
+                ).read_bytes(),
+                lint_plugin.read_bytes(),
+            )
+            self.assertNotEqual(lease.launch_source_directory, self.root)
+            self.assertIn('"--literal-mode"', rewritten)
+            self.assertIn('"--Quick.layout-positioning" "error"', rewritten)
+            self.assert_directory_rejects_late_insertion(staged_build_qml)
+            self.assert_directory_rejects_late_insertion(staged_source.parent)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_nested_build_qml_import_prefers_its_immutable_build_snapshot(self):
+        executable = self.build_dir / "tst_style.exe"
+        _write_manifest_pe_fixture(executable)
+        quicktest_input = self.root / "tests" / "tst_style.qml"
+        quicktest_input.parent.mkdir()
+        quicktest_input.write_text("import QtQuick\nItem {}\n", encoding="utf-8")
+        build_qml = self.build_dir / "qml"
+        module = build_qml / "OlrTheme"
+        module.mkdir(parents=True)
+        (module / "qmldir").write_text("module OlrTheme\n", encoding="utf-8")
+        qt_qml = self.qt_root / "qml"
+        qmllint = self.qt_root / "bin" / "qmllint.exe"
+        _write_manifest_pe_fixture(qmllint)
+        lint_plugin = (
+            self.qt_root / "plugins" / "qmllint" / "quicklintplugin.dll"
+        )
+        lint_plugin.parent.mkdir(parents=True)
+        lint_plugin.write_bytes(b"quick lint plugin")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[style]=] "{executable.as_posix()}" '
+            f'"-input" "{quicktest_input.as_posix()}")\n'
+            'set_tests_properties([=[style]=] PROPERTIES '
+            'ENVIRONMENT_MODIFICATION "'
+            f'QML_IMPORT_PATH=path_list_prepend:{qt_qml.as_posix()};'
+            f'QML2_IMPORT_PATH=path_list_prepend:{qt_qml.as_posix()};'
+            f'QML_IMPORT_PATH=path_list_prepend:{build_qml.as_posix()};'
+            f'QML2_IMPORT_PATH=path_list_prepend:{build_qml.as_posix()}")\n'
+            f'add_test([=[qml-smoke]=] "{qmllint.as_posix()}" '
+            f'"-I" "{build_qml.as_posix()}" "{quicktest_input.as_posix()}")\n',
+            encoding="utf-8",
+        )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^(style|qml-smoke)$"),
+            )
+            rewritten = (
+                lease.launch_build_directory / "CTestTestfile.cmake"
+            ).read_text(encoding="utf-8")
+            staged_imports = tuple(
+                Path(value)
+                for value in re.findall(
+                    r"QML_IMPORT_PATH=path_list_prepend:([^;\"]+)",
+                    rewritten,
+                )
+            )
+            staged_build_qml = next(
+                path
+                for path in staged_imports
+                if (path / "OlrTheme" / "qmldir").is_file()
+            )
+
+            self.assertNotIn(build_qml.as_posix(), rewritten)
+            self.assertGreaterEqual(
+                rewritten.count(staged_build_qml.as_posix()),
+                2,
+            )
+            self.assertFalse(
+                staged_build_qml.is_relative_to(lease.launch_source_directory)
+            )
+            self.assertEqual(
+                (staged_build_qml / "OlrTheme" / "qmldir").read_text(
+                    encoding="utf-8"
+                ),
+                "module OlrTheme\n",
+            )
+            self.assert_directory_rejects_late_insertion(staged_build_qml)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_qmllint_plugins_are_scoped_to_the_selected_tests_and_cache_key(self):
+        tool = self.qt_root / "bin" / "qmllint.exe"
+        _write_manifest_pe_fixture(tool)
+        lint_plugin = (
+            self.qt_root / "plugins" / "qmllint" / "quicklintplugin.dll"
+        )
+        lint_plugin.parent.mkdir(parents=True)
+        lint_plugin.write_bytes(b"selected quick lint plugin")
+        unit = self.build_dir / "unit.exe"
+        _write_manifest_pe_fixture(unit)
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[qml-smoke]=] "{tool.as_posix()}")\n'
+            f'add_test([=[unit]=] "{unit.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "qmllint-selection-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with RuntimeAuditLease(cache_root) as normal_lease:
+            normal_env, _ctest = run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=normal_lease,
+                ctest_args=("-R", "^unit$"),
+            )
+            self.assertFalse(
+                (Path(normal_env["QT_PLUGIN_PATH"]) / "qmllint").exists()
+            )
+
+        with RuntimeAuditLease(cache_root) as qmllint_lease:
+            qmllint_env, _ctest = run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=qmllint_lease,
+                ctest_args=("-R", "^qml-smoke$"),
+            )
+            self.assertEqual(
+                (
+                    Path(qmllint_env["QT_PLUGIN_PATH"])
+                    / "qmllint"
+                    / lint_plugin.name
+                ).read_bytes(),
+                lint_plugin.read_bytes(),
+            )
+
+    def test_python_script_and_option_paths_share_one_immutable_source_snapshot(self):
+        python = self.root / "python-tool" / "python.exe"
+        python.parent.mkdir()
+        _write_manifest_pe_fixture(python)
+        script = self.root / "tests" / "driver.py"
+        data = self.root / "tests" / "fixtures" / "input.json"
+        positional = self.root / "playback" / "input.cpp"
+        unrelated_qml = self.root / "ui" / "Unrelated.qml"
+        qt_module = self.qt_root / "qml" / "ReviewerOnly"
+        plugin = self.qt_root / "plugins" / "imageformats" / "qreviewer.dll"
+        data.parent.mkdir(parents=True)
+        positional.parent.mkdir(parents=True)
+        unrelated_qml.parent.mkdir(parents=True)
+        qt_module.mkdir()
+        plugin.parent.mkdir()
+        script.write_text("print('driver')\n", encoding="utf-8")
+        data.write_text('{"input": true}\n', encoding="utf-8")
+        positional.write_text("// positional Python input\n", encoding="utf-8")
+        unrelated_qml.write_text("import ReviewerOnly\nItem {}\n", encoding="utf-8")
+        (qt_module / "qmldir").write_text(
+            "module ReviewerOnly\n", encoding="utf-8"
+        )
+        (qt_module / "ReviewerOnly.qml").write_text(
+            "import QtQuick\nItem {}\n", encoding="utf-8"
+        )
+        plugin.write_bytes(b"python launch must not stage this plugin")
+        graph = self.build_dir / "CTestTestfile.cmake"
+        graph.write_text(
+            f'add_test([=[python-data]=] "{python.as_posix()}" '
+            f'"{script.as_posix()}" "{positional.as_posix()}" '
+            f'"--data={data.as_posix()}" '
+            '"--raw-token")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "python-argument-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with RuntimeAuditLease(cache_root) as lease:
+            env, _ctest = run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            rewritten = (
+                lease.launch_build_directory / "CTestTestfile.cmake"
+            ).read_text(encoding="utf-8")
+
+            self.assertNotIn(script.as_posix(), rewritten)
+            self.assertNotIn(data.as_posix(), rewritten)
+            self.assertNotIn(positional.as_posix(), rewritten)
+            staged_script = next(
+                Path(value)
+                for value in re.findall(r'"([^"]+driver\.py)"', rewritten)
+            )
+            staged_data = next(
+                Path(value.partition("=")[2])
+                for value in re.findall(r'"(--data=[^"]+)"', rewritten)
+            )
+            staged_positional = next(
+                Path(value)
+                for value in re.findall(r'"([^"]+input\.cpp)"', rewritten)
+            )
+            self.assertEqual(staged_script.read_bytes(), script.read_bytes())
+            self.assertEqual(staged_data.read_bytes(), data.read_bytes())
+            self.assertEqual(staged_positional.read_bytes(), positional.read_bytes())
+            self.assertEqual(staged_script.parents[1], staged_data.parents[2])
+            self.assertEqual(staged_script.parents[1], staged_positional.parents[1])
+            self.assertIn('"--raw-token"', rewritten)
+            self.assertFalse(
+                (Path(env["QML_IMPORT_PATH"]) / "ReviewerOnly").exists()
+            )
+            self.assertFalse(
+                (Path(env["QT_PLUGIN_PATH"]) / "imageformats" / plugin.name).exists()
+            )
+            self.assert_directory_rejects_late_insertion(staged_script.parent)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_windows_ctest_runtime_contract_gets_exact_immutable_build_registration_closure(
+        self,
+    ):
+        python = self.root / "python-contract" / "python.exe"
+        python.parent.mkdir()
+        _write_manifest_pe_fixture(python)
+        unselected = self.build_dir / "tst_unselected.exe"
+        _write_manifest_pe_fixture(unselected)
+        unselected_style = self.build_dir / "tst_unselected_style.exe"
+        _write_manifest_pe_fixture(unselected_style)
+        script = self.root / "tests" / "scripts" / "check_windows_ctest_runtime.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("print('contract')\n", encoding="utf-8")
+        generated = self.build_dir / "generated" / "CTestTestfile.cmake"
+        generated.parent.mkdir()
+        generated.write_text("# generated registration\n", encoding="utf-8")
+        unrelated = self.build_dir / "generated" / "Unrelated.cmake"
+        unrelated.write_text("# not in the declared CTest graph\n", encoding="utf-8")
+        noise = self.build_dir / "generated" / "mutable-noise.dat"
+        noise.write_bytes(b"not declared by the contract")
+        project_qml = self.build_dir / "qml"
+        project_module = project_qml / "OlrTheme"
+        project_module.mkdir(parents=True)
+        (project_module / "qmldir").write_text(
+            "module OlrTheme\n", encoding="utf-8"
+        )
+        cache = self.build_dir / "CMakeCache.txt"
+        graph = self.build_dir / "CTestTestfile.cmake"
+        runtime_dirs = (
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+        )
+        runtime_modifications = ";".join(
+            f"PATH=path_list_prepend:{path.as_posix()}"
+            for path in reversed(runtime_dirs)
+        )
+        graph.write_text(
+            f'add_test([=[windows_ctest_runtime_contract]=] "{python.as_posix()}" '
+            f'"{script.as_posix()}" "--build-dir" "{self.build_dir.as_posix()}" '
+            f'"--qt-runtime-dir" "{(self.qt_root / "bin").as_posix()}" '
+            f'"--qt-plugin-dir" "{(self.qt_root / "plugins").as_posix()}" '
+            f'"--qt-qml-dir" "{(self.qt_root / "qml").as_posix()}" '
+            f'"--project-qml-dir" "{project_qml.as_posix()}")\n'
+            f'add_test([=[unselected]=] "{unselected.as_posix()}")\n'
+            'set_tests_properties([=[unselected]=] PROPERTIES '
+            f'ENVIRONMENT_MODIFICATION "{runtime_modifications}")\n'
+            f'add_test([=[unselected-style]=] "{unselected_style.as_posix()}")\n'
+            'set_tests_properties([=[unselected-style]=] PROPERTIES '
+            'ENVIRONMENT_MODIFICATION "'
+            f'QML_IMPORT_PATH=path_list_prepend:{(self.qt_root / "qml").as_posix()};'
+            f'QML2_IMPORT_PATH=path_list_prepend:{(self.qt_root / "qml").as_posix()};'
+            f'QML_IMPORT_PATH=path_list_prepend:{project_qml.as_posix()};'
+            f'QML2_IMPORT_PATH=path_list_prepend:{project_qml.as_posix()}")\n'
+            'add_subdirectory("generated")\n',
+            encoding="utf-8",
+        )
+        cache_root = Path(tempfile.mkdtemp(prefix="olr-contract-build-cache-"))
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        cache_bytes = cache.read_bytes()
+        cache_was_locked_during_parse = False
+        original_require_cache_entries = run_ctest.require_cache_entries
+
+        def observe_cache_lock(*args, **kwargs):
+            nonlocal cache_was_locked_during_parse
+            result = original_require_cache_entries(*args, **kwargs)
+            try:
+                cache.write_bytes(cache_bytes)
+            except OSError:
+                cache_was_locked_during_parse = True
+            return result
+
+        with RuntimeAuditLease(cache_root) as lease, mock.patch.object(
+            run_ctest,
+            "require_cache_entries",
+            side_effect=observe_cache_lock,
+        ):
+            env, staged_ctest = run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^windows_ctest_runtime_contract$"),
+            )
+            staged_build = lease.launch_build_directory
+            rewritten = (staged_build / "CTestTestfile.cmake").read_text(
+                encoding="utf-8"
+            )
+            staged_build_argument = next(
+                Path(value)
+                for value in re.findall(r'"([^\"]+)"', rewritten)
+                if Path(value) == staged_build
+            )
+
+            self.assertEqual(staged_build_argument, staged_build)
+            staged_project_qml = Path(
+                re.search(
+                    r'"--project-qml-dir" "([^"]+)"', rewritten
+                ).group(1)
+            )
+            self.assertNotEqual(staged_project_qml, project_qml)
+            self.assertFalse(staged_project_qml.is_relative_to(staged_build))
+            self.assertNotIn(project_qml.as_posix(), rewritten)
+            self.assertGreaterEqual(
+                rewritten.count(staged_project_qml.as_posix()),
+                3,
+            )
+            self.assertEqual(
+                (staged_project_qml / "OlrTheme" / "qmldir").read_text(
+                    encoding="utf-8"
+                ),
+                "module OlrTheme\n",
+            )
+            self.assert_directory_rejects_late_insertion(staged_project_qml)
+            self.assertTrue(cache_was_locked_during_parse)
+            staged_cache = staged_build / "CMakeCache.txt"
+            staged_entries = windows_runtime_guard.parse_cmake_cache(staged_cache)
+            expected_cache_paths = {
+                "CMAKE_CXX_COMPILER": lease.launch_runtime_directories[0]
+                / (self.compiler_bin / "g++.exe").name,
+                "OLR_FFMPEG_ROOT": lease.launch_runtime_directories[2].parent,
+                "OLR_SRT_ROOT": lease.launch_runtime_directories[4].parent,
+                "CMAKE_CTEST_COMMAND": staged_ctest,
+            }
+            for key, expected in expected_cache_paths.items():
+                self.assertEqual(Path(staged_entries[key].value), expected)
+                self.assertTrue(expected.exists())
+                self.assertNotIn(str(self.cache_values[key]), staged_entries[key].value)
+            self.assertEqual(cache.read_bytes(), cache_bytes)
+            self.assertNotEqual(staged_cache.read_bytes(), cache_bytes)
+            self.assertIn(Path(env["QML_IMPORT_PATH"]).as_posix(), rewritten)
+            self.assertNotIn((self.qt_root / "qml").as_posix(), rewritten)
+            for original, staged in zip(
+                runtime_dirs, lease.launch_runtime_directories, strict=True
+            ):
+                self.assertNotIn(original.as_posix(), rewritten)
+                self.assertIn(staged.as_posix(), rewritten)
+            self.assertFalse((staged_build / unselected.name).exists())
+            self.assertFalse((staged_build / unselected_style.name).exists())
+            self.assertEqual(
+                (staged_build / generated.relative_to(self.build_dir)).read_bytes(),
+                generated.read_bytes(),
+            )
+            self.assertFalse(
+                (staged_build / unrelated.relative_to(self.build_dir)).exists()
+            )
+            self.assertFalse(
+                (staged_build / noise.relative_to(self.build_dir)).exists()
+            )
+            self.assertEqual(
+                {
+                    path.relative_to(staged_build)
+                    for path in staged_build.rglob("*.cmake")
+                },
+                {
+                    Path("CTestTestfile.cmake"),
+                    generated.relative_to(self.build_dir),
+                },
+            )
+            with self.assertRaises(OSError):
+                cache.write_text("poison", encoding="utf-8")
+            with self.assertRaises(OSError):
+                generated.write_text("poison", encoding="utf-8")
+            with self.assertRaises(OSError):
+                staged_cache.write_text("poison", encoding="utf-8")
+
+        with cache.open("ab") as stream:
+            stream.write(b"# cache identity changed\n")
+        with RuntimeAuditLease(cache_root) as changed:
+            _env, changed_ctest = run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=changed,
+                ctest_args=("-R", "^windows_ctest_runtime_contract$"),
+            )
+            self.assertNotEqual(changed.launch_build_directory, staged_build)
+            changed_cache = changed.launch_build_directory / "CMakeCache.txt"
+            self.assertIn(
+                b"# cache identity changed\n",
+                changed_cache.read_bytes(),
+            )
+            self.assertEqual(
+                Path(
+                    windows_runtime_guard.parse_cmake_cache(changed_cache)[
+                        "CMAKE_CTEST_COMMAND"
+                    ].value
+                ),
+                changed_ctest,
+            )
+
+    def test_unknown_existing_python_option_path_fails_closed(self):
+        python = self.root / "python-unknown" / "python.exe"
+        python.parent.mkdir()
+        _write_manifest_pe_fixture(python)
+        script = self.root / "tests" / "unknown_driver.py"
+        undeclared = self.root / "tests" / "undeclared.dat"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("print('driver')\n", encoding="utf-8")
+        undeclared.write_bytes(b"undeclared")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[python-unknown]=] "{python.as_posix()}" '
+            f'"{script.as_posix()}" "--mystery={undeclared.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "unknown-path-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with (
+            RuntimeAuditLease(cache_root) as lease,
+            self.assertRaisesRegex(
+                RuntimeError, "unsupported CTest argument path role"
+            ),
+        ):
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+
+    def test_unknown_split_python_option_path_fails_closed(self):
+        python = self.root / "python-unknown-split" / "python.exe"
+        python.parent.mkdir()
+        _write_manifest_pe_fixture(python)
+        script = self.root / "tests" / "unknown_split_driver.py"
+        undeclared = self.root / "tests" / "undeclared-split.dat"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("print('driver')\n", encoding="utf-8")
+        undeclared.write_bytes(b"undeclared")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[python-unknown-split]=] "{python.as_posix()}" '
+            f'"{script.as_posix()}" "--mystery" "{undeclared.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "unknown-split-path-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with (
+            RuntimeAuditLease(cache_root) as lease,
+            self.assertRaisesRegex(
+                RuntimeError, "unsupported CTest argument path role"
+            ),
+        ):
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+
+    def test_standard_python_interpreter_options_preserve_their_arguments(self):
+        python = self.root / "python-standard-options" / "python.exe"
+        python.parent.mkdir()
+        _write_manifest_pe_fixture(python)
+        script = self.root / "tests" / "scripts" / "option_driver.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("print('driver')\n", encoding="utf-8")
+        stdin_argument = self.root / "tests" / "fixtures" / "stdin-data.txt"
+        stdin_argument.parent.mkdir(parents=True)
+        stdin_argument.write_text("stdin argument\n", encoding="utf-8")
+        command = "open('fixtures/input.txt')"
+        module = "tests.scripts.test_run_ctest"
+        discovery_start = script.parent
+        discovery_top = self.root
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[python-module]=] "{python.as_posix()}" '
+            f'"-I" "-X" "utf8" "-m" "{module}")\n'
+            f'add_test([=[python-unittest-selector]=] "{python.as_posix()}" '
+            f'"-m" "unittest" "-v" "-k" "Case.test_method" '
+            f'"package.tests.Case.test_method")\n'
+            f'add_test([=[python-unittest-discovery]=] "{python.as_posix()}" '
+            f'"-m" "unittest" "discover" "-s" "{discovery_start.as_posix()}" '
+            f'"-p" "test*.py" "-t" "{discovery_top.as_posix()}")\n'
+            f'add_test([=[python-command]=] "{python.as_posix()}" '
+            f'"-B" "-Werror" "-c" "{command}")\n'
+            f'add_test([=[python-combined-flags]=] "{python.as_posix()}" '
+            f'"-IE" "-R" "-VVV" "{script.as_posix()}")\n'
+            f'add_test([=[python-separator]=] "{python.as_posix()}" '
+            f'"--" "{script.as_posix()}")\n'
+            f'add_test([=[python-stdin]=] "{python.as_posix()}" '
+            f'"--" "-" "{stdin_argument.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "standard-python-options-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with RuntimeAuditLease(cache_root) as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            rewritten = (
+                lease.launch_build_directory / "CTestTestfile.cmake"
+            ).read_text(encoding="utf-8")
+
+        self.assertIn(f'"-I" "-X" "utf8" "-m" "{module}"', rewritten)
+        self.assertIn(
+            '"-m" "unittest" "-v" "-k" "Case.test_method" '
+            '"package.tests.Case.test_method"',
+            rewritten,
+        )
+        self.assertNotIn(f'"{discovery_start.as_posix()}"', rewritten)
+        self.assertNotIn(f'"{discovery_top.as_posix()}"', rewritten)
+        self.assertIn('"-p" "test*.py"', rewritten)
+        self.assertIn(f'"-B" "-Werror" "-c" "{command}"', rewritten)
+        self.assertIn('"-IE" "-R" "-VVV"', rewritten)
+        self.assertNotIn(script.as_posix(), rewritten)
+        self.assertNotIn(stdin_argument.as_posix(), rewritten)
+        self.assertIn('"--"', rewritten)
+
+    def test_unknown_colon_attached_python_option_path_fails_closed(self):
+        python = self.root / "python-unknown-colon" / "python.exe"
+        python.parent.mkdir()
+        _write_manifest_pe_fixture(python)
+        script = self.root / "tests" / "unknown_colon_driver.py"
+        undeclared = self.root / "tests" / "undeclared-colon.dat"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("print('driver')\n", encoding="utf-8")
+        undeclared.write_bytes(b"undeclared")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[python-unknown-colon]=] "{python.as_posix()}" '
+            f'"{script.as_posix()}" '
+            f'"--mystery:{undeclared.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "unknown-colon-path-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with (
+            RuntimeAuditLease(cache_root) as lease,
+            self.assertRaisesRegex(
+                RuntimeError, "unsupported CTest argument path role"
+            ),
+        ):
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+
+    def test_python_hash_mode_rejects_empty_attached_value(self):
+        python = self.root / "python-empty-hash-mode" / "python.exe"
+        python.parent.mkdir()
+        _write_manifest_pe_fixture(python)
+        script = self.root / "tests" / "hash_mode_driver.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("print('driver')\n", encoding="utf-8")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[python-empty-hash-mode]=] "{python.as_posix()}" '
+            f'"--check-hash-based-pycs=" "{script.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "empty-hash-mode-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with (
+            RuntimeAuditLease(cache_root) as lease,
+            self.assertRaisesRegex(RuntimeError, "hash-based-pycs|value"),
+        ):
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+
+    def test_python_input_tokens_are_not_misclassified_as_quicktest_paths(self):
+        python = self.root / "python-input-token" / "python.exe"
+        python.parent.mkdir()
+        _write_manifest_pe_fixture(python)
+        script = self.root / "tests" / "input_token_driver.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("print('driver')\n", encoding="utf-8")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[python-command-input-token]=] "{python.as_posix()}" '
+            f'"-c" "-input" "opaque-enum")\n'
+            f'add_test([=[python-app-input-token]=] "{python.as_posix()}" '
+            f'"{script.as_posix()}" "-input" "opaque-enum")\n'
+            f'add_test([=[python-app-attached-input-token]=] "{python.as_posix()}" '
+            f'"{script.as_posix()}" "-input=opaque-enum")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "python-input-token-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with RuntimeAuditLease(cache_root) as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            rewritten = (
+                lease.launch_build_directory / "CTestTestfile.cmake"
+            ).read_text(encoding="utf-8")
+
+        self.assertIn('"-c" "-input" "opaque-enum"', rewritten)
+        self.assertIn('"-input" "opaque-enum"', rewritten)
+        self.assertIn('"-input=opaque-enum"', rewritten)
+
+    def test_unknown_absent_python_paths_fail_before_late_creation(self):
+        python = self.root / "python-absent" / "python.exe"
+        python.parent.mkdir()
+        _write_manifest_pe_fixture(python)
+        script = self.root / "tests" / "absent_driver.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("print('driver')\n", encoding="utf-8")
+        candidates = (
+            self.root / "tests" / "future.dat",
+            self.root / "escaping.dat",
+        )
+        arguments = (
+            f"--mystery={candidates[0].as_posix()}",
+            "../escaping.dat",
+        )
+
+        for index, (argument, candidate) in enumerate(zip(arguments, candidates)):
+            with self.subTest(argument=argument):
+                (self.build_dir / "CTestTestfile.cmake").write_text(
+                    f'add_test([=[python-absent-{index}]=] "{python.as_posix()}" '
+                    f'"{script.as_posix()}" "{argument}")\n',
+                    encoding="utf-8",
+                )
+                cache_root = Path(
+                    tempfile.mkdtemp(prefix=f"olr-absent-path-cache-{index}-")
+                )
+                self.addCleanup(self.remove_test_runtime_cache, cache_root)
+                with (
+                    RuntimeAuditLease(cache_root) as lease,
+                    self.assertRaisesRegex(
+                        RuntimeError, "unsupported CTest argument path role"
+                    ),
+                ):
+                    run_ctest.prepare_windows_runtime(
+                        self.build_dir, {}, audit_lease=lease
+                    )
+                candidate.write_bytes(b"late mutable input")
+                candidate.unlink()
+
+    def test_unsupported_tool_existing_path_argument_fails_closed(self):
+        tool = self.build_dir / "custom_tool.exe"
+        _write_manifest_pe_fixture(tool)
+        input_path = self.root / "custom-input.dat"
+        input_path.write_bytes(b"input")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[custom]=] "{tool.as_posix()}" '
+            f'"{input_path.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "custom-path-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with (
+            RuntimeAuditLease(cache_root) as lease,
+            self.assertRaisesRegex(
+                RuntimeError, "unsupported CTest argument path role"
+            ),
+        ):
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+
+    def test_non_python_tool_closure_keeps_normal_delay_and_dynamic_family(self):
+        root = self.root / "qt-tool-closure"
+        root.mkdir()
+        tool = root / "qmllint.exe"
+        normal = root / "Qt6Normal.dll"
+        delayed = root / "Qt6Delayed.dll"
+        carrier = root / "avcodec-61.dll"
+        unused = root / "Qt6Unused.dll"
+        _write_pe_fixture(
+            tool,
+            imported_name=normal.name,
+            directory_index=1,
+        )
+        _write_pe_fixture(normal, imported_name=delayed.name)
+        _write_pe_fixture(delayed, imported_name="kernel32.dll", directory_index=1)
+        carrier.write_bytes(b"tool-local-dynamic-family")
+        with unused.open("wb") as stream:
+            stream.truncate(16 << 20)
+
+        closure = run_ctest._external_tool_closure(tool)
+
+        self.assertIn(Path(normal.name), closure.entries)
+        self.assertIn(Path(delayed.name), closure.entries)
+        self.assertIn(Path(carrier.name), closure.entries)
+        self.assertNotIn(Path(unused.name), closure.entries)
 
     def test_python_external_tool_closure_bounds_normal_install(self):
         root = self.root / "python-normal"
@@ -2364,6 +4194,8 @@ class RunCtestTests(unittest.TestCase):
         (root / "Lib" / "json" / "__init__.py").write_text(
             "", encoding="utf-8"
         )
+        adjacent = root / "python-adjacent-runtime.dll"
+        adjacent.write_bytes(b"python-adjacent")
         site = root / "Lib" / "site-packages" / "oversized"
         site.mkdir(parents=True)
         for index in range(1024):
@@ -2375,6 +4207,7 @@ class RunCtestTests(unittest.TestCase):
         self.assertEqual(closure.executable_relative, Path("python.exe"))
         self.assertIn(Path("Lib/json/__init__.py"), closure.entries)
         self.assertIn(Path("DLLs/_socket.pyd"), closure.entries)
+        self.assertIn(Path(adjacent.name), closure.entries)
         self.assertNotIn(
             Path("Lib/site-packages/oversized/unused-0000.py"), closure.entries
         )
@@ -2964,6 +4797,27 @@ class RunCtestTests(unittest.TestCase):
             self.assertTrue((changed_path / "ignored.txt").is_file())
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_runtime_audit_lease_batches_tree_source_descriptors(self) -> None:
+        cache_root = self.root / "batched-tree-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        source = self.root / "batched-tree-source"
+        source.mkdir()
+        for index in range(40):
+            (source / f"Module{index}.qml").write_bytes(
+                f"qml-{index}".encode("ascii")
+            )
+
+        with RuntimeAuditLease(cache_root) as lease, mock.patch.object(
+            lease,
+            "_describe_held_sources",
+            wraps=lease._describe_held_sources,
+        ) as describe_many:
+            staged = lease.stage_readonly_tree(source)
+
+        describe_many.assert_called_once()
+        self.assertEqual(len(tuple(staged.glob("*.qml"))), 40)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
     def test_runtime_audit_lease_binds_dependencies_to_exact_cached_layouts(self) -> None:
         cache_root = self.root / "dependency-cache"
         self.addCleanup(self.remove_test_runtime_cache, cache_root)
@@ -3047,7 +4901,7 @@ class RunCtestTests(unittest.TestCase):
         ) as describe:
             with self.assertRaisesRegex(RuntimeError, "entry limit"):
                 lease.stage_readonly_tree(source, entry_limit=1)
-            self.assertEqual(describe.call_count, 1)
+            self.assertEqual(describe.call_count, 0)
             self.assertEqual(lease.cached_layout_directories, ())
 
     @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
@@ -3404,7 +5258,423 @@ class RunCtestTests(unittest.TestCase):
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=17)
     @mock.patch("tools.run_ctest.run_process_tree")
-    def test_main_preserves_hostile_arguments_and_appends_final_zero(
+    def test_main_uses_ephemeral_writable_controller_and_immutable_test_cwd(
+        self,
+        run: mock.Mock,
+        _set_error_mode: mock.Mock,
+        _restore_error_mode: mock.Mock,
+        _set_dll_directory: mock.Mock,
+        _restore_dll_directory: mock.Mock,
+    ) -> None:
+        self.write_cacheable_ctest_graph("unit")
+        controllers: list[Path] = []
+        ambient_config = self.root / "ambient-cmake-config"
+        ambient_query = ambient_config / "instrumentation" / "v1" / "query"
+        ambient_query.mkdir(parents=True)
+        (ambient_query / "callback.json").write_text(
+            '{"version":1,"callbacks":["C:/attacker.exe"],'
+            '"hooks":["postCTest"]}\n',
+            encoding="utf-8",
+        )
+
+        def inspect_controller(command, **kwargs) -> int:
+            controller = Path(command[-3])
+            controllers.append(controller)
+            graph = controller / "CTestTestfile.cmake"
+            self.assertTrue(graph.is_file())
+            self.assertEqual(tuple(controller.rglob("*.exe")), ())
+            self.assertFalse((controller / "CMakeCache.txt").exists())
+            temporary = controller / "Testing" / "Temporary"
+            self.assertEqual(Path(kwargs["env"]["TMPDIR"]), temporary)
+            config = Path(kwargs["env"]["CMAKE_CONFIG_DIR"])
+            self.assertEqual(config, controller / "cmake-config")
+            self.assertTrue(config.is_dir())
+            self.assertEqual(tuple(config.rglob("*")), ())
+            self.assertNotEqual(config, ambient_config)
+            self.assertNotIn("attacker", "\n".join(kwargs["env"].values()).casefold())
+            for name in (
+                "CTEST_USE_INSTRUMENTATION",
+                "CTEST_USE_VERBOSE_INSTRUMENTATION",
+                "CTEST_PARALLEL_LEVEL",
+            ):
+                self.assertNotIn(name.casefold(), {
+                    key.casefold() for key in kwargs["env"]
+                })
+            with self.assertRaises(OSError):
+                (config / "instrumentation" / "v1" / "query").mkdir(
+                    parents=True
+                )
+            shell_temporary = Path(tempfile.mkdtemp(dir=kwargs["env"]["TMPDIR"]))
+            self.assertEqual(shell_temporary.parent, temporary)
+            shell_temporary.rmdir()
+            (temporary / "LastTest.log").write_text("ctest log\n", encoding="utf-8")
+            with self.assertRaises(OSError):
+                (controller / "CTestCustom.cmake").write_text(
+                    "poison\n", encoding="utf-8"
+                )
+            for graph_directory in {
+                path.parent for path in controller.rglob("CTestTestfile.cmake")
+            }:
+                with self.assertRaises(OSError, msg=str(graph_directory)):
+                    (graph_directory / "injected.ctest").write_text(
+                        "poison\n", encoding="utf-8"
+                    )
+
+            replacement = temporary / "replacement.cmake"
+            replacement.write_text("poison\n", encoding="utf-8")
+            with self.assertRaises(OSError):
+                os.replace(replacement, graph)
+
+            rendered = graph.read_text(encoding="utf-8")
+            working_match = re.search(
+                r"WORKING_DIRECTORY \[\[(.*?)\]\]", rendered, re.DOTALL
+            )
+            self.assertIsNotNone(working_match)
+            self.assert_directory_rejects_late_insertion(
+                Path(working_match.group(1))
+            )
+            return 0
+
+        run.side_effect = inspect_controller
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CmAkE_CoNfIg_DiR": str(ambient_config),
+                "cTeSt_UsE_InStRuMeNtAtIoN": "1",
+                "CtEsT_UsE_VeRbOsE_InStRuMeNtAtIoN": "1",
+                "cTeSt_PaRaLlEl_LeVeL": "0",
+            },
+        ):
+            self.assertEqual(
+                run_ctest.main(
+                    ["--test-dir", str(self.build_dir), "-R", "^unit$"]
+                ),
+                0,
+            )
+
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
+    def test_ctest_controller_rejects_injection_before_final_seal(self) -> None:
+        self.write_cacheable_ctest_graph("unit")
+        cache_root = self.root / "controller-injection-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        controllers: list[Path] = []
+        lease = RuntimeAuditLease(cache_root)
+        try:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^unit$"),
+            )
+
+            def inject(controller: Path) -> None:
+                controllers.append(controller)
+                (controller / "CTestCustom.cmake").write_text(
+                    "poison\n", encoding="utf-8"
+                )
+
+            with (
+                mock.patch.object(
+                    lease,
+                    "_before_ctest_controller_seal",
+                    side_effect=inject,
+                    create=True,
+                ),
+                self.assertRaisesRegex(RuntimeError, "unexpected CTest controller"),
+            ):
+                lease.create_ctest_controller()
+        finally:
+            lease.close()
+
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
+    def test_ctest_controller_rejects_expected_graph_substitution(self) -> None:
+        self.write_cacheable_ctest_graph("unit")
+        cache_root = self.root / "controller-graph-substitution-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        controllers: list[Path] = []
+        lease = RuntimeAuditLease(cache_root)
+        try:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^unit$"),
+            )
+
+            def substitute(_source: Path, destination: Path) -> None:
+                controllers.append(destination.parent)
+                replacement = destination.with_name("replacement-graph.cmake")
+                replacement.write_text("poison\n", encoding="utf-8")
+                os.replace(replacement, destination)
+
+            with (
+                mock.patch.object(
+                    lease,
+                    "_before_ctest_graph_hold",
+                    side_effect=substitute,
+                    create=True,
+                ),
+                self.assertRaises(OSError),
+            ):
+                lease.create_ctest_controller()
+        finally:
+            lease.close()
+
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
+    def test_ctest_controller_rejects_expected_graph_mutation(self) -> None:
+        self.write_cacheable_ctest_graph("unit")
+        cache_root = self.root / "controller-graph-mutation-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        controllers: list[Path] = []
+        lease = RuntimeAuditLease(cache_root)
+        try:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^unit$"),
+            )
+
+            def mutate(_source: Path, destination: Path) -> None:
+                controllers.append(destination.parent)
+                destination.write_text("poison\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    lease,
+                    "_before_ctest_graph_hold",
+                    side_effect=mutate,
+                    create=True,
+                ),
+                self.assertRaises(OSError),
+            ):
+                lease.create_ctest_controller()
+        finally:
+            lease.close()
+
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
+    def test_ctest_controller_rejects_same_byte_graph_replacement(self) -> None:
+        self.write_cacheable_ctest_graph("unit")
+        cache_root = self.root / "controller-same-byte-graph-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        controllers: list[Path] = []
+        lease = RuntimeAuditLease(cache_root)
+        try:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^unit$"),
+            )
+
+            def substitute(source: Path, destination: Path) -> None:
+                controllers.append(destination.parent)
+                replacement = destination.with_name("same-byte-graph.cmake")
+                replacement.write_bytes(source.read_bytes())
+                os.replace(replacement, destination)
+
+            with (
+                mock.patch.object(
+                    lease,
+                    "_before_ctest_graph_hold",
+                    side_effect=substitute,
+                ),
+                self.assertRaises(OSError),
+            ):
+                lease.create_ctest_controller()
+        finally:
+            lease.close()
+
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
+    def test_ctest_controller_rejects_transient_graph_mutation(self) -> None:
+        self.write_cacheable_ctest_graph("unit")
+        cache_root = self.root / "controller-transient-graph-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        controllers: list[Path] = []
+        lease = RuntimeAuditLease(cache_root)
+        try:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^unit$"),
+            )
+
+            def mutate_then_restore(source: Path, destination: Path) -> None:
+                controllers.append(destination.parent)
+                original = source.read_bytes()
+                with destination.open("r+b") as stream:
+                    stream.write(b"poison\n")
+                    stream.truncate()
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    stream.seek(0)
+                    stream.write(original)
+                    stream.truncate()
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+            with (
+                mock.patch.object(
+                    lease,
+                    "_before_ctest_graph_hold",
+                    side_effect=mutate_then_restore,
+                ),
+                self.assertRaises(OSError),
+            ):
+                lease.create_ctest_controller()
+        finally:
+            lease.close()
+
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows handle semantics")
+    def test_ctest_controller_graph_handle_is_not_inheritable(self) -> None:
+        import msvcrt
+
+        self.write_cacheable_ctest_graph("unit")
+        cache_root = self.root / "controller-handle-inheritance-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        controllers: list[Path] = []
+        inherited: list[bool] = []
+        lease = RuntimeAuditLease(cache_root)
+        try:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^unit$"),
+            )
+
+            def inspect_handle(_source: Path, destination: Path) -> None:
+                controllers.append(destination.parent)
+                stream = lease._streams[destination.absolute()]
+                handle = msvcrt.get_osfhandle(stream.fileno())
+                inherited.append(os.get_handle_inheritable(handle))
+
+            with mock.patch.object(
+                lease,
+                "_before_ctest_graph_hold",
+                side_effect=inspect_handle,
+            ):
+                lease.create_ctest_controller()
+        finally:
+            lease.close()
+
+        self.assertEqual(inherited, [False])
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
+    def test_ctest_controller_rejects_expected_graph_hardlink(self) -> None:
+        self.write_cacheable_ctest_graph("unit")
+        cache_root = self.root / "controller-graph-hardlink-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        controllers: list[Path] = []
+        lease = RuntimeAuditLease(cache_root)
+        try:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^unit$"),
+            )
+
+            def hardlink(source: Path, destination: Path) -> None:
+                del source
+                controllers.append(destination.parent)
+                alias = destination.with_name("graph-alias.cmake")
+                os.link(destination, alias)
+
+            with (
+                mock.patch.object(
+                    lease,
+                    "_before_ctest_graph_hold",
+                    side_effect=hardlink,
+                    create=True,
+                ),
+                self.assertRaisesRegex(RuntimeError, "file alias"),
+            ):
+                lease.create_ctest_controller()
+        finally:
+            lease.close()
+
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
+    def test_ctest_controller_rejects_preopened_directory_writer(self) -> None:
+        self.write_cacheable_ctest_graph("unit")
+        cache_root = self.root / "controller-writer-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        controllers: list[Path] = []
+        writer_handles: list[int] = []
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        lease = RuntimeAuditLease(cache_root)
+        try:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^unit$"),
+            )
+
+            def open_writer(controller: Path) -> None:
+                controllers.append(controller)
+                handle = kernel32.CreateFileW(
+                    str(controller),
+                    0x00000002,  # FILE_ADD_FILE on a directory
+                    0x00000001 | 0x00000002 | 0x00000004,
+                    None,
+                    3,
+                    0x02000000,
+                    None,
+                )
+                self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+                writer_handles.append(int(handle))
+
+            with (
+                mock.patch.object(
+                    lease,
+                    "_before_ctest_controller_seal",
+                    side_effect=open_writer,
+                    create=True,
+                ),
+                self.assertRaises(OSError),
+            ):
+                lease.create_ctest_controller()
+        finally:
+            for handle in writer_handles:
+                kernel32.CloseHandle(handle)
+            lease.close()
+
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
+
+    @mock.patch("tools.run_ctest._restore_windows_dll_directory")
+    @mock.patch("tools.run_ctest._set_windows_dll_directory", return_value="C:/prior")
+    @mock.patch("tools.run_ctest._restore_windows_error_mode")
+    @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=17)
+    @mock.patch("tools.run_ctest.run_process_tree")
+    def test_main_normalizes_test_dir_and_appends_final_zero(
         self,
         run: mock.Mock,
         set_error_mode: mock.Mock,
@@ -3412,6 +5682,7 @@ class RunCtestTests(unittest.TestCase):
         set_dll_directory: mock.Mock,
         restore_dll_directory: mock.Mock,
     ):
+        self.write_cacheable_ctest_graph("unit")
         run.return_value = 0
         caller_args = [
             "--interactive-debug-mode",
@@ -3431,7 +5702,9 @@ class RunCtestTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         command = run.call_args.args[0]
-        self.assertEqual(command[1 : 1 + len(caller_args)], caller_args)
+        forwarded_args = caller_args[:2] + caller_args[4:]
+        self.assertEqual(command[1 : 1 + len(forwarded_args)], forwarded_args)
+        self.assertNotIn(str(self.build_dir), command)
         self.assertEqual(
             command[-4::2], ["--test-dir", "--interactive-debug-mode"]
         )
@@ -3463,6 +5736,7 @@ class RunCtestTests(unittest.TestCase):
         _set_error_mode: mock.Mock,
         _restore_error_mode: mock.Mock,
     ) -> None:
+        self.write_cacheable_ctest_graph("unit")
         alias = self.root / "build-alias"
         self.make_junction(alias, self.build_dir)
 
@@ -3473,13 +5747,13 @@ class RunCtestTests(unittest.TestCase):
         staged_build = Path(command[-3])
         self.assertNotEqual(staged_build, self.build_dir.resolve())
         self.assertNotEqual(staged_build, alias)
-        self.assertTrue(staged_build.is_dir())
+        self.assertFalse(staged_build.exists())
         self.assertEqual(command[-2:], ["--interactive-debug-mode", "0"])
 
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=13)
     @mock.patch("tools.run_ctest.run_process_tree")
-    def test_main_preserves_interactive_spelling_as_test_dir_value(
+    def test_main_consumes_interactive_spelling_as_test_dir_value(
         self,
         run: mock.Mock,
         set_error_mode: mock.Mock,
@@ -3490,6 +5764,9 @@ class RunCtestTests(unittest.TestCase):
         named_build_dir.mkdir()
         self.build_dir = named_build_dir
         self.write_cache()
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            "", encoding="utf-8"
+        )
         caller_args = ["--test-dir", "--interactive-debug-mode=1"]
 
         with mock.patch.object(run_ctest.Path, "cwd", return_value=self.root):
@@ -3497,7 +5774,7 @@ class RunCtestTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         command = run.call_args.args[0]
-        self.assertEqual(command[1 : 1 + len(caller_args)], caller_args)
+        self.assertNotIn("--interactive-debug-mode=1", command)
         self.assertEqual(command[-4], "--test-dir")
         self.assertNotEqual(Path(command[-3]), self.build_dir.resolve())
         self.assertEqual(command[-2:], ["--interactive-debug-mode", "0"])
@@ -3513,6 +5790,7 @@ class RunCtestTests(unittest.TestCase):
         set_error_mode: mock.Mock,
         restore_error_mode: mock.Mock,
     ):
+        self.write_cacheable_ctest_graph("unit")
         result = run_ctest.main(["--test-dir", str(self.build_dir)])
 
         self.assertEqual(result, 23)
@@ -3522,16 +5800,26 @@ class RunCtestTests(unittest.TestCase):
 
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=29)
-    @mock.patch("tools.run_ctest.run_process_tree", side_effect=OSError("launch failed"))
+    @mock.patch("tools.run_ctest.run_process_tree")
     def test_main_restores_error_mode_when_child_launch_raises(
         self,
-        _run: mock.Mock,
+        run: mock.Mock,
         set_error_mode: mock.Mock,
         restore_error_mode: mock.Mock,
     ):
+        self.write_cacheable_ctest_graph("unit")
+        controllers: list[Path] = []
+
+        def fail_launch(command, **_kwargs):
+            controllers.append(Path(command[-3]))
+            raise OSError("launch failed")
+
+        run.side_effect = fail_launch
         with self.assertRaisesRegex(OSError, "launch failed"):
             run_ctest.main(["--test-dir", str(self.build_dir)])
 
+        self.assertEqual(len(controllers), 1)
+        self.assertFalse(controllers[0].exists())
         set_error_mode.assert_called_once_with()
         restore_error_mode.assert_called_once_with(29)
 
@@ -3543,6 +5831,7 @@ class RunCtestTests(unittest.TestCase):
         _set_error_mode: mock.Mock,
         _restore_error_mode: mock.Mock,
     ) -> None:
+        self.write_cacheable_ctest_graph("unit")
         replacement = self.cmake_bin / "replacement-ctest.exe"
         replacement.write_bytes(b"replacement")
 
